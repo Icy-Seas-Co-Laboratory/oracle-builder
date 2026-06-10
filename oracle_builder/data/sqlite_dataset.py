@@ -1,0 +1,211 @@
+from __future__ import annotations
+
+import argparse
+import json
+import sqlite3
+import uuid
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+
+from oracle_builder.data.decoders import decode_blob, encode_npy, normalize_input
+from oracle_builder.data.splits import assign_missing_splits
+
+
+SAMPLE_COLUMNS = [
+    "uuid",
+    "split",
+    "input_blob",
+    "input_blob_encoding",
+    "input_blob_dimensions",
+    "output_blob",
+    "output_blob_encoding",
+    "output_blob_dimensions",
+    "label_text",
+    "sample_weight",
+    "metadata_json",
+]
+
+
+def synthetic_splits(n: int, validation_fraction: float = 0.2, test_fraction: float = 0.1) -> list[str]:
+    n_test = int(round(n * test_fraction))
+    n_validation = int(round(n * validation_fraction))
+    n_train = max(0, n - n_validation - n_test)
+    return ["train"] * n_train + ["validation"] * n_validation + ["test"] * n_test
+
+
+def ensure_schema(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS samples (
+            uuid TEXT PRIMARY KEY,
+            split TEXT,
+            input_blob BLOB,
+            input_blob_encoding TEXT,
+            input_blob_dimensions TEXT,
+            output_blob BLOB,
+            output_blob_encoding TEXT,
+            output_blob_dimensions TEXT,
+            label_text TEXT,
+            sample_weight REAL,
+            metadata_json TEXT
+        )
+        """
+    )
+
+
+def read_rows(sqlite_path: str | Path) -> list[dict[str, Any]]:
+    connection = sqlite3.connect(sqlite_path)
+    connection.row_factory = sqlite3.Row
+    try:
+        rows = connection.execute(f"SELECT {', '.join(SAMPLE_COLUMNS)} FROM samples").fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        connection.close()
+
+
+def load_arrays(sqlite_path: str | Path, config: dict[str, Any], split: str | None = None) -> tuple[np.ndarray, np.ndarray, list[dict[str, Any]]]:
+    rows = read_rows(sqlite_path)
+    rows = assign_missing_splits(
+        rows,
+        config["data"].get("validation_split", 0.2),
+        config["data"].get("test_split", 0.1),
+        config["run"].get("seed", 123),
+    )
+    if split:
+        rows = [row for row in rows if row.get("split") == split]
+    if not rows:
+        raise ValueError(f"No samples found for split={split!r}")
+
+    task = config["run"]["task"]
+    input_shape = config["data"]["input_shape"]
+    output_shape = config["data"].get("output_shape")
+    xs: list[np.ndarray] = []
+    ys: list[Any] = []
+    records: list[dict[str, Any]] = []
+    for row in rows:
+        x = decode_blob(row["input_blob"], row["input_blob_encoding"], row["input_blob_dimensions"])
+        y = decode_blob(row["output_blob"], row["output_blob_encoding"], row["output_blob_dimensions"])
+        xs.append(normalize_input(x, input_shape))
+        if task == "classification":
+            ys.append(int(y if y is not None else row.get("label_text")))
+        else:
+            if output_shape is None:
+                raise ValueError("data.output_shape is required for segmentation")
+            ys.append(np.asarray(y, dtype="float32").reshape(output_shape))
+        records.append(
+            {
+                "uuid": row["uuid"],
+                "split": row.get("split") or "train",
+                "label_text": row.get("label_text"),
+                "sample_weight": row.get("sample_weight"),
+                "metadata": json.loads(row["metadata_json"]) if row.get("metadata_json") else {},
+            }
+        )
+    return np.stack(xs), np.asarray(ys), records
+
+
+def make_tf_datasets(sqlite_path: str | Path, config: dict[str, Any]):
+    import tensorflow as tf
+
+    datasets = {}
+    records_by_split = {}
+    for split in ("train", "validation", "test"):
+        try:
+            x, y, records = load_arrays(sqlite_path, config, split=split)
+        except ValueError:
+            continue
+        dataset = tf.data.Dataset.from_tensor_slices((x, y))
+        if split == "train":
+            dataset = dataset.shuffle(config["data"].get("shuffle_buffer", 512), seed=config["run"].get("seed", 123))
+        dataset = dataset.batch(config["data"].get("batch_size", 16)).prefetch(tf.data.AUTOTUNE)
+        datasets[split] = dataset
+        records_by_split[split] = records
+    if "train" not in datasets:
+        raise ValueError("Dataset must contain or create a train split")
+    return datasets, records_by_split
+
+
+def create_synthetic_classification(path: str | Path, n: int = 48, shape: tuple[int, int, int] = (128, 128, 3), classes: int = 3) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(path)
+    ensure_schema(connection)
+    rng = np.random.default_rng(123)
+    splits = synthetic_splits(n)
+    for i in range(n):
+        label = i % classes
+        image = rng.normal(0.15, 0.05, shape).astype("float32")
+        channel = label % shape[-1]
+        image[..., channel] += 0.7
+        image = np.clip(image, 0, 1)
+        connection.execute(
+            "INSERT OR REPLACE INTO samples VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                str(uuid.uuid4()),
+                splits[i],
+                encode_npy(image),
+                "npy",
+                json.dumps(list(shape)),
+                str(label).encode("utf-8"),
+                "int",
+                None,
+                str(label),
+                None,
+                json.dumps({"synthetic": True}),
+            ),
+        )
+    connection.commit()
+    connection.close()
+
+
+def create_synthetic_segmentation(path: str | Path, n: int = 24, shape: tuple[int, int, int] = (256, 256, 3)) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(path)
+    ensure_schema(connection)
+    rng = np.random.default_rng(123)
+    splits = synthetic_splits(n)
+    yy, xx = np.mgrid[: shape[0], : shape[1]]
+    for i in range(n):
+        center = rng.integers(shape[0] // 4, shape[0] * 3 // 4, size=2)
+        radius = rng.integers(shape[0] // 8, shape[0] // 4)
+        mask = (((yy - center[0]) ** 2 + (xx - center[1]) ** 2) <= radius**2).astype("float32")[..., None]
+        image = np.repeat(mask, shape[-1], axis=-1) + rng.normal(0, 0.08, shape)
+        image = np.clip(image, 0, 1).astype("float32")
+        connection.execute(
+            "INSERT OR REPLACE INTO samples VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                str(uuid.uuid4()),
+                splits[i],
+                encode_npy(image),
+                "npy",
+                json.dumps(list(shape)),
+                encode_npy(mask),
+                "npy",
+                json.dumps([shape[0], shape[1], 1]),
+                None,
+                None,
+                json.dumps({"synthetic": True}),
+            ),
+        )
+    connection.commit()
+    connection.close()
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Create tiny synthetic oracle-builder SQLite datasets.")
+    parser.add_argument("--classification", type=Path)
+    parser.add_argument("--segmentation", type=Path)
+    args = parser.parse_args()
+    if args.classification:
+        create_synthetic_classification(args.classification)
+    if args.segmentation:
+        create_synthetic_segmentation(args.segmentation)
+    if not args.classification and not args.segmentation:
+        parser.error("Pass --classification PATH or --segmentation PATH")
+
+
+if __name__ == "__main__":
+    main()

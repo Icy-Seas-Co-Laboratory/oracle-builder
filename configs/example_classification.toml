@@ -1,0 +1,37 @@
+[run]
+task = "classification"
+model = "simple_cnn"
+seed = 123
+notes = "Example classification run"
+
+[data]
+input_shape = [128, 128, 3]
+num_classes = 3
+batch_size = 16
+shuffle_buffer = 512
+validation_split = 0.2
+test_split = 0.1
+
+[model]
+dropout = 0.2
+base_filters = 32
+
+[training]
+epochs = 10
+optimizer = "adam"
+learning_rate = 0.001
+loss = "sparse_categorical_crossentropy"
+metrics = ["accuracy"]
+
+[callbacks]
+early_stopping = true
+early_stopping_patience = 5
+reduce_lr_on_plateau = true
+checkpoint_monitor = "val_loss"
+
+[output]
+save_checkpoints = true
+save_predictions = true
+save_figures = true
+export_savedmodel = true
+
