@@ -1,0 +1,6 @@
+napari[all]
+magicgui
+pillow
+scipy
+scikit-image
+

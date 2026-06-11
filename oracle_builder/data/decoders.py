@@ -26,7 +26,7 @@ def decode_blob(blob: bytes | str | int | float | None, encoding: str | None, di
     if encoding == "float":
         text = blob.decode("utf-8") if isinstance(blob, bytes) else str(blob)
         return float(text)
-    if encoding == "png":
+    if encoding in {"png", "jpg", "jpeg", "tif", "tiff"}:
         image = Image.open(io.BytesIO(blob))
         array = np.asarray(image)
         if shape:
@@ -56,4 +56,3 @@ def normalize_input(array: Any, input_shape: list[int] | tuple[int, ...]) -> np.
     if value.dtype.kind in {"u", "i"} and value.max(initial=0) > 1:
         value = value.astype("float32") / 255.0
     return value.astype("float32")
-

@@ -1,0 +1,236 @@
+from __future__ import annotations
+
+import json
+import sqlite3
+from collections import Counter
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+
+from oracle_builder.data.decoders import decode_blob
+from oracle_builder.masking.sqlite_io import decode_mask
+
+
+def validate_unet_dataset(
+    sqlite_path: str | Path,
+    target_input_shape: list[int] | tuple[int, ...] | None = None,
+    target_output_shape: list[int] | tuple[int, ...] | None = None,
+) -> dict[str, Any]:
+    rows = _read_masked_sample_rows(sqlite_path)
+    target_input_shape = list(target_input_shape) if target_input_shape is not None else None
+    target_output_shape = list(target_output_shape) if target_output_shape is not None else None
+    report: dict[str, Any] = {
+        "valid": True,
+        "database": str(sqlite_path),
+        "sample_count": len(rows),
+        "usable_sample_count": 0,
+        "split_counts": {},
+        "input_shapes": {},
+        "output_shapes": {},
+        "target_input_shape": target_input_shape,
+        "target_output_shape": target_output_shape,
+        "inferred_input_shape": None,
+        "inferred_output_shape": None,
+        "warnings": [],
+        "errors": [],
+        "samples": [],
+    }
+    if not rows:
+        report["valid"] = False
+        report["errors"].append("No samples with accepted masks were found in samples.output_blob.")
+        return report
+
+    split_counts: Counter[str] = Counter()
+    input_shapes: Counter[tuple[int, ...]] = Counter()
+    output_shapes: Counter[tuple[int, ...]] = Counter()
+    for row in rows:
+        sample_report = _validate_sample(row)
+        report["samples"].append(sample_report)
+        split_counts[sample_report["split"]] += 1
+        if sample_report["usable"]:
+            report["usable_sample_count"] += 1
+            input_shapes[tuple(sample_report["input_shape"])] += 1
+            output_shapes[tuple(sample_report["output_shape"])] += 1
+        report["warnings"].extend(f"{sample_report['uuid']}: {warning}" for warning in sample_report["warnings"])
+        report["errors"].extend(f"{sample_report['uuid']}: {error}" for error in sample_report["errors"])
+
+    report["split_counts"] = dict(sorted(split_counts.items()))
+    report["input_shapes"] = {str(list(shape)): count for shape, count in sorted(input_shapes.items())}
+    report["output_shapes"] = {str(list(shape)): count for shape, count in sorted(output_shapes.items())}
+    if input_shapes:
+        report["inferred_input_shape"] = list(input_shapes.most_common(1)[0][0])
+    if output_shapes:
+        report["inferred_output_shape"] = list(output_shapes.most_common(1)[0][0])
+    if target_input_shape:
+        report["inferred_input_shape"] = target_input_shape
+    if target_output_shape:
+        report["inferred_output_shape"] = target_output_shape
+    if len(input_shapes) > 1 and not target_input_shape:
+        report["valid"] = False
+        report["errors"].append("Usable samples have inconsistent input shapes.")
+    elif len(input_shapes) > 1:
+        report["warnings"].append("Usable samples have inconsistent input shapes and will be resized to target_input_shape.")
+    if len(output_shapes) > 1 and not target_output_shape:
+        report["valid"] = False
+        report["errors"].append("Usable samples have inconsistent output shapes.")
+    elif len(output_shapes) > 1:
+        report["warnings"].append("Usable samples have inconsistent output shapes and will be resized to target_output_shape.")
+    if report["usable_sample_count"] == 0:
+        report["valid"] = False
+        report["errors"].append("No usable U-Net segmentation samples were found.")
+    if report["errors"]:
+        report["valid"] = False
+    return report
+
+
+def write_unet_config_from_dataset(
+    sqlite_path: str | Path,
+    config_path: str | Path,
+    run_name: str | None = None,
+    model_name: str = "unet",
+    batch_size: int = 8,
+    epochs: int = 20,
+) -> dict[str, Any]:
+    report = validate_unet_dataset(sqlite_path)
+    if not report["valid"]:
+        raise ValueError("Cannot write U-Net config for invalid dataset: " + "; ".join(report["errors"]))
+    config = {
+        "run": {
+            "task": "segmentation",
+            "model": model_name,
+            "seed": 123,
+            "notes": f"Generated from {Path(sqlite_path).name} by mask_builder",
+        },
+        "data": {
+            "input_shape": report["inferred_input_shape"],
+            "output_shape": report["inferred_output_shape"],
+            "batch_size": batch_size,
+            "shuffle_buffer": max(32, report["usable_sample_count"]),
+            "validation_split": 0.2,
+            "test_split": 0.1,
+        },
+        "model": {
+            "base_filters": 32,
+            "depth": 4,
+            "dropout": 0.1,
+            "activation": "relu",
+            "final_activation": "sigmoid",
+        },
+        "training": {
+            "epochs": epochs,
+            "optimizer": "adam",
+            "learning_rate": 0.0001,
+            "loss": "binary_crossentropy",
+            "metrics": ["accuracy", "dice", "iou"],
+        },
+        "callbacks": {
+            "early_stopping": True,
+            "early_stopping_patience": 8,
+            "reduce_lr_on_plateau": True,
+            "checkpoint_monitor": "val_loss",
+        },
+        "output": {
+            "save_checkpoints": True,
+            "save_predictions": True,
+            "save_figures": True,
+            "export_savedmodel": True,
+        },
+    }
+    if run_name:
+        config["run"]["notes"] = f"{config['run']['notes']} ({run_name})"
+    Path(config_path).parent.mkdir(parents=True, exist_ok=True)
+    Path(config_path).write_text(_to_toml(config))
+    return {"config": config, "validation": report}
+
+
+def _read_masked_sample_rows(sqlite_path: str | Path) -> list[dict[str, Any]]:
+    connection = sqlite3.connect(sqlite_path)
+    connection.row_factory = sqlite3.Row
+    try:
+        rows = connection.execute(
+            """
+            SELECT uuid, split, input_blob, input_blob_encoding, input_blob_dimensions,
+                   output_blob, output_blob_encoding, output_blob_dimensions, metadata_json
+            FROM samples
+            WHERE output_blob IS NOT NULL AND length(output_blob) > 0
+            ORDER BY uuid
+            """
+        ).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        connection.close()
+
+
+def _validate_sample(row: dict[str, Any]) -> dict[str, Any]:
+    sample_report = {
+        "uuid": row["uuid"],
+        "split": row.get("split") or "unspecified",
+        "usable": True,
+        "input_shape": None,
+        "output_shape": None,
+        "warnings": [],
+        "errors": [],
+    }
+    try:
+        image = np.asarray(decode_blob(row["input_blob"], row["input_blob_encoding"], row["input_blob_dimensions"]))
+        mask = decode_mask(row["output_blob"], row["output_blob_encoding"], row["output_blob_dimensions"])
+        if mask is None:
+            raise ValueError("Accepted mask could not be decoded.")
+        mask = np.asarray(mask)
+        input_shape = _training_input_shape(image)
+        output_shape = _training_output_shape(mask)
+        sample_report["input_shape"] = input_shape
+        sample_report["output_shape"] = output_shape
+        if tuple(input_shape[:2]) != tuple(output_shape[:2]):
+            sample_report["errors"].append("Image and mask height/width do not match.")
+        if not set(np.unique(mask).tolist()).issubset({0, 1, False, True}):
+            sample_report["errors"].append("Mask is not binary after decoding.")
+        if mask.size == 0:
+            sample_report["errors"].append("Mask has no pixels.")
+        if image.size == 0:
+            sample_report["errors"].append("Image has no pixels.")
+        if np.asarray(mask > 0).sum() == 0:
+            sample_report["warnings"].append("Mask has no foreground pixels.")
+    except Exception as exc:
+        sample_report["errors"].append(str(exc))
+    sample_report["usable"] = not sample_report["errors"]
+    return sample_report
+
+
+def _training_input_shape(image: np.ndarray) -> list[int]:
+    if image.ndim == 2:
+        return [int(image.shape[0]), int(image.shape[1]), 1]
+    if image.ndim == 3:
+        return [int(image.shape[0]), int(image.shape[1]), int(image.shape[2])]
+    raise ValueError(f"Unsupported image shape for U-Net training: {image.shape}")
+
+
+def _training_output_shape(mask: np.ndarray) -> list[int]:
+    if mask.ndim == 2:
+        return [int(mask.shape[0]), int(mask.shape[1]), 1]
+    if mask.ndim == 3 and mask.shape[-1] == 1:
+        return [int(mask.shape[0]), int(mask.shape[1]), 1]
+    raise ValueError(f"Unsupported mask shape for binary U-Net training: {mask.shape}")
+
+
+def _to_toml(data: dict[str, Any]) -> str:
+    lines: list[str] = []
+    for section, values in data.items():
+        lines.append(f"[{section}]")
+        for key, value in values.items():
+            lines.append(f"{key} = {_toml_value(value)}")
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _toml_value(value: Any) -> str:
+    if isinstance(value, str):
+        return json.dumps(value)
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, list):
+        return "[" + ", ".join(_toml_value(item) for item in value) + "]"
+    raise TypeError(f"Unsupported TOML value: {value!r}")

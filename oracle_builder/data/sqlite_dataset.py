@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+from PIL import Image
 
 from oracle_builder.data.decoders import decode_blob, encode_npy, normalize_input
 from oracle_builder.data.splits import assign_missing_splits
@@ -67,6 +68,9 @@ def read_rows(sqlite_path: str | Path) -> list[dict[str, Any]]:
 
 def load_arrays(sqlite_path: str | Path, config: dict[str, Any], split: str | None = None) -> tuple[np.ndarray, np.ndarray, list[dict[str, Any]]]:
     rows = read_rows(sqlite_path)
+    task = config["run"]["task"]
+    if task == "segmentation":
+        rows = [row for row in rows if row.get("output_blob")]
     rows = assign_missing_splits(
         rows,
         config["data"].get("validation_split", 0.2),
@@ -78,7 +82,6 @@ def load_arrays(sqlite_path: str | Path, config: dict[str, Any], split: str | No
     if not rows:
         raise ValueError(f"No samples found for split={split!r}")
 
-    task = config["run"]["task"]
     input_shape = config["data"]["input_shape"]
     output_shape = config["data"].get("output_shape")
     xs: list[np.ndarray] = []
@@ -87,13 +90,19 @@ def load_arrays(sqlite_path: str | Path, config: dict[str, Any], split: str | No
     for row in rows:
         x = decode_blob(row["input_blob"], row["input_blob_encoding"], row["input_blob_dimensions"])
         y = decode_blob(row["output_blob"], row["output_blob_encoding"], row["output_blob_dimensions"])
+        if task == "segmentation":
+            x = resize_segmentation_input(x, input_shape)
         xs.append(normalize_input(x, input_shape))
         if task == "classification":
             ys.append(int(y if y is not None else row.get("label_text")))
         else:
             if output_shape is None:
                 raise ValueError("data.output_shape is required for segmentation")
-            ys.append(np.asarray(y, dtype="float32").reshape(output_shape))
+            target = np.asarray(y, dtype="float32")
+            if (row.get("output_blob_encoding") or "").lower() == "png":
+                target = (target > 0).astype("float32")
+            target = resize_array_to_shape(target, output_shape, mask=True)
+            ys.append(target.reshape(output_shape))
         records.append(
             {
                 "uuid": row["uuid"],
@@ -114,7 +123,9 @@ def make_tf_datasets(sqlite_path: str | Path, config: dict[str, Any]):
     for split in ("train", "validation", "test"):
         try:
             x, y, records = load_arrays(sqlite_path, config, split=split)
-        except ValueError:
+        except ValueError as exc:
+            if not str(exc).startswith("No samples found for split="):
+                raise
             continue
         dataset = tf.data.Dataset.from_tensor_slices((x, y))
         if split == "train":
@@ -125,6 +136,70 @@ def make_tf_datasets(sqlite_path: str | Path, config: dict[str, Any]):
     if "train" not in datasets:
         raise ValueError("Dataset must contain or create a train split")
     return datasets, records_by_split
+
+
+def resize_segmentation_input(array: Any, input_shape: list[int] | tuple[int, ...]) -> np.ndarray:
+    value = np.asarray(array)
+    target_shape = tuple(int(part) for part in input_shape)
+    if value.shape == target_shape:
+        return value
+    if value.ndim == 3 and value.shape[-1] == 2 and len(target_shape) == 3 and target_shape[-1] == 2:
+        roi = resize_array_to_shape(value[..., 0], target_shape[:2], mask=False)
+        candidate = resize_array_to_shape(value[..., 1], target_shape[:2], mask=True)
+        if value.dtype.kind in {"u", "i"}:
+            candidate = np.where(candidate > 0, np.iinfo(value.dtype).max, 0).astype(value.dtype)
+        return np.stack([roi, candidate], axis=-1)
+    return resize_array_to_shape(value, target_shape, mask=False)
+
+
+def resize_array_to_shape(
+    array: Any,
+    target_shape: list[int] | tuple[int, ...],
+    mask: bool = False,
+) -> np.ndarray:
+    value = np.asarray(array)
+    target = tuple(int(part) for part in target_shape)
+    if value.shape == target:
+        return value
+
+    if len(target) == 2:
+        target_h, target_w = target
+        target_channels = None
+    elif len(target) == 3:
+        target_h, target_w, target_channels = target
+    else:
+        raise ValueError(f"Unsupported target shape for resizing: {target}")
+
+    if value.ndim == 2 and target_channels is not None:
+        value = value[..., None]
+    if value.ndim == 3 and value.shape[-1] == 1 and target_channels is None:
+        value = value[..., 0]
+    if value.ndim not in {2, 3}:
+        raise ValueError(f"Unsupported array shape for resizing: {value.shape}")
+    if value.ndim == 3 and target_channels is not None and value.shape[-1] != target_channels:
+        raise ValueError(f"Cannot resize array with {value.shape[-1]} channels to target shape {target}")
+
+    resample = Image.Resampling.NEAREST if mask else Image.Resampling.BILINEAR
+
+    def resize_channel(channel: np.ndarray) -> np.ndarray:
+        channel_array = np.asarray(channel)
+        pil_input = channel_array.astype("float32") if channel_array.dtype.kind == "f" else channel_array
+        resized = Image.fromarray(pil_input).resize((target_w, target_h), resample=resample)
+        result = np.asarray(resized)
+        if mask:
+            return (result > 0).astype("float32")
+        return result.astype(channel_array.dtype, copy=False)
+
+    if value.ndim == 2:
+        resized_value = resize_channel(value)
+    else:
+        resized_value = np.stack([resize_channel(value[..., index]) for index in range(value.shape[-1])], axis=-1)
+
+    if len(target) == 3 and resized_value.ndim == 2:
+        resized_value = resized_value[..., None]
+    if mask:
+        resized_value = (resized_value > 0).astype("float32")
+    return resized_value.reshape(target)
 
 
 def create_synthetic_classification(path: str | Path, n: int = 48, shape: tuple[int, int, int] = (128, 128, 3), classes: int = 3) -> None:

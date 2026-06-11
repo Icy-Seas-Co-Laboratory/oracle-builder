@@ -5,11 +5,11 @@ seed = 123
 notes = "Example U-Net segmentation run"
 
 [data]
-input_shape = [256, 256, 3]
+input_shape = [256, 256, 2]
 output_shape = [256, 256, 1]
 batch_size = 8
 shuffle_buffer = 128
-validation_split = 0.2
+validation_split = 0.25
 test_split = 0.1
 
 [model]

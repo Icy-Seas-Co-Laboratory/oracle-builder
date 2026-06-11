@@ -44,6 +44,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--resume", action="store_true", help="TODO: resume support is not implemented yet.")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--preflight", action="store_true", help="Validate segmentation SQLite dataset compatibility and exit.")
     parser.add_argument("--debug", action="store_true")
     return parser.parse_args()
 
@@ -53,9 +54,27 @@ def main() -> int:
     if args.resume:
         print("--resume is reserved for a future implementation.", file=sys.stderr)
         return 2
-    run_dir = create_run_dir(args.runs_dir, args.output, overwrite=args.overwrite, dry_run=args.dry_run)
+    run_dir = Path(args.runs_dir) / args.output if args.preflight else create_run_dir(
+        args.runs_dir,
+        args.output,
+        overwrite=args.overwrite,
+        dry_run=args.dry_run,
+    )
     config = resolve_config(args.config, args.input, run_dir)
     config["debug"] = bool(args.debug)
+    if args.preflight:
+        if config["run"]["task"] != "segmentation":
+            print("--preflight currently validates segmentation datasets only.")
+            return 0
+        from oracle_builder.masking.unet_dataset import validate_unet_dataset
+
+        report = validate_unet_dataset(
+            args.input,
+            target_input_shape=config["data"].get("input_shape"),
+            target_output_shape=config["data"].get("output_shape"),
+        )
+        print(json.dumps(report, indent=2, sort_keys=True, default=str))
+        return 0 if report["valid"] else 2
     if args.dry_run:
         print(json.dumps({"run_dir": str(run_dir), "resolved_config": config}, indent=2))
         return 0
