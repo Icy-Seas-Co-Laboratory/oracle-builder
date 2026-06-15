@@ -1,0 +1,4 @@
+# Linux NVIDIA GPU install profile.
+# Official TensorFlow pip guidance recommends tensorflow[and-cuda] for CUDA-enabled Linux installs.
+-r requirements.txt
+tensorflow[and-cuda]

@@ -82,6 +82,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--write-unet-config", type=Path, help="Write a U-Net config TOML inferred from --database and exit.")
     parser.add_argument("--unet-batch-size", type=int, default=8, help="Batch size for --write-unet-config.")
     parser.add_argument("--unet-epochs", type=int, default=20, help="Epoch count for --write-unet-config.")
+    parser.add_argument("--unet-input-shape", type=parse_shape, help="Target U-Net input shape, for example 256,256,2.")
+    parser.add_argument("--unet-output-shape", type=parse_shape, help="Target U-Net output shape, for example 256,256,1.")
     parser.add_argument("--debug", action="store_true")
     return parser.parse_args()
 
@@ -166,6 +168,17 @@ def image_queue_from_path(path: Path) -> list[dict]:
     return [{"uuid": path.stem, "path": path}]
 
 
+def parse_shape(value: str) -> list[int]:
+    parts = value.replace("x", ",").split(",")
+    try:
+        shape = [int(part.strip()) for part in parts if part.strip()]
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"Invalid shape {value!r}; use comma-separated integers.") from exc
+    if len(shape) not in {2, 3} or any(part <= 0 for part in shape):
+        raise argparse.ArgumentTypeError(f"Invalid shape {value!r}; expected two or three positive integers.")
+    return shape
+
+
 def main() -> int:
     args = parse_args()
     if args.input and not args.image and path_is_image_source(args.input):
@@ -178,7 +191,11 @@ def main() -> int:
     if args.validate_unet_dataset or args.write_unet_config:
         if not database_path:
             raise SystemExit("--validate-unet-dataset and --write-unet-config require --database.")
-        report = validate_unet_dataset(database_path)
+        report = validate_unet_dataset(
+            database_path,
+            target_input_shape=args.unet_input_shape,
+            target_output_shape=args.unet_output_shape,
+        )
         print(json.dumps(report, indent=2, sort_keys=True, default=str))
         if args.write_unet_config:
             result = write_unet_config_from_dataset(
@@ -186,6 +203,8 @@ def main() -> int:
                 args.write_unet_config,
                 batch_size=args.unet_batch_size,
                 epochs=args.unet_epochs,
+                target_input_shape=args.unet_input_shape,
+                target_output_shape=args.unet_output_shape,
             )
             print(f"Wrote U-Net config to {args.write_unet_config}")
             if args.debug:

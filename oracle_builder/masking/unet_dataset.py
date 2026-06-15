@@ -91,8 +91,14 @@ def write_unet_config_from_dataset(
     model_name: str = "unet",
     batch_size: int = 8,
     epochs: int = 20,
+    target_input_shape: list[int] | tuple[int, ...] | None = None,
+    target_output_shape: list[int] | tuple[int, ...] | None = None,
 ) -> dict[str, Any]:
-    report = validate_unet_dataset(sqlite_path)
+    report = validate_unet_dataset(
+        sqlite_path,
+        target_input_shape=target_input_shape,
+        target_output_shape=target_output_shape,
+    )
     if not report["valid"]:
         raise ValueError("Cannot write U-Net config for invalid dataset: " + "; ".join(report["errors"]))
     config = {
@@ -129,6 +135,23 @@ def write_unet_config_from_dataset(
             "early_stopping_patience": 8,
             "reduce_lr_on_plateau": True,
             "checkpoint_monitor": "val_loss",
+        },
+        "augmentation": {
+            "enabled": False,
+            "invert": False,
+            "rotation": 0.05,
+            "zoom": 0.15,
+            "translation": [0.1, 0.1],
+            "skew": 0.05,
+            "flip_horizontal": True,
+            "flip_vertical": True,
+            "brightness": 0.15,
+            "contrast": 0.15,
+            "gaussian_noise": 0.03,
+            "fill_value": 0.0,
+            "mask_fill_value": 0.0,
+            "photometric_channels": [0],
+            "mask_input_channels": [1] if report["inferred_input_shape"][-1] == 2 else [],
         },
         "output": {
             "save_checkpoints": True,

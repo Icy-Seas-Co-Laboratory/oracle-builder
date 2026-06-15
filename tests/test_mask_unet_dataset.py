@@ -139,6 +139,52 @@ def test_variable_api_roi_dataset_resizes_to_configured_unet_shape(tmp_path):
     assert len(records) == 2
 
 
+def test_write_unet_config_accepts_target_shapes_for_variable_rois(tmp_path):
+    db_path = tmp_path / "api_masks.sqlite"
+    config_path = tmp_path / "configs" / "api_unet.toml"
+    with open_database(db_path) as conn:
+        for index, shape in enumerate(((7, 9), (5, 11))):
+            image = np.zeros(shape, dtype="uint8")
+            candidate = np.zeros(shape, dtype="uint8")
+            candidate[1:-1, 2:-2] = 1
+            validated = np.zeros(shape, dtype="uint8")
+            validated[2:-1, 3:-1] = 1
+            create_or_update_image_sample(
+                conn,
+                f"api-sample-{index}",
+                image,
+                "png",
+                {"source": "api"},
+                candidate_mask=candidate,
+            )
+            save_mask_annotation(
+                conn,
+                f"api-sample-{index}",
+                validated,
+                "png",
+                method="test",
+                parameters={},
+                validation={"valid": True},
+            )
+
+    result = write_unet_config_from_dataset(
+        db_path,
+        config_path,
+        batch_size=2,
+        epochs=5,
+        target_input_shape=[16, 16, 2],
+        target_output_shape=[16, 16, 1],
+    )
+    resolved = resolve_config(config_path, db_path, tmp_path / "runs" / "run")
+
+    assert result["validation"]["valid"]
+    assert result["validation"]["warnings"]
+    assert resolved["data"]["input_shape"] == [16, 16, 2]
+    assert resolved["data"]["output_shape"] == [16, 16, 1]
+    assert resolved["data"]["batch_size"] == 2
+    assert resolved["training"]["epochs"] == 5
+
+
 def test_mask_builder_dataset_loads_as_unet_training_arrays(tmp_path):
     db_path = tmp_path / "masks.sqlite"
     _create_mask_builder_unet_dataset(db_path)
@@ -213,6 +259,41 @@ def test_mask_builder_cli_validate_and_write_unet_config(monkeypatch, tmp_path, 
     output = capsys.readouterr().out
     assert '"valid": true' in output
     assert config_path.exists()
+
+
+def test_mask_builder_cli_write_unet_config_with_target_shapes(monkeypatch, tmp_path, capsys):
+    db_path = tmp_path / "api_masks.sqlite"
+    config_path = tmp_path / "api_unet.toml"
+    with open_database(db_path) as conn:
+        for index, shape in enumerate(((7, 9), (5, 11))):
+            image = np.zeros(shape, dtype="uint8")
+            candidate = np.zeros(shape, dtype="uint8")
+            candidate[1:-1, 2:-2] = 1
+            validated = np.zeros(shape, dtype="uint8")
+            validated[2:-1, 3:-1] = 1
+            create_or_update_image_sample(conn, f"api-sample-{index}", image, "png", {}, candidate_mask=candidate)
+            save_mask_annotation(conn, f"api-sample-{index}", validated, "png", "test", {}, {"valid": True})
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "mask_builder.py",
+            "--database",
+            str(db_path),
+            "--write-unet-config",
+            str(config_path),
+            "--unet-input-shape",
+            "16,16,2",
+            "--unet-output-shape",
+            "16x16x1",
+        ],
+    )
+
+    assert mask_builder.main() == 0
+    output = capsys.readouterr().out
+    resolved = resolve_config(config_path, db_path, tmp_path / "runs" / "run")
+    assert '"valid": true' in output
+    assert resolved["data"]["input_shape"] == [16, 16, 2]
+    assert resolved["data"]["output_shape"] == [16, 16, 1]
 
 
 def test_model_training_preflight_validates_without_creating_run_dir(monkeypatch, tmp_path, capsys):

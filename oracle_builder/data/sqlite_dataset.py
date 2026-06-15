@@ -117,6 +117,7 @@ def load_arrays(sqlite_path: str | Path, config: dict[str, Any], split: str | No
 
 def make_tf_datasets(sqlite_path: str | Path, config: dict[str, Any]):
     import tensorflow as tf
+    from oracle_builder.training.augmentation import apply_training_augmentation
 
     datasets = {}
     records_by_split = {}
@@ -130,7 +131,10 @@ def make_tf_datasets(sqlite_path: str | Path, config: dict[str, Any]):
         dataset = tf.data.Dataset.from_tensor_slices((x, y))
         if split == "train":
             dataset = dataset.shuffle(config["data"].get("shuffle_buffer", 512), seed=config["run"].get("seed", 123))
-        dataset = dataset.batch(config["data"].get("batch_size", 16)).prefetch(tf.data.AUTOTUNE)
+        dataset = dataset.batch(config["data"].get("batch_size", 16))
+        if split == "train":
+            dataset = apply_training_augmentation(dataset, config)
+        dataset = dataset.prefetch(tf.data.AUTOTUNE)
         datasets[split] = dataset
         records_by_split[split] = records
     if "train" not in datasets:

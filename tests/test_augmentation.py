@@ -1,0 +1,71 @@
+from __future__ import annotations
+
+import numpy as np
+import tensorflow as tf
+
+from oracle_builder.training.augmentation import augment_batch, input_mask_channels, photometric_channels
+
+
+def test_segmentation_defaults_protect_candidate_mask_channel_from_photometric_changes():
+    config = {
+        "run": {"task": "segmentation"},
+        "data": {"input_shape": [4, 4, 2]},
+        "augmentation": {"enabled": True, "invert": True},
+    }
+    x = np.zeros((1, 4, 4, 2), dtype="float32")
+    x[..., 0] = 0.25
+    x[..., 1] = 1.0
+    y = np.zeros((1, 4, 4, 1), dtype="float32")
+
+    augmented_x, augmented_y = augment_batch(tf.constant(x), tf.constant(y), config)
+
+    assert np.allclose(augmented_x.numpy()[..., 0], 0.75)
+    assert np.allclose(augmented_x.numpy()[..., 1], 1.0)
+    assert np.array_equal(augmented_y.numpy(), y)
+    assert photometric_channels(config, config["augmentation"]) == [0]
+    assert input_mask_channels(config, config["augmentation"]) == [1]
+
+
+def test_segmentation_geometric_augmentation_preserves_shapes_and_binary_masks():
+    config = {
+        "run": {"task": "segmentation"},
+        "data": {"input_shape": [8, 8, 2]},
+        "augmentation": {
+            "enabled": True,
+            "rotation": 0.05,
+            "zoom": 0.10,
+            "translation": [0.10, 0.10],
+            "skew": 0.05,
+            "mask_input_channels": [1],
+            "photometric_channels": [0],
+        },
+    }
+    x = np.zeros((2, 8, 8, 2), dtype="float32")
+    x[:, 2:6, 2:6, 0] = 0.5
+    x[:, 3:5, 3:5, 1] = 1.0
+    y = np.zeros((2, 8, 8, 1), dtype="float32")
+    y[:, 2:6, 2:6, 0] = 1.0
+
+    augmented_x, augmented_y = augment_batch(tf.constant(x), tf.constant(y), config)
+
+    assert augmented_x.shape == x.shape
+    assert augmented_y.shape == y.shape
+    assert set(np.unique(augmented_x.numpy()[..., 1]).tolist()).issubset({0.0, 1.0})
+    assert set(np.unique(augmented_y.numpy()).tolist()).issubset({0.0, 1.0})
+
+
+def test_classification_augmentation_keeps_label_dtype_and_shape():
+    config = {
+        "run": {"task": "classification"},
+        "data": {"input_shape": [4, 4, 3]},
+        "augmentation": {"enabled": True, "invert": True, "brightness": 0.0},
+    }
+    x = np.ones((3, 4, 4, 3), dtype="float32") * 0.2
+    y = np.array([0, 1, 2], dtype="int64")
+
+    augmented_x, augmented_y = augment_batch(tf.constant(x), tf.constant(y), config)
+
+    assert augmented_x.shape == x.shape
+    assert augmented_y.dtype == tf.int64
+    assert np.array_equal(augmented_y.numpy(), y)
+    assert np.allclose(augmented_x.numpy(), 0.8)

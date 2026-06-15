@@ -19,6 +19,25 @@ dependencies = [
   "scikit-learn",
 ]
 
+[project.optional-dependencies]
+gpu-linux = [
+  "tensorflow[and-cuda]",
+]
+gpu-wsl2 = [
+  "tensorflow[and-cuda]",
+]
+gpu-macos = [
+  "tensorflow>=2.18,<2.19; platform_system == 'Darwin'",
+  "tensorflow-metal==1.2.0; platform_system == 'Darwin'",
+  "numpy>=2.0,<2.1; platform_system == 'Darwin'",
+  "tifffile<2026.5.0; platform_system == 'Darwin'",
+]
+gui = [
+  "napari[all]",
+  "magicgui",
+  "scipy",
+  "scikit-image",
+]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-

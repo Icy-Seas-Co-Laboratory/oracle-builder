@@ -29,9 +29,22 @@ early_stopping_patience = 5
 reduce_lr_on_plateau = true
 checkpoint_monitor = "val_loss"
 
+[augmentation]
+enabled = false
+invert = false
+rotation = 0.05
+zoom = 0.15
+translation = 0.10
+skew = 0.05
+flip_horizontal = true
+flip_vertical = true
+brightness = 0.15
+contrast = 0.15
+gaussian_noise = 0.03
+fill_value = 0.0
+
 [output]
 save_checkpoints = true
 save_predictions = true
 save_figures = true
 export_savedmodel = true
-
