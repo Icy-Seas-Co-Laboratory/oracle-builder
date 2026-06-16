@@ -26,6 +26,30 @@ def _viewer_theme_for_background(background: str) -> str:
     raise ValueError("Viewer background must be 'black' or 'white'")
 
 
+def _is_mask_layer(layer: Any) -> bool:
+    if layer is None or not hasattr(layer, "data"):
+        return False
+    name = getattr(layer, "name", "")
+    if name in {"candidate mask", "validated mask"}:
+        return True
+    return layer.__class__.__name__ == "Labels"
+
+
+def _selected_mask_layer(viewer: Any, default_layer: Any) -> Any:
+    selection = getattr(getattr(viewer, "layers", None), "selection", None)
+    active_layer = getattr(selection, "active", None)
+    return active_layer if _is_mask_layer(active_layer) else default_layer
+
+
+def _replace_mask_layer(layer: Any, new_mask: np.ndarray, reveal: bool = False) -> None:
+    layer.data = np.asarray(new_mask, dtype="uint8")
+    if reveal and hasattr(layer, "visible"):
+        layer.visible = True
+    refresh = getattr(layer, "refresh", None)
+    if callable(refresh):
+        refresh()
+
+
 def _provenance(
     threshold: float,
     invert: bool,
@@ -179,13 +203,22 @@ def launch_mask_builder_app(
     def current_candidate_mask() -> np.ndarray:
         return (np.asarray(candidate_layer.data) > 0).astype("uint8")
 
+    def selected_mask_layer():
+        return _selected_mask_layer(viewer, labels_layer)
+
+    def current_selected_mask() -> np.ndarray:
+        return (np.asarray(selected_mask_layer().data) > 0).astype("uint8")
+
     def replace_mask(new_mask: np.ndarray) -> None:
-        labels_layer.data = np.asarray(new_mask, dtype="uint8")
-        labels_layer.refresh()
+        _replace_mask_layer(labels_layer, new_mask)
 
     def replace_candidate_mask(new_mask: np.ndarray) -> None:
-        candidate_layer.data = np.asarray(new_mask, dtype="uint8")
-        candidate_layer.refresh()
+        _replace_mask_layer(candidate_layer, new_mask)
+
+    def replace_selected_mask(new_mask: np.ndarray):
+        layer = selected_mask_layer()
+        _replace_mask_layer(layer, new_mask, reveal=True)
+        return layer
 
     def apply_threshold() -> None:
         new_mask = threshold_mask(
@@ -195,29 +228,37 @@ def launch_mask_builder_app(
             blur_method=blur_method.currentText(),
             kernel_size=blur_kernel.value(),
         )
-        current["morphology"] = {
-            "fill_holes_applied": False,
-            "remove_small_objects_min_size": None,
-            "keep_largest_component_applied": False,
-        }
-        replace_mask(new_mask)
-        set_status("Applied threshold. This replaced the current mask.")
+        layer = replace_selected_mask(new_mask)
+        if layer is labels_layer:
+            current["morphology"] = {
+                "fill_holes_applied": False,
+                "remove_small_objects_min_size": None,
+                "keep_largest_component_applied": False,
+            }
+        layer_name = getattr(layer, "name", "selected mask")
+        set_status(f"Applied threshold. This replaced {layer_name}.")
 
     def do_fill_holes() -> None:
-        replace_mask(fill_holes(current_mask()))
-        current["morphology"]["fill_holes_applied"] = True
-        set_status("Filled holes.")
+        layer = replace_selected_mask(fill_holes(current_selected_mask()))
+        if layer is labels_layer:
+            current["morphology"]["fill_holes_applied"] = True
+        layer_name = getattr(layer, "name", "selected mask")
+        set_status(f"Filled holes in {layer_name}.")
 
     def do_remove_small_objects() -> None:
         min_size = small_object_size.value()
-        replace_mask(remove_small_objects(current_mask(), min_size))
-        current["morphology"]["remove_small_objects_min_size"] = min_size
-        set_status(f"Removed foreground components smaller than {min_size} pixels.")
+        layer = replace_selected_mask(remove_small_objects(current_selected_mask(), min_size))
+        if layer is labels_layer:
+            current["morphology"]["remove_small_objects_min_size"] = min_size
+        layer_name = getattr(layer, "name", "selected mask")
+        set_status(f"Removed foreground components smaller than {min_size} pixels from {layer_name}.")
 
     def do_keep_largest() -> None:
-        replace_mask(keep_largest_component(current_mask()))
-        current["morphology"]["keep_largest_component_applied"] = True
-        set_status("Kept largest foreground component.")
+        layer = replace_selected_mask(keep_largest_component(current_selected_mask()))
+        if layer is labels_layer:
+            current["morphology"]["keep_largest_component_applied"] = True
+        layer_name = getattr(layer, "name", "selected mask")
+        set_status(f"Kept largest foreground component in {layer_name}.")
 
     def do_validate() -> dict[str, Any]:
         report = validate_mask(current_mask(), current["image"])
@@ -273,50 +314,31 @@ def launch_mask_builder_app(
             set_status("Mask is invalid; fix validation errors before saving.", report)
             return
         with open_database(output_path) as conn:
-            try:
-                annotation_id = save_mask_annotation(
-                    conn,
-                    current["uuid"],
-                    current_mask(),
-                    mask_encoding,
-                    method="manual_threshold_plus_edit",
-                    parameters=_provenance(
-                        threshold_value.value(),
-                        invert_value.isChecked(),
-                        blur_method.currentText(),
-                        blur_kernel.value(),
-                        current["morphology"],
-                    ),
-                    validation=report,
-                    accepted=True,
-                    notes=notes.text() or None,
-                )
-            except KeyError:
-                create_or_update_image_sample(
-                    conn,
-                    current["uuid"],
-                    current["image"],
-                    "png",
-                    current.get("metadata") or {"created_by": "oracle-builder mask_builder", "source": "mask_builder_runtime_copy"},
-                    candidate_mask=current_candidate_mask(),
-                )
-                annotation_id = save_mask_annotation(
-                    conn,
-                    current["uuid"],
-                    current_mask(),
-                    mask_encoding,
-                    method="manual_threshold_plus_edit",
-                    parameters=_provenance(
-                        threshold_value.value(),
-                        invert_value.isChecked(),
-                        blur_method.currentText(),
-                        blur_kernel.value(),
-                        current["morphology"],
-                    ),
-                    validation=report,
-                    accepted=True,
-                    notes=notes.text() or None,
-                )
+            create_or_update_image_sample(
+                conn,
+                current["uuid"],
+                current["image"],
+                "png",
+                current.get("metadata") or {"created_by": "oracle-builder mask_builder", "source": "mask_builder_runtime_copy"},
+                candidate_mask=current_candidate_mask(),
+            )
+            annotation_id = save_mask_annotation(
+                conn,
+                current["uuid"],
+                current_mask(),
+                mask_encoding,
+                method="manual_threshold_plus_edit",
+                parameters=_provenance(
+                    threshold_value.value(),
+                    invert_value.isChecked(),
+                    blur_method.currentText(),
+                    blur_kernel.value(),
+                    current["morphology"],
+                ),
+                validation=report,
+                accepted=True,
+                notes=notes.text() or None,
+            )
         set_status(f"Saved annotation {annotation_id}.")
         if advance:
             load_queue_index(current["index"] + 1)

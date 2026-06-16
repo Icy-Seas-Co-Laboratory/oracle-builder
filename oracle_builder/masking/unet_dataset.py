@@ -138,6 +138,7 @@ def write_unet_config_from_dataset(
         },
         "augmentation": {
             "enabled": False,
+            "repeats_per_epoch": 1,
             "invert": False,
             "rotation": 0.05,
             "zoom": 0.15,

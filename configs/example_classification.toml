@@ -31,6 +31,7 @@ checkpoint_monitor = "val_loss"
 
 [augmentation]
 enabled = false
+repeats_per_epoch = 1
 invert = false
 rotation = 0.05
 zoom = 0.15

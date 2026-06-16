@@ -113,6 +113,32 @@ def test_candidate_mask_is_stored_as_training_input_channel_and_aux_layer():
     assert np.array_equal(sample["candidate_mask"], candidate)
 
 
+def test_image_sample_update_with_candidate_mask_rewrites_two_channel_input():
+    conn = sqlite3.connect(":memory:")
+    ensure_schema(conn)
+    image = np.zeros((4, 5), dtype="uint8")
+    image[:, 2:] = 100
+    candidate = np.zeros((4, 5), dtype="uint8")
+    candidate[1:3, 2:4] = 1
+
+    create_or_update_image_sample(conn, "sample-candidate", image, "png", {})
+    create_or_update_image_sample(conn, "sample-candidate", image, "png", {}, candidate_mask=candidate)
+    row = conn.execute(
+        """
+        SELECT input_blob, input_blob_encoding, input_blob_dimensions, output_blob
+        FROM samples WHERE uuid = ?
+        """,
+        ("sample-candidate",),
+    ).fetchone()
+
+    training_input = np.asarray(decode_blob(row[0], row[1], row[2]))
+    assert row[1] == "npy"
+    assert training_input.shape == (4, 5, 2)
+    assert np.array_equal(training_input[..., 0], image)
+    assert np.array_equal(training_input[..., 1] > 0, candidate > 0)
+    assert row[3] is None
+
+
 def test_training_input_tensor_converts_rgb_roi_to_two_channels():
     image = np.zeros((3, 4, 3), dtype="uint8")
     image[..., 0] = 255

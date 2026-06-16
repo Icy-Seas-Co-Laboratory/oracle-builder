@@ -40,6 +40,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "augmentation": {
         "enabled": False,
+        "repeats_per_epoch": 1,
         "invert": False,
         "rotation": 0.0,
         "zoom": 0.0,

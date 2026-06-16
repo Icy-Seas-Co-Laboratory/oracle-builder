@@ -131,6 +131,11 @@ def make_tf_datasets(sqlite_path: str | Path, config: dict[str, Any]):
         dataset = tf.data.Dataset.from_tensor_slices((x, y))
         if split == "train":
             dataset = dataset.shuffle(config["data"].get("shuffle_buffer", 512), seed=config["run"].get("seed", 123))
+            repeats_per_epoch = int(config.get("augmentation", {}).get("repeats_per_epoch", 1))
+            if repeats_per_epoch < 1:
+                raise ValueError("augmentation.repeats_per_epoch must be at least 1")
+            if repeats_per_epoch > 1:
+                dataset = dataset.repeat(repeats_per_epoch)
         dataset = dataset.batch(config["data"].get("batch_size", 16))
         if split == "train":
             dataset = apply_training_augmentation(dataset, config)

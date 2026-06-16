@@ -167,7 +167,7 @@ The viewer has three important layers:
 - `candidate mask`: the mask provided by the API, shown as a labels layer and hidden by default.
 - `validated mask`: the editable manual result, initialized from the candidate mask.
 
-Paint foreground in `validated mask` with label `1`; erase with label `0`. The side panel includes thresholding, image inversion before thresholding, cleanup actions, black/white background switching, validation, `Save`, `Save and next`, and `Skip`.
+Paint foreground in `validated mask` with label `1`; erase with label `0`. The side panel includes thresholding, image inversion before thresholding, cleanup actions, black/white background switching, validation, `Save`, `Save and next`, and `Skip`. Thresholding and cleanup actions update the selected labels layer, so local image sources without an API mask can select `candidate mask` and use `Apply threshold` to generate an initial candidate. On save, the image and current candidate mask are stored as the two-channel input blob, and the validated mask is stored as the output blob.
 
 Invalid masks are blocked from saving. Validation checks for empty masks, NaN/Inf values, binary labels, image/mask dimension mismatch, foreground fraction, connected components, and foreground touching the border.
 
@@ -334,6 +334,7 @@ Input augmentation is configured in TOML under `[augmentation]` and is applied o
 ```toml
 [augmentation]
 enabled = true
+repeats_per_epoch = 4
 invert = true
 rotation = 0.05
 zoom = 0.25
@@ -351,6 +352,8 @@ mask_fill_value = 0.0
 Geometric augmentation includes rotation, zoom, translation, skew/shear, and horizontal/vertical flips. For segmentation, the same geometric transform is applied to both the model input and the validated output mask. Image-like input channels use bilinear interpolation; masks use nearest-neighbor interpolation and are re-binarized.
 
 Photometric augmentation includes inversion, brightness, contrast, and Gaussian noise. These affect only image-like input channels, not output masks.
+
+`repeats_per_epoch` controls how many augmented passes over the training split are used per epoch. For example, `repeats_per_epoch = 4` means every stored training ROI is reused four times in each epoch, with augmentation sampled independently for each pass. Validation and test data are still used once and are not augmented.
 
 For two-channel U-Net inputs shaped `[height, width, 2]`, oracle-builder assumes channel 0 is the ROI image and channel 1 is the candidate/API mask. By default:
 
