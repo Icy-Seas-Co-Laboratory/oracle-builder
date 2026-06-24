@@ -40,4 +40,3 @@ def test_nan_and_inf_are_detected():
     assert not report["valid"]
     assert report["has_nan"]
     assert report["has_inf"]
-

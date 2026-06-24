@@ -373,6 +373,22 @@ def test_list_api_rois_prints_detection_ids(monkeypatch, capsys):
     assert "d2\tasset-1" in output
 
 
+def test_list_api_rois_accepts_width_height_aliases(monkeypatch, capsys):
+    def fake_list(base_url, **filters):
+        assert filters["min_bbox_w"] == 64
+        assert filters["min_bbox_h"] == 32
+        return [{"id": "d1"}]
+
+    monkeypatch.setattr(mask_builder, "list_pelagia_detections", fake_list)
+    monkeypatch.setattr(
+        "sys.argv",
+        ["mask_builder.py", "--list-api-rois", "--min-width", "64", "--min-height", "32"],
+    )
+
+    assert mask_builder.main() == 0
+    assert "d1" in capsys.readouterr().out
+
+
 def test_random_api_roi_selects_detection_before_loading(monkeypatch, tmp_path):
     db_path = tmp_path / "api.sqlite"
     image = np.zeros((5, 6), dtype="uint8")

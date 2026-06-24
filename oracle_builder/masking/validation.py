@@ -83,4 +83,3 @@ def validate_mask(
     report["valid"] = bool(valid)
     report["warnings"] = warnings
     return report
-

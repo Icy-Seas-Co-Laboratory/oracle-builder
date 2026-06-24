@@ -139,7 +139,7 @@ python3 mask_builder.py \
   --database datasets/unet_training.sqlite
 ```
 
-Useful Pelagia filters include `--run-id`, `--asset-id`, `--collection`, `--frame-id`, `--start-frame`, `--end-frame`, `--roi-index`, bbox filters such as `--min-bbox-x` and `--max-bbox-w`, area/perimeter filters such as `--min-area 500`, payload filters such as `--roi-encoding`, `--roi-format`, `--api-mask-encoding`, `--mask-format`, and paging/sorting filters such as `--limit`, `--offset`, `--sort-by`, and `--sort-dir`.
+Useful Pelagia filters include `--run-id`, `--asset-id`, `--collection`, `--frame-id`, `--start-frame`, `--end-frame`, `--roi-index`, bbox filters such as `--min-bbox-x`, `--min-width`, and `--max-bbox-w`, area/perimeter filters such as `--min-area 500`, payload filters such as `--roi-encoding`, `--roi-format`, `--api-mask-encoding`, `--mask-format`, and paging/sorting filters such as `--limit`, `--offset`, `--sort-by`, and `--sort-dir`.
 
 By default the Pelagia loader uses:
 
@@ -225,9 +225,9 @@ Pelagia detection filters:
 | `--api-max-bbox-x N`, `--max-bbox-x N` | Maximum bounding-box x. |
 | `--api-min-bbox-y N`, `--min-bbox-y N` | Minimum bounding-box y. |
 | `--api-max-bbox-y N`, `--max-bbox-y N` | Maximum bounding-box y. |
-| `--api-min-bbox-w N`, `--min-bbox-w N` | Minimum bounding-box width. |
+| `--api-min-bbox-w N`, `--min-bbox-w N`, `--min-width N` | Minimum bounding-box width. |
 | `--api-max-bbox-w N`, `--max-bbox-w N` | Maximum bounding-box width. |
-| `--api-min-bbox-h N`, `--min-bbox-h N` | Minimum bounding-box height. |
+| `--api-min-bbox-h N`, `--min-bbox-h N`, `--min-height N` | Minimum bounding-box height. |
 | `--api-max-bbox-h N`, `--max-bbox-h N` | Maximum bounding-box height. |
 | `--api-min-area N`, `--min-area N` | Minimum ROI area. |
 | `--api-max-area N`, `--max-area N` | Maximum ROI area. |
