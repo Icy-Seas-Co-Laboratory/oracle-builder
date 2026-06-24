@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 from pathlib import Path
 
@@ -12,6 +13,7 @@ from oracle_builder.masking.image_io import SUPPORTED_IMAGE_SUFFIXES, list_image
 from oracle_builder.masking.api_io import (
     detection_id_from_summary,
     list_pelagia_detections,
+    login_pelagia,
     load_api_roi,
     load_pelagia_detection,
 )
@@ -31,6 +33,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--image", type=Path, help="Local image file to load.")
     parser.add_argument("--output", type=Path, help="Legacy alias for --database.")
     parser.add_argument("--api-base-url", default="http://localhost:8000", help="Base URL for ROI/mask API loading.")
+    parser.add_argument("--api-token", help="Pelagia bearer token. Defaults to PELAGIA_API_TOKEN.")
+    parser.add_argument("--api-username", help="Pelagia username for /auth/login. Defaults to PELAGIA_USERNAME.")
+    parser.add_argument("--api-password", help="Pelagia password for /auth/login. Defaults to PELAGIA_PASSWORD.")
+    parser.add_argument("--api-project-key", help="Pelagia project key for /auth/login. Defaults to PELAGIA_PROJECT_KEY or default.")
     parser.add_argument("--list-api-rois", action="store_true", help="List Pelagia detection/ROI ids and exit.")
     parser.add_argument("--api-browse-rois", action="store_true", help="Open the first Pelagia detection/ROI from the filtered list.")
     parser.add_argument("--random-api-roi", action="store_true", help="Choose a random Pelagia detection/ROI id to open.")
@@ -133,6 +139,21 @@ def pelagia_detection_filters(args: argparse.Namespace) -> dict:
     }
 
 
+def resolve_pelagia_token(args: argparse.Namespace) -> str | None:
+    token = args.api_token or os.environ.get("PELAGIA_API_TOKEN")
+    if token:
+        return token
+
+    username = args.api_username or os.environ.get("PELAGIA_USERNAME")
+    password = args.api_password or os.environ.get("PELAGIA_PASSWORD")
+    project_key = args.api_project_key or os.environ.get("PELAGIA_PROJECT_KEY") or "default"
+    if not username and not password:
+        return None
+    if not username or not password:
+        raise SystemExit("Pelagia login requires both --api-username and --api-password, or PELAGIA_USERNAME and PELAGIA_PASSWORD.")
+    return login_pelagia(args.api_base_url, username, password, project_key=project_key).token
+
+
 def print_detection_list(detections: list[dict]) -> None:
     if not detections:
         print("No detections found.")
@@ -210,15 +231,19 @@ def main() -> int:
             if args.debug:
                 print(json.dumps(result["config"], indent=2, sort_keys=True))
         return 0 if report["valid"] else 2
+    api_token = None
+    api_requested = args.list_api_rois or args.random_api_roi or args.api_browse_rois or bool(args.api_roi_id)
+    if api_requested:
+        api_token = resolve_pelagia_token(args)
     if args.list_api_rois:
-        detections = list_pelagia_detections(args.api_base_url, **pelagia_detection_filters(args))
+        detections = list_pelagia_detections(args.api_base_url, token=api_token, **pelagia_detection_filters(args))
         print_detection_list(detections)
         return 0
     api_queue = None
     if args.random_api_roi or args.api_browse_rois:
         if args.api_roi_id:
             raise SystemExit("--api-browse-rois/--random-api-roi cannot be combined with --api-roi-id.")
-        api_queue = list_pelagia_detections(args.api_base_url, **pelagia_detection_filters(args))
+        api_queue = list_pelagia_detections(args.api_base_url, token=api_token, **pelagia_detection_filters(args))
         if not api_queue:
             raise SystemExit("No Pelagia detections found for the requested filters.")
         if args.random_api_roi:
@@ -246,7 +271,7 @@ def main() -> int:
     if args.api_roi_id:
         def load_pelagia_queue_sample(sample_info: dict) -> dict:
             detection_id = detection_id_from_summary(sample_info)
-            sample = load_pelagia_detection(args.api_base_url, detection_id)
+            sample = load_pelagia_detection(args.api_base_url, detection_id, token=api_token)
             return {
                 "uuid": sample.uuid,
                 "image": sample.image,
@@ -260,9 +285,10 @@ def main() -> int:
                 args.api_base_url,
                 args.api_roi_id,
                 endpoint_template=args.api_endpoint_template,
+                token=api_token,
             )
         else:
-            api_sample = load_pelagia_detection(args.api_base_url, args.api_roi_id)
+            api_sample = load_pelagia_detection(args.api_base_url, args.api_roi_id, token=api_token)
         image = api_sample.image
         sample_uuid = args.uuid or api_sample.uuid
         initial_candidate_mask = api_sample.mask if api_sample.mask is not None else np.zeros(image.shape[:2], dtype="uint8")

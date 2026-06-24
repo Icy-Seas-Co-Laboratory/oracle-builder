@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 import sys
 import types
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -137,9 +138,10 @@ def test_api_roi_id_uses_pelagia_detection_loader_by_default(monkeypatch, tmp_pa
     mask[1:3, 2:4] = 1
     captured = {}
 
-    def fake_load_pelagia_detection(base_url, detection_id):
+    def fake_load_pelagia_detection(base_url, detection_id, token=None):
         assert base_url == "http://localhost:8000"
         assert detection_id == "roi-7"
+        assert token is None
         return ApiMaskSample(
             uuid="roi-7",
             image=image,
@@ -183,6 +185,92 @@ def test_api_roi_id_uses_pelagia_detection_loader_by_default(monkeypatch, tmp_pa
     assert "api" in row[7]
 
 
+def test_api_token_is_passed_to_pelagia_loader(monkeypatch, tmp_path):
+    db_path = tmp_path / "api.sqlite"
+    image = np.zeros((5, 6), dtype="uint8")
+    captured = {}
+
+    def fake_load_pelagia_detection(base_url, detection_id, token=None):
+        assert detection_id == "roi-token"
+        assert token == "cli-token"
+        return ApiMaskSample(uuid=detection_id, image=image, mask=None, metadata={}, raw={})
+
+    fake_module = types.ModuleType("oracle_builder.masking.napari_app")
+
+    def fake_launch(**kwargs):
+        captured.update(kwargs)
+
+    fake_module.launch_mask_builder_app = fake_launch
+    monkeypatch.setattr(mask_builder, "load_pelagia_detection", fake_load_pelagia_detection)
+    monkeypatch.setitem(sys.modules, "oracle_builder.masking.napari_app", fake_module)
+    monkeypatch.setattr(
+        "sys.argv",
+        ["mask_builder.py", "--api-roi-id", "roi-token", "--api-token", "cli-token", "--database", str(db_path)],
+    )
+
+    assert mask_builder.main() == 0
+    assert captured["sample_uuid"] == "roi-token"
+
+
+def test_api_env_token_is_passed_to_pelagia_list(monkeypatch, capsys):
+    def fake_list(base_url, **filters):
+        assert base_url == "http://localhost:8000"
+        assert filters["token"] == "env-token"
+        return [{"id": "d1"}]
+
+    monkeypatch.setenv("PELAGIA_API_TOKEN", "env-token")
+    monkeypatch.setattr(mask_builder, "list_pelagia_detections", fake_list)
+    monkeypatch.setattr("sys.argv", ["mask_builder.py", "--list-api-rois"])
+
+    assert mask_builder.main() == 0
+    assert "d1" in capsys.readouterr().out
+
+
+def test_api_username_password_login_supplies_token(monkeypatch, tmp_path):
+    db_path = tmp_path / "api.sqlite"
+    image = np.zeros((5, 6), dtype="uint8")
+    captured = {}
+
+    def fake_login(base_url, username, password, project_key="default"):
+        assert base_url == "http://localhost:8000"
+        assert username == "ada"
+        assert password == "secret"
+        assert project_key == "default"
+        return SimpleNamespace(token="login-token")
+
+    def fake_load_pelagia_detection(base_url, detection_id, token=None):
+        assert detection_id == "roi-login"
+        assert token == "login-token"
+        return ApiMaskSample(uuid=detection_id, image=image, mask=None, metadata={}, raw={})
+
+    fake_module = types.ModuleType("oracle_builder.masking.napari_app")
+
+    def fake_launch(**kwargs):
+        captured.update(kwargs)
+
+    fake_module.launch_mask_builder_app = fake_launch
+    monkeypatch.setattr(mask_builder, "login_pelagia", fake_login)
+    monkeypatch.setattr(mask_builder, "load_pelagia_detection", fake_load_pelagia_detection)
+    monkeypatch.setitem(sys.modules, "oracle_builder.masking.napari_app", fake_module)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "mask_builder.py",
+            "--api-roi-id",
+            "roi-login",
+            "--api-username",
+            "ada",
+            "--api-password",
+            "secret",
+            "--database",
+            str(db_path),
+        ],
+    )
+
+    assert mask_builder.main() == 0
+    assert captured["sample_uuid"] == "roi-login"
+
+
 def test_api_browse_rois_builds_save_next_queue(monkeypatch, tmp_path):
     db_path = tmp_path / "api.sqlite"
     captured = {}
@@ -193,7 +281,7 @@ def test_api_browse_rois_builds_save_next_queue(monkeypatch, tmp_path):
         lambda base_url, **filters: [{"id": "d1"}, {"id": "d2"}],
     )
 
-    def fake_load_pelagia_detection(base_url, detection_id):
+    def fake_load_pelagia_detection(base_url, detection_id, token=None):
         value = 1 if detection_id == "d1" else 2
         return ApiMaskSample(
             uuid=detection_id,
@@ -229,10 +317,11 @@ def test_api_endpoint_template_uses_generic_loader(monkeypatch, tmp_path):
     image = np.zeros((5, 6), dtype="uint8")
     captured = {}
 
-    def fake_load_api_roi(base_url, roi_id, endpoint_template):
+    def fake_load_api_roi(base_url, roi_id, endpoint_template, token=None):
         assert base_url == "http://localhost:8000"
         assert roi_id == "roi-8"
         assert endpoint_template == "/legacy/{roi_id}"
+        assert token is None
         return ApiMaskSample(uuid="roi-8", image=image, mask=None, metadata={"source": "generic"}, raw={})
 
     fake_module = types.ModuleType("oracle_builder.masking.napari_app")
@@ -295,8 +384,9 @@ def test_random_api_roi_selects_detection_before_loading(monkeypatch, tmp_path):
 
     monkeypatch.setattr(mask_builder, "list_pelagia_detections", fake_list)
 
-    def fake_load_pelagia_detection(base_url, detection_id):
+    def fake_load_pelagia_detection(base_url, detection_id, token=None):
         assert detection_id == "random-detection"
+        assert token is None
         return ApiMaskSample(uuid=detection_id, image=image, mask=None, metadata={"source": "api"}, raw={})
 
     fake_module = types.ModuleType("oracle_builder.masking.napari_app")

@@ -81,6 +81,20 @@ The usual U-Net workflow is:
 
 ### Build A Dataset From Pelagia
 
+Authenticated Pelagia deployments require a bearer token on read endpoints. You can pass an existing token:
+
+```bash
+export PELAGIA_API_TOKEN=YOUR_TOKEN
+```
+
+Or let `mask_builder.py` log in before loading data:
+
+```bash
+export PELAGIA_USERNAME=ada
+export PELAGIA_PASSWORD=secret
+export PELAGIA_PROJECT_KEY=default
+```
+
 List matching Pelagia detection/ROI ids:
 
 ```bash
@@ -96,6 +110,9 @@ Open a random matching ROI and save edits to a SQLite dataset:
 ```bash
 python3 mask_builder.py \
   --api-base-url http://localhost:8000 \
+  --api-username ada \
+  --api-password secret \
+  --api-project-key default \
   --min-area 500 \
   --limit 100 \
   --database datasets/unet_training.sqlite \
@@ -130,6 +147,8 @@ By default the Pelagia loader uses:
 - `GET /detections/{detection_id}/roi?format=png` for the ROI image
 - `GET /detections/{detection_id}/mask?format=png` for the candidate mask
 
+These calls send `Authorization: Bearer <token>` when `--api-token`, `PELAGIA_API_TOKEN`, or login credentials are provided. A Pelagia `viewer` project role is enough for these read-only dataset-building operations.
+
 If an API uses a different route, set `--api-endpoint-template` and `--api-roi-id`:
 
 ```bash
@@ -158,6 +177,81 @@ python3 mask_builder.py \
   --image images/to_mask \
   --database datasets/unet_training.sqlite
 ```
+
+### Mask Builder CLI Reference
+
+Run `python3 mask_builder.py --help` for the argparse source of truth. Current arguments:
+
+| Argument | Description |
+| --- | --- |
+| `--database PATH` | SQLite dataset to read from or write to. |
+| `--input PATH` | Legacy alias for `--database`; image paths are treated as image imports. |
+| `--image PATH` | Local image file or folder to mask. |
+| `--output PATH` | Legacy alias for `--database`. |
+| `--uuid UUID` | Sample UUID; defaults to the image filename stem for image imports. |
+| `--split NAME` | Filter existing SQLite samples by split. |
+| `--missing-masks-only` | When reading SQLite samples, show only samples without saved masks. |
+| `--read-only` | Open without saving to a dataset. |
+| `--mask-encoding {png,npy}` | Encoding used when saving validated masks. |
+| `--debug` | Print extra launch and selection details. |
+
+Pelagia connection and auth:
+
+| Argument | Description |
+| --- | --- |
+| `--api-base-url URL` | Pelagia base URL; defaults to `http://localhost:8000`. |
+| `--api-token TOKEN` | Bearer token; defaults to `PELAGIA_API_TOKEN`. |
+| `--api-username NAME` | Username for `POST /auth/login`; defaults to `PELAGIA_USERNAME`. |
+| `--api-password PASSWORD` | Password for `POST /auth/login`; defaults to `PELAGIA_PASSWORD`. |
+| `--api-project-key KEY` | Project key for login; defaults to `PELAGIA_PROJECT_KEY` or `default`. |
+| `--api-roi-id ID`, `--roi-id ID`, `--detection-id ID` | Pelagia detection/ROI id to open. |
+| `--api-endpoint-template TEMPLATE` | Generic ROI endpoint template using `{roi_id}` instead of the Pelagia detection routes. |
+| `--list-api-rois` | List matching Pelagia detections and exit. |
+| `--api-browse-rois` | Open the first matching Pelagia detection as a queue. |
+| `--random-api-roi` | Pick a random matching Pelagia detection. |
+
+Pelagia detection filters:
+
+| Argument | Description |
+| --- | --- |
+| `--api-run-id ID`, `--run-id ID` | Filter by run id. |
+| `--api-asset-id ID`, `--asset-id ID` | Filter by asset id. |
+| `--api-collection NAME`, `--collection NAME` | Filter by collection. |
+| `--api-frame-id ID`, `--frame-id ID` | Filter by frame id. |
+| `--api-start-frame N`, `--start-frame N` | Minimum frame index. |
+| `--api-end-frame N`, `--end-frame N` | Maximum frame index. |
+| `--api-roi-index N`, `--roi-index N` | Filter by ROI index. |
+| `--api-min-bbox-x N`, `--min-bbox-x N` | Minimum bounding-box x. |
+| `--api-max-bbox-x N`, `--max-bbox-x N` | Maximum bounding-box x. |
+| `--api-min-bbox-y N`, `--min-bbox-y N` | Minimum bounding-box y. |
+| `--api-max-bbox-y N`, `--max-bbox-y N` | Maximum bounding-box y. |
+| `--api-min-bbox-w N`, `--min-bbox-w N` | Minimum bounding-box width. |
+| `--api-max-bbox-w N`, `--max-bbox-w N` | Maximum bounding-box width. |
+| `--api-min-bbox-h N`, `--min-bbox-h N` | Minimum bounding-box height. |
+| `--api-max-bbox-h N`, `--max-bbox-h N` | Maximum bounding-box height. |
+| `--api-min-area N`, `--min-area N` | Minimum ROI area. |
+| `--api-max-area N`, `--max-area N` | Maximum ROI area. |
+| `--api-min-perimeter N`, `--min-perimeter N` | Minimum ROI perimeter. |
+| `--api-max-perimeter N`, `--max-perimeter N` | Maximum ROI perimeter. |
+| `--api-roi-encoding VALUE`, `--roi-encoding VALUE` | Filter by ROI payload encoding. |
+| `--api-roi-format VALUE`, `--roi-format VALUE` | Request/filter ROI response format. |
+| `--api-mask-encoding VALUE` | Filter by mask payload encoding. |
+| `--api-mask-format VALUE`, `--mask-format VALUE` | Request/filter mask response format. |
+| `--api-limit N`, `--limit N` | Maximum detections to list or sample. |
+| `--api-offset N`, `--offset N` | Detection list offset. |
+| `--api-sort-by FIELD`, `--sort-by FIELD` | Detection list sort field. |
+| `--api-sort-dir {asc,desc}`, `--sort-dir {asc,desc}` | Detection list sort direction. |
+
+U-Net dataset utilities:
+
+| Argument | Description |
+| --- | --- |
+| `--validate-unet-dataset` | Validate that `--database` is ready for U-Net training and exit. |
+| `--write-unet-config PATH` | Write a U-Net TOML config inferred from the dataset and exit. |
+| `--unet-batch-size N` | Batch size for generated U-Net configs. |
+| `--unet-epochs N` | Epoch count for generated U-Net configs. |
+| `--unet-input-shape SHAPE` | Target input shape, for example `256,256,2`. |
+| `--unet-output-shape SHAPE` | Target output shape, for example `256,256,1`. |
 
 ### Napari Mask Editing
 
@@ -237,17 +331,23 @@ python3 scripts/visualize_unet_training_rois.py \
   --output runs/unet-test/training_roi_overview.png
 ```
 
-Useful options:
+Visualization arguments:
 
-```bash
---split train
---thumbnail-size 180
---columns 0
---limit 100
---candidate-alpha 0.35
---refined-alpha 0.45
---no-labels
-```
+| Argument | Description |
+| --- | --- |
+| `--database PATH` | Required oracle-builder SQLite dataset. |
+| `--output PATH` | Required output PNG path. |
+| `--config PATH` | Optional TOML config for seed and split fractions. |
+| `--split NAME` | Split to visualize; defaults to `train`. |
+| `--thumbnail-size N` | Maximum tile image size in pixels. |
+| `--columns N` | Grid columns; `0` chooses approximately square layout. |
+| `--limit N` | Maximum number of ROIs to render. |
+| `--candidate-alpha N` | Blue candidate-mask overlay opacity. |
+| `--refined-alpha N` | Green validated-mask overlay opacity. |
+| `--seed N` | Override split assignment seed. |
+| `--validation-split N` | Override validation split fraction. |
+| `--test-split N` | Override test split fraction. |
+| `--no-labels` | Hide UUID labels under tiles. |
 
 ## SQLite Dataset Format
 
@@ -380,17 +480,19 @@ python3 model_training.py \
   --output RUN_NAME
 ```
 
-Useful flags:
+Arguments:
 
-```bash
---runs-dir runs
---overwrite
---dry-run
---preflight
---debug
-```
-
-`--resume` is reserved but not implemented.
+| Argument | Description |
+| --- | --- |
+| `-c PATH`, `--config PATH` | Required TOML config. |
+| `-i PATH`, `--input PATH` | Required SQLite dataset. |
+| `-o NAME`, `--output NAME` | Required run name under `--runs-dir`. |
+| `--runs-dir PATH` | Parent folder for runs; defaults to `./runs`. |
+| `--overwrite` | Replace an existing run directory with the same name. |
+| `--resume` | Reserved; currently exits because resume is not implemented. |
+| `--dry-run` | Print resolved config and run path without training. |
+| `--preflight` | Validate segmentation SQLite compatibility and exit. |
+| `--debug` | Enable debug mode in the resolved config. |
 
 ## Evaluation And Inference
 
@@ -403,6 +505,14 @@ python3 model_evaluate.py \
   --split test
 ```
 
+Evaluation arguments:
+
+| Argument | Description |
+| --- | --- |
+| `--run PATH` | Required run directory containing `resolved_config.json` and model artifacts. |
+| `--input PATH` | Required SQLite dataset. |
+| `--split NAME` | Required split to evaluate. |
+
 Write predictions from a saved run:
 
 ```bash
@@ -412,6 +522,15 @@ python3 model_inference.py \
   --split test \
   --output runs/RUN_NAME/predictions/predictions.sqlite
 ```
+
+Inference arguments:
+
+| Argument | Description |
+| --- | --- |
+| `--run PATH` | Required run directory containing `resolved_config.json` and model artifacts. |
+| `--input PATH` | Required SQLite dataset. |
+| `--output PATH` | Required predictions SQLite output path. |
+| `--split NAME` | Split to predict; defaults to `test`. |
 
 ## Run Outputs
 

@@ -24,6 +24,14 @@ class ApiMaskSample:
     raw: dict[str, Any]
 
 
+@dataclass
+class PelagiaSession:
+    token: str
+    user: dict[str, Any]
+    project: dict[str, Any]
+    session: dict[str, Any]
+
+
 def build_api_url(base_url: str, endpoint_template: str, roi_id: str) -> str:
     base = base_url.rstrip("/")
     endpoint = endpoint_template.format(roi_id=urllib.parse.quote(roi_id, safe=""))
@@ -40,22 +48,97 @@ def build_url(base_url: str, path: str, query: dict[str, Any] | None = None) -> 
     return url
 
 
-def fetch_json(url: str, timeout: float = 30.0) -> dict[str, Any]:
-    request = urllib.request.Request(url, headers={"Accept": "application/json"})
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        payload = response.read()
+def request_headers(accept: str, token: str | None = None, content_type: str | None = None) -> dict[str, str]:
+    headers = {"Accept": accept}
+    if content_type:
+        headers["Content-Type"] = content_type
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
+def post_json(
+    url: str,
+    payload: dict[str, Any],
+    timeout: float = 30.0,
+    token: str | None = None,
+) -> dict[str, Any]:
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers=request_headers("application/json", token=token, content_type="application/json"),
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            response_payload = response.read()
+    except urllib.error.HTTPError as exc:
+        _raise_pelagia_http_error(exc)
+    data = json.loads(response_payload.decode("utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError(f"API response must be a JSON object, got {type(data).__name__}")
+    return data
+
+
+def login_pelagia(
+    base_url: str,
+    username: str,
+    password: str,
+    project_key: str = "default",
+    timeout: float = 30.0,
+) -> PelagiaSession:
+    payload = post_json(
+        build_url(base_url, "/auth/login"),
+        {"username": username, "password": password, "project_key": project_key},
+        timeout=timeout,
+    )
+    token = payload.get("token")
+    if not isinstance(token, str) or not token:
+        raise ValueError("Pelagia login response did not include a token.")
+    return PelagiaSession(
+        token=token,
+        user=payload.get("user") if isinstance(payload.get("user"), dict) else {},
+        project=payload.get("project") if isinstance(payload.get("project"), dict) else {},
+        session=payload.get("session") if isinstance(payload.get("session"), dict) else {},
+    )
+
+
+def fetch_json(url: str, timeout: float = 30.0, token: str | None = None) -> dict[str, Any]:
+    request = urllib.request.Request(url, headers=request_headers("application/json", token=token))
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            payload = response.read()
+    except urllib.error.HTTPError as exc:
+        _raise_pelagia_http_error(exc)
     data = json.loads(payload.decode("utf-8"))
     if not isinstance(data, dict):
         raise ValueError(f"API response must be a JSON object, got {type(data).__name__}")
     return data
 
 
-def fetch_bytes(url: str, timeout: float = 30.0, accept: str = "image/png, application/json") -> tuple[bytes, str]:
-    request = urllib.request.Request(url, headers={"Accept": accept})
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        payload = response.read()
-        content_type = response.headers.get("Content-Type", "")
+def fetch_bytes(
+    url: str,
+    timeout: float = 30.0,
+    accept: str = "image/png, application/json",
+    token: str | None = None,
+) -> tuple[bytes, str]:
+    request = urllib.request.Request(url, headers=request_headers(accept, token=token))
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            payload = response.read()
+            content_type = response.headers.get("Content-Type", "")
+    except urllib.error.HTTPError as exc:
+        _raise_pelagia_http_error(exc)
     return payload, content_type
+
+
+def _raise_pelagia_http_error(exc: urllib.error.HTTPError) -> None:
+    if exc.code in {401, 403}:
+        raise RuntimeError(
+            "Pelagia rejected the request. Pass --api-token or log in with "
+            "--api-username, --api-password, and --api-project-key."
+        ) from exc
+    raise exc
 
 
 def load_api_roi(
@@ -63,9 +146,10 @@ def load_api_roi(
     roi_id: str,
     endpoint_template: str = "/rois/{roi_id}",
     timeout: float = 30.0,
+    token: str | None = None,
 ) -> ApiMaskSample:
     url = build_api_url(base_url, endpoint_template, roi_id)
-    payload = fetch_json(url, timeout=timeout)
+    payload = fetch_json(url, timeout=timeout, token=token)
     return parse_api_roi_payload(payload, fallback_uuid=roi_id, source_url=url)
 
 
@@ -76,9 +160,10 @@ def load_pelagia_detection(
     mask_format: str = "png",
     include_mask: bool = True,
     timeout: float = 30.0,
+    token: str | None = None,
 ) -> ApiMaskSample:
     detail_url = build_url(base_url, f"/detections/{urllib.parse.quote(detection_id, safe='')}")
-    detail_payload = fetch_json(detail_url, timeout=timeout)
+    detail_payload = fetch_json(detail_url, timeout=timeout, token=token)
     detection = detail_payload.get("detection", detail_payload)
     if not isinstance(detection, dict):
         detection = {}
@@ -88,7 +173,7 @@ def load_pelagia_detection(
         f"/detections/{urllib.parse.quote(detection_id, safe='')}/roi",
         {"format": image_format},
     )
-    roi_bytes, roi_content_type = fetch_bytes(roi_url, timeout=timeout, accept=f"image/{image_format}, application/json")
+    roi_bytes, roi_content_type = fetch_bytes(roi_url, timeout=timeout, accept=f"image/{image_format}, application/json", token=token)
     image, roi_metadata = decode_pelagia_image_response(roi_bytes, roi_content_type, source_url=roi_url, mask=False)
 
     mask = None
@@ -100,7 +185,7 @@ def load_pelagia_detection(
     )
     if include_mask:
         try:
-            mask_bytes, mask_content_type = fetch_bytes(mask_url, timeout=timeout, accept=f"image/{mask_format}, application/json")
+            mask_bytes, mask_content_type = fetch_bytes(mask_url, timeout=timeout, accept=f"image/{mask_format}, application/json", token=token)
             decoded_mask, mask_metadata = decode_pelagia_image_response(mask_bytes, mask_content_type, source_url=mask_url, mask=True)
             mask = (np.asarray(decoded_mask) > 0).astype("uint8")
         except urllib.error.HTTPError as exc:
@@ -158,6 +243,7 @@ def list_pelagia_detections(
     sort_by: str = "asset_frame",
     sort_dir: str = "desc",
     timeout: float = 30.0,
+    token: str | None = None,
 ) -> list[dict[str, Any]]:
     url = build_url(
         base_url,
@@ -192,7 +278,7 @@ def list_pelagia_detections(
             "sort_dir": sort_dir,
         },
     )
-    payload = fetch_json(url, timeout=timeout)
+    payload = fetch_json(url, timeout=timeout, token=token)
     detections = payload.get("detections", [])
     if not isinstance(detections, list):
         raise ValueError("Pelagia /detections response did not contain a detections list.")
@@ -236,6 +322,7 @@ def choose_random_pelagia_detection_id(
     sort_by: str = "asset_frame",
     sort_dir: str = "desc",
     timeout: float = 30.0,
+    token: str | None = None,
 ) -> str:
     detections = list_pelagia_detections(
         base_url,
@@ -267,6 +354,7 @@ def choose_random_pelagia_detection_id(
         sort_by=sort_by,
         sort_dir=sort_dir,
         timeout=timeout,
+        token=token,
     )
     if not detections:
         raise ValueError("Pelagia returned no detections for the requested filters.")

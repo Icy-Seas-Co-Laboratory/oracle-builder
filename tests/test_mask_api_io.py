@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import io
+import json
 
 import numpy as np
 from PIL import Image
@@ -11,7 +12,10 @@ from oracle_builder.masking.api_io import (
     choose_random_pelagia_detection_id,
     decode_pelagia_image_response,
     detection_id_from_summary,
+    fetch_bytes,
+    fetch_json,
     list_pelagia_detections,
+    login_pelagia,
     parse_api_roi_payload,
 )
 
@@ -22,11 +26,91 @@ def _png_base64(array: np.ndarray) -> str:
     return base64.b64encode(buffer.getvalue()).decode("ascii")
 
 
+class _FakeResponse:
+    def __init__(self, payload: bytes, content_type: str = "application/json"):
+        self.payload = payload
+        self.headers = {"Content-Type": content_type}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return None
+
+    def read(self):
+        return self.payload
+
+
 def test_build_api_url_uses_roi_template():
     assert (
         build_api_url("http://localhost:8000/", "/rois/{roi_id}", "abc 123")
         == "http://localhost:8000/rois/abc%20123"
     )
+
+
+def test_fetch_json_sends_bearer_token(monkeypatch):
+    captured = {}
+
+    def fake_urlopen(request, timeout=30.0):
+        captured["url"] = request.full_url
+        captured["authorization"] = request.get_header("Authorization")
+        captured["accept"] = request.get_header("Accept")
+        return _FakeResponse(json.dumps({"ok": True}).encode("utf-8"))
+
+    monkeypatch.setattr("oracle_builder.masking.api_io.urllib.request.urlopen", fake_urlopen)
+
+    payload = fetch_json("http://api/detections", token="secret-token")
+
+    assert payload == {"ok": True}
+    assert captured["url"] == "http://api/detections"
+    assert captured["authorization"] == "Bearer secret-token"
+    assert captured["accept"] == "application/json"
+
+
+def test_fetch_bytes_sends_bearer_token(monkeypatch):
+    captured = {}
+
+    def fake_urlopen(request, timeout=30.0):
+        captured["authorization"] = request.get_header("Authorization")
+        captured["accept"] = request.get_header("Accept")
+        return _FakeResponse(b"png-bytes", content_type="image/png")
+
+    monkeypatch.setattr("oracle_builder.masking.api_io.urllib.request.urlopen", fake_urlopen)
+
+    payload, content_type = fetch_bytes("http://api/detections/d1/roi", token="secret-token")
+
+    assert payload == b"png-bytes"
+    assert content_type == "image/png"
+    assert captured["authorization"] == "Bearer secret-token"
+    assert captured["accept"] == "image/png, application/json"
+
+
+def test_login_pelagia_posts_credentials_and_returns_session(monkeypatch):
+    captured = {}
+
+    def fake_urlopen(request, timeout=30.0):
+        captured["url"] = request.full_url
+        captured["method"] = request.get_method()
+        captured["content_type"] = request.get_header("Content-Type") or request.get_header("Content-type")
+        captured["payload"] = json.loads(request.data.decode("utf-8"))
+        response = {
+            "token": "session-token",
+            "user": {"username": "ada"},
+            "project": {"key": "default"},
+            "session": {"id": "session-1"},
+        }
+        return _FakeResponse(json.dumps(response).encode("utf-8"))
+
+    monkeypatch.setattr("oracle_builder.masking.api_io.urllib.request.urlopen", fake_urlopen)
+
+    session = login_pelagia("http://api", "ada", "secret", "default")
+
+    assert session.token == "session-token"
+    assert session.user["username"] == "ada"
+    assert captured["url"] == "http://api/auth/login"
+    assert captured["method"] == "POST"
+    assert captured["content_type"] == "application/json"
+    assert captured["payload"] == {"username": "ada", "password": "secret", "project_key": "default"}
 
 
 def test_parse_api_roi_payload_decodes_image_mask_and_metadata():
@@ -98,8 +182,9 @@ def test_decode_pelagia_json_matrix_response_as_mask():
 def test_list_pelagia_detections_parses_detection_list(monkeypatch):
     captured = {}
 
-    def fake_fetch_json(url, timeout=30.0):
+    def fake_fetch_json(url, timeout=30.0, token=None):
         captured["url"] = url
+        captured["token"] = token
         return {"detections": [{"id": "d1"}, {"id": "d2"}]}
 
     monkeypatch.setattr("oracle_builder.masking.api_io.fetch_json", fake_fetch_json)
@@ -111,6 +196,7 @@ def test_list_pelagia_detections_parses_detection_list(monkeypatch):
     assert "min_area=500" in captured["url"]
     assert "max_bbox_w=80" in captured["url"]
     assert "limit=2" in captured["url"]
+    assert captured["token"] is None
 
 
 def test_choose_random_pelagia_detection_id(monkeypatch):
