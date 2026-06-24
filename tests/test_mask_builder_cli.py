@@ -396,6 +396,7 @@ def test_random_api_roi_selects_detection_before_loading(monkeypatch, tmp_path):
 
     def fake_list(base_url, **filters):
         assert filters["min_area"] == 500
+        assert filters["sort_by"] == "id"
         return [{"id": "random-detection"}]
 
     monkeypatch.setattr(mask_builder, "list_pelagia_detections", fake_list)
@@ -416,6 +417,36 @@ def test_random_api_roi_selects_detection_before_loading(monkeypatch, tmp_path):
     monkeypatch.setattr(
         "sys.argv",
         ["mask_builder.py", "--random-api-roi", "--min-area", "500", "--database", str(db_path)],
+    )
+
+    assert mask_builder.main() == 0
+    assert captured["sample_uuid"] == "random-detection"
+
+
+def test_random_api_roi_respects_explicit_sort_by(monkeypatch, tmp_path):
+    db_path = tmp_path / "api.sqlite"
+    image = np.zeros((5, 6), dtype="uint8")
+    captured = {}
+
+    def fake_list(base_url, **filters):
+        assert filters["sort_by"] == "asset_frame"
+        return [{"id": "random-detection"}]
+
+    def fake_load_pelagia_detection(base_url, detection_id, token=None):
+        return ApiMaskSample(uuid=detection_id, image=image, mask=None, metadata={"source": "api"}, raw={})
+
+    fake_module = types.ModuleType("oracle_builder.masking.napari_app")
+
+    def fake_launch(**kwargs):
+        captured.update(kwargs)
+
+    fake_module.launch_mask_builder_app = fake_launch
+    monkeypatch.setattr(mask_builder, "list_pelagia_detections", fake_list)
+    monkeypatch.setattr(mask_builder, "load_pelagia_detection", fake_load_pelagia_detection)
+    monkeypatch.setitem(sys.modules, "oracle_builder.masking.napari_app", fake_module)
+    monkeypatch.setattr(
+        "sys.argv",
+        ["mask_builder.py", "--random-api-roi", "--sort-by", "asset_frame", "--database", str(db_path)],
     )
 
     assert mask_builder.main() == 0

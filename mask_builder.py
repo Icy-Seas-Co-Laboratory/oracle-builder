@@ -77,7 +77,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--api-mask-format", "--mask-format", dest="api_mask_format", help="Optional mask_format filter.")
     parser.add_argument("--api-limit", "--limit", dest="api_limit", type=int, default=25, help="Maximum detections to list or sample from.")
     parser.add_argument("--api-offset", "--offset", dest="api_offset", type=int, default=0, help="Pelagia /detections offset.")
-    parser.add_argument("--api-sort-by", "--sort-by", dest="api_sort_by", default="asset_frame", help="Pelagia /detections sort_by value.")
+    parser.add_argument(
+        "--api-sort-by",
+        "--sort-by",
+        dest="api_sort_by",
+        help="Pelagia /detections sort_by value. Defaults to asset_frame, or id for --random-api-roi.",
+    )
     parser.add_argument("--api-sort-dir", "--sort-dir", dest="api_sort_dir", choices=["asc", "desc"], default="desc", help="Pelagia /detections sort_dir value.")
     parser.add_argument("--uuid", help="Sample UUID. Defaults to the image filename stem for image imports.")
     parser.add_argument("--split", help="Optional split filter such as train, validation, test, holdout.")
@@ -107,7 +112,7 @@ def resolve_database_path(args: argparse.Namespace) -> Path | None:
     return database
 
 
-def pelagia_detection_filters(args: argparse.Namespace) -> dict:
+def pelagia_detection_filters(args: argparse.Namespace, default_sort_by: str = "asset_frame") -> dict:
     return {
         "run_id": args.api_run_id,
         "asset_id": args.api_asset_id,
@@ -134,7 +139,7 @@ def pelagia_detection_filters(args: argparse.Namespace) -> dict:
         "mask_format": args.api_mask_format,
         "limit": args.api_limit,
         "offset": args.api_offset,
-        "sort_by": args.api_sort_by,
+        "sort_by": args.api_sort_by or default_sort_by,
         "sort_dir": args.api_sort_dir,
     }
 
@@ -243,7 +248,12 @@ def main() -> int:
     if args.random_api_roi or args.api_browse_rois:
         if args.api_roi_id:
             raise SystemExit("--api-browse-rois/--random-api-roi cannot be combined with --api-roi-id.")
-        api_queue = list_pelagia_detections(args.api_base_url, token=api_token, **pelagia_detection_filters(args))
+        default_sort_by = "id" if args.random_api_roi else "asset_frame"
+        api_queue = list_pelagia_detections(
+            args.api_base_url,
+            token=api_token,
+            **pelagia_detection_filters(args, default_sort_by=default_sort_by),
+        )
         if not api_queue:
             raise SystemExit("No Pelagia detections found for the requested filters.")
         if args.random_api_roi:
