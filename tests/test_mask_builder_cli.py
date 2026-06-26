@@ -226,6 +226,30 @@ def test_api_env_token_is_passed_to_pelagia_list(monkeypatch, capsys):
     assert "d1" in capsys.readouterr().out
 
 
+def test_list_api_rois_uses_username_password_login(monkeypatch, capsys):
+    def fake_login(base_url, username, password, project_key="default"):
+        assert base_url == "http://localhost:8000"
+        assert username == "ada"
+        assert password == "secret"
+        assert project_key == "default"
+        return SimpleNamespace(token="login-token")
+
+    def fake_list(base_url, **filters):
+        assert base_url == "http://localhost:8000"
+        assert filters["token"] == "login-token"
+        return [{"id": "d1"}]
+
+    monkeypatch.setattr(mask_builder, "login_pelagia", fake_login)
+    monkeypatch.setattr(mask_builder, "list_pelagia_detections", fake_list)
+    monkeypatch.setattr(
+        "sys.argv",
+        ["mask_builder.py", "--list-api-rois", "--api-username", "ada", "--api-password", "secret"],
+    )
+
+    assert mask_builder.main() == 0
+    assert "d1" in capsys.readouterr().out
+
+
 def test_api_username_password_login_supplies_token(monkeypatch, tmp_path):
     db_path = tmp_path / "api.sqlite"
     image = np.zeros((5, 6), dtype="uint8")
