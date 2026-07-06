@@ -200,8 +200,15 @@ def test_list_pelagia_detections_parses_detection_list(monkeypatch):
 
 
 def test_choose_random_pelagia_detection_id(monkeypatch):
+    captured = {}
+
+    def fake_list(*args, **kwargs):
+        captured.update(kwargs)
+        return [{"id": "d1"}, {"id": "d2"}]
+
     monkeypatch.setattr(
         "oracle_builder.masking.api_io.list_pelagia_detections",
-        lambda *args, **kwargs: [{"id": "d1"}],
+        fake_list,
     )
     assert choose_random_pelagia_detection_id("http://api") == "d1"
+    assert captured["sort_by"] == "random"

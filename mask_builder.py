@@ -4,7 +4,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import random
 from pathlib import Path
 
 import numpy as np
@@ -81,7 +80,7 @@ def parse_args() -> argparse.Namespace:
         "--api-sort-by",
         "--sort-by",
         dest="api_sort_by",
-        help="Pelagia /detections sort_by value. Defaults to asset_frame, or id for --random-api-roi.",
+        help="Pelagia /detections sort_by value. Defaults to asset_frame, or random for --random-api-roi.",
     )
     parser.add_argument("--api-sort-dir", "--sort-dir", dest="api_sort_dir", choices=["asc", "desc"], default="desc", help="Pelagia /detections sort_dir value.")
     parser.add_argument("--uuid", help="Sample UUID. Defaults to the image filename stem for image imports.")
@@ -248,7 +247,7 @@ def main() -> int:
     if args.random_api_roi or args.api_browse_rois:
         if args.api_roi_id:
             raise SystemExit("--api-browse-rois/--random-api-roi cannot be combined with --api-roi-id.")
-        default_sort_by = "id" if args.random_api_roi else "asset_frame"
+        default_sort_by = "random" if args.random_api_roi else "asset_frame"
         api_queue = list_pelagia_detections(
             args.api_base_url,
             token=api_token,
@@ -256,8 +255,6 @@ def main() -> int:
         )
         if not api_queue:
             raise SystemExit("No Pelagia detections found for the requested filters.")
-        if args.random_api_roi:
-            random.shuffle(api_queue)
         args.api_roi_id = detection_id_from_summary(api_queue[0])
         if args.debug:
             selection_mode = "Random" if args.random_api_roi else "First"

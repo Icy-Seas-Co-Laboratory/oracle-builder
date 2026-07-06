@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import base64
 import json
-import random
 import urllib.parse
 import urllib.request
 import urllib.error
@@ -319,7 +318,7 @@ def choose_random_pelagia_detection_id(
     mask_format: str | None = None,
     limit: int | None = 100,
     offset: int = 0,
-    sort_by: str = "asset_frame",
+    sort_by: str = "random",
     sort_dir: str = "desc",
     timeout: float = 30.0,
     token: str | None = None,
@@ -358,7 +357,7 @@ def choose_random_pelagia_detection_id(
     )
     if not detections:
         raise ValueError("Pelagia returned no detections for the requested filters.")
-    return detection_id_from_summary(random.choice(detections))
+    return detection_id_from_summary(detections[0])
 
 
 def decode_pelagia_image_response(

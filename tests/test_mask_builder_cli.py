@@ -420,8 +420,8 @@ def test_random_api_roi_selects_detection_before_loading(monkeypatch, tmp_path):
 
     def fake_list(base_url, **filters):
         assert filters["min_area"] == 500
-        assert filters["sort_by"] == "id"
-        return [{"id": "random-detection"}]
+        assert filters["sort_by"] == "random"
+        return [{"id": "random-detection"}, {"id": "second-detection"}]
 
     monkeypatch.setattr(mask_builder, "list_pelagia_detections", fake_list)
 

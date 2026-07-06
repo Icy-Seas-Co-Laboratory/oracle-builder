@@ -239,7 +239,7 @@ Pelagia detection filters:
 | `--api-mask-format VALUE`, `--mask-format VALUE` | Request/filter mask response format. |
 | `--api-limit N`, `--limit N` | Maximum detections to list or sample. |
 | `--api-offset N`, `--offset N` | Detection list offset. |
-| `--api-sort-by FIELD`, `--sort-by FIELD` | Detection list sort field; defaults to `asset_frame`, or `id` for `--random-api-roi`. |
+| `--api-sort-by FIELD`, `--sort-by FIELD` | Detection list sort field; defaults to `asset_frame`, or `random` for `--random-api-roi`. |
 | `--api-sort-dir {asc,desc}`, `--sort-dir {asc,desc}` | Detection list sort direction. |
 
 U-Net dataset utilities:
