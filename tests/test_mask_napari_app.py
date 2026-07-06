@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import numpy as np
 import pytest
 
 from oracle_builder.masking.napari_app import (
     CANDIDATE_MASK_COLOR,
+    TRANSPARENT_LABEL_COLOR,
     VALIDATED_MASK_COLOR,
     VALIDATED_MASK_OPACITY,
     _enable_layer_editing,
@@ -78,6 +80,30 @@ def test_replace_mask_layer_reveals_and_refreshes_layer():
     assert layer.data.dtype == "uint8"
 
 
+def test_replace_mask_layer_copies_source_data():
+    source = np.array([[0, 1], [1, 0]], dtype="uint8")
+    layer = FakeLayer("validated mask")
+
+    _replace_mask_layer(layer, source)
+    source[0, 1] = 0
+
+    assert layer.data[0, 1] == 1
+    assert not np.shares_memory(layer.data, source)
+
+
+def test_layers_replaced_from_same_source_do_not_share_data():
+    source = np.array([[0, 1], [1, 0]], dtype="uint8")
+    candidate = FakeLayer("candidate mask")
+    validated = FakeLayer("validated mask")
+
+    _replace_mask_layer(candidate, source)
+    _replace_mask_layer(validated, source)
+    candidate.data[0, 1] = 0
+
+    assert validated.data[0, 1] == 1
+    assert not np.shares_memory(candidate.data, validated.data)
+
+
 def test_candidate_mask_layer_editing_can_be_enabled():
     layer = FakeLayer("candidate mask")
 
@@ -91,7 +117,7 @@ def test_label_foreground_color_can_be_set_for_refined_mask():
 
     _set_label_foreground_color(layer, VALIDATED_MASK_COLOR)
 
-    assert layer.color == {1: VALIDATED_MASK_COLOR}
+    assert layer.color == {None: TRANSPARENT_LABEL_COLOR, 0: TRANSPARENT_LABEL_COLOR, 1: VALIDATED_MASK_COLOR}
 
 
 def test_candidate_mask_color_is_red():
@@ -99,7 +125,7 @@ def test_candidate_mask_color_is_red():
 
     _set_label_foreground_color(layer, CANDIDATE_MASK_COLOR)
 
-    assert layer.color == {1: "#ff0000"}
+    assert layer.color == {None: TRANSPARENT_LABEL_COLOR, 0: TRANSPARENT_LABEL_COLOR, 1: "#ff0000"}
 
 
 def test_validated_mask_opacity_defaults_to_half():

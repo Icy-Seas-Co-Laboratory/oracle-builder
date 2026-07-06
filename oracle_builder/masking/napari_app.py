@@ -15,6 +15,7 @@ from oracle_builder.masking.validation import validate_mask
 CANDIDATE_MASK_COLOR = "#ff0000"
 VALIDATED_MASK_COLOR = "#20c997"
 VALIDATED_MASK_OPACITY = 0.5
+TRANSPARENT_LABEL_COLOR = [0.0, 0.0, 0.0, 0.0]
 
 
 def _empty_mask_for(image: np.ndarray) -> np.ndarray:
@@ -46,7 +47,7 @@ def _selected_mask_layer(viewer: Any, default_layer: Any) -> Any:
 
 
 def _replace_mask_layer(layer: Any, new_mask: np.ndarray, reveal: bool = False) -> None:
-    layer.data = np.asarray(new_mask, dtype="uint8")
+    layer.data = np.array(new_mask, dtype="uint8", copy=True)
     if reveal and hasattr(layer, "visible"):
         layer.visible = True
     refresh = getattr(layer, "refresh", None)
@@ -60,7 +61,7 @@ def _enable_layer_editing(layer: Any) -> None:
 
 
 def _set_label_foreground_color(layer: Any, color: str) -> None:
-    colors = {1: color}
+    colors = {None: TRANSPARENT_LABEL_COLOR, 0: TRANSPARENT_LABEL_COLOR, 1: color}
     if hasattr(layer, "color"):
         layer.color = colors
         return
@@ -145,21 +146,21 @@ def launch_mask_builder_app(
     queue = sample_queue or [{"uuid": sample_uuid}]
     output_path = output_db_path or db_path
     candidate_mask = (
-        np.asarray(initial_candidate_mask, dtype="uint8")
+        np.array(initial_candidate_mask, dtype="uint8", copy=True)
         if initial_candidate_mask is not None
-        else np.asarray(initial_mask, dtype="uint8")
+        else np.array(initial_mask, dtype="uint8", copy=True)
         if initial_mask is not None
         else _empty_mask_for(current["image"])
     )
-    mask = np.asarray(initial_mask, dtype="uint8") if initial_mask is not None else candidate_mask.copy()
+    mask = np.array(initial_mask, dtype="uint8", copy=True) if initial_mask is not None else candidate_mask.copy()
 
     viewer = napari.Viewer(title=f"oracle-builder mask builder: {sample_uuid}")
     viewer.theme = _viewer_theme_for_background("black")
     image_layer = viewer.add_image(current["image"], name="image")
-    candidate_layer = viewer.add_labels(candidate_mask, name="candidate mask", visible=False)
+    candidate_layer = viewer.add_labels(candidate_mask.copy(), name="candidate mask", visible=False)
     _enable_layer_editing(candidate_layer)
     _set_label_foreground_color(candidate_layer, CANDIDATE_MASK_COLOR)
-    labels_layer = viewer.add_labels(mask, name="validated mask")
+    labels_layer = viewer.add_labels(mask.copy(), name="validated mask")
     _enable_layer_editing(labels_layer)
     _set_label_foreground_color(labels_layer, VALIDATED_MASK_COLOR)
     _set_layer_opacity(labels_layer, VALIDATED_MASK_OPACITY)
