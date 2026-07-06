@@ -261,7 +261,7 @@ The viewer has three important layers:
 - `candidate mask`: the mask provided by the API, shown as a labels layer and hidden by default.
 - `validated mask`: the editable manual result, initialized from the candidate mask.
 
-Paint foreground in `validated mask` with label `1`; erase with label `0`. The side panel includes thresholding, image inversion before thresholding, cleanup actions, black/white background switching, validation, `Save`, `Save and next`, and `Skip`. Thresholding and cleanup actions update the selected labels layer, so local image sources without an API mask can select `candidate mask` and use `Apply threshold` to generate an initial candidate. On save, the image and current candidate mask are stored as the two-channel input blob, and the validated mask is stored as the output blob.
+Paint foreground in `validated mask` with label `1`; erase with label `0`. The side panel includes thresholding, image inversion before thresholding, cleanup actions, black/white background switching, validation, `Save`, `Save and next`, and `Skip`. Thresholding and cleanup actions update the selected labels layer, so local image sources without an API mask can select `candidate mask` and use `Apply threshold` to generate an initial candidate. Candidate and validated masks render with distinct foreground colors. On save, the image and current candidate mask are stored as the two-channel input blob, and the validated mask is stored as the output blob.
 
 Invalid masks are blocked from saving. Validation checks for empty masks, NaN/Inf values, binary labels, image/mask dimension mismatch, foreground fraction, connected components, and foreground touching the border.
 

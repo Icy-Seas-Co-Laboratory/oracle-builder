@@ -12,6 +12,10 @@ from oracle_builder.masking.sqlite_io import create_or_update_image_sample, load
 from oracle_builder.masking.threshold import invert_display_image, threshold_mask
 from oracle_builder.masking.validation import validate_mask
 
+CANDIDATE_MASK_COLOR = "#ff0000"
+VALIDATED_MASK_COLOR = "#20c997"
+VALIDATED_MASK_OPACITY = 0.5
+
 
 def _empty_mask_for(image: np.ndarray) -> np.ndarray:
     return np.zeros(np.asarray(image).shape[:2], dtype="uint8")
@@ -48,6 +52,25 @@ def _replace_mask_layer(layer: Any, new_mask: np.ndarray, reveal: bool = False) 
     refresh = getattr(layer, "refresh", None)
     if callable(refresh):
         refresh()
+
+
+def _enable_layer_editing(layer: Any) -> None:
+    if hasattr(layer, "editable"):
+        layer.editable = True
+
+
+def _set_label_foreground_color(layer: Any, color: str) -> None:
+    colors = {1: color}
+    if hasattr(layer, "color"):
+        layer.color = colors
+        return
+    if hasattr(layer, "colormap"):
+        layer.colormap = colors
+
+
+def _set_layer_opacity(layer: Any, opacity: float) -> None:
+    if hasattr(layer, "opacity"):
+        layer.opacity = float(opacity)
 
 
 def _provenance(
@@ -134,9 +157,12 @@ def launch_mask_builder_app(
     viewer.theme = _viewer_theme_for_background("black")
     image_layer = viewer.add_image(current["image"], name="image")
     candidate_layer = viewer.add_labels(candidate_mask, name="candidate mask", visible=False)
-    if hasattr(candidate_layer, "editable"):
-        candidate_layer.editable = False
+    _enable_layer_editing(candidate_layer)
+    _set_label_foreground_color(candidate_layer, CANDIDATE_MASK_COLOR)
     labels_layer = viewer.add_labels(mask, name="validated mask")
+    _enable_layer_editing(labels_layer)
+    _set_label_foreground_color(labels_layer, VALIDATED_MASK_COLOR)
+    _set_layer_opacity(labels_layer, VALIDATED_MASK_OPACITY)
 
     panel = QWidget()
     layout = QVBoxLayout()
