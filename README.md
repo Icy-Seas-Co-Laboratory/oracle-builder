@@ -317,7 +317,7 @@ input_shape = [256, 256, 2]
 output_shape = [256, 256, 1]
 ```
 
-Pelagia ROI crops can have different raw sizes. During segmentation training, oracle-builder resizes inputs to `data.input_shape` and validated masks to `data.output_shape`. The ROI channel uses bilinear resizing; candidate and validated mask channels use nearest-neighbor resizing.
+Pelagia ROI crops can have different raw sizes. During segmentation training, oracle-builder preserves their aspect ratio while rescaling and center-padding inputs to `data.input_shape` and validated masks to `data.output_shape`. The ROI channel uses bilinear resizing; candidate and validated mask channels use nearest-neighbor resizing. Padding uses zeros.
 
 ### Visualize Training ROIs
 
@@ -331,12 +331,30 @@ python3 scripts/visualize_unet_training_rois.py \
   --output runs/unet-test/training_roi_overview.png
 ```
 
+Compare each ROI across candidate/original, model-output, and validated-mask columns:
+
+```bash
+python3 scripts/visualize_unet_training_rois.py \
+  --database datasets/unet_training.sqlite \
+  --config configs/unet_training.toml \
+  --split test \
+  --side-by-side \
+  --predictions runs/unet-test/predictions/predictions.sqlite \
+  --prediction-set unet-test \
+  --output runs/unet-test/mask_comparison.png
+```
+
+The predictions database is a complete SQLite backup of the input dataset with additive `prediction_sets` and `predictions` tables. Post-training prediction includes every ROI and records its `train`, `validation`, or `test` tag. ROIs without ground truth still receive predictions, with null truth and metrics fields.
+
 Visualization arguments:
 
 | Argument | Description |
 | --- | --- |
 | `--database PATH` | Required oracle-builder SQLite dataset. |
 | `--output PATH` | Required output PNG path. |
+| `--predictions PATH` | Augmented dataset SQLite database; required with `--side-by-side`. |
+| `--prediction-set NAME` | Prediction set to show; optional when the database contains exactly one set. |
+| `--side-by-side` | Show original/candidate, model-output, and validated overlays as columns. |
 | `--config PATH` | Optional TOML config for seed and split fractions. |
 | `--split NAME` | Split to visualize; defaults to `train`. |
 | `--thumbnail-size N` | Maximum tile image size in pixels. |
@@ -344,6 +362,8 @@ Visualization arguments:
 | `--limit N` | Maximum number of ROIs to render. |
 | `--candidate-alpha N` | Blue candidate-mask overlay opacity. |
 | `--refined-alpha N` | Green validated-mask overlay opacity. |
+| `--prediction-alpha N` | Orange model-output overlay opacity. |
+| `--prediction-threshold N` | Model probability threshold; defaults to `0.5`. |
 | `--seed N` | Override split assignment seed. |
 | `--validation-split N` | Override validation split fraction. |
 | `--test-split N` | Override test split fraction. |
@@ -385,6 +405,34 @@ For mask-builder U-Net datasets:
 - `samples.input_aux_blob` stores the candidate mask separately for viewer round-tripping.
 - `samples.output_blob` stores the accepted validated mask shaped `[height, width, 1]`.
 - `mask_annotations` stores append-only annotation history.
+
+Prediction output databases retain these source tables and add:
+
+```sql
+CREATE TABLE prediction_sets (
+    prediction_set TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL,
+    run_id TEXT,
+    run_name TEXT,
+    config_json TEXT NOT NULL
+);
+
+CREATE TABLE predictions (
+    prediction_set TEXT NOT NULL,
+    uuid TEXT NOT NULL,
+    split TEXT,
+    y_true_blob BLOB,
+    y_true_encoding TEXT,
+    y_pred_blob BLOB,
+    y_pred_encoding TEXT,
+    y_prob_json TEXT,
+    metrics_json TEXT,
+    metadata_json TEXT,
+    PRIMARY KEY (prediction_set, uuid)
+);
+```
+
+Multiple runs can append distinct prediction sets to the same output database. Reusing a set name replaces that set's prediction for the same ROI.
 
 Pelagia detection ids are preserved as `samples.uuid` values unless `--uuid` is explicitly provided. Pelagia metadata is stored in `metadata_json`, including `pelagia_detection_id` and the full detection metadata under `metadata_json.pelagia`.
 
@@ -519,7 +567,8 @@ Write predictions from a saved run:
 python3 model_inference.py \
   --run runs/RUN_NAME \
   --input DATASET.sqlite \
-  --split test \
+  --split all \
+  --prediction-set RUN_NAME \
   --output runs/RUN_NAME/predictions/predictions.sqlite
 ```
 
@@ -529,8 +578,9 @@ Inference arguments:
 | --- | --- |
 | `--run PATH` | Required run directory containing `resolved_config.json` and model artifacts. |
 | `--input PATH` | Required SQLite dataset. |
-| `--output PATH` | Required predictions SQLite output path. |
-| `--split NAME` | Split to predict; defaults to `test`. |
+| `--output PATH` | Required augmented SQLite output path. A new file starts as a complete backup of `--input`. |
+| `--split NAME` | One of `all`, `train`, `validation`, or `test`; defaults to `all`. |
+| `--prediction-set NAME` | Set name used as part of each prediction key; defaults to the run directory name. |
 
 ## Run Outputs
 
@@ -545,7 +595,7 @@ Each training run is self-contained under `runs/<run_name>/`. Common outputs inc
 - `metrics.csv` and `metrics.json`: training history.
 - `model/`: model artifacts and load test report.
 - `evaluation/`: task-specific evaluation files.
-- `predictions/predictions.sqlite`: prediction records.
+- `predictions/predictions.sqlite`: a copy of the input dataset augmented with predictions for all ROIs and their split tags.
 - `figures/`: plots where available.
 
 ## Model Portability
@@ -669,4 +719,3 @@ At the time of writing, this installs TensorFlow `>=2.18,<2.19` with `tensorflow
 - SavedModel loading is inference-only.
 - The SQLite loader currently materializes arrays in memory before building `tf.data.Dataset`.
 - The mask builder requires optional GUI dependencies and does not automate napari GUI testing.
-- The U-Net loader resizes variable-size ROIs to the configured shape; it does not pad or preserve aspect ratio.

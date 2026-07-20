@@ -94,7 +94,7 @@ def main() -> int:
     init_training_log(training_log, run_id, args.output, config, environment)
 
     try:
-        from oracle_builder.data.sqlite_dataset import load_arrays, make_tf_datasets
+        from oracle_builder.data.sqlite_dataset import load_arrays, load_prediction_arrays, make_tf_datasets
         from oracle_builder.evaluation.predictions import write_predictions_db
         from oracle_builder.evaluation.reports import evaluate_run_model
         from oracle_builder.saving.load_test import run_load_tests
@@ -110,9 +110,18 @@ def main() -> int:
         write_load_test_report(run_dir, load_report)
         evaluation = evaluate_run_model(model, config, args.input, run_dir, split="test")
         if config.get("output", {}).get("save_predictions", True):
-            split = "test" if "test" in records_by_split else "validation"
-            x, y, records = load_arrays(args.input, config, split=split)
-            write_predictions_db(model, x, y, records, config, run_dir / "predictions" / "predictions.sqlite")
+            predictions_path = run_dir / "predictions" / "predictions.sqlite"
+            x, targets, records = load_prediction_arrays(args.input, config)
+            write_predictions_db(
+                model,
+                x,
+                targets,
+                records,
+                config,
+                predictions_path,
+                source_sqlite=args.input,
+                prediction_set=args.output,
+            )
         run_metadata["status"] = "complete"
         run_metadata["evaluation_summary"] = evaluation.get("summary")
         write_json(run_dir / "run_metadata.json", run_metadata)

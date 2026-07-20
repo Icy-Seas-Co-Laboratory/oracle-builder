@@ -2,11 +2,15 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
+
 from oracle_builder.data.sqlite_dataset import (
     create_synthetic_classification,
     create_synthetic_segmentation,
     load_arrays,
     make_tf_datasets,
+    resize_array_to_shape,
+    resize_segmentation_input,
     synthetic_splits,
 )
 
@@ -28,6 +32,29 @@ def test_synthetic_splits_always_match_requested_count():
     assert len(synthetic_splits(48)) == 48
     assert len(synthetic_splits(24)) == 24
     assert len(synthetic_splits(5)) == 5
+
+
+def test_unet_input_rescales_and_pads_without_changing_aspect_ratio():
+    image = np.full((2, 4, 1), 100, dtype="uint8")
+
+    resized = resize_segmentation_input(image, [8, 8, 1])
+
+    assert resized.shape == (8, 8, 1)
+    assert np.all(resized[:2] == 0)
+    assert np.all(resized[2:6] == 100)
+    assert np.all(resized[6:] == 0)
+
+
+def test_unet_mask_rescales_and_pads_with_nearest_neighbor():
+    mask = np.ones((4, 2), dtype="uint8")
+
+    resized = resize_array_to_shape(mask, [8, 8, 1], mask=True)
+
+    assert resized.shape == (8, 8, 1)
+    assert set(np.unique(resized).tolist()) == {0.0, 1.0}
+    assert np.all(resized[:, :2] == 0)
+    assert np.all(resized[:, 2:6] == 1)
+    assert np.all(resized[:, 6:] == 0)
 
 
 def test_create_default_synthetic_segmentation_dataset(tmp_path: Path):

@@ -115,6 +115,63 @@ def load_arrays(sqlite_path: str | Path, config: dict[str, Any], split: str | No
     return np.stack(xs), np.asarray(ys), records
 
 
+def load_prediction_arrays(
+    sqlite_path: str | Path,
+    config: dict[str, Any],
+    split: str | None = None,
+) -> tuple[np.ndarray, list[Any | None], list[dict[str, Any]]]:
+    """Load every model input, including segmentation ROIs without validated masks."""
+    rows = read_rows(sqlite_path)
+    task = config["run"]["task"]
+    validation_split = config["data"].get("validation_split", 0.2)
+    test_split = config["data"].get("test_split", 0.1)
+    seed = config["run"].get("seed", 123)
+    if task == "segmentation":
+        with_targets = [row for row in rows if row.get("output_blob")]
+        without_targets = [row for row in rows if not row.get("output_blob")]
+        assigned = assign_missing_splits(with_targets, validation_split, test_split, seed)
+        assigned += assign_missing_splits(without_targets, validation_split, test_split, seed)
+    else:
+        assigned = assign_missing_splits(rows, validation_split, test_split, seed)
+    if split:
+        assigned = [row for row in assigned if row.get("split") == split]
+    if not assigned:
+        raise ValueError(f"No samples found for split={split!r}")
+
+    input_shape = config["data"]["input_shape"]
+    output_shape = config["data"].get("output_shape")
+    xs: list[np.ndarray] = []
+    targets: list[Any | None] = []
+    records: list[dict[str, Any]] = []
+    for row in assigned:
+        x = decode_blob(row["input_blob"], row["input_blob_encoding"], row["input_blob_dimensions"])
+        if task == "segmentation":
+            x = resize_segmentation_input(x, input_shape)
+        xs.append(normalize_input(x, input_shape))
+        if row.get("output_blob") is None:
+            target = None
+        else:
+            target = decode_blob(row["output_blob"], row["output_blob_encoding"], row["output_blob_dimensions"])
+            if task == "classification":
+                target = int(target if target is not None else row.get("label_text"))
+            else:
+                target = np.asarray(target, dtype="float32")
+                if (row.get("output_blob_encoding") or "").lower() == "png":
+                    target = (target > 0).astype("float32")
+                target = resize_array_to_shape(target, output_shape, mask=True)
+        targets.append(target)
+        records.append(
+            {
+                "uuid": row["uuid"],
+                "split": row.get("split") or "train",
+                "label_text": row.get("label_text"),
+                "sample_weight": row.get("sample_weight"),
+                "metadata": json.loads(row["metadata_json"]) if row.get("metadata_json") else {},
+            }
+        )
+    return np.stack(xs), targets, records
+
+
 def make_tf_datasets(sqlite_path: str | Path, config: dict[str, Any]):
     import tensorflow as tf
     from oracle_builder.training.augmentation import apply_training_augmentation
@@ -188,13 +245,20 @@ def resize_array_to_shape(
     if value.ndim == 3 and target_channels is not None and value.shape[-1] != target_channels:
         raise ValueError(f"Cannot resize array with {value.shape[-1]} channels to target shape {target}")
 
+    source_h, source_w = value.shape[:2]
+    scale = min(target_h / source_h, target_w / source_w)
+    resized_h = min(target_h, max(1, int(round(source_h * scale))))
+    resized_w = min(target_w, max(1, int(round(source_w * scale))))
+    offset_y = (target_h - resized_h) // 2
+    offset_x = (target_w - resized_w) // 2
     resample = Image.Resampling.NEAREST if mask else Image.Resampling.BILINEAR
 
     def resize_channel(channel: np.ndarray) -> np.ndarray:
         channel_array = np.asarray(channel)
         pil_input = channel_array.astype("float32") if channel_array.dtype.kind == "f" else channel_array
-        resized = Image.fromarray(pil_input).resize((target_w, target_h), resample=resample)
-        result = np.asarray(resized)
+        resized = Image.fromarray(pil_input).resize((resized_w, resized_h), resample=resample)
+        result = np.zeros((target_h, target_w), dtype=np.asarray(resized).dtype)
+        result[offset_y : offset_y + resized_h, offset_x : offset_x + resized_w] = np.asarray(resized)
         if mask:
             return (result > 0).astype("float32")
         return result.astype(channel_array.dtype, copy=False)
