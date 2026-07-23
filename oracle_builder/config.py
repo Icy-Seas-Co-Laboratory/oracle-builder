@@ -31,6 +31,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "learning_rate": 0.001,
         "loss": None,
         "metrics": ["accuracy"],
+        "spatial_edge_weighting": False,
+        "edge_weight_lambda": 1.0,
+        "edge_weight_sigma": 5.0,
     },
     "callbacks": {
         "early_stopping": False,
@@ -60,6 +63,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "save_figures": True,
         "export_savedmodel": True,
     },
+    "evaluation": {"segmentation_threshold": 0.5},
 }
 
 
@@ -94,6 +98,13 @@ def validate_config(config: dict[str, Any]) -> None:
         raise ValueError("data.num_classes is required for classification")
     if task == "segmentation" and "output_shape" not in config["data"]:
         raise ValueError("data.output_shape is required for segmentation")
+    if config["training"].get("spatial_edge_weighting", False):
+        if task != "segmentation":
+            raise ValueError("training.spatial_edge_weighting is only supported for segmentation")
+        if float(config["training"].get("edge_weight_lambda", 1.0)) < 0:
+            raise ValueError("training.edge_weight_lambda must be non-negative")
+        if float(config["training"].get("edge_weight_sigma", 5.0)) <= 0:
+            raise ValueError("training.edge_weight_sigma must be greater than zero")
     if not config["training"].get("loss"):
         raise ValueError("training.loss is required")
 

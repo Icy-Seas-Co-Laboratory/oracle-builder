@@ -100,6 +100,7 @@ def write_predictions_db(
         ),
     )
     task = config["run"]["task"]
+    segmentation_threshold = float(config.get("evaluation", {}).get("segmentation_threshold", 0.5))
     for row, true_value, prediction in zip(records, y, predictions, strict=False):
         if true_value is None:
             y_true_blob = None
@@ -122,7 +123,8 @@ def write_predictions_db(
             metrics_json = json.dumps({"correct": bool(pred_class == int(true_value))})
             true_encoding = pred_encoding = "int"
         else:
-            metrics = binary_metrics(true_value, prediction)
+            metrics = binary_metrics(true_value, prediction, threshold=segmentation_threshold)
+            metrics["probability_threshold"] = segmentation_threshold
             y_true_blob = encode_npy(np.asarray(true_value))
             y_pred_blob = encode_npy(np.asarray(prediction))
             y_prob_json = None

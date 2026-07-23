@@ -101,3 +101,31 @@ def test_training_dataset_can_repeat_augmented_samples_per_epoch(tmp_path: Path)
 
     assert sample_count == 7
     assert observed_count == sample_count * 3
+
+
+def test_segmentation_dataset_includes_boundary_sample_weights_when_enabled(tmp_path: Path):
+    db_path = tmp_path / "segmentation.sqlite"
+    create_synthetic_segmentation(db_path, n=5, shape=(16, 16, 1))
+    config = {
+        "run": {"task": "segmentation", "seed": 123},
+        "data": {
+            "input_shape": [16, 16, 1],
+            "output_shape": [16, 16, 1],
+            "batch_size": 5,
+            "validation_split": 0.0,
+            "test_split": 0.0,
+        },
+        "training": {
+            "spatial_edge_weighting": True,
+            "edge_weight_lambda": 4.0,
+            "edge_weight_sigma": 2.0,
+        },
+        "augmentation": {"enabled": False},
+    }
+
+    datasets, _records = make_tf_datasets(db_path, config)
+    _x, _y, weights = next(iter(datasets["train"]))
+
+    assert weights.shape == (4, 16, 16)
+    assert np.isclose(float(np.max(weights)), 5.0)
+    assert float(np.min(weights)) >= 1.0

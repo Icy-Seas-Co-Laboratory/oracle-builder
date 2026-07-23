@@ -19,7 +19,11 @@ def plot_history(history, run_dir: Path) -> None:
     figures = run_dir / "figures"
     figures.mkdir(exist_ok=True)
     history_dict = history.history
-    for metric, filename in (("loss", "loss_curve.png"), ("accuracy", "accuracy_curve.png")):
+    for metric, filename in (
+        ("loss", "loss_curve.png"),
+        ("accuracy", "accuracy_curve.png"),
+        ("dice", "dice_curve.png"),
+    ):
         if metric not in history_dict and f"val_{metric}" not in history_dict:
             continue
         fig, ax = plt.subplots(figsize=(7, 4))
@@ -97,6 +101,7 @@ def main() -> int:
         from oracle_builder.data.sqlite_dataset import load_arrays, load_prediction_arrays, make_tf_datasets
         from oracle_builder.evaluation.predictions import write_predictions_db
         from oracle_builder.evaluation.reports import evaluate_run_model
+        from oracle_builder.evaluation.thresholds import analyze_validation_threshold
         from oracle_builder.saving.load_test import run_load_tests
         from oracle_builder.saving.save_model import save_model_artifacts, write_load_test_report
         from oracle_builder.training.train import train_model
@@ -105,6 +110,25 @@ def main() -> int:
         log_event(training_log, run_id, "INFO", "Datasets loaded", {"splits": list(datasets)})
         model, history = train_model(config, datasets, run_dir, training_log, run_id)
         plot_history(history, run_dir)
+        threshold_analysis = None
+        if config["run"]["task"] == "segmentation" and "validation" in datasets:
+            validation_x, validation_y, _validation_records = load_arrays(
+                args.input, config, split="validation"
+            )
+            threshold_analysis = analyze_validation_threshold(
+                model, validation_x, validation_y, run_dir
+            )
+            config.setdefault("evaluation", {})["segmentation_threshold"] = threshold_analysis[
+                "best_threshold"
+            ]
+            write_json(run_dir / "resolved_config.json", config)
+            log_event(
+                training_log,
+                run_id,
+                "INFO",
+                "Optimized segmentation probability threshold on validation data",
+                threshold_analysis,
+            )
         save_report = save_model_artifacts(model, run_dir, config)
         load_report = run_load_tests(run_dir, config, save_report)
         write_load_test_report(run_dir, load_report)
@@ -124,6 +148,10 @@ def main() -> int:
             )
         run_metadata["status"] = "complete"
         run_metadata["evaluation_summary"] = evaluation.get("summary")
+        if threshold_analysis is not None:
+            run_metadata["validation_threshold_analysis"] = {
+                key: value for key, value in threshold_analysis.items() if key != "curve"
+            }
         write_json(run_dir / "run_metadata.json", run_metadata)
         mark_run_complete(training_log, run_id, "complete")
         return 0

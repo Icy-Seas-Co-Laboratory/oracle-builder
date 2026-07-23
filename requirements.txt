@@ -7,4 +7,4 @@ tomli-w
 pillow
 matplotlib
 scikit-learn
-
+scipy

@@ -10,13 +10,15 @@ def apply_training_augmentation(dataset, config: dict[str, Any]):
     augmentation = config.get("augmentation", {})
     if not augmentation.get("enabled", False):
         return dataset
-    return dataset.map(
-        lambda x, y: augment_batch(x, y, config),
-        num_parallel_calls=tf.data.AUTOTUNE,
-    )
+    if config.get("training", {}).get("spatial_edge_weighting", False):
+        return dataset.map(
+            lambda x, y, weights: augment_batch(x, y, config, weights),
+            num_parallel_calls=tf.data.AUTOTUNE,
+        )
+    return dataset.map(lambda x, y: augment_batch(x, y, config), num_parallel_calls=tf.data.AUTOTUNE)
 
 
-def augment_batch(x, y, config: dict[str, Any]):
+def augment_batch(x, y, config: dict[str, Any], sample_weight=None):
     augmentation = config.get("augmentation", {})
     task = config["run"]["task"]
     x = tf.cast(x, tf.float32)
@@ -39,19 +41,40 @@ def augment_batch(x, y, config: dict[str, Any]):
                 fill_value=float(augmentation.get("mask_fill_value", 0.0)),
             )
             y = tf.cast(y > 0.5, tf.float32)
+            if sample_weight is not None:
+                sample_weight = apply_affine_transform(
+                    sample_weight[..., None],
+                    transforms,
+                    interpolation="BILINEAR",
+                    fill_value=1.0,
+                )[..., 0]
 
     if bool(augmentation.get("flip_horizontal", False)):
         do_flip = tf.random.uniform(()) < 0.5
         x = tf.cond(do_flip, lambda: tf.image.flip_left_right(x), lambda: x)
         if task == "segmentation":
             y = tf.cond(do_flip, lambda: tf.image.flip_left_right(y), lambda: y)
+            if sample_weight is not None:
+                sample_weight = tf.cond(
+                    do_flip,
+                    lambda: tf.image.flip_left_right(sample_weight[..., None])[..., 0],
+                    lambda: sample_weight,
+                )
     if bool(augmentation.get("flip_vertical", False)):
         do_flip = tf.random.uniform(()) < 0.5
         x = tf.cond(do_flip, lambda: tf.image.flip_up_down(x), lambda: x)
         if task == "segmentation":
             y = tf.cond(do_flip, lambda: tf.image.flip_up_down(y), lambda: y)
+            if sample_weight is not None:
+                sample_weight = tf.cond(
+                    do_flip,
+                    lambda: tf.image.flip_up_down(sample_weight[..., None])[..., 0],
+                    lambda: sample_weight,
+                )
 
     x = apply_photometric_augmentation(x, config, augmentation)
+    if sample_weight is not None:
+        return x, tf.cast(y, y_dtype), tf.cast(sample_weight, tf.float32)
     return x, tf.cast(y, y_dtype)
 
 

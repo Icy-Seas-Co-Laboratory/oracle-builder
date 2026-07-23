@@ -17,6 +17,7 @@ dependencies = [
   "pillow",
   "matplotlib",
   "scikit-learn",
+  "scipy",
 ]
 
 [project.optional-dependencies]

@@ -127,7 +127,10 @@ def write_unet_config_from_dataset(
             "epochs": epochs,
             "optimizer": "adam",
             "learning_rate": 0.0001,
-            "loss": "binary_crossentropy",
+            "loss": "bce_soft_dice",
+            "bce_weight": 1.0,
+            "soft_dice_weight": 1.0,
+            "soft_dice_smooth": 0.000001,
             "metrics": ["accuracy", "dice", "iou"],
         },
         "callbacks": {

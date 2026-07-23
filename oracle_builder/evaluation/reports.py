@@ -15,5 +15,5 @@ def evaluate_run_model(model, config: dict[str, Any], input_path: str | Path, ru
         x, y, records = load_arrays(input_path, config, split="validation")
     if config["run"]["task"] == "classification":
         return evaluate_classification(model, x, y, records, run_dir)
-    return evaluate_segmentation(model, x, y, records, run_dir)
-
+    threshold = float(config.get("evaluation", {}).get("segmentation_threshold", 0.5))
+    return evaluate_segmentation(model, x, y, records, run_dir, threshold=threshold)

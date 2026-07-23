@@ -69,3 +69,25 @@ def test_classification_augmentation_keeps_label_dtype_and_shape():
     assert augmented_y.dtype == tf.int64
     assert np.array_equal(augmented_y.numpy(), y)
     assert np.allclose(augmented_x.numpy(), 0.8)
+
+
+def test_segmentation_augmentation_transforms_spatial_weights_with_masks():
+    config = {
+        "run": {"task": "segmentation"},
+        "data": {"input_shape": [8, 8, 1]},
+        "augmentation": {"enabled": True, "translation": [0.1, 0.1]},
+    }
+    x = np.zeros((1, 8, 8, 1), dtype="float32")
+    y = np.zeros((1, 8, 8, 1), dtype="float32")
+    y[:, 2:6, 2:6] = 1.0
+    weights = np.ones((1, 8, 8), dtype="float32")
+    weights[:, 2:6, 2:6] = 3.0
+
+    augmented_x, augmented_y, augmented_weights = augment_batch(
+        tf.constant(x), tf.constant(y), config, tf.constant(weights)
+    )
+
+    assert augmented_x.shape == x.shape
+    assert augmented_y.shape == y.shape
+    assert augmented_weights.shape == weights.shape
+    assert float(tf.reduce_min(augmented_weights)) >= 1.0

@@ -261,7 +261,7 @@ The viewer has three important layers:
 - `candidate mask`: the mask provided by the API, shown as a labels layer and hidden by default.
 - `validated mask`: the editable manual result, initialized from the candidate mask.
 
-Paint foreground in `validated mask` with label `1`; erase with label `0`. The side panel includes thresholding, image inversion before thresholding, cleanup actions, black/white background switching, validation, `Save`, `Save and next`, and `Skip`. Thresholding and cleanup actions update the selected labels layer, so local image sources without an API mask can select `candidate mask` and use `Apply threshold` to generate an initial candidate. Candidate and validated masks render with distinct foreground colors. On save, the image and current candidate mask are stored as the two-channel input blob, and the validated mask is stored as the output blob.
+Paint foreground in `validated mask` with label `1`; erase with label `0`. The side panel includes thresholding, image inversion before thresholding, cleanup actions, black/white background switching, validation, `Save`, `Save and next`, and `Skip`. A horizontally scrollable ROI navigator at the bottom shows the active database, API, or folder queue; click any thumbnail to move backward or forward without saving the current edits. The selected ROI is highlighted. Thresholding and cleanup actions update the selected labels layer, so local image sources without an API mask can select `candidate mask` and use `Apply threshold` to generate an initial candidate. Candidate and validated masks render with distinct foreground colors. On save, the image and current candidate mask are stored as the two-channel input blob, and the validated mask is stored as the output blob.
 
 Invalid masks are blocked from saving. Validation checks for empty masks, NaN/Inf values, binary labels, image/mask dimension mismatch, foreground fraction, connected components, and foreground touching the border.
 
@@ -469,9 +469,31 @@ input_shape = [256, 256, 2]
 output_shape = [256, 256, 1]
 
 [training]
-loss = "binary_crossentropy"
+loss = "bce_soft_dice"
+bce_weight = 1.0
+soft_dice_weight = 1.0
 metrics = ["accuracy", "dice", "iou"]
 ```
+
+U-Net segmentation can emphasize errors near target boundaries using per-pixel weights
+`w = 1 + lambda * exp(-d^2 / (2 * sigma^2))`, where `d` is the Euclidean distance to the validated-mask boundary:
+
+```toml
+[training]
+loss = "bce_soft_dice"
+spatial_edge_weighting = true
+edge_weight_lambda = 4.0
+edge_weight_sigma = 5.0
+```
+
+The `bce_soft_dice` objective is binary cross-entropy plus `1 - soft_dice`, calculated per image. `bce_weight` and `soft_dice_weight` default to `1.0`; `soft_dice_smooth` defaults to `1e-6`. `edge_weight_lambda` controls the additional spatial weight at the boundary (the maximum weight is `1 + lambda`). `edge_weight_sigma`, measured in pixels at `data.output_shape`, controls how far that emphasis extends. Empty masks receive neutral spatial weights of `1`. The same spatial transform is applied to weights during geometric augmentation.
+
+When `dice` appears in `training.metrics`, training history includes `dice` and `val_dice`, and the run writes `figures/dice_curve.png`. After segmentation training, oracle-builder predicts the validation split at thresholds from `0.05` through `0.95`, selects the threshold with the highest aggregate Dice, and uses it for final evaluation and saved prediction metrics. Ties are resolved toward `0.5`. Results are written to:
+
+- `evaluation/validation_threshold_analysis.json`
+- `evaluation/validation_threshold_curve.csv`
+- `resolved_config.json` under `evaluation.segmentation_threshold`
+- `run_metadata.json` under `validation_threshold_analysis`
 
 Default values are merged in from `oracle_builder/config.py`. Common settings include `batch_size`, `shuffle_buffer`, `validation_split`, `test_split`, `epochs`, `optimizer`, `learning_rate`, callback settings, and output toggles.
 

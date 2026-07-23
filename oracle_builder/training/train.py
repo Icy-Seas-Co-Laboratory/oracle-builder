@@ -12,6 +12,8 @@ from tensorflow import keras
 
 from oracle_builder.registry import get_model_builder
 from oracle_builder.training.callbacks import build_callbacks
+from oracle_builder.training.losses import BinaryCrossentropySoftDice
+from oracle_builder.training.metrics import BinaryDice
 
 
 def set_seed(seed: int) -> None:
@@ -32,12 +34,25 @@ def compile_model(model: keras.Model, config: dict[str, Any]) -> keras.Model:
         optimizer = keras.optimizers.get(optimizer_name)
         optimizer.learning_rate = learning_rate
 
+    loss_name = training["loss"]
+    if str(loss_name).lower() in {"bce_soft_dice", "bce+soft_dice", "binary_crossentropy_soft_dice"}:
+        loss = BinaryCrossentropySoftDice(
+            bce_weight=float(training.get("bce_weight", 1.0)),
+            dice_weight=float(training.get("soft_dice_weight", 1.0)),
+            smooth=float(training.get("soft_dice_smooth", 1e-6)),
+        )
+    else:
+        loss = loss_name
+
     metrics = []
     for metric in training.get("metrics", []):
-        if metric in {"dice", "iou"}:
+        if str(metric).lower() == "dice":
+            metrics.append(BinaryDice())
+            continue
+        if str(metric).lower() == "iou":
             continue
         metrics.append(metric)
-    model.compile(optimizer=optimizer, loss=training["loss"], metrics=metrics)
+    model.compile(optimizer=optimizer, loss=loss, metrics=metrics)
     return model
 
 
@@ -76,4 +91,3 @@ def train_model(config: dict[str, Any], datasets: dict[str, Any], run_dir: str |
     metrics_df.to_csv(Path(run_dir) / "metrics.csv", index=False)
     Path(run_dir, "metrics.json").write_text(json.dumps(history.history, indent=2, default=float) + "\n")
     return model, history
-

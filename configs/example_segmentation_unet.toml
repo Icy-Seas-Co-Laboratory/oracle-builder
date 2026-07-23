@@ -13,18 +13,24 @@ validation_split = 0.25
 test_split = 0.1
 
 [model]
-base_filters = 32
-depth = 4
-dropout = 0.1
+base_filters = 128
+depth = 2
+dropout = 0.05
 activation = "relu"
 final_activation = "sigmoid"
 
 [training]
-epochs = 20
+epochs = 10
 optimizer = "adam"
 learning_rate = 0.0001
-loss = "binary_crossentropy"
+loss = "bce_soft_dice"
+bce_weight = 1.0
+soft_dice_weight = 3.0
+soft_dice_smooth = 0.000001
 metrics = ["accuracy", "dice", "iou"]
+spatial_edge_weighting = true
+edge_weight_lambda = 4.0
+edge_weight_sigma = 2.0
 
 [callbacks]
 early_stopping = true
@@ -34,17 +40,17 @@ checkpoint_monitor = "val_loss"
 
 [augmentation]
 enabled = true
-repeats_per_epoch = 4
-invert = false
-rotation = 0.05
-zoom = 0.15
-translation = [0.10, 0.10]
-skew = 0.05
+repeats_per_epoch = 2
+invert = false # Assume black background and light foreground.
+rotation = 0.5
+zoom = 0.25
+translation = [0.25, 0.25]
+skew = 0.20
 flip_horizontal = true
 flip_vertical = true
-brightness = 0.15
-contrast = 0.15
-gaussian_noise = 0.03
+brightness = 0.25
+contrast = 0.25
+gaussian_noise = 0.05
 fill_value = 0.0
 mask_fill_value = 0.0
 photometric_channels = [0]

@@ -13,6 +13,7 @@ from oracle_builder.masking.napari_app import (
     _selected_mask_layer,
     _set_label_foreground_color,
     _set_layer_opacity,
+    _thumbnail_rgb,
     _viewer_theme_for_background,
 )
 
@@ -134,3 +135,25 @@ def test_validated_mask_opacity_defaults_to_half():
     _set_layer_opacity(layer, VALIDATED_MASK_OPACITY)
 
     assert layer.opacity == 0.5
+
+
+def test_thumbnail_preserves_aspect_ratio_and_letterboxes():
+    image = np.tile(np.arange(8, dtype="uint8"), (4, 1))
+
+    thumbnail = _thumbnail_rgb(image, size=16)
+
+    assert thumbnail.shape == (16, 16, 3)
+    assert np.all(thumbnail[:4] == 0)
+    assert np.any(thumbnail[4:12] > 0)
+    assert np.all(thumbnail[12:] == 0)
+
+
+def test_thumbnail_scales_unit_float_images_to_rgb():
+    image = np.linspace(0, 1, 16, dtype="float32").reshape(4, 4)
+
+    thumbnail = _thumbnail_rgb(image, size=4)
+
+    assert thumbnail.shape == (4, 4, 3)
+    assert thumbnail[0, 0, 0] == 0
+    assert thumbnail[-1, -1, 0] == 255
+    assert np.array_equal(thumbnail[..., 0], thumbnail[..., 1])

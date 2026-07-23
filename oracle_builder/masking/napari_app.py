@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 import numpy as np
+from PIL import Image
 
 from oracle_builder.masking.morphology import fill_holes, keep_largest_component, remove_small_objects
 from oracle_builder.masking.sqlite_io import create_or_update_image_sample, load_sample, open_database, save_mask_annotation
@@ -16,6 +17,31 @@ CANDIDATE_MASK_COLOR = "#ff0000"
 VALIDATED_MASK_COLOR = "#20c997"
 VALIDATED_MASK_OPACITY = 0.5
 TRANSPARENT_LABEL_COLOR = [0.0, 0.0, 0.0, 0.0]
+
+
+def _thumbnail_rgb(image: np.ndarray, size: int = 112) -> np.ndarray:
+    array = np.asarray(image)
+    if array.ndim == 3 and array.shape[-1] >= 3:
+        rgb = array[..., :3].astype("float32")
+    elif array.ndim == 3 and array.shape[-1] == 1:
+        rgb = np.repeat(array.astype("float32"), 3, axis=-1)
+    elif array.ndim == 2:
+        rgb = np.repeat(array[..., None].astype("float32"), 3, axis=-1)
+    else:
+        raise ValueError(f"Unsupported thumbnail image shape: {array.shape}")
+    finite = rgb[np.isfinite(rgb)]
+    if finite.size == 0:
+        rgb = np.zeros_like(rgb)
+    elif finite.min() >= 0 and finite.max() <= 1:
+        rgb = rgb * 255
+    else:
+        lo, hi = np.percentile(finite, [1, 99])
+        rgb = np.zeros_like(rgb) if hi <= lo else (rgb - lo) * (255 / (hi - lo))
+    source = Image.fromarray(np.clip(rgb, 0, 255).astype("uint8"), mode="RGB")
+    source.thumbnail((size, size), Image.Resampling.BILINEAR)
+    canvas = Image.new("RGB", (size, size), "black")
+    canvas.paste(source, ((size - source.width) // 2, (size - source.height) // 2))
+    return np.asarray(canvas)
 
 
 def _empty_mask_for(image: np.ndarray) -> np.ndarray:
@@ -111,7 +137,10 @@ def launch_mask_builder_app(
 ) -> None:
     try:
         import napari
+        from qtpy.QtCore import QSize, Qt
+        from qtpy.QtGui import QIcon, QImage, QPixmap
         from qtpy.QtWidgets import (
+            QButtonGroup,
             QCheckBox,
             QComboBox,
             QDoubleSpinBox,
@@ -120,8 +149,10 @@ def launch_mask_builder_app(
             QLabel,
             QLineEdit,
             QPushButton,
+            QScrollArea,
             QSpinBox,
             QTextEdit,
+            QToolButton,
             QVBoxLayout,
             QWidget,
         )
@@ -144,6 +175,15 @@ def launch_mask_builder_app(
         "metadata": initial_metadata or {},
     }
     queue = sample_queue or [{"uuid": sample_uuid}]
+    sample_cache: dict[int, dict[str, Any]] = {
+        0: {
+            "uuid": sample_uuid,
+            "image": current["image"],
+            "mask": initial_mask,
+            "candidate_mask": initial_candidate_mask,
+            "metadata": current["metadata"],
+        }
+    }
     output_path = output_db_path or db_path
     candidate_mask = (
         np.array(initial_candidate_mask, dtype="uint8", copy=True)
@@ -295,11 +335,13 @@ def launch_mask_builder_app(
         return report
 
     def load_queue_index(index: int) -> bool:
-        if index >= len(queue):
+        if index < 0 or index >= len(queue):
             set_status("No more samples in queue.")
             return False
         sample_info = queue[index]
-        if sample_loader is not None:
+        if index in sample_cache:
+            sample = sample_cache[index]
+        elif sample_loader is not None:
             sample = sample_loader(sample_info)
         elif db_path:
             with open_database(db_path) as conn:
@@ -307,6 +349,7 @@ def launch_mask_builder_app(
         else:
             set_status("No loader is configured for the next sample.")
             return False
+        sample_cache[index] = sample
         current["image"] = sample["image"]
         current["uuid"] = sample["uuid"]
         current["index"] = index
@@ -326,6 +369,8 @@ def launch_mask_builder_app(
         replace_mask(sample["mask"] if sample["mask"] is not None else current_candidate_mask().copy())
         title.setText(f"Sample: {current['uuid']}")
         viewer.title = f"oracle-builder mask builder: {current['uuid']}"
+        if "thumbnail_buttons" in navigation:
+            navigation["thumbnail_buttons"][index].setChecked(True)
         set_status(f"Loaded sample {index + 1} of {len(queue)}.")
         return True
 
@@ -405,5 +450,68 @@ def launch_mask_builder_app(
 
     layout.addWidget(validation_text)
     viewer.window.add_dock_widget(panel, area="right", name="Mask Builder")
+
+    navigation: dict[str, Any] = {}
+    thumbnail_panel = QWidget()
+    thumbnail_panel_layout = QVBoxLayout()
+    thumbnail_panel.setLayout(thumbnail_panel_layout)
+    position_label = QLabel(f"ROI 1 of {len(queue)}")
+    thumbnail_panel_layout.addWidget(position_label)
+    scroll = QScrollArea()
+    scroll.setWidgetResizable(True)
+    scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+    strip = QWidget()
+    strip_layout = QHBoxLayout()
+    strip.setLayout(strip_layout)
+    button_group = QButtonGroup(strip)
+    button_group.setExclusive(True)
+    thumbnail_buttons: list[Any] = []
+
+    def load_thumbnail_sample(index: int) -> dict[str, Any]:
+        info = queue[index]
+        if index == current["index"]:
+            return {"image": current["image"]}
+        if index in sample_cache:
+            return sample_cache[index]
+        if sample_loader is not None:
+            sample = sample_loader(info)
+            sample_cache[index] = sample
+            return sample
+        if db_path:
+            with open_database(db_path) as conn:
+                sample = load_sample(conn, info["uuid"])
+            sample_cache[index] = sample
+            return sample
+        raise ValueError("No sample loader is configured")
+
+    def navigate_to(index: int) -> None:
+        if load_queue_index(index):
+            position_label.setText(f"ROI {index + 1} of {len(queue)}")
+
+    for index, info in enumerate(queue):
+        button = QToolButton()
+        button.setCheckable(True)
+        button.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
+        button.setIconSize(QSize(112, 112))
+        button.setText(str(info.get("uuid", index))[:16])
+        button.setToolTip(str(info.get("uuid", index)))
+        try:
+            thumbnail = np.ascontiguousarray(_thumbnail_rgb(load_thumbnail_sample(index)["image"]))
+            height, width, _channels = thumbnail.shape
+            qimage = QImage(thumbnail.data, width, height, width * 3, QImage.Format_RGB888).copy()
+            button.setIcon(QIcon(QPixmap.fromImage(qimage)))
+        except Exception as exc:
+            if debug:
+                print(f"Could not load thumbnail for {info.get('uuid', index)}: {exc}")
+        button.clicked.connect(lambda _checked=False, selected=index: navigate_to(selected))
+        button_group.addButton(button, index)
+        strip_layout.addWidget(button)
+        thumbnail_buttons.append(button)
+    strip_layout.addStretch(1)
+    scroll.setWidget(strip)
+    thumbnail_panel_layout.addWidget(scroll)
+    navigation["thumbnail_buttons"] = thumbnail_buttons
+    thumbnail_buttons[0].setChecked(True)
+    viewer.window.add_dock_widget(thumbnail_panel, area="bottom", name="ROI Navigator")
     set_status("Ready. Paint label 1 for foreground and label 0 to erase.")
     napari.run()

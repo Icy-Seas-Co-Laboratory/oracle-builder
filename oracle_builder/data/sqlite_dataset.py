@@ -175,6 +175,7 @@ def load_prediction_arrays(
 def make_tf_datasets(sqlite_path: str | Path, config: dict[str, Any]):
     import tensorflow as tf
     from oracle_builder.training.augmentation import apply_training_augmentation
+    from oracle_builder.training.spatial_weights import batch_boundary_distance_weights
 
     datasets = {}
     records_by_split = {}
@@ -185,7 +186,16 @@ def make_tf_datasets(sqlite_path: str | Path, config: dict[str, Any]):
             if not str(exc).startswith("No samples found for split="):
                 raise
             continue
-        dataset = tf.data.Dataset.from_tensor_slices((x, y))
+        training_config = config.get("training", {})
+        if training_config.get("spatial_edge_weighting", False):
+            weights = batch_boundary_distance_weights(
+                y,
+                weight_lambda=float(training_config.get("edge_weight_lambda", 1.0)),
+                sigma=float(training_config.get("edge_weight_sigma", 5.0)),
+            )
+            dataset = tf.data.Dataset.from_tensor_slices((x, y, weights))
+        else:
+            dataset = tf.data.Dataset.from_tensor_slices((x, y))
         if split == "train":
             dataset = dataset.shuffle(config["data"].get("shuffle_buffer", 512), seed=config["run"].get("seed", 123))
             repeats_per_epoch = int(config.get("augmentation", {}).get("repeats_per_epoch", 1))

@@ -9,8 +9,8 @@ import pandas as pd
 
 
 def binary_metrics(y_true: np.ndarray, y_pred: np.ndarray, threshold: float = 0.5) -> dict[str, float]:
-    true_mask = y_true.astype("float32") > threshold
-    pred_mask = y_pred.astype("float32") > threshold
+    true_mask = y_true.astype("float32") > 0.5
+    pred_mask = y_pred.astype("float32") >= threshold
     tp = float(np.logical_and(true_mask, pred_mask).sum())
     fp = float(np.logical_and(~true_mask, pred_mask).sum())
     fn = float(np.logical_and(true_mask, ~pred_mask).sum())
@@ -21,11 +21,18 @@ def binary_metrics(y_true: np.ndarray, y_pred: np.ndarray, threshold: float = 0.
     return {"dice": dice, "iou": iou, "precision": precision, "recall": recall}
 
 
-def evaluate_segmentation(model, x: np.ndarray, y: np.ndarray, records: list[dict[str, Any]], run_dir: str | Path) -> dict[str, Any]:
+def evaluate_segmentation(
+    model,
+    x: np.ndarray,
+    y: np.ndarray,
+    records: list[dict[str, Any]],
+    run_dir: str | Path,
+    threshold: float = 0.5,
+) -> dict[str, Any]:
     predictions = model.predict(x, verbose=0)
     rows = []
     for row, true_mask, pred_mask in zip(records, y, predictions, strict=False):
-        metrics = binary_metrics(true_mask, pred_mask)
+        metrics = binary_metrics(true_mask, pred_mask, threshold=threshold)
         rows.append({"uuid": row["uuid"], "split": row["split"], **metrics})
 
     evaluation_dir = Path(run_dir) / "evaluation"
@@ -35,6 +42,7 @@ def evaluate_segmentation(model, x: np.ndarray, y: np.ndarray, records: list[dic
     metrics_df.to_csv(evaluation_dir / "segmentation_metrics.csv", index=False)
     summary = {
         "task": "segmentation",
+        "probability_threshold": threshold,
         "mean_dice": float(metrics_df["dice"].mean()) if not metrics_df.empty else None,
         "mean_iou": float(metrics_df["iou"].mean()) if not metrics_df.empty else None,
         "mean_precision": float(metrics_df["precision"].mean()) if not metrics_df.empty else None,
@@ -42,4 +50,3 @@ def evaluate_segmentation(model, x: np.ndarray, y: np.ndarray, records: list[dic
     }
     (evaluation_dir / "evaluation_summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     return {"summary": summary, "predictions": predictions, "sample_metrics": rows}
-
