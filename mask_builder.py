@@ -115,6 +115,23 @@ def parse_args() -> argparse.Namespace:
         default=32.0,
         help="Pixel distance mapped to +/-1 in the generated candidate SDF channel.",
     )
+    parser.add_argument(
+        "--unet-tiling",
+        action="store_true",
+        help="Enable large-ROI tiling in the generated U-Net config.",
+    )
+    parser.add_argument(
+        "--unet-tiling-overlap",
+        type=float,
+        default=0.5,
+        help="Fractional overlap between adjacent generated-config tiles.",
+    )
+    parser.add_argument(
+        "--unet-tiling-blend",
+        choices=("uniform", "hann"),
+        default="hann",
+        help="Probability blending window used to reassemble tiled predictions.",
+    )
     parser.add_argument("--unet-input-shape", type=parse_shape, help="Target U-Net input shape, for example 256,256,2.")
     parser.add_argument("--unet-output-shape", type=parse_shape, help="Target U-Net output shape, for example 256,256,1.")
     parser.add_argument("--debug", action="store_true")
@@ -253,6 +270,9 @@ def main() -> int:
                 segmentation_target=args.unet_segmentation_target,
                 candidate_sdf=args.unet_candidate_sdf,
                 candidate_sdf_clip_distance=args.unet_candidate_sdf_clip_distance,
+                tiling_enabled=args.unet_tiling,
+                tiling_overlap_fraction=args.unet_tiling_overlap,
+                tiling_blend_mode=args.unet_tiling_blend,
                 batch_size=args.unet_batch_size,
                 epochs=args.unet_epochs,
                 target_input_shape=args.unet_input_shape,

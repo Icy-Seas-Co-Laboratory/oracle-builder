@@ -10,6 +10,7 @@ import numpy as np
 
 from oracle_builder.data.decoders import encode_npy
 from oracle_builder.evaluation.segmentation import binary_metrics
+from oracle_builder.evaluation.segmentation import predict_reassembled_segmentation
 from oracle_builder.evaluation.segmentation_targets import CANDIDATE_DELTA, reconstruct_validated_mask, reconstruct_validated_probability, segmentation_target_mode
 
 
@@ -91,7 +92,11 @@ def write_predictions_db(
     source_sqlite: str | Path | None = None,
     prediction_set: str = "default",
 ) -> None:
-    predictions = model.predict(x, verbose=0)
+    task = config["run"]["task"]
+    if task == "segmentation":
+        predictions, y, records = predict_reassembled_segmentation(model, x, y, records, config)
+    else:
+        predictions = model.predict(x, verbose=0)
     connection = init_predictions_db(sqlite_path, source_sqlite=source_sqlite)
     run = config.get("run", {})
     connection.execute(
@@ -111,10 +116,17 @@ def write_predictions_db(
             json.dumps(config, sort_keys=True, default=str),
         ),
     )
-    task = config["run"]["task"]
     target_mode = segmentation_target_mode(config)
     segmentation_threshold = float(config.get("evaluation", {}).get("segmentation_threshold", 0.5))
     for row, true_value, prediction in zip(records, y, predictions, strict=False):
+        prediction_metadata = dict(row.get("metadata", {}))
+        prediction_metadata["prediction"] = {
+            "tile_count": int(row.get("tile_count", 1)),
+            "source_shape": row.get("source_shape"),
+            "tiling_enabled": bool(config.get("tiling", {}).get("enabled", False)),
+            "overlap_fraction": float(config.get("tiling", {}).get("overlap_fraction", 0.0)),
+            "blend_mode": config.get("tiling", {}).get("blend_mode", "uniform"),
+        }
         if true_value is None:
             y_true_blob = None
             true_encoding = None
@@ -183,7 +195,7 @@ def write_predictions_db(
                 pred_encoding,
                 y_prob_json,
                 metrics_json,
-                json.dumps(row.get("metadata", {})),
+                json.dumps(prediction_metadata),
                 target_mode,
                 encode_npy(np.asarray(reconstructed_prediction)) if task == "segmentation" else None,
                 "npy" if task == "segmentation" else None,

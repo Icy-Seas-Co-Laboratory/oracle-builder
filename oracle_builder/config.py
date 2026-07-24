@@ -67,6 +67,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "export_savedmodel": True,
     },
     "evaluation": {"segmentation_threshold": 0.5},
+    "tiling": {
+        "enabled": False,
+        "overlap_fraction": 0.5,
+        "blend_mode": "hann",
+        "tile_large_rois_only": True,
+        "normalize_training_coverage": True,
+    },
 }
 
 
@@ -117,6 +124,19 @@ def validate_config(config: dict[str, Any]) -> None:
             raise ValueError("data.candidate_sdf requires segmentation with a three-channel input_shape")
         if float(config["data"].get("candidate_sdf_clip_distance", 32.0)) <= 0:
             raise ValueError("data.candidate_sdf_clip_distance must be greater than zero")
+    tiling = config.get("tiling", {})
+    if tiling.get("enabled", False):
+        if task != "segmentation":
+            raise ValueError("tiling is only supported for segmentation")
+        overlap = float(tiling.get("overlap_fraction", 0.5))
+        if not 0.0 <= overlap < 1.0:
+            raise ValueError("tiling.overlap_fraction must be in [0, 1)")
+        if tiling.get("blend_mode", "hann") not in {"uniform", "hann"}:
+            raise ValueError("tiling.blend_mode must be 'uniform' or 'hann'")
+        input_shape = config["data"]["input_shape"]
+        output_shape = config["data"]["output_shape"]
+        if tuple(input_shape[:2]) != tuple(output_shape[:2]):
+            raise ValueError("tiling currently requires matching input and output spatial dimensions")
     if config["training"].get("spatial_edge_weighting", False):
         if task != "segmentation":
             raise ValueError("training.spatial_edge_weighting is only supported for segmentation")

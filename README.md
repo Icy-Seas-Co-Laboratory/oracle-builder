@@ -254,6 +254,9 @@ U-Net dataset utilities:
 | `--unet-segmentation-target NAME` | Generated target mode: `validated_mask` or `candidate_delta`. |
 | `--unet-candidate-sdf` | Generate a three-channel model config with candidate signed distance as channel 2. |
 | `--unet-candidate-sdf-clip-distance N` | Candidate SDF distance mapped to magnitude `1`; defaults to `32` pixels. |
+| `--unet-tiling` | Enable large-ROI tiling in the generated config. |
+| `--unet-tiling-overlap N` | Adjacent tile overlap fraction; defaults to `0.5`. |
+| `--unet-tiling-blend NAME` | Reassembly weighting: `uniform` or `hann`. |
 | `--unet-input-shape SHAPE` | Target input shape, for example `256,256,2`. |
 | `--unet-output-shape SHAPE` | Target output shape, for example `256,256,1`. |
 
@@ -372,6 +375,7 @@ Visualization arguments:
 | `--validation-split N` | Override validation split fraction. |
 | `--test-split N` | Override test split fraction. |
 | `--no-labels` | Hide UUID labels under tiles. |
+| `--show-tile-grid` | Draw tile boundaries from the supplied config over each source ROI. |
 
 ## SQLite Dataset Format
 
@@ -516,6 +520,33 @@ python3 mask_builder.py \
   --unet-candidate-sdf \
   --unet-candidate-sdf-clip-distance 32
 ```
+
+### Large ROI Tiling
+
+Large segmentation ROIs can be processed at their native resolution instead of being downscaled:
+
+```toml
+[tiling]
+enabled = true
+overlap_fraction = 0.5
+blend_mode = "hann"
+tile_large_rois_only = true
+normalize_training_coverage = true
+```
+
+Tile height and width come from `data.input_shape`. With a 256×256 model input, a 512×512 ROI produces four tiles at zero overlap or nine tiles at 50% overlap. Non-divisible dimensions receive a final tile anchored to the far edge, ensuring complete coverage. If only one source dimension exceeds the tile, that dimension is tiled and the smaller dimension is center-padded.
+
+ROI split assignment happens before expansion, so every tile from one source remains in the same train, validation, or test split. ROI image, candidate mask, validated or delta target, SDF, and spatial edge weights share identical tile coordinates. SDF and boundary weights are calculated over the full ROI before cropping, avoiding artificial tile-edge boundaries.
+
+When `normalize_training_coverage` is enabled, per-pixel training weights are divided by the number of overlapping tiles covering that source pixel. This prevents overlap from increasing the effective loss weight of central regions.
+
+Inference predicts every tile and reassembles one full-resolution probability map per original ROI:
+
+```text
+full_probability = sum(tile_probability * blend_weight) / sum(blend_weight)
+```
+
+`uniform` performs ordinary averaging. `hann` reduces contributions near tile edges and uses a small positive edge floor so source-border pixels remain covered. Candidate-delta reconstruction and validation threshold optimization occur after full-resolution reassembly. Prediction databases retain one row per original ROI and record its original shape, tile count, overlap, and blend mode.
 
 U-Net segmentation can emphasize errors near target boundaries using per-pixel weights
 `w = 1 + lambda * exp(-d^2 / (2 * sigma^2))`, where `d` is the Euclidean distance to the active training-target boundary:

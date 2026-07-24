@@ -19,6 +19,7 @@ if str(REPO_ROOT) not in sys.path:
 from oracle_builder.config import load_toml
 from oracle_builder.data.decoders import decode_blob
 from oracle_builder.data.splits import assign_missing_splits
+from oracle_builder.data.tiling import plan_tiles
 from oracle_builder.masking.sqlite_io import load_sample, open_database
 
 
@@ -56,6 +57,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--validation-split", type=float, help="Override validation split fraction.")
     parser.add_argument("--test-split", type=float, help="Override test split fraction.")
     parser.add_argument("--no-labels", action="store_true", help="Hide UUID labels under each tile.")
+    parser.add_argument("--show-tile-grid", action="store_true", help="Draw configured tile boundaries over each ROI.")
     return parser.parse_args()
 
 
@@ -69,6 +71,8 @@ def main() -> int:
         args.validation_split if args.validation_split is not None else float(data_config.get("validation_split", 0.2))
     )
     test_split = args.test_split if args.test_split is not None else float(data_config.get("test_split", 0.1))
+    tile_shape = tuple(data_config.get("input_shape", [])[:2]) or None
+    tile_overlap = float(config.get("tiling", {}).get("overlap_fraction", 0.5))
 
     rows = read_training_rows(args.database, validation_split, test_split, seed, args.split)
     if args.limit is not None:
@@ -102,6 +106,9 @@ def main() -> int:
             refined_alpha=args.refined_alpha,
             prediction_threshold=args.prediction_threshold,
             show_labels=not args.no_labels,
+            show_tile_grid=args.show_tile_grid,
+            tile_shape=tile_shape,
+            tile_overlap=tile_overlap,
         )
     else:
         sheet = build_contact_sheet(
@@ -111,6 +118,9 @@ def main() -> int:
             candidate_alpha=args.candidate_alpha,
             refined_alpha=args.refined_alpha,
             show_labels=not args.no_labels,
+            show_tile_grid=args.show_tile_grid,
+            tile_shape=tile_shape,
+            tile_overlap=tile_overlap,
         )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     sheet.save(args.output)
@@ -228,6 +238,9 @@ def build_side_by_side_sheet(
     refined_alpha: float,
     prediction_threshold: float | None,
     show_labels: bool,
+    show_tile_grid: bool = False,
+    tile_shape: tuple[int, int] | None = None,
+    tile_overlap: float = 0.5,
 ) -> Image.Image:
     delta_mode = any(
         isinstance(value, dict) and value.get("target_mode") == "candidate_delta"
@@ -249,6 +262,8 @@ def build_side_by_side_sheet(
         draw.text((column * thumbnail_size + 4, 6), header, fill=(20, 20, 20), font=font)
     for row_index, sample in enumerate(samples):
         roi = normalize_roi(sample["image"])
+        if show_tile_grid and tile_shape:
+            roi = apply_tile_grid(roi, tile_shape, tile_overlap)
         detail = predictions[sample["uuid"]]
         raw_prediction = detail["raw"] if isinstance(detail, dict) else detail
         threshold = (
@@ -337,6 +352,9 @@ def build_contact_sheet(
     candidate_alpha: float,
     refined_alpha: float,
     show_labels: bool,
+    show_tile_grid: bool = False,
+    tile_shape: tuple[int, int] | None = None,
+    tile_overlap: float = 0.5,
 ) -> Image.Image:
     if columns <= 0:
         columns = max(1, math.ceil(math.sqrt(len(samples))))
@@ -347,6 +365,9 @@ def build_contact_sheet(
             candidate_alpha=candidate_alpha,
             refined_alpha=refined_alpha,
             show_label=show_labels,
+            show_tile_grid=show_tile_grid,
+            tile_shape=tile_shape,
+            tile_overlap=tile_overlap,
         )
         for sample in samples
     ]
@@ -367,8 +388,13 @@ def make_overlay_tile(
     candidate_alpha: float,
     refined_alpha: float,
     show_label: bool,
+    show_tile_grid: bool = False,
+    tile_shape: tuple[int, int] | None = None,
+    tile_overlap: float = 0.5,
 ) -> Image.Image:
     roi = normalize_roi(sample["image"])
+    if show_tile_grid and tile_shape:
+        roi = apply_tile_grid(roi, tile_shape, tile_overlap)
     candidate = sample.get("candidate_mask")
     refined = sample.get("mask")
     overlay = apply_mask_overlay(roi, candidate, BLUE, candidate_alpha)
@@ -386,6 +412,24 @@ def make_overlay_tile(
     draw.text((4, thumbnail_size + 2), label, fill=(20, 20, 20), font=ImageFont.load_default())
     draw.text((4, thumbnail_size + 14), shape, fill=(80, 80, 80), font=ImageFont.load_default())
     return tile
+
+
+def apply_tile_grid(
+    roi: np.ndarray,
+    tile_shape: tuple[int, int],
+    overlap_fraction: float,
+) -> np.ndarray:
+    image = Image.fromarray(np.asarray(roi, dtype="uint8"), mode="RGB")
+    draw = ImageDraw.Draw(image)
+    for plan in plan_tiles(image.size[::-1], tile_shape, overlap_fraction):
+        y, x = plan["origin"]
+        crop_h, crop_w = plan["crop_shape"]
+        draw.rectangle(
+            (x, y, x + crop_w - 1, y + crop_h - 1),
+            outline=(255, 220, 30),
+            width=1,
+        )
+    return np.asarray(image)
 
 
 def normalize_roi(image: np.ndarray) -> np.ndarray:

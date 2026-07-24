@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 
 from oracle_builder.evaluation.segmentation import binary_metrics
+from oracle_builder.evaluation.segmentation import predict_reassembled_segmentation
 from oracle_builder.evaluation.segmentation_targets import CANDIDATE_DELTA, candidate_delta, reconstruct_validated_mask, segmentation_target_mode
 
 
@@ -18,20 +19,20 @@ def optimize_dice_threshold(
 ) -> dict[str, Any]:
     if thresholds is None:
         thresholds = np.linspace(0.05, 0.95, 91)
-    true_mask = np.asarray(y_true) > 0.5
-    probabilities = np.asarray(probabilities, dtype="float32")
+    true_samples = [np.asarray(value) > 0.5 for value in y_true]
+    probability_samples = [np.asarray(value, dtype="float32") for value in probabilities]
     rows: list[dict[str, float]] = []
     for threshold_value in thresholds:
         threshold = float(threshold_value)
-        pred_mask = probabilities >= threshold
-        tp = float(np.logical_and(true_mask, pred_mask).sum())
-        fp = float(np.logical_and(~true_mask, pred_mask).sum())
-        fn = float(np.logical_and(true_mask, ~pred_mask).sum())
+        predicted_samples = [value >= threshold for value in probability_samples]
+        tp = float(sum(np.logical_and(target, prediction).sum() for target, prediction in zip(true_samples, predicted_samples, strict=False)))
+        fp = float(sum(np.logical_and(~target, prediction).sum() for target, prediction in zip(true_samples, predicted_samples, strict=False)))
+        fn = float(sum(np.logical_and(target, ~prediction).sum() for target, prediction in zip(true_samples, predicted_samples, strict=False)))
         denominator = 2 * tp + fp + fn
         aggregate_dice = (2 * tp / denominator) if denominator else 1.0
         sample_dice = [
             binary_metrics(target, prediction, threshold=threshold)["dice"]
-            for target, prediction in zip(y_true, probabilities, strict=False)
+            for target, prediction in zip(true_samples, probability_samples, strict=False)
         ]
         rows.append(
             {
@@ -60,12 +61,18 @@ def analyze_validation_threshold(
     records: list[dict[str, Any]] | None = None,
     thresholds: np.ndarray | None = None,
 ) -> dict[str, Any]:
-    probabilities = model.predict(x, verbose=0)
+    if config is not None and records is not None:
+        probabilities, targets, records = predict_reassembled_segmentation(
+            model, x, y, records, config
+        )
+        y = targets
+    else:
+        probabilities = model.predict(x, verbose=0)
     if config is not None and segmentation_target_mode(config) == CANDIDATE_DELTA:
         if not records:
             raise ValueError("Candidate-delta threshold analysis requires validation records")
-        candidates = np.stack([record["candidate_mask"] for record in records])
-        validated = np.stack([record["validated_mask"] for record in records])
+        candidates = [record["candidate_mask"] for record in records]
+        validated = [record["validated_mask"] for record in records]
         analysis = optimize_delta_threshold(validated, candidates, probabilities, thresholds=thresholds)
     else:
         analysis = optimize_dice_threshold(y, probabilities, thresholds=thresholds)
@@ -88,19 +95,26 @@ def optimize_delta_threshold(
 ) -> dict[str, Any]:
     if thresholds is None:
         thresholds = np.linspace(0.05, 0.95, 91)
-    validated_mask = np.asarray(validated) > 0.5
-    candidate_mask = np.asarray(candidates) > 0.5
-    true_delta = candidate_delta(candidate_mask, validated_mask)
+    validated_masks = [np.asarray(value) > 0.5 for value in validated]
+    candidate_masks = [np.asarray(value) > 0.5 for value in candidates]
+    probability_samples = [np.asarray(value, dtype="float32") for value in delta_probabilities]
+    true_deltas = [
+        candidate_delta(candidate, target)
+        for candidate, target in zip(candidate_masks, validated_masks, strict=False)
+    ]
     rows: list[dict[str, float]] = []
     for threshold_value in thresholds:
         threshold = float(threshold_value)
-        predicted_delta = np.asarray(delta_probabilities) >= threshold
-        reconstructed = reconstruct_validated_mask(candidate_mask, predicted_delta)
-        reconstructed_metrics = binary_metrics(validated_mask, reconstructed)
-        delta_metrics = binary_metrics(true_delta, predicted_delta)
+        predicted_deltas = [value >= threshold for value in probability_samples]
+        reconstructed = [
+            reconstruct_validated_mask(candidate, delta)
+            for candidate, delta in zip(candidate_masks, predicted_deltas, strict=False)
+        ]
+        reconstructed_metrics = _aggregate_binary_metrics(validated_masks, reconstructed)
+        delta_metrics = _aggregate_binary_metrics(true_deltas, predicted_deltas)
         sample_dice = [
             binary_metrics(target, prediction)["dice"]
-            for target, prediction in zip(validated_mask, reconstructed, strict=False)
+            for target, prediction in zip(validated_masks, reconstructed, strict=False)
         ]
         rows.append(
             {
@@ -121,3 +135,14 @@ def optimize_delta_threshold(
         "thresholds_evaluated": len(rows),
         "curve": rows,
     }
+
+
+def _aggregate_binary_metrics(targets, predictions) -> dict[str, float]:
+    tp = float(sum(np.logical_and(target, prediction).sum() for target, prediction in zip(targets, predictions, strict=False)))
+    fp = float(sum(np.logical_and(~np.asarray(target, dtype=bool), prediction).sum() for target, prediction in zip(targets, predictions, strict=False)))
+    fn = float(sum(np.logical_and(target, ~np.asarray(prediction, dtype=bool)).sum() for target, prediction in zip(targets, predictions, strict=False)))
+    dice = 2 * tp / (2 * tp + fp + fn) if (2 * tp + fp + fn) else 1.0
+    iou = tp / (tp + fp + fn) if (tp + fp + fn) else 1.0
+    precision = tp / (tp + fp) if (tp + fp) else 1.0
+    recall = tp / (tp + fn) if (tp + fn) else 1.0
+    return {"dice": dice, "iou": iou, "precision": precision, "recall": recall}

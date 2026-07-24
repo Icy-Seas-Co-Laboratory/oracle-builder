@@ -7,6 +7,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from oracle_builder.data.tiling import group_and_reassemble
 from oracle_builder.evaluation.segmentation_targets import CANDIDATE_DELTA, reconstruct_validated_mask, segmentation_target_mode
 
 
@@ -23,6 +24,45 @@ def binary_metrics(y_true: np.ndarray, y_pred: np.ndarray, threshold: float = 0.
     return {"dice": dice, "iou": iou, "precision": precision, "recall": recall}
 
 
+def predict_reassembled_segmentation(
+    model,
+    x: np.ndarray,
+    y: Any,
+    records: list[dict[str, Any]],
+    config: dict[str, Any],
+) -> tuple[list[np.ndarray], list[np.ndarray | None], list[dict[str, Any]]]:
+    tile_predictions = model.predict(x, verbose=0)
+    blend_mode = config.get("tiling", {}).get("blend_mode", "hann")
+    predictions, source_records = group_and_reassemble(tile_predictions, records, blend_mode=blend_mode)
+    target_values = list(y)
+    if any(value is None for value in target_values):
+        grouped_targets: dict[str, list[np.ndarray | None]] = {}
+        for value, record in zip(target_values, records, strict=False):
+            source_uuid = record.get("source_uuid", record["uuid"])
+            grouped_targets.setdefault(source_uuid, []).append(value)
+        targets = []
+        for record in source_records:
+            values = grouped_targets[record["uuid"]]
+            if values[0] is None:
+                targets.append(None)
+            else:
+                source_tiles = [
+                    value for value in values if value is not None
+                ]
+                source_tile_records = [
+                    tile_record
+                    for tile_record in records
+                    if tile_record.get("source_uuid", tile_record["uuid"]) == record["uuid"]
+                ]
+                reassembled, _ = group_and_reassemble(
+                    source_tiles, source_tile_records, blend_mode="uniform"
+                )
+                targets.append(reassembled[0])
+    else:
+        targets, _ = group_and_reassemble(target_values, records, blend_mode="uniform")
+    return predictions, targets, source_records
+
+
 def evaluate_segmentation(
     model,
     x: np.ndarray,
@@ -32,10 +72,12 @@ def evaluate_segmentation(
     threshold: float = 0.5,
     config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    predictions = model.predict(x, verbose=0)
+    predictions, targets, records = predict_reassembled_segmentation(
+        model, x, y, records, config or {}
+    )
     rows = []
     target_mode = segmentation_target_mode(config or {})
-    for row, true_mask, pred_mask in zip(records, y, predictions, strict=False):
+    for row, true_mask, pred_mask in zip(records, targets, predictions, strict=False):
         if target_mode == CANDIDATE_DELTA:
             candidate = row["candidate_mask"]
             validated = row["validated_mask"]

@@ -65,3 +65,10 @@ save_checkpoints = true
 save_predictions = true
 save_figures = true
 export_savedmodel = true
+
+[tiling]
+enabled = true
+overlap_fraction = 0.5
+blend_mode = "hann"
+tile_large_rois_only = true
+normalize_training_coverage = true

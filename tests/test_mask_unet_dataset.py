@@ -348,6 +348,33 @@ def test_mask_builder_cli_can_generate_candidate_delta_config(monkeypatch, tmp_p
     assert resolved["training"]["segmentation_target"] == "candidate_delta"
 
 
+def test_mask_builder_cli_can_generate_tiled_config(monkeypatch, tmp_path):
+    db_path = tmp_path / "masks.sqlite"
+    config_path = tmp_path / "tiled.toml"
+    _create_mask_builder_unet_dataset(db_path)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "mask_builder.py",
+            "--database",
+            str(db_path),
+            "--write-unet-config",
+            str(config_path),
+            "--unet-tiling",
+            "--unet-tiling-overlap",
+            "0.3",
+            "--unet-tiling-blend",
+            "uniform",
+        ],
+    )
+
+    assert mask_builder.main() == 0
+    resolved = resolve_config(config_path, db_path, tmp_path / "run")
+    assert resolved["tiling"]["enabled"] is True
+    assert resolved["tiling"]["overlap_fraction"] == 0.3
+    assert resolved["tiling"]["blend_mode"] == "uniform"
+
+
 def test_model_training_preflight_validates_without_creating_run_dir(monkeypatch, tmp_path, capsys):
     db_path = tmp_path / "masks.sqlite"
     config_path = tmp_path / "unet.toml"

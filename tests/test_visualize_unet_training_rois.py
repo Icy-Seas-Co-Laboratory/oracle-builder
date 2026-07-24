@@ -8,6 +8,7 @@ from oracle_builder.masking.sqlite_io import create_or_update_image_sample, open
 from scripts.visualize_unet_training_rois import (
     build_contact_sheet,
     build_side_by_side_sheet,
+    apply_tile_grid,
     make_overlay_tile,
     prediction_to_roi_mask,
     read_predictions,
@@ -156,3 +157,12 @@ def test_side_by_side_sheet_adds_delta_and_reconstruction_columns():
     )
 
     assert sheet.size == (64, 40)
+
+
+def test_tile_grid_draws_configured_tile_boundaries():
+    roi = np.zeros((8, 16, 3), dtype="uint8")
+
+    gridded = apply_tile_grid(roi, (8, 8), overlap_fraction=0.0)
+
+    assert np.array_equal(gridded[0, 0], [255, 220, 30])
+    assert np.array_equal(gridded[0, 8], [255, 220, 30])

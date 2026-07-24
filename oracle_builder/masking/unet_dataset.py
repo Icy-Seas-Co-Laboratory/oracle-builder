@@ -99,6 +99,9 @@ def write_unet_config_from_dataset(
     segmentation_target: str = "validated_mask",
     candidate_sdf: bool = False,
     candidate_sdf_clip_distance: float = 32.0,
+    tiling_enabled: bool = False,
+    tiling_overlap_fraction: float = 0.5,
+    tiling_blend_mode: str = "hann",
     target_input_shape: list[int] | tuple[int, ...] | None = None,
     target_output_shape: list[int] | tuple[int, ...] | None = None,
 ) -> dict[str, Any]:
@@ -186,6 +189,13 @@ def write_unet_config_from_dataset(
             "save_predictions": True,
             "save_figures": True,
             "export_savedmodel": True,
+        },
+        "tiling": {
+            "enabled": tiling_enabled,
+            "overlap_fraction": tiling_overlap_fraction,
+            "blend_mode": tiling_blend_mode,
+            "tile_large_rois_only": True,
+            "normalize_training_coverage": True,
         },
     }
     if run_name:

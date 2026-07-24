@@ -13,6 +13,7 @@ from PIL import Image
 from oracle_builder.data.decoders import decode_blob, encode_npy, normalize_input
 from oracle_builder.data.splits import assign_missing_splits
 from oracle_builder.data.signed_distance import signed_distance_field
+from oracle_builder.data.tiling import coverage_map, extract_tile, plan_tiles
 from oracle_builder.evaluation.segmentation_targets import CANDIDATE_DELTA, candidate_delta, segmentation_target_mode
 
 
@@ -93,6 +94,13 @@ def load_arrays(sqlite_path: str | Path, config: dict[str, Any], split: str | No
         x = decode_blob(row["input_blob"], row["input_blob_encoding"], row["input_blob_dimensions"])
         candidate = _candidate_mask_for_output(x, output_shape) if task == "segmentation" else None
         y = decode_blob(row["output_blob"], row["output_blob_encoding"], row["output_blob_dimensions"])
+        if task == "segmentation" and _should_tile_segmentation(x, config):
+            tiled = _expand_tiled_segmentation_row(row, x, y, config)
+            for tile_x, tile_y, tile_record in tiled:
+                xs.append(tile_x)
+                ys.append(tile_y)
+                records.append(tile_record)
+            continue
         if task == "segmentation":
             x = prepare_segmentation_input(x, input_shape, config)
         xs.append(normalize_input(x, input_shape))
@@ -155,6 +163,18 @@ def load_prediction_arrays(
     records: list[dict[str, Any]] = []
     for row in assigned:
         x = decode_blob(row["input_blob"], row["input_blob_encoding"], row["input_blob_dimensions"])
+        decoded_target = (
+            decode_blob(row["output_blob"], row["output_blob_encoding"], row["output_blob_dimensions"])
+            if row.get("output_blob") is not None
+            else None
+        )
+        if task == "segmentation" and _should_tile_segmentation(x, config):
+            tiled = _expand_tiled_segmentation_row(row, x, decoded_target, config)
+            for tile_x, tile_y, tile_record in tiled:
+                xs.append(tile_x)
+                targets.append(tile_y)
+                records.append(tile_record)
+            continue
         candidate = _candidate_mask_for_output(x, output_shape) if task == "segmentation" else None
         if task == "segmentation" and segmentation_target_mode(config) == CANDIDATE_DELTA and candidate is None:
             raise ValueError(f"Sample {row['uuid']} has no candidate mask required for candidate_delta prediction")
@@ -199,6 +219,134 @@ def _candidate_mask_for_output(array: Any, output_shape: list[int] | tuple[int, 
     return resize_array_to_shape(value[..., 1], output_shape, mask=True).reshape(output_shape)
 
 
+def _should_tile_segmentation(array: Any, config: dict[str, Any]) -> bool:
+    tiling = config.get("tiling", {})
+    if not tiling.get("enabled", False):
+        return False
+    value = np.asarray(array)
+    tile_h, tile_w = (int(part) for part in config["data"]["input_shape"][:2])
+    if tiling.get("tile_large_rois_only", True):
+        return value.shape[0] > tile_h or value.shape[1] > tile_w
+    return True
+
+
+def _normalize_native_input(value: np.ndarray) -> np.ndarray:
+    result = np.asarray(value)
+    if result.dtype.kind in {"u", "i"} and result.max(initial=0) > 1:
+        result = result.astype("float32") / float(np.iinfo(result.dtype).max)
+    return result.astype("float32")
+
+
+def _native_model_input(array: Any, config: dict[str, Any]) -> tuple[np.ndarray, np.ndarray | None]:
+    value = np.asarray(array)
+    candidate = None
+    if value.ndim == 3 and value.shape[-1] == 2:
+        roi = _normalize_native_input(value[..., 0])
+        candidate = (value[..., 1] > 0).astype("float32")
+        channels = [roi, candidate]
+        if config.get("data", {}).get("candidate_sdf", False):
+            channels.append(
+                signed_distance_field(
+                    candidate,
+                    float(config["data"].get("candidate_sdf_clip_distance", 32.0)),
+                )
+            )
+        return np.stack(channels, axis=-1), candidate[..., None]
+    return _normalize_native_input(value), candidate
+
+
+def _extract_input_tile(full_input: np.ndarray, plan: dict[str, Any], candidate_sdf: bool) -> np.ndarray:
+    if not candidate_sdf:
+        return extract_tile(full_input, plan, fill_value=0.0)
+    pieces = [
+        extract_tile(full_input[..., 0], plan, fill_value=0.0),
+        extract_tile(full_input[..., 1], plan, fill_value=0.0),
+        extract_tile(full_input[..., 2], plan, fill_value=-1.0),
+    ]
+    return np.stack(pieces, axis=-1).astype("float32")
+
+
+def _expand_tiled_segmentation_row(
+    row: dict[str, Any],
+    raw_input: Any,
+    raw_target: Any | None,
+    config: dict[str, Any],
+) -> list[tuple[np.ndarray, np.ndarray | None, dict[str, Any]]]:
+    from oracle_builder.training.spatial_weights import boundary_distance_weights
+
+    full_input, candidate = _native_model_input(raw_input, config)
+    source_shape = tuple(int(part) for part in full_input.shape[:2])
+    tile_shape = tuple(int(part) for part in config["data"]["input_shape"][:2])
+    overlap = float(config.get("tiling", {}).get("overlap_fraction", 0.5))
+    plans = plan_tiles(source_shape, tile_shape, overlap)
+    validated = None
+    full_target = None
+    if raw_target is not None:
+        validated = (np.asarray(raw_target) > 0).astype("float32")
+        if validated.ndim == 2:
+            validated = validated[..., None]
+        if validated.shape[:2] != source_shape:
+            raise ValueError(
+                f"Sample {row['uuid']} input shape {source_shape} does not match target shape {validated.shape[:2]}"
+            )
+        full_target = validated
+        if segmentation_target_mode(config) == CANDIDATE_DELTA:
+            if candidate is None:
+                raise ValueError(f"Sample {row['uuid']} has no candidate mask required for candidate_delta training")
+            full_target = candidate_delta(candidate, validated)
+    if segmentation_target_mode(config) == CANDIDATE_DELTA and candidate is None:
+        raise ValueError(f"Sample {row['uuid']} has no candidate mask required for candidate_delta prediction")
+
+    coverage = coverage_map(plans)
+    normalize_coverage = bool(config.get("tiling", {}).get("normalize_training_coverage", True))
+    spatial = bool(config.get("training", {}).get("spatial_edge_weighting", False))
+    full_weights = None
+    if full_target is not None and spatial:
+        full_weights = boundary_distance_weights(
+            full_target,
+            float(config["training"].get("edge_weight_lambda", 1.0)),
+            float(config["training"].get("edge_weight_sigma", 5.0)),
+        )
+    elif full_target is not None and normalize_coverage:
+        full_weights = np.ones(source_shape, dtype="float32")
+    if full_weights is not None and normalize_coverage:
+        full_weights = full_weights / coverage
+
+    source_record = {
+        "uuid": row["uuid"],
+        "split": row.get("split") or "train",
+        "label_text": row.get("label_text"),
+        "sample_weight": row.get("sample_weight"),
+        "metadata": json.loads(row["metadata_json"]) if row.get("metadata_json") else {},
+        "candidate_mask": candidate,
+        "validated_mask": validated,
+        "tile_count": len(plans),
+        "source_shape": list(source_shape),
+    }
+    outputs = []
+    for index, plan in enumerate(plans):
+        record = {
+            **source_record,
+            "uuid": f"{row['uuid']}::tile:{index}",
+            "source_uuid": row["uuid"],
+            "tile_index": index,
+            "tile_plan": plan,
+            "source_record": source_record,
+        }
+        if full_weights is not None:
+            record["pixel_weights"] = extract_tile(full_weights, plan, fill_value=0.0)
+        outputs.append(
+            (
+                _extract_input_tile(
+                    full_input, plan, bool(config.get("data", {}).get("candidate_sdf", False))
+                ),
+                extract_tile(full_target, plan, fill_value=0.0) if full_target is not None else None,
+                record,
+            )
+        )
+    return outputs
+
+
 def make_tf_datasets(sqlite_path: str | Path, config: dict[str, Any]):
     import tensorflow as tf
     from oracle_builder.training.augmentation import apply_training_augmentation
@@ -214,11 +362,18 @@ def make_tf_datasets(sqlite_path: str | Path, config: dict[str, Any]):
                 raise
             continue
         training_config = config.get("training", {})
-        if training_config.get("spatial_edge_weighting", False):
-            weights = batch_boundary_distance_weights(
+        has_precomputed_weights = any("pixel_weights" in record for record in records)
+        if training_config.get("spatial_edge_weighting", False) or has_precomputed_weights:
+            generated = batch_boundary_distance_weights(
                 y,
                 weight_lambda=float(training_config.get("edge_weight_lambda", 1.0)),
                 sigma=float(training_config.get("edge_weight_sigma", 5.0)),
+            ) if training_config.get("spatial_edge_weighting", False) else np.ones(y.shape[:3], dtype="float32")
+            weights = np.stack(
+                [
+                    record.get("pixel_weights", generated[index])
+                    for index, record in enumerate(records)
+                ]
             )
             dataset = tf.data.Dataset.from_tensor_slices((x, y, weights))
         else:

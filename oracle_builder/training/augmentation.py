@@ -45,10 +45,10 @@ def augment_batch(x, y, config: dict[str, Any], sample_weight=None):
             y = tf.cast(y > 0.5, tf.float32)
             if sample_weight is not None:
                 sample_weight = apply_affine_transform(
-                    sample_weight[..., None],
-                    transforms,
-                    interpolation="BILINEAR",
-                    fill_value=1.0,
+                sample_weight[..., None],
+                transforms,
+                interpolation="BILINEAR",
+                fill_value=0.0 if config.get("tiling", {}).get("enabled", False) else 1.0,
                 )[..., 0]
 
     if bool(augmentation.get("flip_horizontal", False)):
