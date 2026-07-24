@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
-from oracle_builder.data.sqlite_dataset import load_arrays, load_prediction_arrays
+from oracle_builder.data.sqlite_dataset import load_arrays, load_prediction_arrays, make_tf_datasets
 from oracle_builder.data.tiling import coverage_map, extract_tile, plan_tiles, reassemble_tiles
 from oracle_builder.evaluation.segmentation import predict_reassembled_segmentation
 from oracle_builder.masking.sqlite_io import create_or_update_image_sample, open_database, save_mask_annotation
+from oracle_builder.training.train import build_and_compile_model
 
 
 def test_512_square_produces_four_tiles_without_overlap():
@@ -148,3 +150,50 @@ def test_tiled_predictions_reassemble_to_one_original_roi(tmp_path):
     assert predictions[0].shape == (16, 16, 1)
     assert np.allclose(predictions[0][..., 0], image.astype("float32") / 255.0)
     assert source_records[0]["uuid"] == "large"
+
+
+def test_tiled_augmentation_accepts_coverage_weighted_dataset_triples(tmp_path):
+    database = tmp_path / "large.sqlite"
+    create_large_sample(database)
+    config = tiled_config(overlap=0.5)
+    config["data"]["batch_size"] = 4
+    config["augmentation"] = {
+        "enabled": True,
+        "rotation": 0.05,
+        "flip_horizontal": True,
+    }
+
+    datasets, _records = make_tf_datasets(database, config)
+    batch = next(iter(datasets["train"]))
+
+    assert len(batch) == 3
+    x, y, weights = batch
+    assert x.shape == (4, 8, 8, 2)
+    assert y.shape == (4, 8, 8, 1)
+    assert weights.shape == (4, 8, 8)
+
+
+@pytest.mark.parametrize("model_name", ["residual_unet", "unet_plus_plus"])
+def test_tiled_augmented_dataset_trains_new_unet_architectures(model_name, tmp_path):
+    database = tmp_path / f"{model_name}.sqlite"
+    create_large_sample(database)
+    config = tiled_config(overlap=0.5)
+    config["run"]["model"] = model_name
+    config["data"]["batch_size"] = 4
+    config["model"] = {
+        "base_filters": 2,
+        "depth": 1,
+        "dropout": 0.0,
+        "activation": "relu",
+        "final_activation": "sigmoid",
+    }
+    config["training"].update(
+        {"optimizer": "adam", "learning_rate": 0.001, "metrics": ["dice"]}
+    )
+    config["augmentation"] = {"enabled": True, "flip_horizontal": True}
+    datasets, _records = make_tf_datasets(database, config)
+    model = build_and_compile_model(config)
+
+    history = model.fit(datasets["train"].take(1), epochs=1, verbose=0)
+
+    assert np.isfinite(history.history["loss"][0])

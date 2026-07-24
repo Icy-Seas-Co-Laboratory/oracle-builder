@@ -10,7 +10,8 @@ def apply_training_augmentation(dataset, config: dict[str, Any]):
     augmentation = config.get("augmentation", {})
     if not augmentation.get("enabled", False):
         return dataset
-    if config.get("training", {}).get("spatial_edge_weighting", False):
+    element_spec = dataset.element_spec
+    if isinstance(element_spec, (tuple, list)) and len(element_spec) == 3:
         return dataset.map(
             lambda x, y, weights: augment_batch(x, y, config, weights),
             num_parallel_calls=tf.data.AUTOTUNE,
