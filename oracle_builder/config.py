@@ -23,6 +23,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "shuffle_buffer": 512,
         "validation_split": 0.2,
         "test_split": 0.1,
+        "candidate_sdf": False,
+        "candidate_sdf_clip_distance": 32.0,
     },
     "model": {},
     "training": {
@@ -31,6 +33,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "learning_rate": 0.001,
         "loss": None,
         "metrics": ["accuracy"],
+        "segmentation_target": "validated_mask",
         "spatial_edge_weighting": False,
         "edge_weight_lambda": 1.0,
         "edge_weight_sigma": 5.0,
@@ -98,6 +101,22 @@ def validate_config(config: dict[str, Any]) -> None:
         raise ValueError("data.num_classes is required for classification")
     if task == "segmentation" and "output_shape" not in config["data"]:
         raise ValueError("data.output_shape is required for segmentation")
+    segmentation_target = str(config["training"].get("segmentation_target", "validated_mask")).lower()
+    if segmentation_target not in {"validated_mask", "candidate_delta"}:
+        raise ValueError("training.segmentation_target must be 'validated_mask' or 'candidate_delta'")
+    if segmentation_target == "candidate_delta":
+        input_shape = config["data"]["input_shape"]
+        if task != "segmentation":
+            raise ValueError("training.segmentation_target='candidate_delta' requires segmentation")
+        expected_channels = 3 if config["data"].get("candidate_sdf", False) else 2
+        if len(input_shape) != 3 or int(input_shape[-1]) != expected_channels:
+            raise ValueError(f"candidate_delta training requires data.input_shape with {expected_channels} channels")
+    if config["data"].get("candidate_sdf", False):
+        input_shape = config["data"]["input_shape"]
+        if task != "segmentation" or len(input_shape) != 3 or int(input_shape[-1]) != 3:
+            raise ValueError("data.candidate_sdf requires segmentation with a three-channel input_shape")
+        if float(config["data"].get("candidate_sdf_clip_distance", 32.0)) <= 0:
+            raise ValueError("data.candidate_sdf_clip_distance must be greater than zero")
     if config["training"].get("spatial_edge_weighting", False):
         if task != "segmentation":
             raise ValueError("training.spatial_edge_weighting is only supported for segmentation")

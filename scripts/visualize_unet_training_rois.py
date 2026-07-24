@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import sqlite3
 import sys
@@ -24,6 +25,9 @@ from oracle_builder.masking.sqlite_io import load_sample, open_database
 BLUE = np.array([40, 130, 255], dtype="float32")
 GREEN = np.array([40, 220, 80], dtype="float32")
 ORANGE = np.array([255, 145, 35], dtype="float32")
+PURPLE = np.array([170, 80, 230], dtype="float32")
+CYAN = np.array([30, 210, 230], dtype="float32")
+RED = np.array([240, 55, 55], dtype="float32")
 
 
 def parse_args() -> argparse.Namespace:
@@ -47,7 +51,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--candidate-alpha", type=float, default=0.35, help="Transparent blue candidate mask alpha.")
     parser.add_argument("--refined-alpha", type=float, default=0.45, help="Transparent green refined mask alpha.")
     parser.add_argument("--prediction-alpha", type=float, default=0.45, help="Transparent orange model mask alpha.")
-    parser.add_argument("--prediction-threshold", type=float, default=0.5, help="Model mask probability threshold.")
+    parser.add_argument("--prediction-threshold", type=float, help="Override the saved model probability threshold.")
     parser.add_argument("--seed", type=int, help="Override split assignment seed.")
     parser.add_argument("--validation-split", type=float, help="Override validation split fraction.")
     parser.add_argument("--test-split", type=float, help="Override test split fraction.")
@@ -78,7 +82,7 @@ def main() -> int:
     if args.side_by_side:
         if args.predictions is None:
             raise SystemExit("--side-by-side requires --predictions.")
-        predictions = read_predictions(
+        predictions = read_prediction_details(
             args.predictions,
             {sample["uuid"] for sample in samples},
             prediction_set=args.prediction_set,
@@ -142,8 +146,18 @@ def read_predictions(
     uuids: set[str] | None = None,
     prediction_set: str | None = None,
 ) -> dict[str, np.ndarray]:
+    details = read_prediction_details(database, uuids=uuids, prediction_set=prediction_set)
+    return {uuid: detail["raw"] for uuid, detail in details.items()}
+
+
+def read_prediction_details(
+    database: Path,
+    uuids: set[str] | None = None,
+    prediction_set: str | None = None,
+) -> dict[str, dict[str, Any]]:
     connection = sqlite3.connect(database)
     connection.row_factory = sqlite3.Row
+    saved_threshold = 0.5
     try:
         columns = {row[1] for row in connection.execute("PRAGMA table_info(predictions)")}
         if "prediction_set" in columns:
@@ -157,9 +171,27 @@ def read_predictions(
                 prediction_set = available[0]
             if prediction_set not in available:
                 raise ValueError(f"Prediction set {prediction_set!r} not found; available sets: {available}")
+            config_row = connection.execute(
+                "SELECT config_json FROM prediction_sets WHERE prediction_set = ?",
+                (prediction_set,),
+            ).fetchone()
+            if config_row:
+                try:
+                    saved_config = json.loads(config_row[0])
+                    saved_threshold = float(
+                        saved_config.get("evaluation", {}).get("segmentation_threshold", 0.5)
+                    )
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    saved_threshold = 0.5
+            detail_columns = (
+                "uuid, y_pred_blob, y_pred_encoding, target_mode, "
+                "reconstructed_pred_blob, reconstructed_pred_encoding"
+                if "target_mode" in columns
+                else "uuid, y_pred_blob, y_pred_encoding, 'validated_mask' AS target_mode, NULL AS reconstructed_pred_blob, NULL AS reconstructed_pred_encoding"
+            )
             rows = connection.execute(
                 """
-                SELECT uuid, y_pred_blob, y_pred_encoding
+                SELECT """ + detail_columns + """
                 FROM predictions
                 WHERE prediction_set = ?
                 ORDER BY uuid
@@ -170,12 +202,18 @@ def read_predictions(
             if prediction_set is not None:
                 raise ValueError("--prediction-set cannot be used with a legacy predictions database")
             rows = connection.execute(
-                "SELECT uuid, y_pred_blob, y_pred_encoding FROM predictions ORDER BY uuid"
+                "SELECT uuid, y_pred_blob, y_pred_encoding, 'validated_mask' AS target_mode, NULL AS reconstructed_pred_blob, NULL AS reconstructed_pred_encoding FROM predictions ORDER BY uuid"
             ).fetchall()
     finally:
         connection.close()
     return {
-        row["uuid"]: np.asarray(decode_blob(row["y_pred_blob"], row["y_pred_encoding"]))
+        row["uuid"]: {
+            "raw": np.asarray(decode_blob(row["y_pred_blob"], row["y_pred_encoding"])),
+            "reconstructed": np.asarray(decode_blob(row["reconstructed_pred_blob"], row["reconstructed_pred_encoding"]))
+            if row["reconstructed_pred_blob"] is not None else None,
+            "target_mode": row["target_mode"] or "validated_mask",
+            "probability_threshold": saved_threshold,
+        }
         for row in rows
         if uuids is None or row["uuid"] in uuids
     }
@@ -183,33 +221,59 @@ def read_predictions(
 
 def build_side_by_side_sheet(
     samples: list[dict[str, Any]],
-    predictions: dict[str, np.ndarray],
+    predictions: dict[str, Any],
     thumbnail_size: int,
     candidate_alpha: float,
     prediction_alpha: float,
     refined_alpha: float,
-    prediction_threshold: float,
+    prediction_threshold: float | None,
     show_labels: bool,
 ) -> Image.Image:
-    headers = ("Original mask", "Model output", "Validated mask")
-    colors = (BLUE, ORANGE, GREEN)
+    delta_mode = any(
+        isinstance(value, dict) and value.get("target_mode") == "candidate_delta"
+        for value in predictions.values()
+    )
+    headers = (
+        ("Candidate mask", "Predicted changes", "Reconstructed mask", "Validated mask")
+        if delta_mode
+        else ("Original mask", "Model output", "Validated mask")
+    )
+    colors = (BLUE, ORANGE, PURPLE, GREEN) if delta_mode else (BLUE, ORANGE, GREEN)
     header_h = 24
     label_h = 28 if show_labels else 0
     row_h = thumbnail_size + label_h
-    sheet = Image.new("RGB", (thumbnail_size * 3, header_h + row_h * len(samples)), "white")
+    sheet = Image.new("RGB", (thumbnail_size * len(headers), header_h + row_h * len(samples)), "white")
     draw = ImageDraw.Draw(sheet)
     font = ImageFont.load_default()
     for column, header in enumerate(headers):
         draw.text((column * thumbnail_size + 4, 6), header, fill=(20, 20, 20), font=font)
     for row_index, sample in enumerate(samples):
         roi = normalize_roi(sample["image"])
-        model_mask = prediction_to_roi_mask(
-            predictions[sample["uuid"]], roi.shape[:2], threshold=prediction_threshold
+        detail = predictions[sample["uuid"]]
+        raw_prediction = detail["raw"] if isinstance(detail, dict) else detail
+        threshold = (
+            prediction_threshold
+            if prediction_threshold is not None
+            else float(detail.get("probability_threshold", 0.5))
+            if isinstance(detail, dict)
+            else 0.5
         )
-        masks = (sample.get("candidate_mask"), model_mask, sample.get("mask"))
-        alphas = (candidate_alpha, prediction_alpha, refined_alpha)
+        model_mask = prediction_to_roi_mask(raw_prediction, roi.shape[:2], threshold=threshold)
+        if delta_mode:
+            candidate = np.asarray(sample.get("candidate_mask")) > 0
+            reconstructed = np.logical_xor(candidate, model_mask > 0).astype("uint8")
+            masks = (sample.get("candidate_mask"), model_mask, reconstructed, sample.get("mask"))
+            alphas = (candidate_alpha, prediction_alpha, prediction_alpha, refined_alpha)
+        else:
+            masks = (sample.get("candidate_mask"), model_mask, sample.get("mask"))
+            alphas = (candidate_alpha, prediction_alpha, refined_alpha)
         for column, (mask, color, alpha) in enumerate(zip(masks, colors, alphas, strict=True)):
-            panel = make_colored_overlay_tile(roi, mask, color, alpha, thumbnail_size)
+            if delta_mode and column == 1:
+                panel = make_change_overlay_tile(
+                    roi, sample.get("candidate_mask"), mask, alpha, thumbnail_size
+                )
+            else:
+                panel = make_colored_overlay_tile(roi, mask, color, alpha, thumbnail_size)
             x = column * thumbnail_size + (thumbnail_size - panel.width) // 2
             y = header_h + row_index * row_h
             sheet.paste(panel, (x, y))
@@ -243,6 +307,24 @@ def make_colored_overlay_tile(
     roi: np.ndarray, mask: np.ndarray | None, color: np.ndarray, alpha: float, thumbnail_size: int
 ) -> Image.Image:
     overlay = apply_mask_overlay(roi, mask, color, alpha)
+    image = Image.fromarray(overlay.astype("uint8"), mode="RGB")
+    image.thumbnail((thumbnail_size, thumbnail_size), Image.Resampling.BILINEAR)
+    return image
+
+
+def make_change_overlay_tile(
+    roi: np.ndarray,
+    candidate: np.ndarray,
+    delta: np.ndarray,
+    alpha: float,
+    thumbnail_size: int,
+) -> Image.Image:
+    candidate_mask = np.asarray(candidate) > 0
+    delta_mask = np.asarray(delta) > 0
+    additions = np.logical_and(~candidate_mask, delta_mask)
+    removals = np.logical_and(candidate_mask, delta_mask)
+    overlay = apply_mask_overlay(roi, additions, CYAN, alpha)
+    overlay = apply_mask_overlay(overlay, removals, RED, alpha)
     image = Image.fromarray(overlay.astype("uint8"), mode="RGB")
     image.thumbnail((thumbnail_size, thumbnail_size), Image.Resampling.BILINEAR)
     return image

@@ -32,6 +32,8 @@ def augment_batch(x, y, config: dict[str, Any], sample_weight=None):
             transforms,
             fill_value=float(augmentation.get("fill_value", 0.0)),
             mask_channels=input_mask_channels(config, augmentation),
+            distance_channels=signed_distance_input_channels(config, augmentation),
+            distance_fill_value=float(augmentation.get("signed_distance_fill_value", -1.0)),
         )
         if task == "segmentation":
             y = apply_affine_transform(
@@ -160,18 +162,27 @@ def matrix_from_values(a00, a01, a02, a10, a11, a12):
     )
 
 
-def transform_input_channels(x, transforms, fill_value: float, mask_channels: list[int]):
+def transform_input_channels(
+    x,
+    transforms,
+    fill_value: float,
+    mask_channels: list[int],
+    distance_channels: list[int] | None = None,
+    distance_fill_value: float = -1.0,
+):
     channel_count = x.shape[-1]
     if channel_count is None:
         return apply_affine_transform(x, transforms, interpolation="BILINEAR", fill_value=fill_value)
     transformed_channels = []
+    distance_channel_set = set(distance_channels or [])
     for index in range(int(channel_count)):
         interpolation = "NEAREST" if index in mask_channels else "BILINEAR"
+        channel_fill_value = distance_fill_value if index in distance_channel_set else fill_value
         transformed = apply_affine_transform(
             x[..., index : index + 1],
             transforms,
             interpolation=interpolation,
-            fill_value=fill_value,
+            fill_value=channel_fill_value,
         )
         if index in mask_channels:
             transformed = tf.cast(transformed > 0.5, tf.float32)
@@ -239,8 +250,18 @@ def input_mask_channels(config: dict[str, Any], augmentation: dict[str, Any]) ->
     if "mask_input_channels" in augmentation:
         return [int(channel) for channel in augmentation.get("mask_input_channels") or []]
     input_shape = config.get("data", {}).get("input_shape", [])
-    if config.get("run", {}).get("task") == "segmentation" and input_shape and int(input_shape[-1]) == 2:
+    if config.get("run", {}).get("task") == "segmentation" and input_shape and (
+        int(input_shape[-1]) == 2 or config.get("data", {}).get("candidate_sdf", False)
+    ):
         return [1]
+    return []
+
+
+def signed_distance_input_channels(config: dict[str, Any], augmentation: dict[str, Any]) -> list[int]:
+    if "signed_distance_input_channels" in augmentation:
+        return [int(channel) for channel in augmentation.get("signed_distance_input_channels") or []]
+    if config.get("data", {}).get("candidate_sdf", False):
+        return [2]
     return []
 
 
@@ -251,6 +272,8 @@ def photometric_channels(config: dict[str, Any], augmentation: dict[str, Any]) -
     if not input_shape:
         return []
     channels = int(input_shape[-1])
-    if config.get("run", {}).get("task") == "segmentation" and channels == 2:
+    if config.get("run", {}).get("task") == "segmentation" and (
+        channels == 2 or config.get("data", {}).get("candidate_sdf", False)
+    ):
         return [0]
     return list(range(channels))

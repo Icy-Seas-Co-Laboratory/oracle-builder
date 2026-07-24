@@ -16,6 +16,7 @@ def validate_unet_dataset(
     sqlite_path: str | Path,
     target_input_shape: list[int] | tuple[int, ...] | None = None,
     target_output_shape: list[int] | tuple[int, ...] | None = None,
+    require_candidate_mask: bool = False,
 ) -> dict[str, Any]:
     rows = _read_masked_sample_rows(sqlite_path)
     target_input_shape = list(target_input_shape) if target_input_shape is not None else None
@@ -46,6 +47,10 @@ def validate_unet_dataset(
     output_shapes: Counter[tuple[int, ...]] = Counter()
     for row in rows:
         sample_report = _validate_sample(row)
+        sample_input_shape = sample_report.get("input_shape") or []
+        if require_candidate_mask and (not sample_input_shape or sample_input_shape[-1] != 2):
+            sample_report["errors"].append("Candidate-delta training requires a two-channel candidate-mask input.")
+            sample_report["usable"] = False
         report["samples"].append(sample_report)
         split_counts[sample_report["split"]] += 1
         if sample_report["usable"]:
@@ -91,6 +96,9 @@ def write_unet_config_from_dataset(
     model_name: str = "unet",
     batch_size: int = 8,
     epochs: int = 20,
+    segmentation_target: str = "validated_mask",
+    candidate_sdf: bool = False,
+    candidate_sdf_clip_distance: float = 32.0,
     target_input_shape: list[int] | tuple[int, ...] | None = None,
     target_output_shape: list[int] | tuple[int, ...] | None = None,
 ) -> dict[str, Any]:
@@ -98,9 +106,22 @@ def write_unet_config_from_dataset(
         sqlite_path,
         target_input_shape=target_input_shape,
         target_output_shape=target_output_shape,
+        require_candidate_mask=segmentation_target == "candidate_delta",
     )
     if not report["valid"]:
         raise ValueError("Cannot write U-Net config for invalid dataset: " + "; ".join(report["errors"]))
+    raw_candidate_inputs = all(
+        sample.get("input_shape") and sample["input_shape"][-1] == 2
+        for sample in report["samples"]
+        if sample.get("usable")
+    )
+    if segmentation_target == "candidate_delta" and not raw_candidate_inputs:
+        raise ValueError("candidate_delta config generation requires two-channel candidate-mask inputs")
+    if candidate_sdf and not raw_candidate_inputs:
+        raise ValueError("candidate SDF config generation requires two-channel candidate-mask inputs")
+    model_input_shape = list(report["inferred_input_shape"])
+    if candidate_sdf:
+        model_input_shape[-1] = 3
     config = {
         "run": {
             "task": "segmentation",
@@ -109,12 +130,14 @@ def write_unet_config_from_dataset(
             "notes": f"Generated from {Path(sqlite_path).name} by mask_builder",
         },
         "data": {
-            "input_shape": report["inferred_input_shape"],
+            "input_shape": model_input_shape,
             "output_shape": report["inferred_output_shape"],
             "batch_size": batch_size,
             "shuffle_buffer": max(32, report["usable_sample_count"]),
             "validation_split": 0.2,
             "test_split": 0.1,
+            "candidate_sdf": candidate_sdf,
+            "candidate_sdf_clip_distance": candidate_sdf_clip_distance,
         },
         "model": {
             "base_filters": 32,
@@ -132,6 +155,7 @@ def write_unet_config_from_dataset(
             "soft_dice_weight": 1.0,
             "soft_dice_smooth": 0.000001,
             "metrics": ["accuracy", "dice", "iou"],
+            "segmentation_target": segmentation_target,
         },
         "callbacks": {
             "early_stopping": True,

@@ -296,6 +296,58 @@ def test_mask_builder_cli_write_unet_config_with_target_shapes(monkeypatch, tmp_
     assert resolved["data"]["output_shape"] == [16, 16, 1]
 
 
+def test_mask_builder_cli_can_generate_unet_plus_plus_config(monkeypatch, tmp_path):
+    db_path = tmp_path / "masks.sqlite"
+    config_path = tmp_path / "unetpp.toml"
+    _create_mask_builder_unet_dataset(db_path)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "mask_builder.py",
+            "--database",
+            str(db_path),
+            "--write-unet-config",
+            str(config_path),
+            "--unet-model",
+            "unet_plus_plus",
+        ],
+    )
+
+    assert mask_builder.main() == 0
+    resolved = resolve_config(config_path, db_path, tmp_path / "run")
+    assert resolved["run"]["model"] == "unet_plus_plus"
+    assert resolved["training"]["loss"] == "bce_soft_dice"
+
+
+def test_mask_builder_cli_can_generate_candidate_delta_config(monkeypatch, tmp_path):
+    db_path = tmp_path / "masks.sqlite"
+    config_path = tmp_path / "delta.toml"
+    with open_database(db_path) as connection:
+        image = np.zeros((8, 9), dtype="uint8")
+        candidate = np.zeros((8, 9), dtype="uint8")
+        validated = np.zeros((8, 9), dtype="uint8")
+        candidate[1:5, 1:5] = 1
+        validated[2:6, 2:6] = 1
+        create_or_update_image_sample(connection, "sample", image, "png", {}, candidate_mask=candidate)
+        save_mask_annotation(connection, "sample", validated, "png", "test", {}, {"valid": True})
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "mask_builder.py",
+            "--database",
+            str(db_path),
+            "--write-unet-config",
+            str(config_path),
+            "--unet-segmentation-target",
+            "candidate_delta",
+        ],
+    )
+
+    assert mask_builder.main() == 0
+    resolved = resolve_config(config_path, db_path, tmp_path / "run")
+    assert resolved["training"]["segmentation_target"] == "candidate_delta"
+
+
 def test_model_training_preflight_validates_without_creating_run_dir(monkeypatch, tmp_path, capsys):
     db_path = tmp_path / "masks.sqlite"
     config_path = tmp_path / "unet.toml"

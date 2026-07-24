@@ -92,6 +92,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--write-unet-config", type=Path, help="Write a U-Net config TOML inferred from --database and exit.")
     parser.add_argument("--unet-batch-size", type=int, default=8, help="Batch size for --write-unet-config.")
     parser.add_argument("--unet-epochs", type=int, default=20, help="Epoch count for --write-unet-config.")
+    parser.add_argument(
+        "--unet-model",
+        choices=("unet", "residual_unet", "unet_plus_plus"),
+        default="unet",
+        help="Architecture for --write-unet-config.",
+    )
+    parser.add_argument(
+        "--unet-segmentation-target",
+        choices=("validated_mask", "candidate_delta"),
+        default="validated_mask",
+        help="Training target for --write-unet-config.",
+    )
+    parser.add_argument(
+        "--unet-candidate-sdf",
+        action="store_true",
+        help="Append a signed-distance field derived from the candidate mask as model input channel 2.",
+    )
+    parser.add_argument(
+        "--unet-candidate-sdf-clip-distance",
+        type=float,
+        default=32.0,
+        help="Pixel distance mapped to +/-1 in the generated candidate SDF channel.",
+    )
     parser.add_argument("--unet-input-shape", type=parse_shape, help="Target U-Net input shape, for example 256,256,2.")
     parser.add_argument("--unet-output-shape", type=parse_shape, help="Target U-Net output shape, for example 256,256,1.")
     parser.add_argument("--debug", action="store_true")
@@ -226,6 +249,10 @@ def main() -> int:
             result = write_unet_config_from_dataset(
                 database_path,
                 args.write_unet_config,
+                model_name=args.unet_model,
+                segmentation_target=args.unet_segmentation_target,
+                candidate_sdf=args.unet_candidate_sdf,
+                candidate_sdf_clip_distance=args.unet_candidate_sdf_clip_distance,
                 batch_size=args.unet_batch_size,
                 epochs=args.unet_epochs,
                 target_input_shape=args.unet_input_shape,

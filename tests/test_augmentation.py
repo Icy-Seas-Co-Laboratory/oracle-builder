@@ -3,7 +3,13 @@ from __future__ import annotations
 import numpy as np
 import tensorflow as tf
 
-from oracle_builder.training.augmentation import augment_batch, input_mask_channels, photometric_channels
+from oracle_builder.training.augmentation import (
+    augment_batch,
+    input_mask_channels,
+    photometric_channels,
+    signed_distance_input_channels,
+    transform_input_channels,
+)
 
 
 def test_segmentation_defaults_protect_candidate_mask_channel_from_photometric_changes():
@@ -91,3 +97,49 @@ def test_segmentation_augmentation_transforms_spatial_weights_with_masks():
     assert augmented_y.shape == y.shape
     assert augmented_weights.shape == weights.shape
     assert float(tf.reduce_min(augmented_weights)) >= 1.0
+
+
+def test_candidate_sdf_channel_is_excluded_from_photometric_augmentation():
+    config = {
+        "run": {"task": "segmentation"},
+        "data": {"input_shape": [4, 4, 3], "candidate_sdf": True},
+        "augmentation": {"enabled": True, "invert": True},
+    }
+    x = np.zeros((1, 4, 4, 3), dtype="float32")
+    x[..., 0] = 0.25
+    x[..., 1] = 1.0
+    x[..., 2] = np.linspace(-1, 1, 16).reshape(4, 4)
+    y = np.zeros((1, 4, 4, 1), dtype="float32")
+
+    augmented_x, _augmented_y = augment_batch(tf.constant(x), tf.constant(y), config)
+
+    assert np.allclose(augmented_x.numpy()[..., 0], 0.75)
+    assert np.array_equal(augmented_x.numpy()[..., 1], x[..., 1])
+    assert np.allclose(augmented_x.numpy()[..., 2], x[..., 2])
+    assert photometric_channels(config, config["augmentation"]) == [0]
+    assert input_mask_channels(config, config["augmentation"]) == [1]
+
+
+def test_candidate_sdf_augmentation_uses_continuous_field_and_negative_outside_fill():
+    config = {
+        "run": {"task": "segmentation"},
+        "data": {"input_shape": [4, 4, 3], "candidate_sdf": True},
+        "augmentation": {},
+    }
+    x = np.zeros((1, 4, 4, 3), dtype="float32")
+    x[..., 1] = 1.0
+    x[..., 2] = 0.5
+    transforms = tf.constant([[1.0, 0.0, 10.0, 0.0, 1.0, 10.0, 0.0, 0.0]])
+
+    transformed = transform_input_channels(
+        tf.constant(x),
+        transforms,
+        fill_value=0.0,
+        mask_channels=input_mask_channels(config, config["augmentation"]),
+        distance_channels=signed_distance_input_channels(config, config["augmentation"]),
+    ).numpy()
+
+    assert np.all(transformed[..., 0] == 0.0)
+    assert np.all(transformed[..., 1] == 0.0)
+    assert np.all(transformed[..., 2] == -1.0)
+    assert photometric_channels(config, config["augmentation"]) == [0]

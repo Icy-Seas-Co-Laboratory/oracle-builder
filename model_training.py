@@ -76,6 +76,7 @@ def main() -> int:
             args.input,
             target_input_shape=config["data"].get("input_shape"),
             target_output_shape=config["data"].get("output_shape"),
+            require_candidate_mask=config["training"].get("segmentation_target") == "candidate_delta",
         )
         print(json.dumps(report, indent=2, sort_keys=True, default=str))
         return 0 if report["valid"] else 2
@@ -112,11 +113,11 @@ def main() -> int:
         plot_history(history, run_dir)
         threshold_analysis = None
         if config["run"]["task"] == "segmentation" and "validation" in datasets:
-            validation_x, validation_y, _validation_records = load_arrays(
+            validation_x, validation_y, validation_records = load_arrays(
                 args.input, config, split="validation"
             )
             threshold_analysis = analyze_validation_threshold(
-                model, validation_x, validation_y, run_dir
+                model, validation_x, validation_y, run_dir, config=config, records=validation_records
             )
             config.setdefault("evaluation", {})["segmentation_threshold"] = threshold_analysis[
                 "best_threshold"

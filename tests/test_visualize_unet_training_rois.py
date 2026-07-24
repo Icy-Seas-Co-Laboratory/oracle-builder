@@ -119,8 +119,11 @@ def test_read_predictions_selects_named_prediction_set(tmp_path):
         ("run-b", "now", None, None, "{}"),
     )
     for name, value in (("run-a", 0.25), ("run-b", 0.75)):
-        connection.execute(
-            "INSERT INTO predictions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            connection.execute(
+            """INSERT INTO predictions (
+                prediction_set, uuid, split, y_true_blob, y_true_encoding,
+                y_pred_blob, y_pred_encoding, y_prob_json, metrics_json, metadata_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (name, "sample", "test", encode_npy(np.zeros((2, 2))), "npy", encode_npy(np.full((2, 2), value)), "npy", None, "{}", "{}"),
         )
     connection.commit()
@@ -129,3 +132,27 @@ def test_read_predictions_selects_named_prediction_set(tmp_path):
     predictions = read_predictions(database, prediction_set="run-b")
 
     assert np.all(predictions["sample"] == 0.75)
+
+
+def test_side_by_side_sheet_adds_delta_and_reconstruction_columns():
+    image = np.arange(32, dtype="uint8").reshape(4, 8)
+    candidate = np.zeros((4, 8), dtype="uint8")
+    candidate[:, :3] = 1
+    validated = candidate.copy()
+    validated[:, 2:5] = 1 - validated[:, 2:5]
+    sample = {"uuid": "sample", "image": image, "candidate_mask": candidate, "mask": validated}
+    raw_delta = np.zeros((4, 8, 1), dtype="float32")
+    raw_delta[:, 2:5, 0] = 0.9
+
+    sheet = build_side_by_side_sheet(
+        [sample],
+        {"sample": {"raw": raw_delta, "reconstructed": None, "target_mode": "candidate_delta"}},
+        thumbnail_size=16,
+        candidate_alpha=0.5,
+        prediction_alpha=0.5,
+        refined_alpha=0.5,
+        prediction_threshold=0.5,
+        show_labels=False,
+    )
+
+    assert sheet.size == (64, 40)

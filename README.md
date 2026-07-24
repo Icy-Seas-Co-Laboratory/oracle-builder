@@ -250,6 +250,10 @@ U-Net dataset utilities:
 | `--write-unet-config PATH` | Write a U-Net TOML config inferred from the dataset and exit. |
 | `--unet-batch-size N` | Batch size for generated U-Net configs. |
 | `--unet-epochs N` | Epoch count for generated U-Net configs. |
+| `--unet-model NAME` | Generated architecture: `unet`, `residual_unet`, or `unet_plus_plus`. |
+| `--unet-segmentation-target NAME` | Generated target mode: `validated_mask` or `candidate_delta`. |
+| `--unet-candidate-sdf` | Generate a three-channel model config with candidate signed distance as channel 2. |
+| `--unet-candidate-sdf-clip-distance N` | Candidate SDF distance mapped to magnitude `1`; defaults to `32` pixels. |
 | `--unet-input-shape SHAPE` | Target input shape, for example `256,256,2`. |
 | `--unet-output-shape SHAPE` | Target output shape, for example `256,256,1`. |
 
@@ -363,7 +367,7 @@ Visualization arguments:
 | `--candidate-alpha N` | Blue candidate-mask overlay opacity. |
 | `--refined-alpha N` | Green validated-mask overlay opacity. |
 | `--prediction-alpha N` | Orange model-output overlay opacity. |
-| `--prediction-threshold N` | Model probability threshold; defaults to `0.5`. |
+| `--prediction-threshold N` | Override the threshold saved with the prediction set. |
 | `--seed N` | Override split assignment seed. |
 | `--validation-split N` | Override validation split fraction. |
 | `--test-split N` | Override test split fraction. |
@@ -428,11 +432,16 @@ CREATE TABLE predictions (
     y_prob_json TEXT,
     metrics_json TEXT,
     metadata_json TEXT,
+    target_mode TEXT NOT NULL DEFAULT 'validated_mask',
+    reconstructed_pred_blob BLOB,
+    reconstructed_pred_encoding TEXT,
     PRIMARY KEY (prediction_set, uuid)
 );
 ```
 
 Multiple runs can append distinct prediction sets to the same output database. Reusing a set name replaces that set's prediction for the same ROI.
+
+For candidate-delta runs, `y_pred_blob` stores raw delta probabilities and `reconstructed_pred_blob` stores reconstructed validated-mask probabilities. The side-by-side visualizer automatically shows candidate, predicted changes, reconstructed mask, and validated mask columns.
 
 Pelagia detection ids are preserved as `samples.uuid` values unless `--uuid` is explicitly provided. Pelagia metadata is stored in `metadata_json`, including `pelagia_detection_id` and the full detection metadata under `metadata_json.pelagia`.
 
@@ -473,10 +482,43 @@ loss = "bce_soft_dice"
 bce_weight = 1.0
 soft_dice_weight = 1.0
 metrics = ["accuracy", "dice", "iou"]
+segmentation_target = "validated_mask"
+```
+
+All U-Net architectures can instead learn only the corrections between the candidate and validated masks:
+
+```toml
+[training]
+segmentation_target = "candidate_delta"
+loss = "bce_soft_dice"
+```
+
+Delta mode uses the binary target `candidate XOR validated`. It requires candidate-mask inputs with the candidate in channel 1; the model input has two channels normally or three when SDF input is enabled. At inference, the thresholded model output is XORed with that candidate to reconstruct the predicted validated mask. Validation threshold selection maximizes reconstructed validated-mask Dice, while reports also include raw delta Dice, candidate baseline Dice, Dice improvement, correction fraction, and addition/removal pixel counts. Spatial edge weights, when enabled, are calculated from the delta target. In the visualizer, predicted additions are cyan and predicted removals are red.
+
+Candidate-mask datasets can optionally provide a signed Euclidean distance field as a third model input:
+
+```toml
+[data]
+input_shape = [256, 256, 3]
+candidate_sdf = true
+candidate_sdf_clip_distance = 32.0
+```
+
+The database remains a two-channel ROI-plus-candidate dataset. During loading, oracle-builder resizes and pads the candidate, calculates `distance_inside - distance_outside`, divides by `candidate_sdf_clip_distance`, clips to `[-1, 1]`, and appends it as channel 2. Positive values are inside the candidate and negative values are outside. Empty and full masks produce constant `-1` and `1` fields. Only channel 0 receives photometric augmentation; channel 1 remains a nearest-neighbor binary mask, while the SDF receives the same geometry with bilinear interpolation.
+
+Generate this configuration directly with:
+
+```bash
+python3 mask_builder.py \
+  --database datasets/unet_training.sqlite \
+  --write-unet-config configs/delta_sdf_unet.toml \
+  --unet-segmentation-target candidate_delta \
+  --unet-candidate-sdf \
+  --unet-candidate-sdf-clip-distance 32
 ```
 
 U-Net segmentation can emphasize errors near target boundaries using per-pixel weights
-`w = 1 + lambda * exp(-d^2 / (2 * sigma^2))`, where `d` is the Euclidean distance to the validated-mask boundary:
+`w = 1 + lambda * exp(-d^2 / (2 * sigma^2))`, where `d` is the Euclidean distance to the active training-target boundary:
 
 ```toml
 [training]
@@ -636,10 +678,14 @@ The registry currently supports:
 
 - `simple_cnn`
 - `unet`
+- `residual_unet` (alias: `resunet`)
+- `unet_plus_plus` (alias: `unetpp`)
 - `resnet_like`
 - `densenet_like`
 
 Each model module exposes `build_model(config: dict)`. Add future models in `models/` and register them in `oracle_builder/registry.py`.
+
+The residual U-Net replaces each ordinary convolutional block with a learned residual block and projection shortcut. U-Net++ uses nested dense skip connections between encoder and decoder nodes. Both accept the standard U-Net model options: `base_filters`, `depth`, `dropout`, `activation`, and `final_activation`. U-Net++ additionally accepts `deep_supervision = true`; its full-resolution supervision heads are averaged into one segmentation output so it remains compatible with the existing dataset, loss, evaluation, and prediction pipeline. Example configurations are provided in `configs/example_segmentation_residual_unet.toml` and `configs/example_segmentation_unet_plus_plus.toml`.
 
 ## Analysis Helpers
 

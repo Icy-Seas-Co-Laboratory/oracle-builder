@@ -12,6 +12,8 @@ from PIL import Image
 
 from oracle_builder.data.decoders import decode_blob, encode_npy, normalize_input
 from oracle_builder.data.splits import assign_missing_splits
+from oracle_builder.data.signed_distance import signed_distance_field
+from oracle_builder.evaluation.segmentation_targets import CANDIDATE_DELTA, candidate_delta, segmentation_target_mode
 
 
 SAMPLE_COLUMNS = [
@@ -89,9 +91,10 @@ def load_arrays(sqlite_path: str | Path, config: dict[str, Any], split: str | No
     records: list[dict[str, Any]] = []
     for row in rows:
         x = decode_blob(row["input_blob"], row["input_blob_encoding"], row["input_blob_dimensions"])
+        candidate = _candidate_mask_for_output(x, output_shape) if task == "segmentation" else None
         y = decode_blob(row["output_blob"], row["output_blob_encoding"], row["output_blob_dimensions"])
         if task == "segmentation":
-            x = resize_segmentation_input(x, input_shape)
+            x = prepare_segmentation_input(x, input_shape, config)
         xs.append(normalize_input(x, input_shape))
         if task == "classification":
             ys.append(int(y if y is not None else row.get("label_text")))
@@ -102,6 +105,11 @@ def load_arrays(sqlite_path: str | Path, config: dict[str, Any], split: str | No
             if (row.get("output_blob_encoding") or "").lower() == "png":
                 target = (target > 0).astype("float32")
             target = resize_array_to_shape(target, output_shape, mask=True)
+            validated_target = target.reshape(output_shape)
+            if segmentation_target_mode(config) == CANDIDATE_DELTA:
+                if candidate is None:
+                    raise ValueError(f"Sample {row['uuid']} has no candidate mask required for candidate_delta training")
+                target = candidate_delta(candidate, validated_target)
             ys.append(target.reshape(output_shape))
         records.append(
             {
@@ -110,6 +118,8 @@ def load_arrays(sqlite_path: str | Path, config: dict[str, Any], split: str | No
                 "label_text": row.get("label_text"),
                 "sample_weight": row.get("sample_weight"),
                 "metadata": json.loads(row["metadata_json"]) if row.get("metadata_json") else {},
+                "candidate_mask": candidate,
+                "validated_mask": validated_target if task == "segmentation" else None,
             }
         )
     return np.stack(xs), np.asarray(ys), records
@@ -145,8 +155,11 @@ def load_prediction_arrays(
     records: list[dict[str, Any]] = []
     for row in assigned:
         x = decode_blob(row["input_blob"], row["input_blob_encoding"], row["input_blob_dimensions"])
+        candidate = _candidate_mask_for_output(x, output_shape) if task == "segmentation" else None
+        if task == "segmentation" and segmentation_target_mode(config) == CANDIDATE_DELTA and candidate is None:
+            raise ValueError(f"Sample {row['uuid']} has no candidate mask required for candidate_delta prediction")
         if task == "segmentation":
-            x = resize_segmentation_input(x, input_shape)
+            x = prepare_segmentation_input(x, input_shape, config)
         xs.append(normalize_input(x, input_shape))
         if row.get("output_blob") is None:
             target = None
@@ -159,6 +172,9 @@ def load_prediction_arrays(
                 if (row.get("output_blob_encoding") or "").lower() == "png":
                     target = (target > 0).astype("float32")
                 target = resize_array_to_shape(target, output_shape, mask=True)
+                validated_target = target.reshape(output_shape)
+                if segmentation_target_mode(config) == CANDIDATE_DELTA:
+                    target = candidate_delta(candidate, validated_target)
         targets.append(target)
         records.append(
             {
@@ -167,9 +183,20 @@ def load_prediction_arrays(
                 "label_text": row.get("label_text"),
                 "sample_weight": row.get("sample_weight"),
                 "metadata": json.loads(row["metadata_json"]) if row.get("metadata_json") else {},
+                "candidate_mask": candidate,
+                "validated_mask": validated_target if task == "segmentation" and row.get("output_blob") is not None else None,
             }
         )
     return np.stack(xs), targets, records
+
+
+def _candidate_mask_for_output(array: Any, output_shape: list[int] | tuple[int, ...] | None) -> np.ndarray | None:
+    if output_shape is None:
+        return None
+    value = np.asarray(array)
+    if value.ndim != 3 or value.shape[-1] != 2:
+        return None
+    return resize_array_to_shape(value[..., 1], output_shape, mask=True).reshape(output_shape)
 
 
 def make_tf_datasets(sqlite_path: str | Path, config: dict[str, Any]):
@@ -226,6 +253,31 @@ def resize_segmentation_input(array: Any, input_shape: list[int] | tuple[int, ..
             candidate = np.where(candidate > 0, np.iinfo(value.dtype).max, 0).astype(value.dtype)
         return np.stack([roi, candidate], axis=-1)
     return resize_array_to_shape(value, target_shape, mask=False)
+
+
+def prepare_segmentation_input(
+    array: Any,
+    input_shape: list[int] | tuple[int, ...],
+    config: dict[str, Any],
+) -> np.ndarray:
+    if not config.get("data", {}).get("candidate_sdf", False):
+        return resize_segmentation_input(array, input_shape)
+    value = np.asarray(array)
+    target_shape = tuple(int(part) for part in input_shape)
+    if value.ndim != 3 or value.shape[-1] != 2 or len(target_shape) != 3 or target_shape[-1] != 3:
+        raise ValueError(
+            f"Candidate SDF input requires a raw two-channel ROI+candidate array and target shape [H, W, 3], got {value.shape} -> {target_shape}"
+        )
+    roi = resize_array_to_shape(value[..., 0], target_shape[:2], mask=False)
+    candidate = resize_array_to_shape(value[..., 1], target_shape[:2], mask=True)
+    roi = np.asarray(roi, dtype="float32")
+    if value.dtype.kind in {"u", "i"} and roi.max(initial=0) > 1:
+        roi /= float(np.iinfo(value.dtype).max)
+    sdf = signed_distance_field(
+        candidate,
+        clip_distance=float(config["data"].get("candidate_sdf_clip_distance", 32.0)),
+    )
+    return np.stack([roi, candidate.astype("float32"), sdf], axis=-1)
 
 
 def resize_array_to_shape(
