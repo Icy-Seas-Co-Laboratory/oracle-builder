@@ -38,9 +38,15 @@ def test_tiny_model_save_and_reload(tmp_path: Path):
     assert report["weights_reloaded_into_rebuilt_model"]
     assert report["prediction_test_passed"]
     assert (tmp_path / "model" / "load_test_report.json").exists()
+    assert (tmp_path / "model" / "model_manifest.json").exists()
 
     exported = tf.saved_model.load(str(tmp_path / "model" / "export_savedmodel"))
     assert {"serving_default", "classify", "embed"} <= set(exported.signatures)
+    served = exported.signatures["serving_default"](
+        inputs=tf.zeros((1, 16, 16, 1), dtype=tf.float32)
+    )
+    assert {"logits", "probabilities", "features"} <= set(served)
+    assert served["logits"].shape == (1, 2)
     features = exported.signatures["embed"](
         inputs=tf.zeros((1, 16, 16, 1), dtype=tf.float32)
     )["features"].numpy()

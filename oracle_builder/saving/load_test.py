@@ -8,6 +8,7 @@ import tensorflow as tf
 from tensorflow import keras
 
 from oracle_builder.classification.features import L2Normalization
+from oracle_builder.training.losses import WeightedSparseCategoricalCrossentropy
 from oracle_builder.training.train import build_and_compile_model
 
 
@@ -18,9 +19,12 @@ def _synthetic_input(config: dict[str, Any]) -> np.ndarray:
 def _load_keras_model(path: str | Path):
     return keras.models.load_model(
         path,
+        compile=False,
         custom_objects={
             "L2Normalization": L2Normalization,
             "oracle_builder>L2Normalization": L2Normalization,
+            "WeightedSparseCategoricalCrossentropy": WeightedSparseCategoricalCrossentropy,
+            "oracle_builder>WeightedSparseCategoricalCrossentropy": WeightedSparseCategoricalCrossentropy,
         },
     )
 
@@ -83,6 +87,17 @@ def run_load_tests(run_dir: str | Path, config: dict[str, Any], initial_report: 
 
 
 def load_model_for_run(run_dir: str | Path, config: dict[str, Any]):
+    from oracle_builder.artifacts.layout import RunLayout
+    from oracle_builder.artifacts.run import validate_run_artifact
+
+    layout = RunLayout(run_dir)
+    if layout.manifest.exists():
+        validation = validate_run_artifact(layout.root)
+        if not validation["valid"]:
+            raise RuntimeError(
+                "Run artifact integrity validation failed: "
+                + "; ".join(validation["errors"])
+            )
     model_path = Path(run_dir) / "model"
     errors = []
     try:
@@ -129,3 +144,29 @@ class SavedModelPredictor:
         input_name = next(iter(self.embed.structured_input_signature[1]))
         output = self.embed(**{input_name: tf.constant(x)})
         return output["features"].numpy()
+
+    def predict_outputs(self, x, verbose: int = 0):
+        del verbose
+        output = self.infer(**{self.input_name: tf.constant(x)})
+        probabilities = output.get("probabilities")
+        if probabilities is None:
+            probabilities = next(iter(output.values()))
+        logits = output.get("logits")
+        if logits is None:
+            values = np.asarray(probabilities.numpy())
+            logits_value = np.log(np.clip(values, 1e-7, 1.0))
+            logits_source = "derived_log_probability"
+        else:
+            logits_value = logits.numpy()
+            logits_source = "model"
+        features = None
+        if "features" in output:
+            features = output["features"].numpy()
+        elif self.embed is not None:
+            features = self.predict_features(x)
+        return {
+            "logits": logits_value,
+            "probabilities": probabilities.numpy(),
+            "features": features,
+            "logits_source": logits_source,
+        }

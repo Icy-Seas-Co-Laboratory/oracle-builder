@@ -9,7 +9,14 @@ from typing import Any
 import numpy as np
 
 from oracle_builder.data.decoders import decode_blob
+from oracle_builder.data.sqlite_dataset import read_rows
+from oracle_builder.datasets.schema import (
+    dataset_fingerprint,
+    read_dataset_info,
+    validate_database,
+)
 from oracle_builder.masking.sqlite_io import decode_mask
+from oracle_builder.datasets.legacy_roi import ensure_mask_refinement_database
 
 
 def validate_unet_dataset(
@@ -18,15 +25,55 @@ def validate_unet_dataset(
     target_output_shape: list[int] | tuple[int, ...] | None = None,
     require_candidate_mask: bool = False,
 ) -> dict[str, Any]:
+    migration = ensure_mask_refinement_database(sqlite_path)
     rows = _read_masked_sample_rows(sqlite_path)
+    with sqlite3.connect(Path(sqlite_path).expanduser().resolve()) as connection:
+        dataset_info = read_dataset_info(connection)
+        schema_validation = validate_database(connection)
+        fingerprint = dataset_fingerprint(connection)
+        item_count = int(
+            connection.execute("SELECT count(*) FROM dataset_items").fetchone()[0]
+        )
+        annotation_count = int(
+            connection.execute("SELECT count(*) FROM mask_annotations").fetchone()[0]
+        )
+        candidate_mask_count = int(
+            connection.execute(
+                """
+                SELECT count(*) FROM mask_refinement_items
+                WHERE candidate_mask_asset_id IS NOT NULL
+                """
+            ).fetchone()[0]
+        )
     target_input_shape = list(target_input_shape) if target_input_shape is not None else None
     target_output_shape = list(target_output_shape) if target_output_shape is not None else None
     report: dict[str, Any] = {
         "valid": True,
         "database": str(sqlite_path),
+        "dataset": {
+            "dataset_id": dataset_info["dataset_id"],
+            "revision_id": dataset_info["revision_id"],
+            "parent_revision_id": dataset_info.get("parent_revision_id"),
+            "dataset_type": dataset_info["dataset_type"],
+            "schema_name": dataset_info["schema_name"],
+            "schema_version": dataset_info["schema_version"],
+            "lifecycle": dataset_info["lifecycle"],
+            "fingerprint_sha256": fingerprint,
+        },
+        "migration": migration,
+        "schema_validation": {
+            "valid": schema_validation["valid"],
+            "errors": list(schema_validation["errors"]),
+            "warnings": list(schema_validation["warnings"]),
+        },
+        "item_count": item_count,
         "sample_count": len(rows),
+        "annotated_item_count": len(rows),
+        "missing_current_mask_count": item_count - len(rows),
+        "annotation_count": annotation_count,
+        "historical_annotation_count": annotation_count - len(rows),
+        "candidate_mask_count": candidate_mask_count,
         "usable_sample_count": 0,
-        "split_counts": {},
         "input_shapes": {},
         "output_shapes": {},
         "target_input_shape": target_input_shape,
@@ -37,12 +84,17 @@ def validate_unet_dataset(
         "errors": [],
         "samples": [],
     }
+    report["errors"].extend(
+        f"Dataset schema: {error}" for error in schema_validation["errors"]
+    )
+    report["warnings"].extend(
+        f"Dataset schema: {warning}" for warning in schema_validation["warnings"]
+    )
     if not rows:
         report["valid"] = False
-        report["errors"].append("No samples with accepted masks were found in samples.output_blob.")
+        report["errors"].append("No mask-refinement items with a current accepted mask were found.")
         return report
 
-    split_counts: Counter[str] = Counter()
     input_shapes: Counter[tuple[int, ...]] = Counter()
     output_shapes: Counter[tuple[int, ...]] = Counter()
     for row in rows:
@@ -52,7 +104,6 @@ def validate_unet_dataset(
             sample_report["errors"].append("Candidate-delta training requires a two-channel candidate-mask input.")
             sample_report["usable"] = False
         report["samples"].append(sample_report)
-        split_counts[sample_report["split"]] += 1
         if sample_report["usable"]:
             report["usable_sample_count"] += 1
             input_shapes[tuple(sample_report["input_shape"])] += 1
@@ -60,7 +111,6 @@ def validate_unet_dataset(
         report["warnings"].extend(f"{sample_report['uuid']}: {warning}" for warning in sample_report["warnings"])
         report["errors"].extend(f"{sample_report['uuid']}: {error}" for error in sample_report["errors"])
 
-    report["split_counts"] = dict(sorted(split_counts.items()))
     report["input_shapes"] = {str(list(shape)): count for shape, count in sorted(input_shapes.items())}
     report["output_shapes"] = {str(list(shape)): count for shape, count in sorted(output_shapes.items())}
     if input_shapes:
@@ -206,27 +256,16 @@ def write_unet_config_from_dataset(
 
 
 def _read_masked_sample_rows(sqlite_path: str | Path) -> list[dict[str, Any]]:
-    connection = sqlite3.connect(sqlite_path)
-    connection.row_factory = sqlite3.Row
-    try:
-        rows = connection.execute(
-            """
-            SELECT uuid, split, input_blob, input_blob_encoding, input_blob_dimensions,
-                   output_blob, output_blob_encoding, output_blob_dimensions, metadata_json
-            FROM samples
-            WHERE output_blob IS NOT NULL AND length(output_blob) > 0
-            ORDER BY uuid
-            """
-        ).fetchall()
-        return [dict(row) for row in rows]
-    finally:
-        connection.close()
+    return [
+        row
+        for row in read_rows(sqlite_path)
+        if row.get("output_blob") is not None
+    ]
 
 
 def _validate_sample(row: dict[str, Any]) -> dict[str, Any]:
     sample_report = {
         "uuid": row["uuid"],
-        "split": row.get("split") or "unspecified",
         "usable": True,
         "input_shape": None,
         "output_shape": None,

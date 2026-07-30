@@ -1,24 +1,34 @@
 # Datasets
 
-oracle-builder expects a SQLite database with a `samples` table:
+Oracle Builder dataset schema V1 uses one SQLite file per dataset. A dataset is
+typed as either `classification` or `mask_refinement`; both share stable
+identity, metadata, assets, provenance, lifecycle, and validation
+contracts.
 
-```sql
-CREATE TABLE samples (
-    uuid TEXT PRIMARY KEY,
-    split TEXT,
-    input_blob BLOB,
-    input_blob_encoding TEXT,
-    input_blob_dimensions TEXT,
-    output_blob BLOB,
-    output_blob_encoding TEXT,
-    output_blob_dimensions TEXT,
-    label_text TEXT,
-    sample_weight REAL,
-    metadata_json TEXT
-);
+Create tiny working examples:
+
+```bash
+python3 -m oracle_builder.data.sqlite_dataset \
+  --classification datasets/example_classification.sqlite
+
+python3 -m oracle_builder.data.sqlite_dataset \
+  --segmentation datasets/example_segmentation.sqlite
 ```
 
-Use `python3 -m oracle_builder.data.sqlite_dataset --classification datasets/example_classification.sqlite`
-or `python3 -m oracle_builder.data.sqlite_dataset --segmentation datasets/example_segmentation.sqlite`
-to create tiny synthetic examples.
+Create a frozen training checkpoint:
 
+```bash
+oracle-dataset checkpoint datasets/example_classification.sqlite
+```
+
+Inspect, validate, export, restore, or explicitly reopen a dataset:
+
+```bash
+oracle-dataset info DATASET.sqlite
+oracle-dataset validate DATASET.sqlite
+oracle-dataset export DATASET.sqlite EXPORT_DIRECTORY
+oracle-dataset import EXPORT_DIRECTORY RESTORED.sqlite
+oracle-dataset thaw DATASET.sqlite --reason "resume curation"
+```
+
+See [the V1 schema contract](../docs/dataset-schema-v1.md).

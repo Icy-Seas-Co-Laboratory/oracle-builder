@@ -11,7 +11,7 @@ batch_size = 16
 shuffle_buffer = 128
 validation_split = 0.25
 test_split = 0.1
-candidate_sdf = false
+candidate_sdf = true
 candidate_sdf_clip_distance = 32.0
 
 [model]

@@ -8,7 +8,16 @@ import sys
 import uuid
 from pathlib import Path
 
-from oracle_builder.config import copy_run_config, resolve_config, write_json
+from oracle_builder.artifacts import (
+    RunLayout,
+    attach_split_manifest,
+    create_run_artifact,
+    create_split_manifest,
+    seal_run_artifact,
+    update_run_artifact,
+    write_run_config,
+)
+from oracle_builder.config import resolve_config
 from oracle_builder.environment import write_environment
 from oracle_builder.paths import create_run_dir
 
@@ -58,13 +67,13 @@ def main() -> int:
     if args.resume:
         print("--resume is reserved for a future implementation.", file=sys.stderr)
         return 2
-    run_dir = Path(args.runs_dir) / args.output if args.preflight else create_run_dir(
-        args.runs_dir,
-        args.output,
-        overwrite=args.overwrite,
-        dry_run=args.dry_run,
-    )
+    run_dir = Path(args.runs_dir) / args.output
     config = resolve_config(args.config, args.input, run_dir)
+    if not args.preflight and not args.dry_run and config["dataset"]["lifecycle"] != "frozen":
+        raise ValueError(
+            "Model training requires a frozen dataset checkpoint. Run "
+            f"`oracle-dataset checkpoint {args.input}` and train from the resulting file."
+        )
     config["debug"] = bool(args.debug)
     if args.preflight:
         if config["run"]["task"] != "segmentation":
@@ -85,15 +94,29 @@ def main() -> int:
         return 0
     if args.overwrite and run_dir.exists():
         shutil.rmtree(run_dir)
-        run_dir = create_run_dir(args.runs_dir, args.output, overwrite=True)
+    run_dir = create_run_dir(args.runs_dir, args.output)
 
-    copy_run_config(args.config, run_dir)
-    write_json(run_dir / "resolved_config.json", config)
     run_id = str(uuid.uuid4())
-    run_metadata = {"run_id": run_id, "run_name": args.output, "status": "running"}
-    write_json(run_dir / "run_metadata.json", run_metadata)
+    config["run"]["run_id"] = run_id
+    config["run"]["run_name"] = args.output
+    manifest = create_run_artifact(
+        run_dir,
+        run_id=run_id,
+        name=args.output,
+        config=config,
+        source_config=args.config,
+    )
+    split_manifest = create_split_manifest(run_dir, args.input, config)
+    attach_split_manifest(config, split_manifest)
+    config["artifact"] = {
+        "artifact_id": manifest["artifact_id"],
+        "schema_name": manifest["artifact_schema"]["name"],
+        "schema_version": manifest["artifact_schema"]["version"],
+    }
+    write_run_config(run_dir, config)
+    layout = RunLayout(run_dir)
     environment = write_environment(run_dir)
-    training_log = run_dir / "training_log.sqlite"
+    training_log = layout.training_log
     from oracle_builder.training.logging_callbacks import init_training_log, log_event, mark_run_complete
 
     init_training_log(training_log, run_id, args.output, config, environment)
@@ -107,24 +130,85 @@ def main() -> int:
         from oracle_builder.saving.save_model import save_model_artifacts, write_load_test_report
         from oracle_builder.training.train import train_model
 
-        datasets, records_by_split = make_tf_datasets(args.input, config)
+        streaming_bundle = None
+        if (
+            config["run"]["task"] == "classification"
+            and config.get("data", {}).get("streaming", {}).get("enabled", True)
+        ):
+            from oracle_builder.data.sqlite_stream import (
+                build_classification_index,
+                make_streaming_classification_bundle,
+            )
+
+            streaming_bundle = make_streaming_classification_bundle(args.input, config)
+            datasets = streaming_bundle.datasets
+            records_by_split = {
+                split: list(index.iter_records())
+                for split, index in streaming_bundle.indices.items()
+            }
+        else:
+            datasets, records_by_split = make_tf_datasets(args.input, config)
         log_event(training_log, run_id, "INFO", "Datasets loaded", {"splits": list(datasets)})
+        if config["run"]["task"] == "classification":
+            from oracle_builder.training.class_weights import (
+                resolve_class_weights,
+                uses_weighted_cross_entropy,
+            )
+
+            if uses_weighted_cross_entropy(config):
+                from oracle_builder.data.sqlite_stream import (
+                    build_classification_index,
+                )
+
+                weight_index = build_classification_index(
+                    args.input,
+                    config,
+                    "train",
+                    labeled_only=True,
+                )
+                resolved_weights = resolve_class_weights(
+                    [ref.target for ref in weight_index.refs],
+                    int(config["data"]["num_classes"]),
+                    config["training"].get("class_weights", {}),
+                )
+                config["training"]["class_weights"] = resolved_weights
+                write_run_config(run_dir, config)
+                log_event(
+                    training_log,
+                    run_id,
+                    "INFO",
+                    "Resolved weighted cross entropy class weights",
+                    resolved_weights,
+                )
         pretraining_dataset = None
         if config.get("pretraining", {}).get("enabled", False):
-            from oracle_builder.training.student_teacher import make_pretraining_dataset
+            if streaming_bundle is not None:
+                pretraining_index = build_classification_index(
+                    args.input,
+                    config,
+                    "train",
+                    labeled_only=False,
+                )
+                pretraining_dataset = streaming_bundle.source.image_dataset(
+                    pretraining_index
+                )
+                pretraining_count = len(pretraining_index)
+            else:
+                from oracle_builder.training.student_teacher import make_pretraining_dataset
 
-            pretraining_x, _, pretraining_records = load_prediction_arrays(
-                args.input,
-                config,
-                split="train",
-            )
-            pretraining_dataset = make_pretraining_dataset(pretraining_x, config)
+                pretraining_x, _, pretraining_records = load_prediction_arrays(
+                    args.input,
+                    config,
+                    split="train",
+                )
+                pretraining_dataset = make_pretraining_dataset(pretraining_x, config)
+                pretraining_count = len(pretraining_records)
             log_event(
                 training_log,
                 run_id,
                 "INFO",
                 "Loaded self-supervised pretraining inputs",
-                {"samples": len(pretraining_records), "split": "train"},
+                {"samples": pretraining_count, "split": "train"},
             )
         model, history = train_model(
             config,
@@ -134,48 +218,109 @@ def main() -> int:
             run_id,
             pretraining_dataset=pretraining_dataset,
         )
-        plot_history(history, run_dir)
+        from oracle_builder.inference.batching import (
+            resolve_inference_batch_size,
+        )
+        from oracle_builder.progress import PostTrainingProgress
+
+        post_stage_count = 6
+        if config["run"]["task"] == "classification" and config.get(
+            "evidence", {}
+        ).get("enabled", True):
+            post_stage_count += 1
+        if config["run"]["task"] == "segmentation" and "validation" in datasets:
+            post_stage_count += 1
+        if config.get("output", {}).get("save_predictions", True):
+            post_stage_count += 1
+        post_progress = PostTrainingProgress(post_stage_count)
+
+        with post_progress.stage("Rendering training-history figures"):
+            plot_history(history, run_dir)
+        with post_progress.stage("Selecting a safe inference batch size"):
+            inference_batch_plan = resolve_inference_batch_size(model, config)
+            inference_batch_size = inference_batch_plan.batch_size
+            log_event(
+                training_log,
+                run_id,
+                "INFO",
+                "Resolved inference batch size",
+                inference_batch_plan.to_dict(),
+            )
         evidence_index = None
         if (
             config["run"]["task"] == "classification"
             and config.get("evidence", {}).get("enabled", True)
         ):
-            from oracle_builder.classification.evidence import build_evidence_index
+            with post_progress.stage(
+                "Building prototype and nearest-neighbor evidence"
+            ):
+                if streaming_bundle is not None:
+                    from oracle_builder.classification.evidence import (
+                        build_evidence_index_streaming,
+                    )
 
-            evidence_x, evidence_y, evidence_records = load_arrays(
-                args.input,
-                config,
-                split="train",
-            )
-            evidence_index = build_evidence_index(
-                model,
-                evidence_x,
-                evidence_y,
-                evidence_records,
-                run_dir / "model" / "classification_evidence.npz",
-            )
+                    evidence_sample_index = streaming_bundle.indices["train"]
+                    evidence_index = build_evidence_index_streaming(
+                        model,
+                        streaming_bundle.source.indexed_image_dataset(
+                            evidence_sample_index,
+                            batch_size=inference_batch_size,
+                        ),
+                        evidence_sample_index,
+                        run_dir / "model" / "classification_evidence",
+                        progress=bool(
+                            config.get("inference", {}).get("progress", True)
+                        ),
+                    )
+                    evidence_reference_count = len(evidence_sample_index)
+                else:
+                    from oracle_builder.classification.evidence import (
+                        build_evidence_index,
+                    )
+
+                    evidence_x, evidence_y, evidence_records = load_arrays(
+                        args.input,
+                        config,
+                        split="train",
+                    )
+                    evidence_index = build_evidence_index(
+                        model,
+                        evidence_x,
+                        evidence_y,
+                        evidence_records,
+                        run_dir / "model" / "classification_evidence",
+                    )
+                    evidence_reference_count = len(evidence_records)
             log_event(
                 training_log,
                 run_id,
                 "INFO",
                 "Built classification prototype and KNN evidence index",
                 {
-                    "reference_count": len(evidence_records),
+                    "reference_count": evidence_reference_count,
                     "classes": [int(value) for value in evidence_index.prototype_labels],
                 },
             )
         threshold_analysis = None
         if config["run"]["task"] == "segmentation" and "validation" in datasets:
-            validation_x, validation_y, validation_records = load_arrays(
-                args.input, config, split="validation"
-            )
-            threshold_analysis = analyze_validation_threshold(
-                model, validation_x, validation_y, run_dir, config=config, records=validation_records
-            )
-            config.setdefault("evaluation", {})["segmentation_threshold"] = threshold_analysis[
-                "best_threshold"
-            ]
-            write_json(run_dir / "resolved_config.json", config)
+            with post_progress.stage(
+                "Optimizing the segmentation threshold on validation data"
+            ):
+                validation_x, validation_y, validation_records = load_arrays(
+                    args.input, config, split="validation"
+                )
+                threshold_analysis = analyze_validation_threshold(
+                    model,
+                    validation_x,
+                    validation_y,
+                    run_dir,
+                    config=config,
+                    records=validation_records,
+                )
+                config.setdefault("evaluation", {})[
+                    "segmentation_threshold"
+                ] = threshold_analysis["best_threshold"]
+                write_run_config(run_dir, config)
             log_event(
                 training_log,
                 run_id,
@@ -183,39 +328,91 @@ def main() -> int:
                 "Optimized segmentation probability threshold on validation data",
                 threshold_analysis,
             )
-        save_report = save_model_artifacts(model, run_dir, config)
-        load_report = run_load_tests(run_dir, config, save_report)
-        write_load_test_report(run_dir, load_report)
-        evaluation = evaluate_run_model(model, config, args.input, run_dir, split="test")
-        if config.get("output", {}).get("save_predictions", True):
-            predictions_path = run_dir / "predictions" / "predictions.sqlite"
-            x, targets, records = load_prediction_arrays(args.input, config)
-            write_predictions_db(
+        with post_progress.stage("Saving portable model formats and manifests"):
+            save_report = save_model_artifacts(model, run_dir, config)
+        with post_progress.stage("Reloading and testing saved model formats"):
+            load_report = run_load_tests(run_dir, config, save_report)
+            write_load_test_report(run_dir, load_report)
+        with post_progress.stage("Evaluating the held-out test split"):
+            evaluation = evaluate_run_model(
                 model,
-                x,
-                targets,
-                records,
                 config,
-                predictions_path,
-                source_sqlite=args.input,
-                prediction_set=args.output,
-                evidence_index=evidence_index,
+                args.input,
+                run_dir,
+                split="test",
+                inference_batch_size=inference_batch_size,
             )
-        run_metadata["status"] = "complete"
-        run_metadata["evaluation_summary"] = evaluation.get("summary")
+        if config.get("output", {}).get("save_predictions", True):
+            with post_progress.stage(
+                "Generating and storing predictions for every dataset split"
+            ):
+                predictions_path = (
+                    run_dir / "predictions" / "predictions.sqlite"
+                )
+                if streaming_bundle is not None:
+                    from oracle_builder.data.sqlite_stream import (
+                        build_all_classification_index,
+                    )
+                    from oracle_builder.evaluation.predictions import (
+                        write_classification_predictions_streaming,
+                    )
+
+                    prediction_index = build_all_classification_index(
+                        args.input,
+                        config,
+                        labeled_only=False,
+                    )
+                    write_classification_predictions_streaming(
+                        model,
+                        streaming_bundle.source.indexed_image_dataset(
+                            prediction_index,
+                            batch_size=inference_batch_size,
+                        ),
+                        prediction_index,
+                        config,
+                        predictions_path,
+                        source_sqlite=args.input,
+                        prediction_set=args.output,
+                        evidence_index=evidence_index,
+                        progress=bool(
+                            config.get("inference", {}).get("progress", True)
+                        ),
+                    )
+                else:
+                    x, targets, records = load_prediction_arrays(
+                        args.input, config
+                    )
+                    write_predictions_db(
+                        model,
+                        x,
+                        targets,
+                        records,
+                        config,
+                        predictions_path,
+                        source_sqlite=args.input,
+                        prediction_set=args.output,
+                        evidence_index=evidence_index,
+                        inference_batch_size=inference_batch_size,
+                    )
+        summary = {
+            "evaluation": evaluation.get("summary"),
+            "inference_batching": inference_batch_plan.to_dict(),
+        }
         if threshold_analysis is not None:
-            run_metadata["validation_threshold_analysis"] = {
+            summary["validation_threshold_analysis"] = {
                 key: value for key, value in threshold_analysis.items() if key != "curve"
             }
-        write_json(run_dir / "run_metadata.json", run_metadata)
-        mark_run_complete(training_log, run_id, "complete")
+        with post_progress.stage("Finalizing and sealing the run artifact"):
+            mark_run_complete(training_log, run_id, "complete")
+            update_run_artifact(run_dir, status="complete", summary=summary)
+            seal_run_artifact(run_dir)
+        print(f"Training run complete: {run_dir}", flush=True)
         return 0
     except Exception as exc:
         log_event(training_log, run_id, "ERROR", "Training run failed", {"error": str(exc)})
         mark_run_complete(training_log, run_id, "failed")
-        run_metadata["status"] = "failed"
-        run_metadata["error"] = str(exc)
-        write_json(run_dir / "run_metadata.json", run_metadata)
+        update_run_artifact(run_dir, status="failed", error=str(exc))
+        seal_run_artifact(run_dir)
         raise
 
 

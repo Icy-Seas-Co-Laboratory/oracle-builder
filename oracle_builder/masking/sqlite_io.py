@@ -12,6 +12,9 @@ import numpy as np
 from PIL import Image
 
 from oracle_builder.data.decoders import decode_blob, encode_npy
+from oracle_builder.datasets.repository import SQLiteDatasetRepository
+from oracle_builder.datasets.schema import initialize_database
+from oracle_builder.datasets.legacy_roi import ensure_mask_refinement_database
 from oracle_builder.data.sqlite_dataset import ensure_schema
 from oracle_builder.masking.image_io import encode_image_png
 
@@ -31,37 +34,11 @@ def _utc_now() -> str:
 
 
 def ensure_mask_annotation_table(conn: sqlite3.Connection) -> None:
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS mask_annotations (
-            annotation_id TEXT PRIMARY KEY,
-            sample_uuid TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            annotator TEXT,
-            mask_blob BLOB NOT NULL,
-            mask_blob_encoding TEXT NOT NULL,
-            mask_blob_dimensions TEXT NOT NULL,
-            method TEXT,
-            parameters_json TEXT,
-            validation_json TEXT,
-            accepted INTEGER DEFAULT 1,
-            notes TEXT
-        )
-        """
-    )
+    initialize_database(conn, "mask_refinement")
 
 
 def ensure_mask_builder_columns(conn: sqlite3.Connection) -> None:
-    ensure_schema(conn)
-    columns = {row[1] for row in conn.execute("PRAGMA table_info(samples)").fetchall()}
-    additions = {
-        "input_aux_blob": "BLOB",
-        "input_aux_blob_encoding": "TEXT",
-        "input_aux_blob_dimensions": "TEXT",
-    }
-    for column, column_type in additions.items():
-        if column not in columns:
-            conn.execute(f"ALTER TABLE samples ADD COLUMN {column} {column_type}")
+    initialize_database(conn, "mask_refinement")
 
 
 def encode_mask(mask: np.ndarray, mask_encoding: str) -> tuple[bytes, str, str]:
@@ -158,32 +135,57 @@ def _mask_channel(mask: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
 
 def load_sample(conn: sqlite3.Connection, uuid: str) -> dict[str, Any]:
     conn.row_factory = sqlite3.Row
-    row = conn.execute("SELECT * FROM samples WHERE uuid = ?", (uuid,)).fetchone()
+    row = conn.execute(
+        """
+        SELECT di.item_id, di.sample_weight, di.metadata_json,
+               image.payload AS image_blob, image.encoding AS image_encoding,
+               image.shape_json AS image_dimensions,
+               candidate.payload AS candidate_blob,
+               candidate.encoding AS candidate_encoding,
+               candidate.shape_json AS candidate_dimensions,
+               mask.payload AS mask_blob, mask.encoding AS mask_encoding,
+               mask.shape_json AS mask_dimensions
+        FROM dataset_items di
+        JOIN mask_refinement_items mi ON mi.item_id = di.item_id
+        JOIN assets image ON image.asset_id = mi.image_asset_id
+        LEFT JOIN assets candidate ON candidate.asset_id = mi.candidate_mask_asset_id
+        LEFT JOIN mask_annotations ma
+          ON ma.item_id = di.item_id AND ma.is_current = 1
+        LEFT JOIN assets mask ON mask.asset_id = ma.mask_asset_id
+        WHERE di.item_id = ?
+        """,
+        (uuid,),
+    ).fetchone()
     if row is None:
         raise KeyError(f"No sample found for uuid={uuid!r}")
     sample = dict(row)
-    training_input = decode_blob(sample["input_blob"], sample["input_blob_encoding"], sample["input_blob_dimensions"])
-    image, candidate_mask = split_training_input(np.asarray(training_input))
-    if sample.get("input_aux_blob"):
+    image = decode_blob(
+        sample["image_blob"], sample["image_encoding"], sample["image_dimensions"]
+    )
+    candidate_mask = None
+    if sample.get("candidate_blob"):
         candidate_mask = decode_mask(
-            sample["input_aux_blob"],
-            sample.get("input_aux_blob_encoding"),
-            sample.get("input_aux_blob_dimensions"),
+            sample["candidate_blob"],
+            sample.get("candidate_encoding"),
+            sample.get("candidate_dimensions"),
         )
-    mask = decode_mask(sample["output_blob"], sample["output_blob_encoding"], sample["output_blob_dimensions"])
+    mask = decode_mask(
+        sample.get("mask_blob"),
+        sample.get("mask_encoding"),
+        sample.get("mask_dimensions"),
+    )
     return {
-        "uuid": sample["uuid"],
-        "split": sample.get("split"),
+        "uuid": sample["item_id"],
         "image": np.asarray(image),
         "mask": mask,
         "candidate_mask": candidate_mask,
-        "input_blob_encoding": sample.get("input_blob_encoding"),
-        "input_blob_dimensions": sample.get("input_blob_dimensions"),
-        "input_aux_blob_encoding": sample.get("input_aux_blob_encoding"),
-        "input_aux_blob_dimensions": sample.get("input_aux_blob_dimensions"),
-        "output_blob_encoding": sample.get("output_blob_encoding"),
-        "output_blob_dimensions": sample.get("output_blob_dimensions"),
-        "label_text": sample.get("label_text"),
+        "input_blob_encoding": sample.get("image_encoding"),
+        "input_blob_dimensions": sample.get("image_dimensions"),
+        "input_aux_blob_encoding": sample.get("candidate_encoding"),
+        "input_aux_blob_dimensions": sample.get("candidate_dimensions"),
+        "output_blob_encoding": sample.get("mask_encoding"),
+        "output_blob_dimensions": sample.get("mask_dimensions"),
+        "label_text": None,
         "sample_weight": sample.get("sample_weight"),
         "metadata": _json_loads(sample.get("metadata_json")),
     }
@@ -191,34 +193,33 @@ def load_sample(conn: sqlite3.Connection, uuid: str) -> dict[str, Any]:
 
 def list_samples(
     conn: sqlite3.Connection,
-    split: str | None = None,
     missing_masks_only: bool = False,
 ) -> list[dict[str, Any]]:
     conn.row_factory = sqlite3.Row
     clauses = []
     values: list[Any] = []
-    if split:
-        clauses.append("split = ?")
-        values.append(split)
     if missing_masks_only:
-        clauses.append("(output_blob IS NULL OR length(output_blob) = 0)")
+        clauses.append("ma.annotation_id IS NULL")
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     rows = conn.execute(
         f"""
-        SELECT uuid, split, label_text, input_blob_encoding, input_blob_dimensions,
-               output_blob IS NOT NULL AND length(output_blob) > 0 AS has_mask,
-               metadata_json
-        FROM samples
+        SELECT di.item_id, image.encoding AS input_blob_encoding,
+               image.shape_json AS input_blob_dimensions,
+               ma.annotation_id IS NOT NULL AS has_mask, di.metadata_json
+        FROM dataset_items di
+        JOIN mask_refinement_items mi ON mi.item_id = di.item_id
+        JOIN assets image ON image.asset_id = mi.image_asset_id
+        LEFT JOIN mask_annotations ma
+          ON ma.item_id = di.item_id AND ma.is_current = 1
         {where}
-        ORDER BY uuid
+        ORDER BY di.item_id
         """,
         values,
     ).fetchall()
     return [
         {
-            "uuid": row["uuid"],
-            "split": row["split"],
-            "label_text": row["label_text"],
+            "uuid": row["item_id"],
+            "label_text": None,
             "input_blob_encoding": row["input_blob_encoding"],
             "input_blob_dimensions": row["input_blob_dimensions"],
             "has_mask": bool(row["has_mask"]),
@@ -244,38 +245,65 @@ def save_mask_annotation(
     ensure_mask_builder_columns(conn)
     blob, encoding, dimensions = encode_mask(mask, mask_encoding)
     annotation_id = str(uuid_module.uuid4())
+    repository = SQLiteDatasetRepository(conn)
     with conn:
         existing = conn.execute(
-            "SELECT input_blob_dimensions, metadata_json FROM samples WHERE uuid = ?",
+            """
+            SELECT image.shape_json, di.metadata_json
+            FROM dataset_items di
+            JOIN mask_refinement_items mi ON mi.item_id = di.item_id
+            JOIN assets image ON image.asset_id = mi.image_asset_id
+            WHERE di.item_id = ?
+            """,
             (sample_uuid,),
         ).fetchone()
         if existing is None:
             raise KeyError(f"Cannot save mask annotation; sample does not exist: {sample_uuid}")
+        mask_asset = repository.add_asset(
+            blob,
+            encoding=encoding,
+            media_type="image/png" if encoding == "png" else "application/x-npy",
+            shape=_shape_from_dimensions(dimensions),
+            dtype="uint8",
+        )
+        current = conn.execute(
+            """
+            SELECT annotation_id FROM mask_annotations
+            WHERE item_id = ? AND is_current = 1
+            """,
+            (sample_uuid,),
+        ).fetchone()
+        if accepted and current:
+            conn.execute(
+                "UPDATE mask_annotations SET is_current = 0 WHERE annotation_id = ?",
+                (current[0],),
+            )
         conn.execute(
             """
             INSERT INTO mask_annotations (
-                annotation_id, sample_uuid, created_at, annotator, mask_blob, mask_blob_encoding,
-                mask_blob_dimensions, method, parameters_json, validation_json, accepted, notes
+                annotation_id, item_id, mask_asset_id, created_at, annotator, method,
+                parameters_json, validation_json, status, is_current,
+                parent_annotation_id, notes
             )
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 annotation_id,
                 sample_uuid,
+                mask_asset.asset_id,
                 _utc_now(),
                 annotator,
-                blob,
-                encoding,
-                dimensions,
                 method,
                 json.dumps(parameters, sort_keys=True, default=str),
                 json.dumps(validation, sort_keys=True, default=str),
+                "accepted" if accepted else "rejected",
                 1 if accepted else 0,
+                current[0] if current else None,
                 notes,
             ),
         )
         metadata = _json_loads(existing["metadata_json"] if hasattr(existing, "keys") else existing[1])
-        input_shape = _shape_from_dimensions(existing["input_blob_dimensions"] if hasattr(existing, "keys") else existing[0])
+        input_shape = _shape_from_dimensions(existing["shape_json"] if hasattr(existing, "keys") else existing[0])
         output_shape = _shape_from_dimensions(dimensions)
         if input_shape and len(input_shape) == 2:
             input_shape = [input_shape[0], input_shape[1], 1]
@@ -292,20 +320,18 @@ def save_mask_annotation(
             "input_shape": input_shape,
             "output_shape": output_shape,
         }
-        if accepted:
-            conn.execute(
-                """
-                UPDATE samples
-                SET output_blob = ?, output_blob_encoding = ?, output_blob_dimensions = ?, metadata_json = ?
-                WHERE uuid = ?
-                """,
-                (blob, encoding, dimensions, json.dumps(metadata, sort_keys=True, default=str), sample_uuid),
-            )
-        else:
-            conn.execute(
-                "UPDATE samples SET metadata_json = ? WHERE uuid = ?",
-                (json.dumps(metadata, sort_keys=True, default=str), sample_uuid),
-            )
+        conn.execute(
+            """
+            UPDATE dataset_items
+            SET metadata_json = ?, updated_at = ?
+            WHERE item_id = ?
+            """,
+            (
+                json.dumps(metadata, sort_keys=True, default=str),
+                _utc_now(),
+                sample_uuid,
+            ),
+        )
     return annotation_id
 
 
@@ -343,7 +369,10 @@ def create_or_update_image_sample(
     if candidate_mask is not None:
         candidate_blob, candidate_encoding, candidate_dimensions = encode_mask(candidate_mask, "png")
     with conn:
-        existing = conn.execute("SELECT metadata_json FROM samples WHERE uuid = ?", (uuid,)).fetchone()
+        repository = SQLiteDatasetRepository(conn)
+        existing = conn.execute(
+            "SELECT metadata_json FROM dataset_items WHERE item_id = ?", (uuid,)
+        ).fetchone()
         metadata = _json_loads(existing[0]) if existing else {}
         metadata.update(image_metadata)
         metadata["mask_builder_import"] = {
@@ -353,54 +382,38 @@ def create_or_update_image_sample(
             "input_shape": _shape_from_dimensions(dimensions),
             "candidate_mask_shape": _shape_from_dimensions(candidate_dimensions),
         }
-        if existing:
-            conn.execute(
-                """
-                UPDATE samples
-                SET input_blob = ?, input_blob_encoding = ?, input_blob_dimensions = ?,
-                    input_aux_blob = ?, input_aux_blob_encoding = ?, input_aux_blob_dimensions = ?,
-                    metadata_json = ?
-                WHERE uuid = ?
-                """,
-                (
-                    image_blob,
-                    input_encoding,
-                    dimensions,
-                    candidate_blob,
-                    candidate_encoding,
-                    candidate_dimensions,
-                    json.dumps(metadata, sort_keys=True, default=str),
-                    uuid,
-                ),
+        image_array = np.asarray(image)
+        image_asset = repository.add_asset(
+            encode_image_png(image_array),
+            encoding="png",
+            media_type="image/png",
+            shape=image_array.shape,
+            dtype=str(image_array.dtype),
+        )
+        candidate_asset_id = None
+        if candidate_blob is not None:
+            candidate_asset = repository.add_asset(
+                candidate_blob,
+                encoding=candidate_encoding,
+                media_type="image/png",
+                shape=_shape_from_dimensions(candidate_dimensions),
+                dtype="uint8",
             )
-        else:
-            conn.execute(
-                """
-                INSERT INTO samples (
-                    uuid, split, input_blob, input_blob_encoding, input_blob_dimensions,
-                    input_aux_blob, input_aux_blob_encoding, input_aux_blob_dimensions,
-                    output_blob, output_blob_encoding, output_blob_dimensions,
-                    label_text, sample_weight, metadata_json
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    uuid,
-                    None,
-                    image_blob,
-                    input_encoding,
-                    dimensions,
-                    candidate_blob,
-                    candidate_encoding,
-                    candidate_dimensions,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    json.dumps(metadata, sort_keys=True, default=str),
-                ),
-            )
+            candidate_asset_id = candidate_asset.asset_id
+        item_id = repository.add_item(
+            item_id=uuid,
+            source_key=str(
+                image_metadata.get("pelagia_detection_id")
+                or image_metadata.get("source_path")
+                or uuid
+            ),
+            metadata=metadata,
+        )
+        repository.add_mask_item(
+            item_id=item_id,
+            image_asset_id=image_asset.asset_id,
+            candidate_mask_asset_id=candidate_asset_id,
+        )
 
 
 def open_database(path: str | Path, create: bool = True) -> sqlite3.Connection:
@@ -409,9 +422,9 @@ def open_database(path: str | Path, create: bool = True) -> sqlite3.Connection:
         raise FileNotFoundError(f"SQLite dataset does not exist: {db_path}")
     if create and db_path.parent != Path("."):
         db_path.parent.mkdir(parents=True, exist_ok=True)
+    if db_path.exists():
+        ensure_mask_refinement_database(db_path)
     conn = sqlite3.connect(db_path)
-    ensure_schema(conn)
-    ensure_mask_annotation_table(conn)
-    ensure_mask_builder_columns(conn)
+    initialize_database(conn, "mask_refinement", name=db_path.stem)
     conn.commit()
     return conn

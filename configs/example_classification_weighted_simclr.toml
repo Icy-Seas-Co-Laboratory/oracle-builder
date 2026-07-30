@@ -1,0 +1,112 @@
+# SimCLR plus weighted classification example. Use this when unlabeled
+# structure and class imbalance are both important.
+
+[run]
+task = "classification"
+model = "simple_cnn"
+seed = 123
+notes = "SimpleCNN with SimCLR pretraining and weighted cross entropy"
+
+[data]
+# Grayscale is assumed. Class count and splits are derived at run time.
+input_shape = [224, 224, 1]
+batch_size = 8
+shuffle_buffer = 4096
+validation_split = 0.20
+test_split = 0.10
+
+[data.streaming]
+enabled = true
+reader_workers = 4
+prefetch_batches = 2
+deterministic = true
+sqlite_cache_kib = 65536
+
+[preprocessing]
+resize_mode = "fit_pad"
+normalization = "dtype"
+rescale = true
+invert = false
+pad_value = 0.0
+interpolation = "bilinear"
+channel_mode = "grayscale"
+
+[model]
+# SimpleCNN is the fastest baseline. ResNet, DenseNet, and EfficientNet are
+# stronger family choices when additional capacity is justified.
+base_filters = 32
+embedding_dim = 256
+normalize_embeddings = true
+dropout = 0.20
+
+[pretraining]
+# SimCLR uses contrastive negatives and benefits from larger effective batches.
+# BYOL is the less batch-size-sensitive alternative.
+enabled = true
+method = "simclr" # simclr, byol, or student_teacher
+epochs = 30
+learning_rate = 0.001
+temperature = 0.10
+projection_dim = 128
+projection_hidden_dim = 256
+use_training_augmentation = true
+
+[training]
+epochs = 50
+optimizer = "adam"
+learning_rate = 0.0003
+loss = "weighted_sparse_categorical_crossentropy"
+metrics = ["accuracy"]
+
+[training.class_weights]
+# effective_number moderates rare-class weighting; inverse_frequency is stronger.
+mode = "effective_number"
+beta = 0.999
+normalize = true
+
+[evidence]
+enabled = true
+knn_k = 5
+
+[callbacks]
+early_stopping = true
+early_stopping_patience = 8
+reduce_lr_on_plateau = true
+checkpoint_monitor = "val_loss"
+
+[augmentation]
+# Shared by pretraining and fine-tuning. rotation=0.5 permits any orientation.
+enabled = true
+repeats_per_epoch = 1
+invert = false # Assume black background and light foreground.
+rotation = 0.5
+zoom = 0.20
+translation = [0.15, 0.15]
+skew = 0.20
+flip_horizontal = true
+flip_vertical = true
+brightness = 0.20
+contrast = 0.20
+gaussian_noise = 0.05
+fill_value = 0.0
+
+[inference]
+# Auto batching adapts throughput to input size and available memory.
+batch_size = "auto"
+minimum_batch_size = 1
+maximum_batch_size = 64
+memory_budget_mb = 512
+progress = true
+
+[evaluation.benchmark]
+enabled = true
+warmup_batches = 2
+measured_batches = 10
+
+[output]
+# The final model is saved; per-epoch checkpoints are opt-in.
+save_checkpoints = false
+save_predictions = true
+save_figures = true
+export_savedmodel = true
+prediction_commit_batches = 20

@@ -63,8 +63,12 @@ def pretraining_config():
     }
 
 
-def test_student_teacher_pretraining_updates_shared_classifier_encoder(tmp_path):
+@pytest.mark.parametrize("method", ["byol", "simclr"])
+def test_student_teacher_pretraining_updates_shared_classifier_encoder(
+    tmp_path, method
+):
     config = pretraining_config()
+    config["pretraining"]["method"] = method
     classifier = build_and_compile_model(config)
     x = np.random.default_rng(123).random((4, 16, 16, 1), dtype=np.float32)
     dataset = make_pretraining_dataset(x, config)
@@ -81,9 +85,16 @@ def test_student_teacher_pretraining_updates_shared_classifier_encoder(tmp_path)
         np.array([0, 1], dtype="int64"),
     )
     assert np.all(np.isfinite(supervised_loss))
-    assert (tmp_path / "pretraining" / "metrics.csv").exists()
-    assert (tmp_path / "pretraining" / "student_pretrained.weights.h5").exists()
-    metrics = json.loads((tmp_path / "pretraining" / "metrics.json").read_text())
+    assert (tmp_path / "metrics" / "pretraining" / "metrics.csv").exists()
+    assert (
+        tmp_path
+        / "model"
+        / "pretraining"
+        / "student_pretrained.weights.h5"
+    ).exists()
+    metrics = json.loads(
+        (tmp_path / "metrics" / "pretraining" / "metrics.json").read_text()
+    )
     assert len(metrics["loss"]) == 1
 
 
@@ -131,20 +142,22 @@ def test_pretraining_is_rejected_for_segmentation():
 def test_unlabeled_train_rois_are_available_only_to_pretraining(tmp_path):
     database = tmp_path / "classification.sqlite"
     create_synthetic_classification(database, n=6, shape=(16, 16, 1), classes=3)
+    config = pretraining_config()
+    _, _, initial_train_records = load_prediction_arrays(
+        database,
+        config,
+        split="train",
+    )
+    unlabeled_uuid = initial_train_records[0]["uuid"]
     with sqlite3.connect(database) as connection:
-        unlabeled_uuid = connection.execute(
-            "SELECT uuid FROM samples WHERE split = 'train' LIMIT 1"
-        ).fetchone()[0]
         connection.execute(
             """
-            UPDATE samples
-            SET output_blob = NULL, output_blob_encoding = NULL, label_text = NULL
-            WHERE uuid = ?
+            UPDATE classification_annotations
+            SET is_current = 0
+            WHERE item_id = ?
             """,
             (unlabeled_uuid,),
         )
-    config = pretraining_config()
-
     _, supervised_y, supervised_records = load_arrays(database, config, split="train")
     _, pretraining_y, pretraining_records = load_prediction_arrays(
         database,

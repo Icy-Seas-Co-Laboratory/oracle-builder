@@ -138,7 +138,11 @@ class StudentTeacherPretrainer(keras.Model):
                 self._cosine_loss(student_one, teacher_two)
                 + self._cosine_loss(student_two, teacher_one)
             )
-        gradients = tape.gradient(loss, self.trainable_variables)
+            optimization_loss = loss / tf.cast(
+                tf.distribute.get_strategy().num_replicas_in_sync,
+                loss.dtype,
+            )
+        gradients = tape.gradient(optimization_loss, self.trainable_variables)
         self.optimizer.apply_gradients(
             (gradient, variable)
             for gradient, variable in zip(gradients, self.trainable_variables, strict=False)
@@ -165,32 +169,142 @@ class StudentTeacherPretrainer(keras.Model):
             teacher.assign(self.momentum * teacher + (1.0 - self.momentum) * student)
 
 
+class SimCLRPretrainer(keras.Model):
+    """SimCLR encoder trained with two augmented views and NT-Xent."""
+
+    def __init__(self, classifier: keras.Model, config: dict[str, Any]):
+        super().__init__(name="simclr_pretrainer")
+        settings = config.get("pretraining", {})
+        self.view_config = _view_config(config)
+        self.temperature = float(settings.get("temperature", 0.1))
+        embedding_dim = int(classifier.get_layer("features").output.shape[-1])
+        projection_dim = int(settings.get("projection_dim", 128))
+        hidden_dim = int(
+            settings.get("projection_hidden_dim", max(embedding_dim, 256))
+        )
+        self.encoder = build_embedding_model(classifier)
+        self.projector = _projection_head(
+            embedding_dim,
+            hidden_dim,
+            projection_dim,
+            "simclr_projector",
+        )
+        self.loss_tracker = keras.metrics.Mean(name="loss")
+        self.contrastive_accuracy = keras.metrics.Mean(
+            name="contrastive_accuracy"
+        )
+
+    @property
+    def metrics(self):
+        return [self.loss_tracker, self.contrastive_accuracy]
+
+    def _augment(self, x):
+        dummy = tf.zeros([tf.shape(x)[0]], dtype=tf.int32)
+        augmented, _ = augment_batch(x, dummy, self.view_config)
+        return augmented
+
+    def _nt_xent(self, first, second):
+        first = tf.math.l2_normalize(first, axis=-1)
+        second = tf.math.l2_normalize(second, axis=-1)
+        batch_size = tf.shape(first)[0]
+        representations = tf.concat([first, second], axis=0)
+        logits = tf.matmul(
+            representations, representations, transpose_b=True
+        ) / tf.cast(self.temperature, representations.dtype)
+        count = 2 * batch_size
+        logits = logits - tf.eye(
+            count, dtype=logits.dtype
+        ) * tf.cast(1e9, logits.dtype)
+        positives = tf.concat(
+            [
+                tf.range(batch_size, count),
+                tf.range(0, batch_size),
+            ],
+            axis=0,
+        )
+        loss = tf.reduce_mean(
+            keras.losses.sparse_categorical_crossentropy(
+                positives, logits, from_logits=True
+            )
+        )
+        accuracy = tf.reduce_mean(
+            tf.cast(
+                tf.equal(tf.argmax(logits, axis=1, output_type=tf.int32), positives),
+                tf.float32,
+            )
+        )
+        return loss, accuracy
+
+    def train_step(self, data):
+        x = data[0] if isinstance(data, (tuple, list)) else data
+        view_one = self._augment(tf.cast(x, tf.float32))
+        view_two = self._augment(tf.cast(x, tf.float32))
+        with tf.GradientTape() as tape:
+            first = self.projector(
+                self.encoder(view_one, training=True), training=True
+            )
+            second = self.projector(
+                self.encoder(view_two, training=True), training=True
+            )
+            loss, accuracy = self._nt_xent(first, second)
+            optimization_loss = loss / tf.cast(
+                tf.distribute.get_strategy().num_replicas_in_sync,
+                loss.dtype,
+            )
+        variables = self.encoder.trainable_variables + self.projector.trainable_variables
+        gradients = tape.gradient(optimization_loss, variables)
+        self.optimizer.apply_gradients(
+            (gradient, variable)
+            for gradient, variable in zip(gradients, variables, strict=True)
+            if gradient is not None
+        )
+        self.loss_tracker.update_state(loss)
+        self.contrastive_accuracy.update_state(accuracy)
+        return {metric.name: metric.result() for metric in self.metrics}
+
+
 def run_student_teacher_pretraining(
     classifier: keras.Model,
     dataset,
     config: dict[str, Any],
     run_dir: str | Path,
+    strategy: tf.distribute.Strategy | None = None,
 ):
     settings = config.get("pretraining", {})
     method = str(settings.get("method", "byol")).lower()
-    if method not in {"byol", "student_teacher"}:
-        raise ValueError("pretraining.method must be 'byol' or 'student_teacher'")
-    pretrainer = StudentTeacherPretrainer(classifier, config)
-    pretrainer.compile(
-        optimizer=keras.optimizers.Adam(
-            learning_rate=float(settings.get("learning_rate", 0.001))
+    if method not in {"byol", "student_teacher", "simclr"}:
+        raise ValueError(
+            "pretraining.method must be byol, student_teacher, or simclr"
         )
-    )
+    strategy = strategy or tf.distribute.get_strategy()
+    with strategy.scope():
+        pretrainer = (
+            SimCLRPretrainer(classifier, config)
+            if method == "simclr"
+            else StudentTeacherPretrainer(classifier, config)
+        )
+        pretrainer.compile(
+            optimizer=keras.optimizers.Adam(
+                learning_rate=float(settings.get("learning_rate", 0.001))
+            )
+        )
     history = pretrainer.fit(
         dataset,
         epochs=int(settings.get("epochs", 10)),
         verbose=2 if config.get("debug") else 1,
     )
-    artifact_dir = Path(run_dir) / "pretraining"
-    artifact_dir.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame(history.history).to_csv(artifact_dir / "metrics.csv", index_label="epoch")
-    (artifact_dir / "metrics.json").write_text(
+    from oracle_builder.artifacts.layout import RunLayout
+
+    layout = RunLayout(run_dir)
+    metrics_dir = layout.pretraining_metrics
+    model_dir = layout.pretraining_model
+    metrics_dir.mkdir(parents=True, exist_ok=True)
+    model_dir.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(history.history).to_csv(
+        metrics_dir / "metrics.csv", index_label="epoch"
+    )
+    (metrics_dir / "metrics.json").write_text(
         json.dumps(history.history, indent=2, default=float) + "\n"
     )
-    classifier.save_weights(artifact_dir / "student_pretrained.weights.h5")
+    classifier.save_weights(model_dir / "student_pretrained.weights.h5")
     return history

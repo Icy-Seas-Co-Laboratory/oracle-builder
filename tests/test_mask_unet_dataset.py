@@ -15,14 +15,13 @@ from oracle_builder.masking.unet_dataset import validate_unet_dataset, write_une
 
 def _create_mask_builder_unet_dataset(db_path):
     with open_database(db_path) as conn:
-        for index, split in enumerate(("train", "validation")):
+        for index in range(2):
             image = np.zeros((8, 9, 3), dtype="uint8")
             image[..., index] = 120
             mask = np.zeros((8, 9), dtype="uint8")
             mask[2:6, 3:7] = 1
             uuid = f"sample-{index}"
             create_or_update_image_sample(conn, uuid, image, "png", {"source": "test"})
-            conn.execute("UPDATE samples SET split = ? WHERE uuid = ?", (split, uuid))
             save_mask_annotation(
                 conn,
                 uuid,
@@ -43,6 +42,11 @@ def test_mask_builder_dataset_validates_for_unet(tmp_path):
     report = validate_unet_dataset(db_path)
 
     assert report["valid"]
+    assert report["item_count"] == 3
+    assert report["annotated_item_count"] == 2
+    assert report["missing_current_mask_count"] == 1
+    assert report["annotation_count"] == 2
+    assert "split_counts" not in report
     assert report["usable_sample_count"] == 2
     assert report["inferred_input_shape"] == [8, 9, 3]
     assert report["inferred_output_shape"] == [8, 9, 1]
@@ -230,7 +234,10 @@ def test_mask_save_metadata_records_unet_training_shapes(tmp_path):
 
     with sqlite3.connect(db_path) as conn:
         metadata = json.loads(
-            conn.execute("SELECT metadata_json FROM samples WHERE uuid = ?", ("sample-0",)).fetchone()[0]
+            conn.execute(
+                "SELECT metadata_json FROM dataset_items WHERE item_id = ?",
+                ("sample-0",),
+            ).fetchone()[0]
         )
 
     assert metadata["mask_builder"]["training_task"] == "segmentation"

@@ -13,6 +13,8 @@ from typing import Any
 
 import numpy as np
 
+from oracle_builder.artifacts.layout import RunLayout
+
 
 def _version(module_name: str) -> str | None:
     try:
@@ -72,11 +74,18 @@ def collect_environment() -> dict[str, Any]:
 
 
 def write_environment(run_dir: str | Path) -> dict[str, Any]:
+    layout = RunLayout(run_dir)
     env = collect_environment()
-    Path(run_dir, "environment.json").write_text(json.dumps(env, indent=2, sort_keys=True) + "\n")
+    layout.environment.write_text(
+        json.dumps(env, indent=2, sort_keys=True) + "\n"
+    )
     try:
-        freeze = subprocess.check_output([sys.executable, "-m", "pip", "freeze"], text=True)
+        freeze = subprocess.check_output(
+            [sys.executable, "-m", "pip", "freeze"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
     except Exception as exc:
         freeze = f"# pip freeze failed: {exc}\n"
-    Path(run_dir, "requirements_freeze.txt").write_text(freeze)
+    layout.requirements.write_text(freeze)
     return env

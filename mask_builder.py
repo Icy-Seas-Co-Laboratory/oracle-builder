@@ -84,7 +84,6 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--api-sort-dir", "--sort-dir", dest="api_sort_dir", choices=["asc", "desc"], default="desc", help="Pelagia /detections sort_dir value.")
     parser.add_argument("--uuid", help="Sample UUID. Defaults to the image filename stem for image imports.")
-    parser.add_argument("--split", help="Optional split filter such as train, validation, test, holdout.")
     parser.add_argument("--missing-masks-only", action="store_true")
     parser.add_argument("--read-only", action="store_true")
     parser.add_argument("--mask-encoding", choices=["png", "npy"], default="png")
@@ -388,7 +387,9 @@ def main() -> int:
                 sample = load_sample(conn, args.uuid)
                 sample_queue = [{"uuid": args.uuid}]
             else:
-                sample_queue = list_samples(conn, split=args.split, missing_masks_only=args.missing_masks_only)
+                sample_queue = list_samples(
+                    conn, missing_masks_only=args.missing_masks_only
+                )
                 if not sample_queue:
                     raise SystemExit("No matching samples found.")
                 sample = load_sample(conn, sample_queue[0]["uuid"])

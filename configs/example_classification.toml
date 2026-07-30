@@ -1,3 +1,6 @@
+# Fast classification baseline. Start here to verify a new dataset and pipeline;
+# use ResNet, DenseNet, or EfficientNet when model capacity is the main question.
+
 [run]
 task = "classification"
 model = "simple_cnn"
@@ -5,29 +8,33 @@ seed = 123
 notes = "Example classification run"
 
 [data]
-input_shape = [128, 128, 3]
-num_classes = 3
+# Classification defaults assume grayscale. Class count and split assignments
+# are inferred from the SQLite dataset and recorded in the run artifact.
+input_shape = [128, 128, 1]
 batch_size = 16
 shuffle_buffer = 512
-validation_split = 0.2
-test_split = 0.1
+validation_split = 0.20
+test_split = 0.10
 
 [preprocessing]
+# fit_pad preserves the full image. Preprocessing travels with the saved model.
 resize_mode = "fit_pad"
 normalization = "dtype"
 rescale = true
 invert = false
 pad_value = 0.0
 interpolation = "bilinear"
-channel_mode = "auto"
+channel_mode = "grayscale"
 
 [model]
-dropout = 0.2
+# base_filters controls overall capacity; embedding_dim fixes feature size.
 base_filters = 32
+dropout = 0.20
 embedding_dim = 256
 normalize_embeddings = true
 
 [evidence]
+# Preserve embeddings, prototypes, and KNN evidence with predictions.
 enabled = true
 knn_k = 5
 
@@ -35,8 +42,16 @@ knn_k = 5
 epochs = 10
 optimizer = "adam"
 learning_rate = 0.001
-loss = "sparse_categorical_crossentropy"
+# Weighted cross entropy is the default; ordinary sparse cross entropy is the
+# simpler alternative when the dataset is already balanced.
+loss = "weighted_sparse_categorical_crossentropy"
 metrics = ["accuracy"]
+
+[training.class_weights]
+# effective_number is gentler than inverse_frequency; explicit accepts a list.
+mode = "effective_number"
+beta = 0.999
+normalize = true
 
 [callbacks]
 early_stopping = true
@@ -45,22 +60,24 @@ reduce_lr_on_plateau = true
 checkpoint_monitor = "val_loss"
 
 [augmentation]
+# Shared classification policy. rotation=0.5 permits any orientation.
 enabled = true
 repeats_per_epoch = 1
-invert = false
+invert = false # Assume black background and light foreground.
 rotation = 0.5
-zoom = 0.25
-translation = 0.10
+zoom = 0.20
+translation = [0.15, 0.15]
 skew = 0.20
 flip_horizontal = true
 flip_vertical = true
-brightness = 0.15
-contrast = 0.15
-gaussian_noise = 0.03
+brightness = 0.20
+contrast = 0.20
+gaussian_noise = 0.05
 fill_value = 0.0
 
 [output]
-save_checkpoints = true
+# The final model is saved; per-epoch checkpoints are opt-in.
+save_checkpoints = false
 save_predictions = true
 save_figures = true
 export_savedmodel = true

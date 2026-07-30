@@ -11,7 +11,6 @@ from oracle_builder.data.sqlite_dataset import (
     make_tf_datasets,
     resize_array_to_shape,
     resize_segmentation_input,
-    synthetic_splits,
 )
 
 
@@ -26,12 +25,6 @@ def test_load_synthetic_classification_arrays(tmp_path: Path):
     assert x.shape[1:] == (16, 16, 3)
     assert y.ndim == 1
     assert len(records) == len(y)
-
-
-def test_synthetic_splits_always_match_requested_count():
-    assert len(synthetic_splits(48)) == 48
-    assert len(synthetic_splits(24)) == 24
-    assert len(synthetic_splits(5)) == 5
 
 
 def test_unet_input_rescales_and_pads_without_changing_aspect_ratio():
@@ -99,7 +92,7 @@ def test_training_dataset_can_repeat_augmented_samples_per_epoch(tmp_path: Path)
     sample_count = len(records_by_split["train"])
     observed_count = sum(int(batch_x.shape[0]) for batch_x, _ in datasets["train"])
 
-    assert sample_count == 7
+    assert sample_count == 10
     assert observed_count == sample_count * 3
 
 
@@ -126,6 +119,6 @@ def test_segmentation_dataset_includes_boundary_sample_weights_when_enabled(tmp_
     datasets, _records = make_tf_datasets(db_path, config)
     _x, _y, weights = next(iter(datasets["train"]))
 
-    assert weights.shape == (4, 16, 16)
+    assert weights.shape == (5, 16, 16)
     assert np.isclose(float(np.max(weights)), 5.0)
     assert float(np.min(weights)) >= 1.0

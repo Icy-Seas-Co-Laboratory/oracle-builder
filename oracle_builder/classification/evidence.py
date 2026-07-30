@@ -8,6 +8,8 @@ from typing import Any
 import numpy as np
 
 from oracle_builder.classification.features import predict_with_features
+from oracle_builder.classification.features import build_feature_model
+from oracle_builder.progress import BatchProgress
 
 
 EVIDENCE_SCHEMA_VERSION = 1
@@ -50,6 +52,15 @@ class IdentityEvidenceIndex:
 
     def save(self, path: str | Path) -> None:
         path = Path(path)
+        if path.suffix != ".npz":
+            path.mkdir(parents=True, exist_ok=True)
+            np.save(path / "embeddings.npy", self.embeddings, allow_pickle=False)
+            np.save(path / "labels.npy", self.labels, allow_pickle=False)
+            np.save(path / "uuids.npy", self.uuids, allow_pickle=False)
+            np.save(path / "prototype_labels.npy", self.prototype_labels, allow_pickle=False)
+            np.save(path / "prototypes.npy", self.prototypes, allow_pickle=False)
+            _write_metadata(path / "metadata.json", self)
+            return
         path.parent.mkdir(parents=True, exist_ok=True)
         np.savez_compressed(
             path,
@@ -59,18 +70,19 @@ class IdentityEvidenceIndex:
             prototype_labels=self.prototype_labels,
             prototypes=self.prototypes,
         )
-        metadata = {
-            "schema_version": EVIDENCE_SCHEMA_VERSION,
-            "metric": "cosine_similarity",
-            "normalized": True,
-            "reference_count": int(len(self.labels)),
-            "embedding_dim": int(self.embeddings.shape[1]),
-            "classes": [int(label) for label in self.prototype_labels],
-        }
-        path.with_suffix(".json").write_text(json.dumps(metadata, indent=2) + "\n")
+        _write_metadata(path.with_suffix(".json"), self)
 
     @classmethod
     def load(cls, path: str | Path) -> "IdentityEvidenceIndex":
+        path = Path(path)
+        if path.is_dir():
+            return cls(
+                embeddings=np.load(path / "embeddings.npy", mmap_mode="r"),
+                labels=np.load(path / "labels.npy", mmap_mode="r"),
+                uuids=np.load(path / "uuids.npy", mmap_mode="r"),
+                prototype_labels=np.load(path / "prototype_labels.npy", mmap_mode="r"),
+                prototypes=np.load(path / "prototypes.npy", mmap_mode="r"),
+            )
         with np.load(path, allow_pickle=False) as values:
             return cls(
                 embeddings=values["embeddings"],
@@ -198,3 +210,92 @@ def build_evidence_index(
     )
     index.save(path)
     return index
+
+
+def build_evidence_index_streaming(
+    model,
+    dataset,
+    sample_index,
+    path: str | Path,
+    *,
+    progress: bool = True,
+) -> IdentityEvidenceIndex:
+    """Build an evidence index without retaining decoded source images."""
+    feature_model = build_feature_model(model)
+    embedding_dim = int(model.get_layer("features").output.shape[-1])
+    path = Path(path)
+    if path.suffix == ".npz":
+        embeddings = np.empty((len(sample_index), embedding_dim), dtype="float32")
+    else:
+        path.mkdir(parents=True, exist_ok=True)
+        embeddings = np.lib.format.open_memmap(
+            path / "embeddings.npy",
+            mode="w+",
+            dtype="float32",
+            shape=(len(sample_index), embedding_dim),
+        )
+    labels = np.asarray([ref.target for ref in sample_index.refs], dtype="int64")
+    prototype_labels = np.unique(labels)
+    prototype_sums = {
+        int(label): np.zeros(embedding_dim, dtype="float64")
+        for label in prototype_labels
+    }
+    prototype_counts = {int(label): 0 for label in prototype_labels}
+    display = BatchProgress(
+        "Building classification evidence",
+        len(sample_index),
+        enabled=progress,
+    )
+    for images, positions in dataset:
+        outputs = feature_model(images, training=False)
+        batch_features = np.asarray(outputs["features"], dtype="float32")
+        position_values = np.asarray(positions, dtype="int64")
+        normalized_batch = _normalize(batch_features)
+        embeddings[position_values] = normalized_batch
+        batch_labels = labels[position_values]
+        for label in np.unique(batch_labels):
+            selected = normalized_batch[batch_labels == label]
+            prototype_sums[int(label)] += selected.sum(axis=0)
+            prototype_counts[int(label)] += len(selected)
+        display.update(len(position_values))
+    display.close()
+    prototypes = np.stack(
+        [
+            _normalize(
+                (
+                    prototype_sums[int(label)] / max(prototype_counts[int(label)], 1)
+                )[None, :]
+            )[0]
+            for label in prototype_labels
+        ]
+    )
+    index = IdentityEvidenceIndex(
+        embeddings=embeddings,
+        labels=labels,
+        uuids=np.asarray([ref.uuid for ref in sample_index.refs], dtype=str),
+        prototype_labels=prototype_labels,
+        prototypes=prototypes,
+    )
+    if path.suffix == ".npz":
+        index.save(path)
+    else:
+        np.save(path / "labels.npy", labels, allow_pickle=False)
+        np.save(path / "uuids.npy", index.uuids, allow_pickle=False)
+        np.save(path / "prototype_labels.npy", prototype_labels, allow_pickle=False)
+        np.save(path / "prototypes.npy", prototypes, allow_pickle=False)
+        embeddings.flush()
+        _write_metadata(path / "metadata.json", index)
+    return index
+
+
+def _write_metadata(path: Path, index: IdentityEvidenceIndex) -> None:
+    metadata = {
+        "schema_version": EVIDENCE_SCHEMA_VERSION,
+        "metric": "cosine_similarity",
+        "normalized": True,
+        "storage": "memory_mapped_npy" if path.name == "metadata.json" else "npz",
+        "reference_count": int(len(index.labels)),
+        "embedding_dim": int(index.embeddings.shape[1]),
+        "classes": [int(label) for label in index.prototype_labels],
+    }
+    path.write_text(json.dumps(metadata, indent=2) + "\n")

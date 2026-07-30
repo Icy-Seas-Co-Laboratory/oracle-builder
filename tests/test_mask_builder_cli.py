@@ -30,7 +30,13 @@ def test_input_path_initializes_missing_database_before_listing(monkeypatch, tmp
             row[0]
             for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
         }
-    assert {"samples", "mask_annotations"}.issubset(tables)
+    assert {
+        "dataset",
+        "dataset_items",
+        "assets",
+        "mask_refinement_items",
+        "mask_annotations",
+    }.issubset(tables)
 
 
 def test_database_path_initializes_missing_database_before_listing(monkeypatch, tmp_path):
@@ -49,7 +55,13 @@ def test_database_path_initializes_missing_database_before_listing(monkeypatch, 
             row[0]
             for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
         }
-    assert {"samples", "mask_annotations"}.issubset(tables)
+    assert {
+        "dataset",
+        "dataset_items",
+        "assets",
+        "mask_refinement_items",
+        "mask_annotations",
+    }.issubset(tables)
 
 
 def test_input_image_path_is_treated_as_image_import(monkeypatch, tmp_path):
@@ -75,7 +87,14 @@ def test_input_image_path_is_treated_as_image_import(monkeypatch, tmp_path):
     assert captured["output_db_path"] == str(db_path)
     assert db_path.exists()
     with sqlite3.connect(db_path) as conn:
-        row = conn.execute("SELECT uuid, input_blob_encoding FROM samples").fetchone()
+        row = conn.execute(
+            """
+            SELECT di.item_id, a.encoding
+            FROM dataset_items di
+            JOIN mask_refinement_items mi ON mi.item_id = di.item_id
+            JOIN assets a ON a.asset_id = mi.image_asset_id
+            """
+        ).fetchone()
     assert row == ("000094a2-bcad-4de0-b4e1-37b836463909", "png")
 
 
@@ -170,18 +189,23 @@ def test_api_roi_id_uses_pelagia_detection_loader_by_default(monkeypatch, tmp_pa
     with sqlite3.connect(db_path) as conn:
         row = conn.execute(
             """
-            SELECT uuid, input_blob, input_blob_encoding, input_blob_dimensions,
-                   input_aux_blob, input_aux_blob_encoding, input_aux_blob_dimensions, metadata_json
-            FROM samples
+            SELECT di.item_id,
+                   image.payload, image.encoding, image.shape_json,
+                   candidate.payload, candidate.encoding, candidate.shape_json,
+                   di.metadata_json
+            FROM dataset_items di
+            JOIN mask_refinement_items mi ON mi.item_id = di.item_id
+            JOIN assets image ON image.asset_id = mi.image_asset_id
+            LEFT JOIN assets candidate ON candidate.asset_id = mi.candidate_mask_asset_id
             """
         ).fetchone()
     assert row[0] == "roi-7"
-    assert row[2] == "npy"
-    training_input = decode_blob(row[1], row[2], row[3])
+    assert row[2] == "png"
+    roi_image = decode_blob(row[1], row[2], row[3])
     candidate_mask = decode_blob(row[4], row[5], row[6])
-    assert training_input.shape == (5, 6, 2)
-    assert np.array_equal(training_input[..., 1] > 0, mask > 0)
-    assert np.array_equal(candidate_mask > 0, mask[..., None] > 0)
+    assert roi_image.shape == (5, 6)
+    assert np.array_equal(roi_image, image)
+    assert np.array_equal(np.squeeze(candidate_mask) > 0, mask > 0)
     assert "api" in row[7]
 
 

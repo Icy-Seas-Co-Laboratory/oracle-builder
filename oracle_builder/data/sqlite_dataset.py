@@ -10,114 +10,123 @@ from typing import Any
 import numpy as np
 from PIL import Image
 
+from oracle_builder.datasets.repository import SQLiteDatasetRepository
+from oracle_builder.datasets.schema import initialize_database, read_dataset_info, utc_now
 from oracle_builder.data.decoders import (
     decode_blob,
     encode_npy,
     normalize_input,
     prepare_classification_input,
 )
-from oracle_builder.data.splits import assign_missing_splits
+from oracle_builder.data.splits import assign_run_splits
 from oracle_builder.data.signed_distance import signed_distance_field
 from oracle_builder.data.tiling import coverage_map, extract_tile, plan_tiles
 from oracle_builder.evaluation.segmentation_targets import CANDIDATE_DELTA, candidate_delta, segmentation_target_mode
 
 
-SAMPLE_COLUMNS = [
-    "uuid",
-    "split",
-    "input_blob",
-    "input_blob_encoding",
-    "input_blob_dimensions",
-    "output_blob",
-    "output_blob_encoding",
-    "output_blob_dimensions",
-    "label_text",
-    "sample_weight",
-    "metadata_json",
-]
-
-
-def synthetic_splits(n: int, validation_fraction: float = 0.2, test_fraction: float = 0.1) -> list[str]:
-    n_test = int(round(n * test_fraction))
-    n_validation = int(round(n * validation_fraction))
-    n_train = max(0, n - n_validation - n_test)
-    return ["train"] * n_train + ["validation"] * n_validation + ["test"] * n_test
-
-
-def ensure_schema(connection: sqlite3.Connection) -> None:
-    connection.execute(
-        """
-        CREATE TABLE IF NOT EXISTS samples (
-            uuid TEXT PRIMARY KEY,
-            split TEXT,
-            input_blob BLOB,
-            input_blob_encoding TEXT,
-            input_blob_dimensions TEXT,
-            output_blob BLOB,
-            output_blob_encoding TEXT,
-            output_blob_dimensions TEXT,
-            label_text TEXT,
-            sample_weight REAL,
-            metadata_json TEXT
-        )
-        """
-    )
-    connection.execute(
-        """
-        CREATE TABLE IF NOT EXISTS class_labels (
-            class_index INTEGER PRIMARY KEY,
-            class_name TEXT NOT NULL UNIQUE
-        )
-        """
-    )
-    connection.execute(
-        """
-        CREATE TABLE IF NOT EXISTS classification_imports (
-            import_id TEXT PRIMARY KEY,
-            created_at TEXT NOT NULL,
-            source_root TEXT NOT NULL,
-            options_json TEXT NOT NULL,
-            summary_json TEXT NOT NULL
-        )
-        """
-    )
-    connection.execute(
-        """
-        CREATE TABLE IF NOT EXISTS dataset_metadata (
-            metadata_name TEXT PRIMARY KEY,
-            source_filename TEXT NOT NULL,
-            source_format TEXT NOT NULL,
-            metadata_json TEXT NOT NULL,
-            raw_text TEXT,
-            sha256 TEXT NOT NULL,
-            import_id TEXT,
-            FOREIGN KEY (import_id) REFERENCES classification_imports(import_id)
-        )
-        """
-    )
+def ensure_schema(
+    connection: sqlite3.Connection,
+    dataset_type: str = "mask_refinement",
+    **metadata: Any,
+) -> dict[str, Any]:
+    """Create or validate the breaking V1 use-case-specific dataset schema."""
+    return initialize_database(connection, dataset_type, **metadata)
 
 
 def read_rows(sqlite_path: str | Path) -> list[dict[str, Any]]:
+    # Keep compatibility at the lowest shared SQLite read boundary. This
+    # helper ignores classification databases and only upgrades recognized
+    # pre-V1 ROI databases before V1 repository queries are attempted.
+    from oracle_builder.datasets.legacy_roi import migrate_legacy_roi_if_needed
+
+    migrate_legacy_roi_if_needed(sqlite_path)
     connection = sqlite3.connect(sqlite_path)
     connection.row_factory = sqlite3.Row
     try:
-        rows = connection.execute(f"SELECT {', '.join(SAMPLE_COLUMNS)} FROM samples").fetchall()
-        return [dict(row) for row in rows]
+        info = read_dataset_info(connection)
+        repository = SQLiteDatasetRepository(connection)
+        if info["dataset_type"] == "classification":
+            return [
+                {
+                    "uuid": row["item_id"],
+                    "input_blob": row["image_blob"],
+                    "input_blob_encoding": row["image_encoding"],
+                    "input_blob_dimensions": row["image_dimensions"],
+                    "output_blob": (
+                        str(row["class_index"]).encode("utf-8")
+                        if row["class_index"] is not None
+                        else None
+                    ),
+                    "output_blob_encoding": "int" if row["class_index"] is not None else None,
+                    "output_blob_dimensions": None,
+                    "label_text": row["class_name"],
+                    "sample_weight": row["sample_weight"],
+                    "metadata_json": row["metadata_json"],
+                }
+                for row in repository.classification_rows()
+            ]
+        records = []
+        for row in repository.mask_rows():
+            image = decode_blob(
+                row["image_blob"], row["image_encoding"], row["image_dimensions"]
+            )
+            if row["candidate_blob"] is not None:
+                candidate = decode_blob(
+                    row["candidate_blob"],
+                    row["candidate_encoding"],
+                    row["candidate_dimensions"],
+                )
+                if np.asarray(candidate).ndim == 3:
+                    candidate = np.asarray(candidate)[..., 0]
+                roi = np.asarray(image)
+                if roi.ndim == 3 and roi.shape[-1] == 1:
+                    roi = roi[..., 0]
+                if roi.ndim == 3 and roi.shape[-1] >= 3:
+                    rgb = roi[..., :3].astype("float32")
+                    roi = 0.299 * rgb[..., 0] + 0.587 * rgb[..., 1] + 0.114 * rgb[..., 2]
+                candidate = np.asarray(candidate) > 0
+                if np.asarray(roi).dtype.kind in {"u", "i"}:
+                    candidate = candidate.astype(np.asarray(roi).dtype)
+                    candidate *= np.iinfo(np.asarray(roi).dtype).max
+                training_input = np.stack([roi, candidate], axis=-1)
+                input_blob = encode_npy(training_input)
+                input_encoding = "npy"
+                input_dimensions = json.dumps(list(training_input.shape))
+            else:
+                input_blob = row["image_blob"]
+                input_encoding = row["image_encoding"]
+                input_dimensions = row["image_dimensions"]
+            records.append(
+                {
+                    "uuid": row["item_id"],
+                    "input_blob": input_blob,
+                    "input_blob_encoding": input_encoding,
+                    "input_blob_dimensions": input_dimensions,
+                    "output_blob": row["validated_blob"],
+                    "output_blob_encoding": row["validated_encoding"],
+                    "output_blob_dimensions": row["validated_dimensions"],
+                    "label_text": None,
+                    "sample_weight": row["sample_weight"],
+                    "metadata_json": row["metadata_json"],
+                }
+            )
+        return records
     finally:
         connection.close()
 
 
 def load_arrays(sqlite_path: str | Path, config: dict[str, Any], split: str | None = None) -> tuple[np.ndarray, np.ndarray, list[dict[str, Any]]]:
-    rows = read_rows(sqlite_path)
     task = config["run"]["task"]
     if task == "segmentation":
+        from oracle_builder.datasets.legacy_roi import (
+            ensure_mask_refinement_database,
+        )
+
+        ensure_mask_refinement_database(sqlite_path)
+    rows = read_rows(sqlite_path)
+    if task == "segmentation":
         rows = [row for row in rows if row.get("output_blob")]
-    rows = assign_missing_splits(
-        rows,
-        config["data"].get("validation_split", 0.2),
-        config["data"].get("test_split", 0.1),
-        config["run"].get("seed", 123),
-    )
+    rows = assign_run_splits(rows, config)
     if task == "classification":
         rows = [
             row
@@ -187,18 +196,21 @@ def load_prediction_arrays(
     split: str | None = None,
 ) -> tuple[np.ndarray, list[Any | None], list[dict[str, Any]]]:
     """Load every model input, including segmentation ROIs without validated masks."""
-    rows = read_rows(sqlite_path)
     task = config["run"]["task"]
-    validation_split = config["data"].get("validation_split", 0.2)
-    test_split = config["data"].get("test_split", 0.1)
-    seed = config["run"].get("seed", 123)
+    if task == "segmentation":
+        from oracle_builder.datasets.legacy_roi import (
+            ensure_mask_refinement_database,
+        )
+
+        ensure_mask_refinement_database(sqlite_path)
+    rows = read_rows(sqlite_path)
     if task == "segmentation":
         with_targets = [row for row in rows if row.get("output_blob")]
         without_targets = [row for row in rows if not row.get("output_blob")]
-        assigned = assign_missing_splits(with_targets, validation_split, test_split, seed)
-        assigned += assign_missing_splits(without_targets, validation_split, test_split, seed)
+        assigned = assign_run_splits(with_targets, config)
+        assigned += assign_run_splits(without_targets, config)
     else:
-        assigned = assign_missing_splits(rows, validation_split, test_split, seed)
+        assigned = assign_run_splits(rows, config)
     if split:
         assigned = [row for row in assigned if row.get("split") == split]
     if not assigned:
@@ -400,6 +412,17 @@ def _expand_tiled_segmentation_row(
 
 
 def make_tf_datasets(sqlite_path: str | Path, config: dict[str, Any]):
+    if (
+        config["run"]["task"] == "classification"
+        and config.get("data", {}).get("streaming", {}).get("enabled", True)
+    ):
+        from oracle_builder.data.sqlite_stream import make_streaming_classification_bundle
+
+        bundle = make_streaming_classification_bundle(sqlite_path, config)
+        return bundle.datasets, {
+            split: list(index.iter_records())
+            for split, index in bundle.indices.items()
+        }
     import tensorflow as tf
     from oracle_builder.training.augmentation import apply_training_augmentation
     from oracle_builder.training.spatial_weights import batch_boundary_distance_weights
@@ -548,30 +571,35 @@ def create_synthetic_classification(path: str | Path, n: int = 48, shape: tuple[
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(path)
-    ensure_schema(connection)
+    ensure_schema(connection, "classification", name="synthetic-classification")
+    repository = SQLiteDatasetRepository(connection)
+    labels = [
+        repository.add_classification_label(index, str(index))
+        for index in range(classes)
+    ]
     rng = np.random.default_rng(123)
-    splits = synthetic_splits(n)
     for i in range(n):
         label = i % classes
         image = rng.normal(0.15, 0.05, shape).astype("float32")
         channel = label % shape[-1]
         image[..., channel] += 0.7
         image = np.clip(image, 0, 1)
-        connection.execute(
-            "INSERT OR REPLACE INTO samples VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                str(uuid.uuid4()),
-                splits[i],
-                encode_npy(image),
-                "npy",
-                json.dumps(list(shape)),
-                str(label).encode("utf-8"),
-                "int",
-                None,
-                str(label),
-                None,
-                json.dumps({"synthetic": True}),
-            ),
+        asset = repository.add_asset(
+            encode_npy(image),
+            encoding="npy",
+            media_type="application/x-npy",
+            shape=shape,
+            dtype=str(image.dtype),
+        )
+        item_id = repository.add_item(
+            source_key=f"synthetic/{i}",
+            metadata={"synthetic": True},
+        )
+        repository.add_classification_item(
+            item_id=item_id,
+            image_asset_id=asset.asset_id,
+            label_id=labels[label],
+            source="synthetic",
         )
     connection.commit()
     connection.close()
@@ -581,9 +609,9 @@ def create_synthetic_segmentation(path: str | Path, n: int = 24, shape: tuple[in
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(path)
-    ensure_schema(connection)
+    ensure_schema(connection, "mask_refinement", name="synthetic-mask-refinement")
+    repository = SQLiteDatasetRepository(connection)
     rng = np.random.default_rng(123)
-    splits = synthetic_splits(n)
     yy, xx = np.mgrid[: shape[0], : shape[1]]
     for i in range(n):
         center = rng.integers(shape[0] // 4, shape[0] * 3 // 4, size=2)
@@ -591,21 +619,38 @@ def create_synthetic_segmentation(path: str | Path, n: int = 24, shape: tuple[in
         mask = (((yy - center[0]) ** 2 + (xx - center[1]) ** 2) <= radius**2).astype("float32")[..., None]
         image = np.repeat(mask, shape[-1], axis=-1) + rng.normal(0, 0.08, shape)
         image = np.clip(image, 0, 1).astype("float32")
+        image_asset = repository.add_asset(
+            encode_npy(image),
+            encoding="npy",
+            media_type="application/x-npy",
+            shape=shape,
+            dtype=str(image.dtype),
+        )
+        mask_asset = repository.add_asset(
+            encode_npy(mask),
+            encoding="npy",
+            media_type="application/x-npy",
+            shape=mask.shape,
+            dtype=str(mask.dtype),
+        )
+        item_id = repository.add_item(
+            source_key=f"synthetic/{i}",
+            metadata={"synthetic": True},
+        )
+        repository.add_mask_item(
+            item_id=item_id,
+            image_asset_id=image_asset.asset_id,
+            candidate_mask_asset_id=None,
+        )
         connection.execute(
-            "INSERT OR REPLACE INTO samples VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                str(uuid.uuid4()),
-                splits[i],
-                encode_npy(image),
-                "npy",
-                json.dumps(list(shape)),
-                encode_npy(mask),
-                "npy",
-                json.dumps([shape[0], shape[1], 1]),
-                None,
-                None,
-                json.dumps({"synthetic": True}),
-            ),
+            """
+            INSERT INTO mask_annotations (
+                annotation_id, item_id, mask_asset_id, created_at, annotator, method,
+                parameters_json, validation_json, status, is_current,
+                parent_annotation_id, notes
+            ) VALUES (?, ?, ?, ?, NULL, 'synthetic', '{}', '{}', 'accepted', 1, NULL, NULL)
+            """,
+            (str(uuid.uuid4()), item_id, mask_asset.asset_id, utc_now()),
         )
     connection.commit()
     connection.close()

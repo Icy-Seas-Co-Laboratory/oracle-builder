@@ -59,15 +59,16 @@ def test_save_mask_annotation_updates_sample_and_preserves_history():
 
     assert first_id != second_id
     assert conn.execute("SELECT count(*) FROM mask_annotations").fetchone()[0] == 2
-    row = conn.execute(
-        "SELECT output_blob, output_blob_encoding, output_blob_dimensions, metadata_json FROM samples WHERE uuid = ?",
-        ("sample-1",),
-    ).fetchone()
-    decoded = decode_mask(row[0], row[1], row[2])
-    metadata = json.loads(row[3])
+    sample = load_sample(conn, "sample-1")
+    decoded = sample["mask"]
+    metadata = sample["metadata"]
     assert np.array_equal(decoded, mask_b)
     assert metadata["existing"] == "kept"
-    assert metadata["mask_builder"]["last_annotation_id"] == second_id
+    current = conn.execute(
+        "SELECT annotation_id FROM mask_annotations WHERE item_id = ? AND is_current = 1",
+        ("sample-1",),
+    ).fetchone()[0]
+    assert current == second_id
 
 
 def test_load_sample_reads_existing_mask():
@@ -92,19 +93,9 @@ def test_candidate_mask_is_stored_as_training_input_channel_and_aux_layer():
     candidate[1:3, 2:4] = 1
 
     create_or_update_image_sample(conn, "sample-candidate", image, "png", {}, candidate_mask=candidate)
-    row = conn.execute(
-        """
-        SELECT input_blob, input_blob_encoding, input_blob_dimensions,
-               input_aux_blob, input_aux_blob_encoding, input_aux_blob_dimensions
-        FROM samples WHERE uuid = ?
-        """,
-        ("sample-candidate",),
-    ).fetchone()
-
-    training_input = np.asarray(decode_blob(row[0], row[1], row[2]))
-    stored_candidate = decode_mask(row[3], row[4], row[5])
     sample = load_sample(conn, "sample-candidate")
-    assert row[1] == "npy"
+    training_input = make_training_input_tensor(sample["image"], sample["candidate_mask"])
+    stored_candidate = sample["candidate_mask"]
     assert training_input.shape == (4, 5, 2)
     assert np.array_equal(training_input[..., 0], image)
     assert np.array_equal(training_input[..., 1] > 0, candidate > 0)
@@ -123,20 +114,12 @@ def test_image_sample_update_with_candidate_mask_rewrites_two_channel_input():
 
     create_or_update_image_sample(conn, "sample-candidate", image, "png", {})
     create_or_update_image_sample(conn, "sample-candidate", image, "png", {}, candidate_mask=candidate)
-    row = conn.execute(
-        """
-        SELECT input_blob, input_blob_encoding, input_blob_dimensions, output_blob
-        FROM samples WHERE uuid = ?
-        """,
-        ("sample-candidate",),
-    ).fetchone()
-
-    training_input = np.asarray(decode_blob(row[0], row[1], row[2]))
-    assert row[1] == "npy"
+    sample = load_sample(conn, "sample-candidate")
+    training_input = make_training_input_tensor(sample["image"], sample["candidate_mask"])
     assert training_input.shape == (4, 5, 2)
     assert np.array_equal(training_input[..., 0], image)
     assert np.array_equal(training_input[..., 1] > 0, candidate > 0)
-    assert row[3] is None
+    assert sample["mask"] is None
 
 
 def test_training_input_tensor_converts_rgb_roi_to_two_channels():
@@ -163,7 +146,13 @@ def test_open_database_initializes_new_file_and_parent_directory(tmp_path):
             for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
         }
     assert db_path.exists()
-    assert {"samples", "mask_annotations"}.issubset(tables)
+    assert {
+        "dataset",
+        "dataset_items",
+        "assets",
+        "mask_refinement_items",
+        "mask_annotations",
+    }.issubset(tables)
 
 
 def test_open_database_can_refuse_missing_input(tmp_path):

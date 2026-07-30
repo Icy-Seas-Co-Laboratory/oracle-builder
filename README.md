@@ -4,6 +4,49 @@ oracle-builder is a small file-based TensorFlow/Keras experimentation tool. It t
 
 It is intentionally not a full ML platform. It does not require MLflow, Weights & Biases, DVC, Hydra, Airflow, Docker, or a database server.
 
+## Dataset architecture V1
+
+Datasets use a versioned, use-case-specific schema: `classification` or
+`mask_refinement`. One SQLite file represents one dataset with a stable UUID,
+an independently addressable revision UUID, standardized metadata,
+content-addressed assets, annotation history, lifecycle state,
+and a semantic fingerprint.
+
+Active databases are `working`. Save a frozen training checkpoint with:
+
+```bash
+oracle-dataset checkpoint path/to/training.sqlite
+```
+
+The source remains editable; the timestamped copy is frozen. Use
+`oracle-dataset thaw <database> --reason "..."` to make a frozen database
+editable again through an explicit, audited transition. Actual training requires
+a frozen dataset, while validation and preflight can inspect working datasets.
+
+Legacy ROI databases with `samples` and the older `mask_annotations` schema are
+automatically migrated when opened by mask-refinement tools. Oracle Builder
+first writes a timestamped `*.pre-v1-*.sqlite` backup, builds and validates V1
+in a temporary database, and then atomically swaps it into place. Historical
+annotations and compatible additive prediction tables are preserved. Legacy
+dataset-level split assignments are recorded in the migration receipt and
+replaced by run-owned split manifests. This
+applies to the mask editor, ROI analysis and visualization, segmentation
+training, saved-run evaluation, and inference. You can run the conversion
+explicitly with:
+
+```bash
+python3 -m oracle_builder.datasets.cli migrate-roi \
+  datasets/unet_training.sqlite
+```
+
+The migrated file is a `working` dataset; checkpoint it before model training.
+U-Net validation reports the resulting dataset/revision UUIDs, schema version,
+lifecycle, semantic fingerprint, schema validation, and migration receipt.
+
+See [the V1 dataset contract](docs/dataset-schema-v1.md) for the schema,
+deterministic folder interchange format, lifecycle commands, sidecar metadata,
+and PostgreSQL mapping.
+
 ## Quick Start
 
 Install the base training stack:
@@ -12,6 +55,7 @@ Install the base training stack:
 python3 -m venv .venv
 source .venv/bin/activate
 python3 -m pip install -r requirements.txt
+python3 -m pip install -e .
 ```
 
 For GPU acceleration, prefer the platform-specific install profile after creating the virtual environment:
@@ -35,15 +79,61 @@ Verify device visibility:
 python3 scripts/check_tensorflow_devices.py
 ```
 
+### Multi-GPU Training
+
+Training automatically uses `tf.distribute.MirroredStrategy` when TensorFlow
+reports more than one logical GPU:
+
+```toml
+[distribution]
+strategy = "auto"
+devices = []
+cross_device_ops = "auto"
+fallback_to_single = true
+memory_growth = true
+```
+
+`data.batch_size` is the global batch size and must be divisible by the number
+of synchronized replicas. For example, `batch_size = 32` on four GPUs gives a
+per-replica batch size of eight. Model construction, optimizer creation,
+supervised training, and student–teacher pretraining all occur in the same
+strategy scope.
+
+To require mirrored execution and fail when two GPUs are not available:
+
+```toml
+[distribution]
+strategy = "mirrored"
+fallback_to_single = false
+```
+
+Specific logical GPUs and cross-device reduction may be selected explicitly:
+
+```toml
+[distribution]
+strategy = "mirrored"
+devices = ["/GPU:0", "/GPU:1"]
+cross_device_ops = "nccl"
+```
+
+Supported strategies are `auto`, `single`, `mirrored`, and `cpu`.
+`cross_device_ops` can be `auto`, `nccl`, or `hierarchical_copy`. Every run
+writes `provenance/distribution.json` with the resolved strategy, devices, replica count,
+and global/per-replica batch sizes.
+
 Create and train a synthetic classification example:
 
 ```bash
 python3 -m oracle_builder.data.sqlite_dataset \
   --classification datasets/example_classification.sqlite
 
+python3 -m oracle_builder.datasets.cli checkpoint \
+  datasets/example_classification.sqlite \
+  --output datasets/example_classification.training.sqlite
+
 python3 model_training.py \
   --config configs/example_classification.toml \
-  --input datasets/example_classification.sqlite \
+  --input datasets/example_classification.training.sqlite \
   --output example-classification-run \
   --overwrite
 ```
@@ -75,13 +165,28 @@ python3 scripts/import_classification_folders.py \
 Immediate child folders are class names, and images are discovered recursively
 within them. JPEG, PNG, and TIFF are supported. Original encoded image bytes are
 stored by default so different models can later use different preprocessing.
-Class indices are stable and written to both the `class_labels` table and a
+Class indices are stable and written to both `classification_labels` and a
 `.labels.json` sidecar.
 
 Top-level `.json`, `.toml`, `.yaml`, and `.yml` files are parsed as dataset
 metadata. Their parsed JSON, original text, format, checksum, and source filename
-are stored in `dataset_metadata`. Each import is recorded in
-`classification_imports` with its options and summary.
+are stored in `metadata_documents`. Each import is recorded in `import_events`
+with its options and summary.
+
+Attach or replace a metadata document on an existing editable dataset with:
+
+```bash
+python3 -m oracle_builder.datasets.cli metadata-add \
+  datasets/example_training.sqlite \
+  metadata.toml \
+  --actor "$USER"
+```
+
+The source filename is the default logical name. Use `--name about` to update a
+stable logical document from a differently named file. The operation preserves
+the source text, validates and stores parsed JSON, records its SHA-256 checksum,
+adds a provenance event, and changes the dataset fingerprint. Frozen datasets
+must be explicitly thawed before their metadata can be changed.
 
 Inspect a proposed import without creating or modifying the database:
 
@@ -93,16 +198,16 @@ python3 scripts/import_classification_folders.py \
 ```
 
 Every import writes `.import_report.json`, `.import_report.csv`, and
-`.labels.json` beside the output. Reports include per-class split counts,
+`.labels.json` beside the output. Reports include proposed per-class split hints,
 warnings, corrupt files, duplicates, and import status.
 
 Important importer controls include:
 
 | Option | Behavior |
 |---|---|
-| `--split-mode stratified-hash` | Stable class-aware hash assignment; default. |
-| `--split-mode existing-folders` | Read `train/`, `validation/`, and `test/` folders. |
-| `--split-mode none` | Assign every imported image to training. |
+| `--split-mode stratified-hash` | Include proposed split counts in the import report only; default. |
+| `--split-mode existing-folders` | Read class folders nested under source `train/`, `validation/`, and `test/` directories without storing those assignments. |
+| `--split-mode none` | Omit proposed split grouping from the import report. |
 | `--label-map PATH` | Use an explicit class-name-to-index JSON mapping. |
 | `--allow-new-classes` | Permit new classes when appending to an existing database. |
 | `--duplicate-policy error\|skip\|allow` | Handle identical image content. |
@@ -311,7 +416,6 @@ Run `python3 mask_builder.py --help` for the argparse source of truth. Current a
 | `--image PATH` | Local image file or folder to mask. |
 | `--output PATH` | Legacy alias for `--database`. |
 | `--uuid UUID` | Sample UUID; defaults to the image filename stem for image imports. |
-| `--split NAME` | Filter existing SQLite samples by split. |
 | `--missing-masks-only` | When reading SQLite samples, show only samples without saved masks. |
 | `--read-only` | Open without saving to a dataset. |
 | `--mask-encoding {png,npy}` | Encoding used when saving validated masks. |
@@ -455,7 +559,7 @@ Create a contact sheet of the selected split. Candidate/API masks are transparen
 ```bash
 python3 scripts/visualize_unet_training_rois.py \
   --database datasets/unet_training.sqlite \
-  --config configs/unet_training.toml \
+  --run runs/unet-test \
   --split train \
   --output runs/unet-test/training_roi_overview.png
 ```
@@ -465,7 +569,7 @@ Compare each ROI across candidate/original, model-output, and validated-mask col
 ```bash
 python3 scripts/visualize_unet_training_rois.py \
   --database datasets/unet_training.sqlite \
-  --config configs/unet_training.toml \
+  --run runs/unet-test \
   --split test \
   --side-by-side \
   --predictions runs/unet-test/predictions/predictions.sqlite \
@@ -484,7 +588,8 @@ Visualization arguments:
 | `--predictions PATH` | Augmented dataset SQLite database; required with `--side-by-side`. |
 | `--prediction-set NAME` | Prediction set to show; optional when the database contains exactly one set. |
 | `--side-by-side` | Show original/candidate, model-output, and validated overlays as columns. |
-| `--config PATH` | Optional TOML config for seed and split fractions. |
+| `--run PATH` | Preferred model-run artifact; uses its authoritative split manifest and resolved tiling config. |
+| `--config PATH` | Legacy fallback TOML config for deriving splits when no run artifact is available. |
 | `--split NAME` | Split to visualize; defaults to `train`. |
 | `--thumbnail-size N` | Maximum tile image size in pixels. |
 | `--columns N` | Grid columns; `0` chooses approximately square layout. |
@@ -501,40 +606,93 @@ Visualization arguments:
 
 ## SQLite Dataset Format
 
-Datasets are SQLite files with a `samples` table. Core columns are:
+See also the [project architecture](docs/architecture.md) and the
+[V1 dataset contract](docs/dataset-schema-v1.md).
 
-```sql
-CREATE TABLE samples (
-    uuid TEXT PRIMARY KEY,
-    split TEXT,
-    input_blob BLOB,
-    input_blob_encoding TEXT,
-    input_blob_dimensions TEXT,
-    output_blob BLOB,
-    output_blob_encoding TEXT,
-    output_blob_dimensions TEXT,
-    label_text TEXT,
-    sample_weight REAL,
-    metadata_json TEXT
-);
+Oracle Builder V1 treats one SQLite file as one logical dataset revision. Every
+file has a stable lineage `dataset_id`, a distinct `revision_id`, an explicit
+`dataset_type`, schema identity and version, lifecycle state, semantic
+fingerprint, source metadata, and audit events.
+
+The shared tables are:
+
+- `ob_schema`: schema name and semantic version.
+- `dataset`: the singleton dataset identity and metadata record.
+- `assets`: content-addressed embedded bytes or external URIs.
+- `dataset_items`: stable item IDs, weight, source key, and metadata. Split
+  membership is not stored in the dataset schema.
+- `metadata_documents`: parsed and original metadata sidecars.
+- `import_events` and `dataset_events`: provenance and lifecycle history.
+
+Use-case tables are deliberately typed:
+
+- Classification uses `classification_labels`, `classification_items`, and
+  append-only `classification_annotations`.
+- Mask refinement uses `mask_refinement_items` and append-only
+  `mask_annotations`. The ROI image, original candidate mask, and every
+  validated-mask revision are distinct assets.
+
+This avoids a generic input/output blob whose meaning changes with the model.
+Models consume a typed dataset through the repository/loader layer; model
+architecture is not part of the dataset schema.
+
+### Working datasets, checkpoints, and training
+
+New and imported datasets begin in the `working` lifecycle. Create a consistent
+timestamped training checkpoint with:
+
+```bash
+python3 -m oracle_builder.datasets.cli checkpoint datasets/library.sqlite
 ```
 
-The mask builder also migrates datasets to include optional candidate-mask columns:
+The source remains editable. The copied file is marked `frozen`, and SQLite
+triggers reject changes to dataset content or semantic metadata. Training
+requires a frozen V1 checkpoint and records its `dataset_id`, `revision_id`,
+schema version, and semantic SHA-256 fingerprint in `config/resolved.json`.
 
-```sql
-input_aux_blob BLOB,
-input_aux_blob_encoding TEXT,
-input_aux_blob_dimensions TEXT
+An explicit thaw makes a database editable again without changing its
+`dataset_id`; it branches a new working `revision_id` from the frozen revision:
+
+```bash
+python3 -m oracle_builder.datasets.cli thaw \
+  datasets/library.checkpoint-20260730T201503.125000Z.sqlite \
+  --actor "$USER" \
+  --reason "continue annotation review"
 ```
 
-Supported blob encodings include `utf-8`, `json`, `int`, `float`, `png`, `jpg`, `jpeg`, `tif`, `tiff`, and `npy`. `zstd` currently raises a clear error until optional support is added.
+Use `info`, `validate`, or `freeze` for inspection and lifecycle management:
 
-For mask-builder U-Net datasets:
+```bash
+python3 -m oracle_builder.datasets.cli info datasets/library.sqlite
+python3 -m oracle_builder.datasets.cli validate datasets/library.sqlite
+python3 -m oracle_builder.datasets.cli freeze datasets/library.sqlite
+```
 
-- `samples.input_blob` stores the model input. For API samples with a candidate mask, this is an `npy` tensor shaped `[height, width, 2]`: channel 0 is grayscale ROI, channel 1 is candidate mask.
-- `samples.input_aux_blob` stores the candidate mask separately for viewer round-tripping.
-- `samples.output_blob` stores the accepted validated mask shaped `[height, width, 1]`.
-- `mask_annotations` stores append-only annotation history.
+### Deterministic folder transfer
+
+Export either dataset type to an ordinary folder bundle:
+
+```bash
+python3 -m oracle_builder.datasets.cli export \
+  datasets/library.sqlite \
+  exports/library-v1
+```
+
+The bundle contains `manifest.json`, `metadata.toml`, source metadata
+documents, images/masks, and `checksums.sha256`. Classification images are
+placed under class folders. The manifest retains stable IDs, complete
+annotation history, asset metadata, and the dataset fingerprint.
+
+Reconstruct the SQLite file and verify every checksum and semantic fingerprint:
+
+```bash
+python3 -m oracle_builder.datasets.cli import \
+  exports/library-v1 \
+  datasets/library-restored.sqlite
+```
+
+The complete contract and planned SQLite-to-PostgreSQL type mapping are in
+[Dataset schema V1](docs/dataset-schema-v1.md).
 
 Prediction output databases retain these source tables and add:
 
@@ -544,6 +702,9 @@ CREATE TABLE prediction_sets (
     created_at TEXT NOT NULL,
     run_id TEXT,
     run_name TEXT,
+    artifact_id TEXT,
+    dataset_id TEXT,
+    dataset_fingerprint_sha256 TEXT,
     config_json TEXT NOT NULL
 );
 
@@ -578,16 +739,20 @@ with the exact run configuration and model that produced its feature space.
 
 For candidate-delta runs, `y_pred_blob` stores raw delta probabilities and `reconstructed_pred_blob` stores reconstructed validated-mask probabilities. The side-by-side visualizer automatically shows candidate, predicted changes, reconstructed mask, and validated mask columns.
 
-Pelagia detection ids are preserved as `samples.uuid` values unless `--uuid` is explicitly provided. Pelagia metadata is stored in `metadata_json`, including `pelagia_detection_id` and the full detection metadata under `metadata_json.pelagia`.
+Pelagia detection IDs are preserved as `dataset_items.item_id` values unless
+`--uuid` is explicitly provided. Pelagia metadata is stored in
+`dataset_items.metadata_json`, including `pelagia_detection_id` and the full
+detection metadata under `pelagia`.
 
-Splits can be stored explicitly in `samples.split`. Rows without a split are assigned deterministically from the config seed and `validation_split`/`test_split`.
+Train/validation/test assignments are stored in
+`protocol/splits.json` inside each model-run artifact. The manifest is keyed by
+dataset item ID and bound to the exact dataset revision and fingerprint.
 
 ## Config Files
 
 Configs are TOML files. Required sections are `[run]`, `[data]`, and `[training]`.
 For classification, `data.num_classes` may be omitted when using SQLite input;
-oracle-builder infers it from the database's `class_labels` table, with a numeric
-sample-label fallback for legacy databases.
+oracle-builder infers it from `classification_labels`.
 
 For classification:
 
@@ -597,16 +762,21 @@ task = "classification"
 model = "simple_cnn"
 
 [data]
-input_shape = [128, 128, 3]
+input_shape = [128, 128, 1]
 
 [training]
-loss = "sparse_categorical_crossentropy"
+loss = "weighted_sparse_categorical_crossentropy"
+
+[training.class_weights]
+mode = "effective_number"
 ```
 
 For classification, `data.num_classes` is optional. When omitted, oracle-builder
-infers it from the selected SQLite database's `class_labels` table, with a
-numeric-label fallback for legacy databases. This keeps model configs reusable
-across training libraries. Explicit `num_classes` remains supported.
+infers it from the selected SQLite database's `classification_labels` table.
+This keeps model configs reusable across training libraries. Explicit
+`num_classes` remains supported. Classification defaults assume grayscale input,
+effective-number class weighting, and no per-epoch checkpoints; each can be
+overridden explicitly.
 
 For segmentation:
 
@@ -703,10 +873,42 @@ When `dice` appears in `training.metrics`, training history includes `dice` and 
 
 - `evaluation/validation_threshold_analysis.json`
 - `evaluation/validation_threshold_curve.csv`
-- `resolved_config.json` under `evaluation.segmentation_threshold`
-- `run_metadata.json` under `validation_threshold_analysis`
+- `config/resolved.json` under `evaluation.segmentation_threshold`
+- `artifact.json` under `summary.validation_threshold_analysis`
 
 Default values are merged in from `oracle_builder/config.py`. Common settings include `batch_size`, `shuffle_buffer`, `validation_split`, `test_split`, `epochs`, `optimizer`, `learning_rate`, callback settings, and output toggles.
+
+## Streaming Classification Data
+
+Classification training streams image data from SQLite by default:
+
+```toml
+[data.streaming]
+enabled = true
+reader_workers = 4
+prefetch_batches = 2
+deterministic = true
+sqlite_cache_kib = 65536
+
+[output]
+prediction_commit_batches = 20
+```
+
+Only row IDs, labels, run-owned split assignments, encodings, dimensions, and lightweight
+metadata are indexed in memory. Each mapping worker owns a read-only SQLite
+connection and lazily fetches and preprocesses the current image. Memory is
+bounded by the shuffle buffer, reader workers, active batch, and configured
+prefetch batches rather than total database size.
+
+The same source feeds supervised training, unlabeled student–teacher
+pretraining, evaluation, feature extraction, prototype construction, and
+prediction writing. Dataset rows are never mutated to create splits.
+Classification prediction rows are committed incrementally.
+Evidence embeddings are written to memory-mapped `.npy` files; prototype sums
+are accumulated online.
+
+Set `data.streaming.enabled = false` only for legacy/debug parity. Segmentation
+currently retains its specialized eager tile/reassembly pathway.
 
 ## Input Augmentation
 
@@ -777,22 +979,91 @@ Arguments:
 
 ## Evaluation And Inference
 
+Inference uses a separate batch policy from training. By default,
+`inference.batch_size = "auto"` chooses a bounded candidate from the input shape
+and architecture, verifies it with a forward pass, and halves it if TensorFlow
+reports resource exhaustion. Set a positive integer for a fixed, still-verified
+batch size. Long post-training stages report their current operation and batch
+progress.
+
+Classification evaluation always preserves raw and normalized confusion
+matrices as CSV/JSON. For large label spaces the primary figure uses sparse
+ticks without per-cell text, and `top_confusions.csv`/`.png` rank the most
+frequent off-diagonal class pairs.
+
+### Weighted classification and SimCLR
+
+Classification supports ordinary sparse cross entropy and class-weighted sparse
+cross entropy. Automatic weights are calculated only from the frozen training
+split and the resolved class counts and values are stored in the run config:
+
+```toml
+[training]
+loss = "weighted_sparse_categorical_crossentropy"
+
+[training.class_weights]
+mode = "effective_number" # explicit, inverse_frequency, effective_number
+beta = 0.999
+normalize = true
+```
+
+Self-supervised pretraining supports the existing BYOL student-teacher method
+and SimCLR with NT-Xent:
+
+```toml
+[pretraining]
+enabled = true
+method = "simclr"
+temperature = 0.1
+projection_dim = 128
+```
+
+See `configs/example_classification_weighted_simclr.toml` for a complete
+weighted SimCLR configuration. Commented, dataset-agnostic starting points for
+every supported classifier family are indexed in
+`configs/classification_defaults/README.md`; their preprocessing and
+augmentation policies are deliberately identical for fair architecture
+comparisons.
+
+Final classification evaluation reports accuracy, balanced accuracy,
+macro/weighted precision, recall and F1, Cohen's kappa, multiclass Matthews
+correlation, top-k accuracy, log loss, multiclass Brier score, expected
+calibration error, per-class metrics and ranked confusions. Segmentation
+evaluation additionally reports specificity, pixel accuracy and DICE
+distribution statistics.
+
+When enabled, `evaluation/performance.json` contains a bounded synthetic
+inference benchmark:
+
+```toml
+[evaluation.benchmark]
+enabled = true
+warmup_batches = 2
+measured_batches = 10
+```
+
+It records model parameter counts, batch and approximate sample latency,
+throughput, TensorFlow devices, the resolved inference batch, evaluation
+pipeline duration and peak device memory when available.
+
 Evaluate a saved run:
 
 ```bash
 python3 model_evaluate.py \
   --run runs/RUN_NAME \
   --input DATASET.sqlite \
-  --split test
+  --split test \
+  --output evaluations/RUN_NAME-test
 ```
 
 Evaluation arguments:
 
 | Argument | Description |
 | --- | --- |
-| `--run PATH` | Required run directory containing `resolved_config.json` and model artifacts. |
+| `--run PATH` | Required V1 run artifact directory. |
 | `--input PATH` | Required SQLite dataset. |
 | `--split NAME` | Required split to evaluate. |
+| `--output PATH` | Required new directory outside the sealed run artifact. |
 
 Write predictions from a saved run:
 
@@ -802,14 +1073,14 @@ python3 model_inference.py \
   --input DATASET.sqlite \
   --split all \
   --prediction-set RUN_NAME \
-  --output runs/RUN_NAME/predictions/predictions.sqlite
+  --output predictions/RUN_NAME.sqlite
 ```
 
 Inference arguments:
 
 | Argument | Description |
 | --- | --- |
-| `--run PATH` | Required run directory containing `resolved_config.json` and model artifacts. |
+| `--run PATH` | Required V1 run artifact directory. |
 | `--input PATH` | Required SQLite dataset. |
 | `--output PATH` | Required augmented SQLite output path. A new file starts as a complete backup of `--input`. |
 | `--split NAME` | One of `all`, `train`, `validation`, or `test`; defaults to `all`. |
@@ -817,19 +1088,34 @@ Inference arguments:
 
 ## Run Outputs
 
-Each training run is self-contained under `runs/<run_name>/`. Common outputs include:
+Each training run is a V1 model-run artifact rooted at `runs/<run_name>/`.
+`artifact.json` is authoritative and records stable artifact/run IDs, dataset
+identity and fingerprint, model input/output contract, status, lifecycle, paths,
+inventory, and artifact fingerprint.
 
-- `run_config.toml`: original user config.
-- `resolved_config.json`: config after defaults and path resolution.
-- `run_metadata.json`: run id, status, and evaluation summary or error.
-- `environment.json`: Python, TensorFlow, Keras, NumPy, platform, GPU, and git metadata.
-- `requirements_freeze.txt`: package snapshot.
-- `training_log.sqlite`: run, epoch metrics, and event tables.
-- `metrics.csv` and `metrics.json`: training history.
-- `model/`: model artifacts and load test report.
-- `evaluation/`: task-specific evaluation files.
-- `predictions/predictions.sqlite`: a copy of the input dataset augmented with predictions for all ROIs and their split tags.
-- `figures/`: plots where available.
+Portable and machine-specific concerns are separated:
+
+- `config/source.toml` and `config/resolved.json`: portable configuration.
+- `provenance/`: runtime paths, environment, package snapshot, and distribution.
+- `logs/training.sqlite`: run, epoch metrics, and execution events.
+- `metrics/`: training and pretraining histories.
+- `model/`: model formats, model manifest, checkpoints, and load-test report.
+- `evaluation/`, `predictions/`, and `figures/`: derived run products.
+- `README.md` and `MODEL_CARD.md`: reader-facing identity and limitations.
+- `checksums.sha256`: complete sealed-file integrity inventory.
+
+Completed and failed runs are sealed automatically. Inspect, verify, and create a
+deterministic preservation package with:
+
+```bash
+oracle-run info runs/RUN_NAME
+oracle-run validate runs/RUN_NAME
+oracle-run pack runs/RUN_NAME archive/RUN_NAME.oracle-run.zip
+oracle-run migrate-legacy runs/OLD_RUN preserved/OLD_RUN-v1
+```
+
+See [Model-run artifact V1](docs/run-artifact-v1.md) for the complete layout,
+lifecycle, portability, preservation, and Pelagia/PostgreSQL mapping.
 
 ## Model Portability
 
@@ -856,6 +1142,28 @@ The registry currently supports:
 - `densenet_like`
 
 Each model module exposes `build_model(config: dict)`. Add future models in `models/` and register them in `oracle_builder/registry.py`.
+
+Documented, runnable, dataset-independent defaults for every classification
+family are in [`configs/classification_defaults/`](configs/classification_defaults/):
+
+- `simple_cnn.toml`
+- `resnet_like.toml`
+- `densenet_like.toml`
+- `resnet.toml`
+- `densenet.toml`
+- `efficientnet.toml`
+
+Each file explains the family-specific architecture choices as well as shared
+preprocessing, streaming, multi-GPU, embedding, pretraining, weighted-loss,
+augmentation, inference, evaluation, and benchmark settings. The class count,
+class order and labels are resolved from the input V1 SQLite dataset; split
+assignments are resolved into the run artifact
+dataset rather than duplicated in a config. Regenerate the checked-in examples
+after changing the shared policy with:
+
+```bash
+python3 scripts/generate_classification_default_configs.py
+```
 
 Classification architectures may be selected either by family and variant:
 
@@ -915,9 +1223,10 @@ knn_k = 5
 
 Each class prototype is the L2-normalized mean of that class's normalized
 training embeddings. Prototype scores are cosine similarities between the query
-and every class prototype. The saved `model/classification_evidence.npz` contains
-the normalized reference embeddings, labels, UUIDs, and prototypes; its adjacent
-JSON file describes the index.
+and every class prototype. New runs save a disk-backed
+`model/classification_evidence/` directory containing memory-mappable `.npy`
+arrays for normalized reference embeddings, labels, UUIDs, and prototypes, plus
+`metadata.json`. Legacy `.npz` indices remain readable.
 
 Exact KNN lookup uses an inner-product matrix operation and partial top-k
 selection. Because both query and reference embeddings are normalized, this has
@@ -980,8 +1289,9 @@ excluded from supervised fine-tuning. Once pretraining completes, the student
 backbone and fixed-size `features` layer continue directly into ordinary
 supervised training.
 
-Pretraining writes `pretraining/metrics.csv`, `pretraining/metrics.json`, and
-`pretraining/student_pretrained.weights.h5`. The projection and prediction heads
+Pretraining writes `metrics/pretraining/metrics.csv`,
+`metrics/pretraining/metrics.json`, and
+`model/pretraining/student_pretrained.weights.h5`. The projection and prediction heads
 exist only during pretraining and are not part of the final classifier. See
 `configs/example_classification_student_teacher.toml` for a complete run.
 
@@ -1085,5 +1395,6 @@ At the time of writing, this installs TensorFlow `>=2.18,<2.19` with `tensorflow
 - Resume support is not implemented.
 - Segmentation evaluation assumes binary masks and thresholded predictions.
 - SavedModel loading is inference-only.
-- The SQLite loader currently materializes arrays in memory before building `tf.data.Dataset`.
+- Segmentation still materializes decoded arrays while its tiling and
+  reassembly pathway is migrated to the streaming source abstraction.
 - The mask builder requires optional GUI dependencies and does not automate napari GUI testing.

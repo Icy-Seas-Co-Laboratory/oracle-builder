@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import uuid
 
 import numpy as np
 
@@ -14,6 +15,7 @@ from oracle_builder.data.sqlite_dataset import (
     load_prediction_arrays,
 )
 from oracle_builder.evaluation.predictions import write_predictions_db
+from oracle_builder.datasets.schema import dataset_fingerprint, read_dataset_info
 from oracle_builder.registry import get_model_builder
 
 
@@ -34,8 +36,23 @@ def test_prediction_database_copies_source_and_supports_multiple_sets(tmp_path):
     source = tmp_path / "training.sqlite"
     output = tmp_path / "training_with_predictions.sqlite"
     create_synthetic_classification(source, n=10, shape=(8, 8, 1), classes=2)
+    with sqlite3.connect(source) as source_connection:
+        source_info = read_dataset_info(source_connection)
+        source_fingerprint = dataset_fingerprint(source_connection)
     config = {
-        "run": {"task": "classification", "model": "simple_cnn", "seed": 123},
+        "run": {
+            "task": "classification",
+            "model": "simple_cnn",
+            "seed": 123,
+            "run_id": "61893e71-dac4-4ddd-acd3-abaa84ae0f27",
+        },
+        "artifact": {
+            "artifact_id": "89d7a5e7-483a-46ad-a2cf-1edfb8057e3d"
+        },
+        "dataset": {
+            "dataset_id": source_info["dataset_id"],
+            "fingerprint_sha256": source_fingerprint,
+        },
         "data": {
             "input_shape": [8, 8, 1],
             "num_classes": 2,
@@ -72,7 +89,7 @@ def test_prediction_database_copies_source_and_supports_multiple_sets(tmp_path):
     )
 
     with sqlite3.connect(output) as connection:
-        assert connection.execute("SELECT count(*) FROM samples").fetchone()[0] == 10
+        assert connection.execute("SELECT count(*) FROM dataset_items").fetchone()[0] == 10
         assert connection.execute("SELECT count(*) FROM predictions WHERE prediction_set = 'run-a'").fetchone()[0] == total
         assert connection.execute("SELECT count(*) FROM predictions WHERE prediction_set = 'run-b'").fetchone()[0] == 1
         assert connection.execute(
@@ -82,6 +99,33 @@ def test_prediction_database_copies_source_and_supports_multiple_sets(tmp_path):
             ("run-a",),
             ("run-b",),
         ]
+        assert connection.execute(
+            """
+            SELECT artifact_id, dataset_id, dataset_fingerprint_sha256
+            FROM prediction_sets WHERE prediction_set = 'run-a'
+            """
+        ).fetchone() == (
+            "89d7a5e7-483a-46ad-a2cf-1edfb8057e3d",
+            source_info["dataset_id"],
+            source_fingerprint,
+        )
+        identity = connection.execute(
+            """
+            SELECT ps.prediction_set_id, ps.result_set_id, p.result_id,
+                   p.logits_blob, p.input_sha256, p.output_sha256,
+                   p.inference_result_json
+            FROM prediction_sets ps
+            JOIN predictions p USING (prediction_set)
+            WHERE ps.prediction_set = 'run-a'
+            LIMIT 1
+            """
+        ).fetchone()
+        assert all(uuid.UUID(value) for value in identity[:3])
+        assert identity[3] is not None
+        assert len(identity[4]) == len(identity[5]) == 64
+        assert json.loads(identity[6])["schema_name"] == (
+            "oracle_builder.inference_result"
+        )
 
 
 def test_all_roi_predictions_include_rows_without_validated_masks(tmp_path):
@@ -89,9 +133,11 @@ def test_all_roi_predictions_include_rows_without_validated_masks(tmp_path):
     output = tmp_path / "segmentation_with_predictions.sqlite"
     create_synthetic_segmentation(source, n=5, shape=(8, 8, 1))
     with sqlite3.connect(source) as connection:
-        missing_uuid = connection.execute("SELECT uuid FROM samples ORDER BY rowid LIMIT 1").fetchone()[0]
+        missing_uuid = connection.execute(
+            "SELECT item_id FROM dataset_items ORDER BY rowid LIMIT 1"
+        ).fetchone()[0]
         connection.execute(
-            "UPDATE samples SET output_blob = NULL, output_blob_encoding = NULL, output_blob_dimensions = NULL WHERE uuid = ?",
+            "UPDATE mask_annotations SET is_current = 0 WHERE item_id = ?",
             (missing_uuid,),
         )
     config = {

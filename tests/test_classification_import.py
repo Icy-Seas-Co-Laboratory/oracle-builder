@@ -46,16 +46,22 @@ def test_folder_import_preserves_originals_labels_audit_and_sidecars(tmp_path):
 
     assert summary["status_counts"] == {"ready": 4}
     with sqlite3.connect(output) as connection:
-        assert connection.execute("SELECT count(*) FROM samples").fetchone()[0] == 4
+        assert connection.execute("SELECT count(*) FROM dataset_items").fetchone()[0] == 4
         assert connection.execute(
-            "SELECT class_index, class_name FROM class_labels ORDER BY class_index"
+            "SELECT class_index, name FROM classification_labels ORDER BY class_index"
         ).fetchall() == [(0, "cod"), (1, "salmon")]
-        assert connection.execute("SELECT count(*) FROM classification_imports").fetchone()[0] == 1
+        assert connection.execute("SELECT count(*) FROM import_events").fetchone()[0] == 1
         sidecars = connection.execute(
-            "SELECT metadata_name, metadata_json FROM dataset_metadata ORDER BY metadata_name"
+            "SELECT name, parsed_json FROM metadata_documents ORDER BY name"
         ).fetchall()
         encoding, blob = connection.execute(
-            "SELECT input_blob_encoding, input_blob FROM samples WHERE metadata_json LIKE '%one.jpg%'"
+            """
+            SELECT a.encoding, a.payload
+            FROM dataset_items di
+            JOIN classification_items ci ON ci.item_id = di.item_id
+            JOIN assets a ON a.asset_id = ci.image_asset_id
+            WHERE di.source_key LIKE '%one.jpg'
+            """
         ).fetchone()
     assert [row[0] for row in sidecars] == ["about.json", "metadata.toml"]
     assert json.loads(sidecars[1][1])["title"] == "Example library"
@@ -78,7 +84,7 @@ def test_folder_import_preserves_originals_labels_audit_and_sidecars(tmp_path):
             "pad_value": 0.0,
         },
     }
-    x, y, records = load_arrays(output, config, split="train")
+    x, y, records = load_arrays(output, config, split=None)
     assert x.shape == (4, 16, 16, 3)
     assert set(y.tolist()) == {0, 1}
     assert len(records) == 4
@@ -119,7 +125,11 @@ def test_materialized_import_applies_requested_preprocessing(tmp_path):
 
     with sqlite3.connect(output) as connection:
         blob, encoding, dimensions = connection.execute(
-            "SELECT input_blob, input_blob_encoding, input_blob_dimensions FROM samples"
+            """
+            SELECT a.payload, a.encoding, a.shape_json
+            FROM classification_items ci
+            JOIN assets a ON a.asset_id = ci.image_asset_id
+            """
         ).fetchone()
     array = decode_blob(blob, encoding, dimensions)
     assert array.shape == (12, 12, 3)
@@ -128,7 +138,7 @@ def test_materialized_import_applies_requested_preprocessing(tmp_path):
     assert np.allclose(array[:3], 1.0)
 
 
-def test_existing_split_folders_are_imported_verbatim(tmp_path):
+def test_existing_split_folders_do_not_become_dataset_state(tmp_path):
     source = tmp_path / "library"
     write_image(source / "train" / "cod" / "one.jpg", (1, 2, 3))
     write_image(source / "validation" / "cod" / "two.jpg", (2, 3, 4))
@@ -140,9 +150,10 @@ def test_existing_split_folders_are_imported_verbatim(tmp_path):
     )
 
     with sqlite3.connect(output) as connection:
-        assert connection.execute(
-            "SELECT split, count(*) FROM samples GROUP BY split ORDER BY split"
-        ).fetchall() == [("test", 1), ("train", 1), ("validation", 1)]
+        assert "split" not in {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(dataset_items)")
+        }
 
 
 def test_preprocessing_supports_resize_inversion_and_channel_conversion():
@@ -179,10 +190,10 @@ def test_repeat_import_skips_existing_samples_and_preserves_labels(tmp_path):
 
     assert second["status_counts"] == {"skipped_existing": 1}
     with sqlite3.connect(output) as connection:
-        assert connection.execute("SELECT count(*) FROM samples").fetchone()[0] == 1
-        assert connection.execute("SELECT count(*) FROM classification_imports").fetchone()[0] == 2
+        assert connection.execute("SELECT count(*) FROM dataset_items").fetchone()[0] == 1
+        assert connection.execute("SELECT count(*) FROM import_events").fetchone()[0] == 2
         assert connection.execute(
-            "SELECT class_index, class_name FROM class_labels"
+            "SELECT class_index, name FROM classification_labels"
         ).fetchall() == [(0, "cod")]
 
 
@@ -196,7 +207,7 @@ def test_duplicate_content_is_skipped_within_a_class(tmp_path):
 
     assert summary["status_counts"] == {"ready": 1, "skipped_duplicate": 1}
     with sqlite3.connect(output) as connection:
-        assert connection.execute("SELECT count(*) FROM samples").fetchone()[0] == 1
+        assert connection.execute("SELECT count(*) FROM dataset_items").fetchone()[0] == 1
 
 
 def test_new_classes_require_explicit_permission_when_appending(tmp_path):
@@ -216,11 +227,11 @@ def test_new_classes_require_explicit_permission_when_appending(tmp_path):
     import_folders(options_for(source, output, "--allow-new-classes"))
     with sqlite3.connect(output) as connection:
         assert connection.execute(
-            "SELECT class_index, class_name FROM class_labels ORDER BY class_index"
+            "SELECT class_index, name FROM classification_labels ORDER BY class_index"
         ).fetchall() == [(0, "cod"), (1, "salmon")]
 
 
-def test_stable_hash_split_does_not_change_when_files_are_added(tmp_path):
+def test_import_does_not_materialize_split_assignments(tmp_path):
     source = tmp_path / "library"
     for index in range(10):
         write_image(source / "cod" / f"{index}.png", (index, 0, 0))
@@ -229,7 +240,9 @@ def test_stable_hash_split_does_not_change_when_files_are_added(tmp_path):
         options_for(source, output, "--duplicate-policy", "allow")
     )
     with sqlite3.connect(output) as connection:
-        before = dict(connection.execute("SELECT uuid, split FROM samples"))
+        before = {
+            row[0] for row in connection.execute("SELECT item_id FROM dataset_items")
+        }
     write_image(source / "cod" / "new.png", (250, 1, 1))
 
     import_folders(
@@ -244,5 +257,12 @@ def test_stable_hash_split_does_not_change_when_files_are_added(tmp_path):
     )
 
     with sqlite3.connect(output) as connection:
-        after = dict(connection.execute("SELECT uuid, split FROM samples"))
-    assert all(after[sample_uuid] == split for sample_uuid, split in before.items())
+        after = {
+            row[0] for row in connection.execute("SELECT item_id FROM dataset_items")
+        }
+        columns = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(dataset_items)")
+        }
+    assert before.issubset(after)
+    assert "split" not in columns

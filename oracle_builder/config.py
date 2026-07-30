@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import json
-import shutil
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -10,12 +8,6 @@ try:
     import tomllib
 except ModuleNotFoundError:  # pragma: no cover
     import tomli as tomllib
-
-try:
-    import tomli_w
-except ModuleNotFoundError:  # pragma: no cover
-    tomli_w = None
-
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "run": {"seed": 123, "notes": ""},
@@ -26,6 +18,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "test_split": 0.1,
         "candidate_sdf": False,
         "candidate_sdf_clip_distance": 32.0,
+        "streaming": {
+            "enabled": True,
+            "reader_workers": 4,
+            "prefetch_batches": 2,
+            "deterministic": True,
+            "sqlite_cache_kib": 65536,
+        },
     },
     "model": {
         "embedding_dim": 256,
@@ -37,6 +36,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "learning_rate": 0.001,
         "loss": None,
         "metrics": ["accuracy"],
+        "class_weights": {
+            "mode": "effective_number",
+            "beta": 0.999,
+            "normalize": True,
+            "values": [],
+        },
         "segmentation_target": "validated_mask",
         "spatial_edge_weighting": False,
         "edge_weight_lambda": 1.0,
@@ -50,12 +55,20 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "teacher_momentum": 0.99,
         "projection_dim": 128,
         "projection_hidden_dim": 256,
+        "temperature": 0.1,
         "use_training_augmentation": False,
         "augmentation": {},
     },
     "evidence": {
         "enabled": True,
         "knn_k": 5,
+    },
+    "inference": {
+        "batch_size": "auto",
+        "minimum_batch_size": 1,
+        "maximum_batch_size": 64,
+        "memory_budget_mb": 512,
+        "progress": True,
     },
     "preprocessing": {
         "resize_mode": "fit_pad",
@@ -64,9 +77,16 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "invert": False,
         "pad_value": 0.0,
         "interpolation": "bilinear",
-        "channel_mode": "auto",
+        "channel_mode": "grayscale",
         "percentile_low": 1.0,
         "percentile_high": 99.0,
+    },
+    "distribution": {
+        "strategy": "auto",
+        "devices": [],
+        "cross_device_ops": "auto",
+        "fallback_to_single": True,
+        "memory_growth": True,
     },
     "callbacks": {
         "early_stopping": False,
@@ -91,12 +111,19 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "mask_fill_value": 0.0,
     },
     "output": {
-        "save_checkpoints": True,
+        "save_checkpoints": False,
         "save_predictions": True,
         "save_figures": True,
         "export_savedmodel": True,
     },
-    "evaluation": {"segmentation_threshold": 0.5},
+    "evaluation": {
+        "segmentation_threshold": 0.5,
+        "benchmark": {
+            "enabled": True,
+            "warmup_batches": 2,
+            "measured_batches": 10,
+        },
+    },
     "tiling": {
         "enabled": False,
         "overlap_fraction": 0.5,
@@ -142,6 +169,27 @@ def validate_config(config: dict[str, Any]) -> None:
         raise ValueError("model.embedding_dim must be a positive integer")
     if int(config.get("evidence", {}).get("knn_k", 5)) < 1:
         raise ValueError("evidence.knn_k must be at least 1")
+    inference = config.get("inference", {})
+    inference_batch = inference.get("batch_size", "auto")
+    if not (
+        (isinstance(inference_batch, str) and inference_batch.lower() == "auto")
+        or (
+            isinstance(inference_batch, int)
+            and not isinstance(inference_batch, bool)
+            and inference_batch >= 1
+        )
+    ):
+        raise ValueError("inference.batch_size must be 'auto' or a positive integer")
+    if int(inference.get("minimum_batch_size", 1)) < 1:
+        raise ValueError("inference.minimum_batch_size must be positive")
+    if int(inference.get("maximum_batch_size", 64)) < int(
+        inference.get("minimum_batch_size", 1)
+    ):
+        raise ValueError(
+            "inference.maximum_batch_size must be at least minimum_batch_size"
+        )
+    if int(inference.get("memory_budget_mb", 512)) < 64:
+        raise ValueError("inference.memory_budget_mb must be at least 64")
     preprocessing = config.get("preprocessing", {})
     if preprocessing.get("resize_mode", "fit_pad") not in {
         "fit_pad",
@@ -171,12 +219,45 @@ def validate_config(config: dict[str, Any]) -> None:
         raise ValueError("Unsupported preprocessing.interpolation")
     if preprocessing.get("channel_mode", "auto") not in {"auto", "grayscale", "rgb", "rgba"}:
         raise ValueError("preprocessing.channel_mode must be auto, grayscale, rgb, or rgba")
+    streaming = config.get("data", {}).get("streaming", {})
+    if int(streaming.get("reader_workers", 4)) < 1:
+        raise ValueError("data.streaming.reader_workers must be at least 1")
+    if int(streaming.get("prefetch_batches", 2)) < 1:
+        raise ValueError("data.streaming.prefetch_batches must be at least 1")
+    if int(streaming.get("sqlite_cache_kib", 65536)) < 1:
+        raise ValueError("data.streaming.sqlite_cache_kib must be at least 1")
+    distribution = config.get("distribution", {})
+    if distribution.get("strategy", "auto") not in {
+        "auto",
+        "single",
+        "none",
+        "mirrored",
+        "cpu",
+    }:
+        raise ValueError(
+            "distribution.strategy must be auto, single, mirrored, or cpu"
+        )
+    if distribution.get("cross_device_ops", "auto") not in {
+        "auto",
+        "nccl",
+        "hierarchical_copy",
+        "hierarchical-copy",
+    }:
+        raise ValueError(
+            "distribution.cross_device_ops must be auto, nccl, or hierarchical_copy"
+        )
     pretraining = config.get("pretraining", {})
     if pretraining.get("enabled", False):
         if task != "classification":
             raise ValueError("self-supervised pretraining is only supported for classification")
-        if str(pretraining.get("method", "byol")).lower() not in {"byol", "student_teacher"}:
-            raise ValueError("pretraining.method must be 'byol' or 'student_teacher'")
+        if str(pretraining.get("method", "byol")).lower() not in {
+            "byol",
+            "student_teacher",
+            "simclr",
+        }:
+            raise ValueError(
+                "pretraining.method must be byol, student_teacher, or simclr"
+            )
         if int(pretraining.get("epochs", 10)) < 1:
             raise ValueError("pretraining.epochs must be at least 1")
         if float(pretraining.get("learning_rate", 0.001)) <= 0:
@@ -188,6 +269,8 @@ def validate_config(config: dict[str, Any]) -> None:
             raise ValueError("pretraining.projection_dim must be positive")
         if int(pretraining.get("projection_hidden_dim", 256)) < 1:
             raise ValueError("pretraining.projection_hidden_dim must be positive")
+        if float(pretraining.get("temperature", 0.1)) <= 0:
+            raise ValueError("pretraining.temperature must be greater than zero")
     if task == "segmentation" and "output_shape" not in config["data"]:
         raise ValueError("data.output_shape is required for segmentation")
     segmentation_target = str(config["training"].get("segmentation_target", "validated_mask")).lower()
@@ -228,16 +311,125 @@ def validate_config(config: dict[str, Any]) -> None:
             raise ValueError("training.edge_weight_sigma must be greater than zero")
     if not config["training"].get("loss"):
         raise ValueError("training.loss is required")
+    benchmark = config.get("evaluation", {}).get("benchmark", {})
+    if int(benchmark.get("warmup_batches", 2)) < 0:
+        raise ValueError("evaluation.benchmark.warmup_batches cannot be negative")
+    if int(benchmark.get("measured_batches", 10)) < 1:
+        raise ValueError("evaluation.benchmark.measured_batches must be positive")
+    from oracle_builder.training.class_weights import (
+        WEIGHTED_CROSS_ENTROPY_NAMES,
+    )
+
+    if str(config["training"]["loss"]).lower() in WEIGHTED_CROSS_ENTROPY_NAMES:
+        if task != "classification":
+            raise ValueError(
+                "weighted cross entropy is only supported for classification"
+            )
+        weights = config["training"].get("class_weights", {})
+        mode = str(weights.get("mode", "inverse_frequency")).lower()
+        if mode not in {"explicit", "inverse_frequency", "effective_number"}:
+            raise ValueError(
+                "training.class_weights.mode must be explicit, "
+                "inverse_frequency, or effective_number"
+            )
+        if mode == "effective_number" and not (
+            0 <= float(weights.get("beta", 0.999)) < 1
+        ):
+            raise ValueError("training.class_weights.beta must be in [0, 1)")
 
 
 def resolve_config(config_path: str | Path, input_path: str | Path, run_dir: str | Path) -> dict[str, Any]:
     user_config = load_toml(config_path)
     resolved = deep_merge(DEFAULT_CONFIG, user_config)
+    task = resolved.get("run", {}).get("task")
+    if task == "classification":
+        if not resolved.get("training", {}).get("loss"):
+            resolved["training"]["loss"] = (
+                "weighted_sparse_categorical_crossentropy"
+            )
+        if "channel_mode" not in user_config.get("preprocessing", {}):
+            resolved["preprocessing"]["channel_mode"] = "grayscale"
+    if resolved.get("run", {}).get("task") == "segmentation":
+        from oracle_builder.datasets.legacy_roi import (
+            ensure_mask_refinement_database,
+        )
+
+        ensure_mask_refinement_database(input_path)
     if (
         resolved.get("run", {}).get("task") == "classification"
         and "num_classes" not in resolved.get("data", {})
     ):
         resolved["data"]["num_classes"] = infer_classification_num_classes(input_path)
+    from oracle_builder.datasets.schema import (
+        dataset_fingerprint,
+        read_dataset_info,
+        validate_database,
+    )
+
+    with sqlite3.connect(Path(input_path).expanduser()) as connection:
+        dataset_info = read_dataset_info(connection)
+        dataset_report = validate_database(connection)
+        if not dataset_report["valid"]:
+            raise ValueError(
+                "Dataset validation failed: " + "; ".join(dataset_report["errors"])
+            )
+        expected_type = (
+            "classification"
+            if resolved.get("run", {}).get("task") == "classification"
+            else "mask_refinement"
+        )
+        if dataset_info["dataset_type"] != expected_type:
+            raise ValueError(
+                f"Training task requires a {expected_type!r} dataset; "
+                f"database contains {dataset_info['dataset_type']!r}"
+            )
+        resolved["dataset"] = {
+            "dataset_id": dataset_info["dataset_id"],
+            "revision_id": dataset_info["revision_id"],
+            "parent_revision_id": dataset_info.get("parent_revision_id"),
+            "dataset_type": dataset_info["dataset_type"],
+            "schema_name": dataset_info["schema_name"],
+            "schema_version": dataset_info["schema_version"],
+            "version": dataset_info.get("version"),
+            "lifecycle": dataset_info["lifecycle"],
+            "fingerprint_sha256": dataset_fingerprint(connection),
+        }
+        source_metadata = dataset_info.get("metadata", {}).get(
+            "source_metadata", {}
+        )
+        source_dataset = (
+            source_metadata.get("dataset", {})
+            if isinstance(source_metadata, dict)
+            else {}
+        )
+        if isinstance(source_dataset, dict):
+            resolved["dataset"]["usage"] = {
+                key: source_dataset.get(key)
+                for key in (
+                    "dataset_doi",
+                    "dataset_url",
+                    "license",
+                    "license_url",
+                    "access_restrictions",
+                    "redistribution_allowed",
+                )
+                if source_dataset.get(key) not in (None, "")
+            }
+        if dataset_info["dataset_type"] == "classification":
+            resolved["dataset"]["labels"] = [
+                {
+                    "label_id": row[0],
+                    "class_index": int(row[1]),
+                    "name": row[2],
+                }
+                for row in connection.execute(
+                    """
+                    SELECT label_id, class_index, name
+                    FROM classification_labels
+                    ORDER BY class_index
+                    """
+                )
+            ]
     validate_config(resolved)
     resolved["paths"] = {
         "config_path": str(Path(config_path).resolve()),
@@ -248,61 +440,25 @@ def resolve_config(config_path: str | Path, input_path: str | Path, run_dir: str
 
 
 def infer_classification_num_classes(input_path: str | Path) -> int:
-    from oracle_builder.data.decoders import decode_blob
-
     connection = sqlite3.connect(Path(input_path).expanduser())
     try:
-        table = connection.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'class_labels'"
+        dataset_type = connection.execute(
+            "SELECT dataset_type FROM dataset WHERE singleton = 1"
         ).fetchone()
-        if table:
-            indices = [
-                int(row[0])
-                for row in connection.execute(
-                    "SELECT class_index FROM class_labels ORDER BY class_index"
-                )
-            ]
-            if indices:
-                expected = list(range(len(indices)))
-                if indices != expected:
-                    raise ValueError(
-                        f"class_labels indices must be contiguous from zero; found {indices}"
-                    )
-                return len(indices)
-        labels = set()
-        for blob, encoding, label_text in connection.execute(
-            "SELECT output_blob, output_blob_encoding, label_text FROM samples"
-        ):
-            if blob is not None:
-                labels.add(int(decode_blob(blob, encoding)))
-            elif label_text is not None:
-                try:
-                    labels.add(int(label_text))
-                except ValueError:
-                    continue
-        if not labels:
-            raise ValueError(
-                "Could not infer classification classes: class_labels is empty and samples "
-                "contain no numeric labels"
+        if dataset_type is None or dataset_type[0] != "classification":
+            raise ValueError("Input is not an Oracle Builder V1 classification dataset")
+        indices = [
+            int(row[0])
+            for row in connection.execute(
+                "SELECT class_index FROM classification_labels ORDER BY class_index"
             )
-        if labels != set(range(max(labels) + 1)):
+        ]
+        if not indices:
+            raise ValueError("Classification dataset contains no labels")
+        if indices != list(range(len(indices))):
             raise ValueError(
-                f"Classification labels must be contiguous from zero; found {sorted(labels)}"
+                f"Classification labels must be contiguous from zero; found {indices}"
             )
-        return max(labels) + 1
+        return len(indices)
     finally:
         connection.close()
-
-
-def write_json(path: str | Path, data: Any) -> None:
-    Path(path).write_text(json.dumps(data, indent=2, sort_keys=True, default=str) + "\n")
-
-
-def write_toml(path: str | Path, data: dict[str, Any]) -> None:
-    if tomli_w is None:
-        raise RuntimeError("Writing TOML requires tomli-w. Install requirements.txt to enable this helper.")
-    Path(path).write_text(tomli_w.dumps(data))
-
-
-def copy_run_config(source: str | Path, run_dir: str | Path) -> None:
-    shutil.copy2(source, Path(run_dir) / "run_config.toml")

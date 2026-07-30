@@ -5,6 +5,45 @@ from tensorflow import keras
 
 
 @keras.utils.register_keras_serializable(package="oracle_builder")
+class WeightedSparseCategoricalCrossentropy(keras.losses.Loss):
+    """Sparse categorical cross entropy weighted by the true class."""
+
+    def __init__(
+        self,
+        class_weights,
+        from_logits: bool = False,
+        name: str = "weighted_sparse_categorical_crossentropy",
+        **kwargs,
+    ):
+        super().__init__(name=name, **kwargs)
+        values = [float(value) for value in class_weights]
+        if not values or any(value <= 0 for value in values):
+            raise ValueError("class_weights must contain positive values")
+        self.class_weights = values
+        self.from_logits = bool(from_logits)
+
+    def call(self, y_true, y_pred):
+        labels = tf.cast(tf.reshape(y_true, [-1]), tf.int32)
+        losses = keras.losses.sparse_categorical_crossentropy(
+            labels,
+            y_pred,
+            from_logits=self.from_logits,
+        )
+        weights = tf.gather(
+            tf.convert_to_tensor(self.class_weights, dtype=losses.dtype),
+            labels,
+        )
+        return losses * weights
+
+    def get_config(self):
+        return {
+            **super().get_config(),
+            "class_weights": self.class_weights,
+            "from_logits": self.from_logits,
+        }
+
+
+@keras.utils.register_keras_serializable(package="oracle_builder")
 class BinaryCrossentropySoftDice(keras.losses.Loss):
     """Pixelwise BCE plus a per-image soft Dice loss broadcast over the image."""
 

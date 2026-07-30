@@ -9,15 +9,23 @@ from tensorflow.keras import layers
 
 
 FEATURE_LAYER_NAME = "features"
+LOGITS_LAYER_NAME = "logits"
 DEFAULT_EMBEDDING_DIM = 256
 
 
 @keras.utils.register_keras_serializable(package="oracle_builder")
 class L2Normalization(layers.Layer):
-    """Normalize nonzero feature vectors to exact unit L2 length."""
+    """Normalize feature vectors, including a deterministic zero-vector fallback."""
 
     def call(self, inputs):
-        return tf.math.divide_no_nan(inputs, tf.norm(inputs, axis=-1, keepdims=True))
+        norm = tf.norm(inputs, axis=-1, keepdims=True)
+        normalized = tf.math.divide_no_nan(inputs, norm)
+        fallback = tf.one_hot(
+            tf.zeros(tf.shape(inputs)[:-1], dtype=tf.int32),
+            depth=tf.shape(inputs)[-1],
+            dtype=inputs.dtype,
+        )
+        return tf.where(norm > 0, normalized, fallback)
 
 
 def classification_head(
@@ -45,15 +53,21 @@ def classification_head(
     x = features
     if dropout:
         x = layers.Dropout(dropout, name="classifier_dropout")(x)
-    return layers.Dense(num_classes, activation="softmax", name="predictions")(x)
+    logits = layers.Dense(num_classes, name=LOGITS_LAYER_NAME)(x)
+    return layers.Activation("softmax", name="predictions")(logits)
 
 
 def build_feature_model(model: keras.Model) -> keras.Model:
-    """Return an inference view containing probabilities and embeddings."""
+    """Return an inference view containing logits, probabilities, and embeddings."""
     features = model.get_layer(FEATURE_LAYER_NAME).output
+    logits = model.get_layer(LOGITS_LAYER_NAME).output
     return keras.Model(
         model.input,
-        {"probabilities": model.output, "features": features},
+        {
+            "logits": logits,
+            "probabilities": model.output,
+            "features": features,
+        },
         name=f"{model.name}_with_features",
     )
 
@@ -79,3 +93,56 @@ def predict_with_features(model, x: np.ndarray) -> tuple[np.ndarray, np.ndarray 
     except (AttributeError, ValueError):
         return np.asarray(model.predict(x, verbose=0)), None
     return np.asarray(outputs["probabilities"]), np.asarray(outputs["features"])
+
+
+def predict_classification_outputs(
+    model,
+    x: np.ndarray,
+    *,
+    batch_size: int | None = None,
+) -> dict[str, np.ndarray | None]:
+    """Return the complete classification inference contract for a batch."""
+    if hasattr(model, "predict_outputs"):
+        outputs = model.predict_outputs(x, verbose=0)
+        return {
+            "logits": np.asarray(outputs["logits"]),
+            "probabilities": np.asarray(outputs["probabilities"]),
+            "features": (
+                np.asarray(outputs["features"])
+                if outputs.get("features") is not None
+                else None
+            ),
+            "logits_source": outputs.get("logits_source", "model"),
+        }
+    try:
+        predict_options = {"verbose": 0}
+        if batch_size is not None:
+            predict_options["batch_size"] = batch_size
+        outputs = build_feature_model(model).predict(
+            x, **predict_options
+        )
+        return {
+            "logits": np.asarray(outputs["logits"]),
+            "probabilities": np.asarray(outputs["probabilities"]),
+            "features": np.asarray(outputs["features"]),
+            "logits_source": "model",
+        }
+    except (AttributeError, ValueError):
+        probabilities = np.asarray(
+            model.predict(x, **predict_options)
+        )
+        features = (
+            np.asarray(model.predict_features(x, verbose=0))
+            if hasattr(model, "predict_features")
+            else None
+        )
+        # Softmax logits are identifiable only up to an additive constant.
+        # log(p) is the stable canonical representative for probability-only
+        # external or historical predictors.
+        logits = np.log(np.clip(probabilities, 1e-7, 1.0))
+        return {
+            "logits": logits.astype("float32"),
+            "probabilities": probabilities,
+            "features": features,
+            "logits_source": "derived_log_probability",
+        }

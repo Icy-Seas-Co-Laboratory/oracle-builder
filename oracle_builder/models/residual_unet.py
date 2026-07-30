@@ -43,5 +43,6 @@ def build_model(config: dict[str, Any]):
         x = layers.Concatenate(name=f"skip_{level}")([x, skips[level]])
         x = _residual_block(x, base * (2**level), activation, dropout if level else 0.0, f"decoder_{level}")
 
-    outputs = layers.Conv2D(output_channels, 1, activation=final_activation, name="segmentation")(x)
+    logits = layers.Conv2D(output_channels, 1, name="logits")(x)
+    outputs = layers.Activation(final_activation, name="segmentation")(logits)
     return keras.Model(inputs, outputs, name="residual_unet")

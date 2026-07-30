@@ -1,0 +1,160 @@
+from __future__ import annotations
+
+import json
+import uuid
+
+import numpy as np
+import pytest
+
+from oracle_builder.inference import (
+    ArrayPayload,
+    InferenceBundle,
+    InferenceItem,
+    InferenceResultSet,
+    ModelReference,
+    SourceReference,
+    run_connector,
+)
+
+
+def model_reference(task: str = "classification") -> ModelReference:
+    return ModelReference(
+        artifact_id=str(uuid.uuid4()),
+        run_id=str(uuid.uuid4()),
+        task=task,
+        architecture="simple_cnn" if task == "classification" else "unet",
+        artifact_fingerprint="a" * 64,
+    )
+
+
+def test_inference_item_and_array_assets_have_uuid_and_hash_identity():
+    source = SourceReference("pelagia", "roi", "pelagia-roi-42")
+    first = ArrayPayload(np.arange(9, dtype="uint8").reshape(3, 3))
+    second = ArrayPayload(np.arange(9, dtype="uint8").reshape(3, 3))
+    item = InferenceItem(inputs={"image": first}, source=source)
+
+    assert uuid.UUID(first.asset_id)
+    assert first.sha256 == second.sha256
+    assert len(item.input_sha256) == 64
+    encoded = item.to_dict(include_data=False)
+    assert encoded["schema_name"] == "oracle_builder.inference_item"
+    assert encoded["source"]["resource_id"] == "pelagia-roi-42"
+    assert "data_base64" not in encoded["inputs"]["image"]
+
+
+def test_result_set_json_lines_is_a_streamable_envelope():
+    result_set = InferenceResultSet(model=model_reference()).complete()
+    events = [json.loads(value) for value in result_set.to_json_lines()]
+
+    assert events[0]["event"] == "result_set_start"
+    assert events[-1]["event"] == "result_set_complete"
+    assert events[-1]["counts"]["requested"] == 0
+
+
+def test_connector_is_in_memory_by_default(tmp_path):
+    class EchoBundle:
+        model_reference = model_reference()
+
+        def predict(
+            self, item, *, result_set_id=None, sequence_number=None
+        ):
+            from oracle_builder.inference.contracts import InferenceResult
+
+            return InferenceResult(
+                request_id=item.request_id,
+                item_id=item.item_id,
+                model=self.model_reference,
+                output={
+                    "type": "classification",
+                    "logits": [0.0],
+                    "probabilities": [{"class_index": 0, "probability": 1.0}],
+                },
+                input_sha256=item.input_sha256,
+                result_set_id=result_set_id,
+                sequence_number=sequence_number,
+            )
+
+    result_set = run_connector(
+        EchoBundle(),
+        [InferenceItem.from_array(np.zeros((2, 2), dtype="uint8"))],
+    )
+
+    assert result_set.counts["succeeded"] == 1
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_classification_bundle_returns_logits_probabilities_and_embedding():
+    tf = pytest.importorskip("tensorflow")
+    from oracle_builder.registry import get_model_builder
+
+    config = {
+        "run": {"task": "classification", "model": "simple_cnn"},
+        "data": {"input_shape": [8, 8, 1], "num_classes": 2},
+        "dataset": {
+            "labels": [
+                {"label_id": str(uuid.uuid4()), "class_index": 0, "name": "a"},
+                {"label_id": str(uuid.uuid4()), "class_index": 1, "name": "b"},
+            ]
+        },
+        "model": {
+            "base_filters": 2,
+            "dropout": 0.0,
+            "embedding_dim": 4,
+            "normalize_embeddings": True,
+        },
+        "preprocessing": {
+            "resize_mode": "fit_pad",
+            "normalization": "dtype",
+            "rescale": True,
+            "channel_mode": "auto",
+            "interpolation": "bilinear",
+        },
+    }
+    model = get_model_builder("simple_cnn")(config)
+    bundle = InferenceBundle(model, config, model_reference())
+    item = InferenceItem.from_array(np.full((5, 7), 128, dtype="uint8"))
+
+    result = bundle.predict(item)
+
+    assert result.status == "ok"
+    assert result.output["type"] == "classification"
+    assert result.output["logits_source"] == "model"
+    assert len(result.output["logits"]) == 2
+    probabilities = [
+        row["probability"] for row in result.output["probabilities"]
+    ]
+    assert np.isclose(sum(probabilities), 1.0)
+    assert result.output["embedding"].values.shape == (4,)
+    assert uuid.UUID(result.result_id)
+    assert len(result.input_sha256) == 64
+
+
+def test_segmentation_bundle_returns_logits_and_hashed_array_outputs():
+    pytest.importorskip("tensorflow")
+    from oracle_builder.registry import get_model_builder
+
+    config = {
+        "run": {"task": "segmentation", "model": "unet"},
+        "data": {"input_shape": [8, 8, 1], "output_shape": [8, 8, 1]},
+        "model": {
+            "base_filters": 2,
+            "depth": 1,
+            "dropout": 0.0,
+            "final_activation": "sigmoid",
+        },
+        "training": {"segmentation_target": "validated_mask"},
+        "evaluation": {"segmentation_threshold": 0.5},
+        "tiling": {"enabled": False},
+    }
+    model = get_model_builder("unet")(config)
+    bundle = InferenceBundle(model, config, model_reference("segmentation"))
+
+    result = bundle.predict(
+        InferenceItem.from_array(np.zeros((8, 8, 1), dtype="float32"))
+    )
+
+    assert result.status == "ok"
+    assert result.output["logits_source"] == "model"
+    assert result.output["logits"].values.shape == (8, 8, 1)
+    assert result.output["probability_map"].values.shape == (8, 8, 1)
+    assert len(result.output["mask"].sha256) == 64

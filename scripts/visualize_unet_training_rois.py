@@ -17,10 +17,12 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from oracle_builder.config import load_toml
+from oracle_builder.artifacts import read_run_config
 from oracle_builder.data.decoders import decode_blob
-from oracle_builder.data.splits import assign_missing_splits
+from oracle_builder.data.splits import assign_run_splits
 from oracle_builder.data.tiling import plan_tiles
 from oracle_builder.masking.sqlite_io import load_sample, open_database
+from oracle_builder.datasets.legacy_roi import ensure_mask_refinement_database
 
 
 BLUE = np.array([40, 130, 255], dtype="float32")
@@ -45,6 +47,11 @@ def parse_args() -> argparse.Namespace:
         help="Render candidate, model output, and validated overlays in three columns per ROI.",
     )
     parser.add_argument("--config", type=Path, help="Optional TOML config used for seed and split fractions.")
+    parser.add_argument(
+        "--run",
+        type=Path,
+        help="Model-run artifact whose protocol/splits.json defines ROI membership.",
+    )
     parser.add_argument("--split", default="train", help="Dataset split to visualize. Defaults to train.")
     parser.add_argument("--thumbnail-size", type=int, default=180, help="Maximum tile image size in pixels.")
     parser.add_argument("--columns", type=int, default=0, help="Grid columns. Defaults to sqrt(sample count).")
@@ -63,7 +70,12 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    config = load_toml(args.config) if args.config else {}
+    ensure_mask_refinement_database(args.database)
+    if args.run and args.config:
+        raise SystemExit("Use either --run or --config, not both.")
+    config = read_run_config(args.run) if args.run else (
+        load_toml(args.config) if args.config else {}
+    )
     data_config = config.get("data", {})
     run_config = config.get("run", {})
     seed = args.seed if args.seed is not None else int(run_config.get("seed", 123))
@@ -74,7 +86,14 @@ def main() -> int:
     tile_shape = tuple(data_config.get("input_shape", [])[:2]) or None
     tile_overlap = float(config.get("tiling", {}).get("overlap_fraction", 0.5))
 
-    rows = read_training_rows(args.database, validation_split, test_split, seed, args.split)
+    rows = read_training_rows(
+        args.database,
+        validation_split,
+        test_split,
+        seed,
+        args.split,
+        config=config,
+    )
     if args.limit is not None:
         rows = rows[: args.limit]
     if not rows:
@@ -95,7 +114,8 @@ def main() -> int:
         if missing:
             raise SystemExit(
                 f"No model predictions found for {len(missing)} selected ROI(s), including {missing[0]!r}. "
-                "A predictions database contains only the split used during inference, not a full copy of the input dataset."
+                "Confirm that --run and --prediction-set refer to the same model run "
+                "and that predictions were generated for all dataset items."
             )
         sheet = build_side_by_side_sheet(
             samples,
@@ -134,20 +154,30 @@ def read_training_rows(
     test_split: float,
     seed: int,
     split: str,
+    config: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     connection = sqlite3.connect(database)
     connection.row_factory = sqlite3.Row
     try:
         rows = connection.execute(
             """
-            SELECT uuid, split, metadata_json
-            FROM samples
-            WHERE output_blob IS NOT NULL AND length(output_blob) > 0
+            SELECT di.item_id AS uuid, di.metadata_json
+            FROM dataset_items di
+            JOIN mask_refinement_items mi ON mi.item_id = di.item_id
+            JOIN mask_annotations ma
+              ON ma.item_id = mi.item_id AND ma.is_current = 1
             """
         ).fetchall()
     finally:
         connection.close()
-    assigned = assign_missing_splits([dict(row) for row in rows], validation_split, test_split, seed)
+    split_config = config or {
+        "run": {"seed": seed},
+        "data": {
+            "validation_split": validation_split,
+            "test_split": test_split,
+        },
+    }
+    assigned = assign_run_splits([dict(row) for row in rows], split_config)
     return [row for row in assigned if row.get("split") == split]
 
 

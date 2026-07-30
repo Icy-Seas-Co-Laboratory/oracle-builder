@@ -33,9 +33,15 @@ def main() -> int:
     payload.update({
         "tensorflow_version": tf.__version__,
         "physical_gpus": [str(device) for device in tf.config.list_physical_devices("GPU")],
+        "logical_gpus": [str(device) for device in tf.config.list_logical_devices("GPU")],
         "physical_cpus": [str(device) for device in tf.config.list_physical_devices("CPU")],
         "built_with_cuda": bool(getattr(tf.test, "is_built_with_cuda", lambda: False)()),
     })
+    logical_gpu_count = len(payload["logical_gpus"])
+    payload["oracle_builder_auto_strategy"] = (
+        "mirrored" if logical_gpu_count > 1 else "single"
+    )
+    payload["replica_count"] = logical_gpu_count if logical_gpu_count > 1 else 1
     try:
         payload["build_info"] = tf.sysconfig.get_build_info()
     except Exception as exc:

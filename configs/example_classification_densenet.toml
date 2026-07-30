@@ -1,3 +1,6 @@
+# DenseNet classification example. Dense connectivity encourages feature reuse
+# and can work well when training data is limited, at a higher memory cost.
+
 [run]
 task = "classification"
 model = "densenet"
@@ -5,12 +8,12 @@ seed = 123
 notes = "DenseNet-121 classification example"
 
 [data]
-input_shape = [224, 224, 3]
-num_classes = 3
+# Grayscale is assumed. Class count comes from the SQLite dataset.
+input_shape = [224, 224, 1]
 batch_size = 16
 shuffle_buffer = 512
-validation_split = 0.2
-test_split = 0.1
+validation_split = 0.20
+test_split = 0.10
 
 [preprocessing]
 resize_mode = "fit_pad"
@@ -19,9 +22,11 @@ rescale = true
 invert = false
 pad_value = 0.0
 interpolation = "bilinear"
-channel_mode = "auto"
+channel_mode = "grayscale"
 
 [model]
+# Variants: densenet121, densenet169, densenet201.
+# DenseNet-121 is the normal starting point; larger variants cost more memory.
 variant = "densenet121"
 stem_kernel_size = 7
 stem_stride = 2
@@ -40,8 +45,13 @@ knn_k = 5
 epochs = 50
 optimizer = "adam"
 learning_rate = 0.001
-loss = "sparse_categorical_crossentropy"
+loss = "weighted_sparse_categorical_crossentropy"
 metrics = ["accuracy"]
+
+[training.class_weights]
+mode = "effective_number"
+beta = 0.999
+normalize = true
 
 [callbacks]
 early_stopping = true
@@ -50,12 +60,24 @@ reduce_lr_on_plateau = true
 checkpoint_monitor = "val_loss"
 
 [augmentation]
+# Shared classification policy. rotation=0.5 permits any orientation.
 enabled = true
+repeats_per_epoch = 1
+invert = false # Assume black background and light foreground.
+rotation = 0.5
+zoom = 0.20
+translation = [0.15, 0.15]
+skew = 0.20
 flip_horizontal = true
-rotation = 0.1
+flip_vertical = true
+brightness = 0.20
+contrast = 0.20
+gaussian_noise = 0.05
+fill_value = 0.0
 
 [output]
-save_checkpoints = true
+# The final model is saved; per-epoch checkpoints are opt-in.
+save_checkpoints = false
 save_predictions = true
 save_figures = true
 export_savedmodel = true

@@ -17,11 +17,21 @@ def binary_metrics(y_true: np.ndarray, y_pred: np.ndarray, threshold: float = 0.
     tp = float(np.logical_and(true_mask, pred_mask).sum())
     fp = float(np.logical_and(~true_mask, pred_mask).sum())
     fn = float(np.logical_and(true_mask, ~pred_mask).sum())
+    tn = float(np.logical_and(~true_mask, ~pred_mask).sum())
     dice = (2 * tp) / (2 * tp + fp + fn) if (2 * tp + fp + fn) else 1.0
     iou = tp / (tp + fp + fn) if (tp + fp + fn) else 1.0
     precision = tp / (tp + fp) if (tp + fp) else 1.0
     recall = tp / (tp + fn) if (tp + fn) else 1.0
-    return {"dice": dice, "iou": iou, "precision": precision, "recall": recall}
+    specificity = tn / (tn + fp) if (tn + fp) else 1.0
+    accuracy = (tp + tn) / (tp + tn + fp + fn) if (tp + tn + fp + fn) else 1.0
+    return {
+        "dice": dice,
+        "iou": iou,
+        "precision": precision,
+        "recall": recall,
+        "specificity": specificity,
+        "pixel_accuracy": accuracy,
+    }
 
 
 def predict_reassembled_segmentation(
@@ -30,8 +40,13 @@ def predict_reassembled_segmentation(
     y: Any,
     records: list[dict[str, Any]],
     config: dict[str, Any],
+    *,
+    batch_size: int | None = None,
 ) -> tuple[list[np.ndarray], list[np.ndarray | None], list[dict[str, Any]]]:
-    tile_predictions = model.predict(x, verbose=0)
+    predict_options = {"verbose": 0}
+    if batch_size is not None:
+        predict_options["batch_size"] = batch_size
+    tile_predictions = model.predict(x, **predict_options)
     blend_mode = config.get("tiling", {}).get("blend_mode", "hann")
     predictions, source_records = group_and_reassemble(tile_predictions, records, blend_mode=blend_mode)
     target_values = list(y)
@@ -71,9 +86,10 @@ def evaluate_segmentation(
     run_dir: str | Path,
     threshold: float = 0.5,
     config: dict[str, Any] | None = None,
+    batch_size: int | None = None,
 ) -> dict[str, Any]:
     predictions, targets, records = predict_reassembled_segmentation(
-        model, x, y, records, config or {}
+        model, x, y, records, config or {}, batch_size=batch_size
     )
     rows = []
     target_mode = segmentation_target_mode(config or {})
@@ -120,6 +136,35 @@ def evaluate_segmentation(
         "mean_iou": float(metrics_df["iou"].mean()) if not metrics_df.empty else None,
         "mean_precision": float(metrics_df["precision"].mean()) if not metrics_df.empty else None,
         "mean_recall": float(metrics_df["recall"].mean()) if not metrics_df.empty else None,
+        "mean_specificity": (
+            float(metrics_df["specificity"].mean())
+            if not metrics_df.empty
+            else None
+        ),
+        "mean_pixel_accuracy": (
+            float(metrics_df["pixel_accuracy"].mean())
+            if not metrics_df.empty
+            else None
+        ),
+        "median_dice": (
+            float(metrics_df["dice"].median()) if not metrics_df.empty else None
+        ),
+        "std_dice": (
+            float(metrics_df["dice"].std(ddof=0))
+            if not metrics_df.empty
+            else None
+        ),
+        "dice_p05": (
+            float(metrics_df["dice"].quantile(0.05))
+            if not metrics_df.empty
+            else None
+        ),
+        "dice_p95": (
+            float(metrics_df["dice"].quantile(0.95))
+            if not metrics_df.empty
+            else None
+        ),
+        "sample_count": int(len(metrics_df)),
     }
     if target_mode == CANDIDATE_DELTA and not metrics_df.empty:
         summary.update(

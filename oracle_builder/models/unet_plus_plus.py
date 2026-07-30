@@ -52,18 +52,21 @@ def build_model(config: dict[str, Any]):
             )
 
     if deep_supervision:
-        heads = [
-            layers.Conv2D(
-                output_channels,
-                1,
-                activation=final_activation,
-                name=f"supervision_{stage}",
-            )(nodes[(0, stage)])
+        head_logits = [
+            layers.Conv2D(output_channels, 1, name=f"supervision_{stage}_logits")(
+                nodes[(0, stage)]
+            )
             for stage in range(1, depth + 1)
         ]
-        outputs = heads[0] if len(heads) == 1 else layers.Average(name="segmentation")(heads)
+        logits = (
+            head_logits[0]
+            if len(head_logits) == 1
+            else layers.Average(name="logits")(head_logits)
+        )
+        if len(head_logits) == 1:
+            logits = layers.Activation("linear", name="logits")(logits)
+        outputs = layers.Activation(final_activation, name="segmentation")(logits)
     else:
-        outputs = layers.Conv2D(
-            output_channels, 1, activation=final_activation, name="segmentation"
-        )(nodes[(0, depth)])
+        logits = layers.Conv2D(output_channels, 1, name="logits")(nodes[(0, depth)])
+        outputs = layers.Activation(final_activation, name="segmentation")(logits)
     return keras.Model(inputs, outputs, name="unet_plus_plus")

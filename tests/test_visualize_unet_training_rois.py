@@ -112,15 +112,23 @@ def test_read_predictions_selects_named_prediction_set(tmp_path):
     database = tmp_path / "predictions.sqlite"
     connection = init_predictions_db(database)
     connection.execute(
-        "INSERT INTO prediction_sets VALUES (?, ?, ?, ?, ?)",
+        """
+        INSERT INTO prediction_sets (
+            prediction_set, created_at, run_id, run_name, config_json
+        ) VALUES (?, ?, ?, ?, ?)
+        """,
         ("run-a", "now", None, None, "{}"),
     )
     connection.execute(
-        "INSERT INTO prediction_sets VALUES (?, ?, ?, ?, ?)",
+        """
+        INSERT INTO prediction_sets (
+            prediction_set, created_at, run_id, run_name, config_json
+        ) VALUES (?, ?, ?, ?, ?)
+        """,
         ("run-b", "now", None, None, "{}"),
     )
     for name, value in (("run-a", 0.25), ("run-b", 0.75)):
-            connection.execute(
+        connection.execute(
             """INSERT INTO predictions (
                 prediction_set, uuid, split, y_true_blob, y_true_encoding,
                 y_pred_blob, y_pred_encoding, y_prob_json, metrics_json, metadata_json

@@ -21,6 +21,26 @@ dependencies = [
   "PyYAML",
 ]
 
+[project.scripts]
+oracle-dataset = "oracle_builder.datasets.cli:main"
+oracle-run = "oracle_builder.artifacts.cli:main"
+oracle-import-classification = "oracle_builder.data.classification_import:main"
+oracle-train = "model_training:main"
+oracle-infer = "model_inference:main"
+oracle-evaluate = "model_evaluate:main"
+oracle-mask-builder = "mask_builder:main"
+
+[tool.setuptools]
+py-modules = [
+  "mask_builder",
+  "model_evaluate",
+  "model_inference",
+  "model_training",
+]
+
+[tool.setuptools.packages.find]
+include = ["oracle_builder*"]
+
 [project.optional-dependencies]
 gpu-linux = [
   "tensorflow[and-cuda]",

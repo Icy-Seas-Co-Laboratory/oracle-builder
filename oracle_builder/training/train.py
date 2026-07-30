@@ -12,8 +12,16 @@ from tensorflow import keras
 
 from oracle_builder.registry import get_model_builder
 from oracle_builder.training.callbacks import build_callbacks
-from oracle_builder.training.losses import BinaryCrossentropySoftDice
+from oracle_builder.training.losses import (
+    BinaryCrossentropySoftDice,
+    WeightedSparseCategoricalCrossentropy,
+)
+from oracle_builder.training.class_weights import WEIGHTED_CROSS_ENTROPY_NAMES
 from oracle_builder.training.metrics import BinaryDice
+from oracle_builder.training.distribution import (
+    select_distribution_strategy,
+    write_distribution_info,
+)
 
 
 def set_seed(seed: int) -> None:
@@ -41,6 +49,14 @@ def compile_model(model: keras.Model, config: dict[str, Any]) -> keras.Model:
             dice_weight=float(training.get("soft_dice_weight", 1.0)),
             smooth=float(training.get("soft_dice_smooth", 1e-6)),
         )
+    elif str(loss_name).lower() in WEIGHTED_CROSS_ENTROPY_NAMES:
+        class_weights = training.get("class_weights", {}).get("values")
+        if not class_weights:
+            raise ValueError(
+                "Weighted cross entropy requires resolved "
+                "training.class_weights.values"
+            )
+        loss = WeightedSparseCategoricalCrossentropy(class_weights)
     else:
         loss = loss_name
 
@@ -77,19 +93,38 @@ def train_model(
     pretraining_dataset=None,
 ):
     set_seed(int(config["run"].get("seed", 123)))
-    model = build_and_compile_model(config)
+    strategy, distribution_info = select_distribution_strategy(config)
+    with strategy.scope():
+        model = build_and_compile_model(config)
+    write_distribution_info(distribution_info, run_dir)
     write_model_summary(model, Path(run_dir) / "model" / "model_summary.txt")
+    from oracle_builder.training.logging_callbacks import log_event
+
+    log_event(
+        training_log,
+        run_id,
+        "INFO",
+        "Configured TensorFlow distribution strategy",
+        {
+            "requested_strategy": distribution_info.requested_strategy,
+            "resolved_strategy": distribution_info.resolved_strategy,
+            "replicas": distribution_info.replicas,
+            "devices": distribution_info.devices,
+            "global_batch_size": distribution_info.global_batch_size,
+            "per_replica_batch_size": distribution_info.per_replica_batch_size,
+            "cross_device_ops": distribution_info.cross_device_ops,
+        },
+    )
     if config.get("pretraining", {}).get("enabled", False):
         if pretraining_dataset is None:
             raise ValueError("Enabled self-supervised pretraining requires a pretraining dataset")
-        from oracle_builder.training.logging_callbacks import log_event
         from oracle_builder.training.student_teacher import run_student_teacher_pretraining
 
         log_event(
             training_log,
             run_id,
             "INFO",
-            "Started student-teacher self-supervised pretraining",
+            "Started self-supervised pretraining",
             config["pretraining"],
         )
         pretraining_history = run_student_teacher_pretraining(
@@ -97,12 +132,13 @@ def train_model(
             pretraining_dataset,
             config,
             run_dir,
+            strategy=strategy,
         )
         log_event(
             training_log,
             run_id,
             "INFO",
-            "Completed student-teacher self-supervised pretraining",
+            "Completed self-supervised pretraining",
             {
                 key: float(values[-1])
                 for key, values in pretraining_history.history.items()
@@ -124,7 +160,12 @@ def train_model(
         for name, value in zip(history.history.keys(), metrics, strict=False):
             row[name] = float(value)
         history_rows.append(row)
+    from oracle_builder.artifacts.layout import RunLayout
+
     metrics_df = pd.DataFrame(history_rows)
-    metrics_df.to_csv(Path(run_dir) / "metrics.csv", index=False)
-    Path(run_dir, "metrics.json").write_text(json.dumps(history.history, indent=2, default=float) + "\n")
+    layout = RunLayout(run_dir)
+    metrics_df.to_csv(layout.metrics_csv, index=False)
+    layout.metrics_json.write_text(
+        json.dumps(history.history, indent=2, default=float) + "\n"
+    )
     return model, history

@@ -7,7 +7,6 @@ import json
 import sqlite3
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -16,20 +15,12 @@ from PIL import Image
 
 from oracle_builder.data.decoders import encode_npy, prepare_classification_input
 from oracle_builder.data.sqlite_dataset import ensure_schema
-
-try:
-    import tomllib
-except ModuleNotFoundError:  # pragma: no cover
-    import tomli as tomllib
-
-try:
-    import yaml
-except ModuleNotFoundError:  # pragma: no cover
-    yaml = None
+from oracle_builder.datasets.metadata import discover_metadata_documents
+from oracle_builder.datasets.repository import SQLiteDatasetRepository
+from oracle_builder.datasets.schema import read_dataset_info, utc_now
 
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".tif", ".tiff"}
-SIDECAR_SUFFIXES = {".json", ".toml", ".yaml", ".yml"}
 SPLIT_FOLDERS = {"train": "train", "validation": "validation", "val": "validation", "test": "test"}
 
 
@@ -72,35 +63,6 @@ def load_label_map(path: Path | None) -> dict[str, int] | None:
     return result
 
 
-def parse_sidecars(root: Path) -> list[dict[str, Any]]:
-    sidecars = []
-    for path in sorted(root.iterdir()):
-        if not path.is_file() or path.suffix.lower() not in SIDECAR_SUFFIXES:
-            continue
-        raw = path.read_text()
-        suffix = path.suffix.lower()
-        if suffix == ".json":
-            parsed = json.loads(raw)
-        elif suffix == ".toml":
-            with path.open("rb") as handle:
-                parsed = tomllib.load(handle)
-        else:
-            if yaml is None:
-                raise RuntimeError("YAML metadata requires PyYAML; install requirements.txt")
-            parsed = yaml.safe_load(raw)
-        sidecars.append(
-            {
-                "metadata_name": path.name,
-                "source_filename": path.name,
-                "source_format": suffix.lstrip("."),
-                "metadata_json": json.dumps(parsed, sort_keys=True, default=str),
-                "raw_text": raw,
-                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
-            }
-        )
-    return sidecars
-
-
 def discover_classes(root: Path, split_mode: str) -> tuple[dict[str, list[tuple[Path, str | None]]], list[str]]:
     classes: dict[str, list[tuple[Path, str | None]]] = {}
     warnings = []
@@ -139,11 +101,17 @@ def build_candidates(
     classes: dict[str, list[tuple[Path, str | None]]],
     label_map: dict[str, int],
     options: argparse.Namespace,
+    dataset_id: str,
 ) -> list[Candidate]:
     candidates = []
     for class_name, files in classes.items():
         for path, explicit_split in files:
-            relative = path.relative_to(root).as_posix()
+            source_relative = path.relative_to(root)
+            relative = (
+                Path(*source_relative.parts[1:]).as_posix()
+                if explicit_split is not None
+                else source_relative.as_posix()
+            )
             try:
                 raw = path.read_bytes()
                 with Image.open(path) as image:
@@ -172,7 +140,7 @@ def build_candidates(
                         class_name=class_name,
                         class_index=label_map[class_name],
                         split=split,
-                        sample_uuid=str(uuid.uuid5(uuid.NAMESPACE_URL, relative)),
+                        sample_uuid=str(uuid.uuid5(uuid.UUID(dataset_id), f"item:{relative}")),
                         sha256=hashlib.sha256(raw).hexdigest(),
                         shape=shape,
                         mode=mode,
@@ -185,7 +153,7 @@ def build_candidates(
                     class_name=class_name,
                     class_index=label_map[class_name],
                     split="",
-                    sample_uuid=str(uuid.uuid5(uuid.NAMESPACE_URL, relative)),
+                    sample_uuid=str(uuid.uuid5(uuid.UUID(dataset_id), f"item:{relative}")),
                     sha256="",
                     shape=[],
                     mode="",
@@ -200,15 +168,26 @@ def build_candidates(
 
 def _existing_state(connection: sqlite3.Connection):
     connection.row_factory = sqlite3.Row
-    rows = connection.execute("SELECT uuid, metadata_json FROM samples").fetchall()
+    rows = connection.execute(
+        """
+        SELECT di.item_id, di.metadata_json, a.content_sha256, l.name AS class_name
+        FROM dataset_items di
+        JOIN classification_items ci ON ci.item_id = di.item_id
+        JOIN assets a ON a.asset_id = ci.image_asset_id
+        LEFT JOIN classification_annotations ca
+          ON ca.item_id = di.item_id AND ca.is_current = 1
+        LEFT JOIN classification_labels l ON l.label_id = ca.label_id
+        """
+    ).fetchall()
     by_uuid = {}
     by_hash = {}
     for row in rows:
         metadata = json.loads(row["metadata_json"]) if row["metadata_json"] else {}
-        by_uuid[row["uuid"]] = metadata
-        content_hash = metadata.get("content_sha256")
+        metadata.setdefault("class_name", row["class_name"])
+        by_uuid[row["item_id"]] = metadata
+        content_hash = row["content_sha256"]
         if content_hash:
-            by_hash.setdefault(content_hash, []).append((row["uuid"], metadata))
+            by_hash.setdefault(content_hash, []).append((row["item_id"], metadata))
     return by_uuid, by_hash
 
 
@@ -239,11 +218,56 @@ def import_folders(options: argparse.Namespace) -> dict[str, Any]:
     root = Path(options.input).expanduser().resolve()
     output = Path(options.output).expanduser().resolve()
     classes, warnings = discover_classes(root, options.split_mode)
+    sidecars = discover_metadata_documents(root)
+    primary_metadata = next(
+        (
+            sidecar["parsed"]
+            for sidecar in sidecars
+            if sidecar["source_filename"].lower() == "metadata.toml"
+            and isinstance(sidecar["parsed"], dict)
+        ),
+        {},
+    )
+    dataset_metadata = (
+        primary_metadata.get("dataset", {})
+        if isinstance(primary_metadata.get("dataset"), dict)
+        else {}
+    )
+    oracle_metadata = (
+        primary_metadata.get("oracle_builder", {})
+        if isinstance(primary_metadata.get("oracle_builder"), dict)
+        else {}
+    )
     supplied_map = load_label_map(Path(options.label_map).expanduser() if options.label_map else None)
     if not options.dry_run:
         output.parent.mkdir(parents=True, exist_ok=True)
+    existing_dataset_id = None
+    if options.dry_run and output.exists():
+        with sqlite3.connect(output) as existing_connection:
+            existing_dataset_id = read_dataset_info(existing_connection)["dataset_id"]
+    requested_dataset_id = (
+        getattr(options, "dataset_id", None)
+        or oracle_metadata.get("dataset_id")
+        or dataset_metadata.get("dataset_id")
+        or existing_dataset_id
+    )
     connection = sqlite3.connect(":memory:" if options.dry_run else output)
-    ensure_schema(connection)
+    info = ensure_schema(
+        connection,
+        "classification",
+        dataset_id=requested_dataset_id,
+        name=(
+            dataset_metadata.get("training_set_name")
+            or dataset_metadata.get("short_name")
+            or dataset_metadata.get("name")
+            or root.name
+        ),
+        title=dataset_metadata.get("dataset_title") or dataset_metadata.get("title"),
+        description=dataset_metadata.get("description"),
+        version=dataset_metadata.get("version"),
+        metadata={"source_metadata": primary_metadata} if primary_metadata else {},
+    )
+    connection.commit()
     label_connection = connection
     if options.dry_run and output.exists():
         label_connection = sqlite3.connect(output)
@@ -251,7 +275,7 @@ def import_folders(options: argparse.Namespace) -> dict[str, Any]:
         existing_labels = {
             row[1]: int(row[0])
             for row in label_connection.execute(
-                "SELECT class_index, class_name FROM class_labels"
+                "SELECT class_index, name FROM classification_labels"
             )
         }
     except sqlite3.OperationalError:
@@ -281,8 +305,9 @@ def import_folders(options: argparse.Namespace) -> dict[str, Any]:
                 )
             label_map[class_name] = next_index
             next_index += 1
-    candidates = build_candidates(root, classes, label_map, options)
-    sidecars = parse_sidecars(root)
+    candidates = build_candidates(
+        root, classes, label_map, options, info["dataset_id"]
+    )
     state_connection = connection
     if options.dry_run and output.exists():
         state_connection = sqlite3.connect(output)
@@ -373,11 +398,10 @@ def import_folders(options: argparse.Namespace) -> dict[str, Any]:
     if not options.dry_run:
         try:
             connection.execute("BEGIN")
+            repository = SQLiteDatasetRepository(connection)
+            label_ids = {}
             for name, index in label_map.items():
-                connection.execute(
-                    "INSERT OR REPLACE INTO class_labels (class_index, class_name) VALUES (?, ?)",
-                    (index, name),
-                )
+                label_ids[name] = repository.add_classification_label(index, name)
             for candidate in candidates:
                 if candidate.status not in {"ready", "update"}:
                     continue
@@ -394,37 +418,51 @@ def import_folders(options: argparse.Namespace) -> dict[str, Any]:
                     "import_id": import_id,
                     "storage_mode": options.storage_mode,
                 }
-                connection.execute(
-                    """
-                    INSERT OR REPLACE INTO samples (
-                        uuid, split, input_blob, input_blob_encoding, input_blob_dimensions,
-                        output_blob, output_blob_encoding, output_blob_dimensions,
-                        label_text, sample_weight, metadata_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        candidate.sample_uuid,
-                        candidate.split,
-                        blob,
-                        encoding,
-                        dimensions,
-                        str(candidate.class_index).encode(),
-                        "int",
-                        None,
-                        candidate.class_name,
-                        None,
-                        json.dumps(metadata, sort_keys=True),
+                shape = json.loads(dimensions) if dimensions else candidate.shape
+                asset = repository.add_asset(
+                    blob,
+                    encoding=encoding,
+                    media_type=(
+                        "application/x-npy"
+                        if encoding == "npy"
+                        else f"image/{'jpeg' if encoding in {'jpg', 'jpeg'} else encoding}"
                     ),
+                    shape=shape,
+                    dtype="float32" if encoding == "npy" else None,
+                    original_filename=candidate.path.name,
+                    metadata={"source_mode": candidate.mode},
+                    content_sha256=(
+                        candidate.sha256 if options.storage_mode == "original" else None
+                    ),
+                )
+                item_id = repository.add_item(
+                    item_id=candidate.sample_uuid,
+                    source_key=candidate.relative_path,
+                    # Split membership is an experimental protocol owned by a
+                    # model-run artifact. The import report may describe source
+                    # layout without making it semantic dataset state.
+                    metadata=metadata,
+                )
+                repository.add_classification_item(
+                    item_id=item_id,
+                    image_asset_id=asset.asset_id,
+                    label_id=label_ids[candidate.class_name],
+                    source="folder_import",
+                    metadata={"import_id": import_id},
                 )
             connection.execute(
                 """
-                INSERT INTO classification_imports
-                (import_id, created_at, source_root, options_json, summary_json)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO import_events
+                (import_id, dataset_id, revision_id, created_at, importer,
+                 source_uri, options_json, summary_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     import_id,
-                    datetime.now(timezone.utc).isoformat(),
+                    info["dataset_id"],
+                    info["revision_id"],
+                    utc_now(),
+                    "classification_folders",
                     str(root),
                     json.dumps(vars(options), sort_keys=True, default=str),
                     json.dumps(summary, sort_keys=True),
@@ -433,19 +471,28 @@ def import_folders(options: argparse.Namespace) -> dict[str, Any]:
             for sidecar in sidecars:
                 connection.execute(
                     """
-                    INSERT OR REPLACE INTO dataset_metadata (
-                        metadata_name, source_filename, source_format, metadata_json,
-                        raw_text, sha256, import_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO metadata_documents (
+                        document_id, dataset_id, name, source_filename, source_format,
+                        parsed_json, raw_text, sha256, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(dataset_id, name) DO UPDATE SET
+                        source_filename = excluded.source_filename,
+                        source_format = excluded.source_format,
+                        parsed_json = excluded.parsed_json,
+                        raw_text = excluded.raw_text,
+                        sha256 = excluded.sha256,
+                        created_at = excluded.created_at
                     """,
                     (
+                        str(uuid.uuid5(uuid.UUID(info["dataset_id"]), f"metadata:{sidecar['metadata_name']}")),
+                        info["dataset_id"],
                         sidecar["metadata_name"],
                         sidecar["source_filename"],
                         sidecar["source_format"],
                         sidecar["metadata_json"],
                         sidecar["raw_text"],
                         sidecar["sha256"],
-                        import_id,
+                        utc_now(),
                     ),
                 )
             connection.commit()
@@ -494,6 +541,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--input", required=True)
     parser.add_argument("--output", required=True)
+    parser.add_argument(
+        "--dataset-id",
+        help="UUID to use for a new dataset (otherwise generated once and stored).",
+    )
     parser.add_argument("--label-map")
     parser.add_argument("--allow-new-classes", action="store_true")
     parser.add_argument(
@@ -551,3 +602,7 @@ def main() -> int:
     summary = import_folders(options)
     print(json.dumps(summary, indent=2, sort_keys=True))
     return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
