@@ -48,6 +48,128 @@ python3 model_training.py \
   --overwrite
 ```
 
+### Import A Classification Folder Library
+
+Classification image libraries can be imported directly from folders:
+
+```text
+example training library/
+├── cod/
+│   ├── cod-001.jpg
+│   └── nested/cod-002.png
+├── salmon/
+│   └── salmon-001.jpg
+├── metadata.toml
+└── about.yml
+```
+
+```bash
+python3 scripts/import_classification_folders.py \
+  --input "$HOME/Desktop/example training library" \
+  --output datasets/example_training.sqlite \
+  --validation-fraction 0.20 \
+  --test-fraction 0.10 \
+  --seed 123
+```
+
+Immediate child folders are class names, and images are discovered recursively
+within them. JPEG, PNG, and TIFF are supported. Original encoded image bytes are
+stored by default so different models can later use different preprocessing.
+Class indices are stable and written to both the `class_labels` table and a
+`.labels.json` sidecar.
+
+Top-level `.json`, `.toml`, `.yaml`, and `.yml` files are parsed as dataset
+metadata. Their parsed JSON, original text, format, checksum, and source filename
+are stored in `dataset_metadata`. Each import is recorded in
+`classification_imports` with its options and summary.
+
+Inspect a proposed import without creating or modifying the database:
+
+```bash
+python3 scripts/import_classification_folders.py \
+  --input "$HOME/Desktop/example training library" \
+  --output datasets/example_training.sqlite \
+  --dry-run
+```
+
+Every import writes `.import_report.json`, `.import_report.csv`, and
+`.labels.json` beside the output. Reports include per-class split counts,
+warnings, corrupt files, duplicates, and import status.
+
+Important importer controls include:
+
+| Option | Behavior |
+|---|---|
+| `--split-mode stratified-hash` | Stable class-aware hash assignment; default. |
+| `--split-mode existing-folders` | Read `train/`, `validation/`, and `test/` folders. |
+| `--split-mode none` | Assign every imported image to training. |
+| `--label-map PATH` | Use an explicit class-name-to-index JSON mapping. |
+| `--allow-new-classes` | Permit new classes when appending to an existing database. |
+| `--duplicate-policy error\|skip\|allow` | Handle identical image content. |
+| `--existing-policy error\|skip\|update` | Handle deterministic UUID collisions. |
+| `--on-error error\|skip` | Abort or report-and-skip invalid images. |
+| `--require-rgb` | Reject images whose decoded source mode is not RGB. |
+| `--no-allow-grayscale` | Reject grayscale inputs. |
+| `--minimum-images-per-class N` | Reject undersized classes. |
+
+Existing-split layout is also supported:
+
+```text
+library/
+├── train/cod/
+├── train/salmon/
+├── validation/cod/
+├── validation/salmon/
+├── test/cod/
+└── test/salmon/
+```
+
+For specialized portable datasets, preprocessing may be materialized during
+import:
+
+```bash
+python3 scripts/import_classification_folders.py \
+  --input images/by-class \
+  --output datasets/materialized.sqlite \
+  --storage-mode materialized \
+  --input-shape 224 224 3 \
+  --resize-mode fit_pad \
+  --channel-mode rgb \
+  --normalization dtype \
+  --invert
+```
+
+Original storage is recommended. Materialized storage permanently fixes image
+dimensions and intensity processing in the database.
+
+### Classification Preprocessing
+
+Original images are deterministically prepared when a classification dataset is
+loaded:
+
+```toml
+[preprocessing]
+resize_mode = "fit_pad"
+normalization = "dtype"
+rescale = true
+invert = false
+pad_value = 0.0
+interpolation = "bilinear"
+channel_mode = "auto"
+percentile_low = 1.0
+percentile_high = 99.0
+```
+
+`data.input_shape` supplies the target height, width, and channel count.
+`fit_pad` preserves aspect ratio and center-pads, `fill_crop` preserves aspect
+ratio and center-crops, `stretch` directly resizes, and `none` requires an exact
+match. `fit` resizes within the bounds but is intended for inspection because
+variable output sizes cannot form ordinary training batches.
+
+Channel mode can be `auto`, `grayscale`, `rgb`, or `rgba`. Normalization can be
+`dtype`, `minmax`, `percentile`, or `none`. Inversion occurs after normalization
+as `1 - x`.
+
 Evaluate and write predictions:
 
 ```bash
@@ -439,11 +561,20 @@ CREATE TABLE predictions (
     target_mode TEXT NOT NULL DEFAULT 'validated_mask',
     reconstructed_pred_blob BLOB,
     reconstructed_pred_encoding TEXT,
+    features_blob BLOB,
+    features_encoding TEXT,
+    features_dim INTEGER,
+    prediction_packet_json TEXT,
     PRIMARY KEY (prediction_set, uuid)
 );
 ```
 
 Multiple runs can append distinct prediction sets to the same output database. Reusing a set name replaces that set's prediction for the same ROI.
+
+Classification prediction rows store their fixed-size feature vectors in
+`features_blob` using NumPy encoding. The `prediction_set` associates each vector
+with the exact run configuration and model that produced its feature space.
+`prediction_packet_json` stores softmax, prototype, and KNN evidence together.
 
 For candidate-delta runs, `y_pred_blob` stores raw delta probabilities and `reconstructed_pred_blob` stores reconstructed validated-mask probabilities. The side-by-side visualizer automatically shows candidate, predicted changes, reconstructed mask, and validated mask columns.
 
@@ -454,6 +585,9 @@ Splits can be stored explicitly in `samples.split`. Rows without a split are ass
 ## Config Files
 
 Configs are TOML files. Required sections are `[run]`, `[data]`, and `[training]`.
+For classification, `data.num_classes` may be omitted when using SQLite input;
+oracle-builder infers it from the database's `class_labels` table, with a numeric
+sample-label fallback for legacy databases.
 
 For classification:
 
@@ -464,11 +598,15 @@ model = "simple_cnn"
 
 [data]
 input_shape = [128, 128, 3]
-num_classes = 3
 
 [training]
 loss = "sparse_categorical_crossentropy"
 ```
+
+For classification, `data.num_classes` is optional. When omitted, oracle-builder
+infers it from the selected SQLite database's `class_labels` table, with a
+numeric-label fallback for legacy databases. This keeps model configs reusable
+across training libraries. Explicit `num_classes` remains supported.
 
 For segmentation:
 
@@ -708,6 +846,9 @@ Every completed run immediately performs a reload/prediction check and writes `m
 The registry currently supports:
 
 - `simple_cnn`
+- `resnet` (`resnet18`, `resnet34`, `resnet50`, `resnet101`, `resnet152`)
+- `densenet` (`densenet121`, `densenet169`, `densenet201`)
+- `efficientnet` (`efficientnet_b0` through `efficientnet_b7`)
 - `unet`
 - `residual_unet` (alias: `resunet`)
 - `unet_plus_plus` (alias: `unetpp`)
@@ -715,6 +856,134 @@ The registry currently supports:
 - `densenet_like`
 
 Each model module exposes `build_model(config: dict)`. Add future models in `models/` and register them in `oracle_builder/registry.py`.
+
+Classification architectures may be selected either by family and variant:
+
+```toml
+[run]
+task = "classification"
+model = "resnet"
+
+[model]
+variant = "resnet50"
+stem_kernel_size = 7
+stem_stride = 2
+embedding_dim = 256
+normalize_embeddings = true
+```
+
+or directly with `model = "resnet50"`. The same applies to the named DenseNet and
+EfficientNet variants. All three families support `stem_kernel_size`, `stem_stride`,
+and `dropout`. ResNet also supports `base_filters`, `block_counts`, and `stem_pool`;
+DenseNet supports `growth_rate`, `initial_filters`, `bottleneck_multiplier`,
+`compression`, `block_config`, and `stem_pool`; EfficientNet supports
+`width_coefficient`, `depth_coefficient`, `stem_filters`, `top_filters`, and
+`se_ratio`. The builders initialize weights from scratch and use the configured
+input shape and number of classes. Full examples are in
+`configs/example_classification_{resnet,densenet,efficientnet}.toml`.
+
+Every classification model has the same embedding contract. Its named `features`
+layer produces a fixed-size vector immediately before dropout and the final
+classifier. `embedding_dim` defaults to `256`, and `normalize_embeddings` defaults
+to `true`, which gives every nonzero vector unit L2 length for similarity search
+and clustering. Training remains a single-output classification problem. In
+Python, retrieve both outputs without changing the trained model:
+
+```python
+from oracle_builder.classification.features import build_feature_model
+
+feature_model = build_feature_model(model)
+outputs = feature_model.predict(images)
+probabilities = outputs["probabilities"]
+features = outputs["features"]
+```
+
+Classification SavedModel exports provide `serving_default`, `classify`, and
+`embed` signatures. The default signature returns both `probabilities` and
+`features`; the other signatures return only their named output.
+
+### Class Prototypes and KNN Evidence
+
+Classification runs build an identity-evidence index from unaugmented,
+L2-normalized training embeddings after supervised fitting:
+
+```toml
+[evidence]
+enabled = true
+knn_k = 5
+```
+
+Each class prototype is the L2-normalized mean of that class's normalized
+training embeddings. Prototype scores are cosine similarities between the query
+and every class prototype. The saved `model/classification_evidence.npz` contains
+the normalized reference embeddings, labels, UUIDs, and prototypes; its adjacent
+JSON file describes the index.
+
+Exact KNN lookup uses an inner-product matrix operation and partial top-k
+selection. Because both query and reference embeddings are normalized, this has
+the same ranking as Euclidean distance and can later be replaced by an
+approximate inner-product index without changing packet semantics. When a
+training ROI is queried, its own UUID is excluded.
+
+Every classification `prediction_packet_json` contains:
+
+- Softmax probabilities, predicted class, and confidence.
+- Similarity to each class prototype, nearest prototype, and prototype margin.
+- Nearest-neighbor cosine similarity.
+- Agreement fraction for the strongest top-k label.
+- Per-label top-k counts.
+- Similarity-weighted label support, using `(cosine_similarity + 1) / 2` as the
+  nonnegative neighbor weight and normalizing support across represented labels.
+- Margin between the strongest and second-strongest weighted label supports.
+- Neighbor UUIDs, labels, and cosine similarities for auditability.
+
+### Student–Teacher Self-Supervised Pretraining
+
+Classification runs can optionally begin with BYOL-style student–teacher
+pretraining:
+
+```toml
+[pretraining]
+enabled = true
+method = "byol"
+epochs = 50
+learning_rate = 0.001
+teacher_momentum = 0.99
+projection_dim = 128
+projection_hidden_dim = 256
+use_training_augmentation = true
+
+[pretraining.augmentation]
+rotation = 0.08
+zoom = 0.15
+translation = 0.10
+flip_horizontal = true
+brightness = 0.20
+contrast = 0.20
+gaussian_noise = 0.03
+```
+
+When `use_training_augmentation = true`, pretraining starts from the run's
+ordinary `[augmentation]` profile. An optional `[pretraining.augmentation]`
+section may override individual values. This allows model sweeps to define one
+canonical augmentation policy without duplicating it.
+
+For each ROI, two independently augmented views are passed through a student and
+teacher encoder. The student predictor learns the representation produced by the
+opposite-view teacher. The teacher is not optimized by gradients; its weights are
+an exponential moving average of the student controlled by `teacher_momentum`.
+No labels or negative image pairs are used.
+
+Only training-split ROIs are used for pretraining, preventing validation or test
+leakage. Unlabeled training ROIs are included in the self-supervised stage and
+excluded from supervised fine-tuning. Once pretraining completes, the student
+backbone and fixed-size `features` layer continue directly into ordinary
+supervised training.
+
+Pretraining writes `pretraining/metrics.csv`, `pretraining/metrics.json`, and
+`pretraining/student_pretrained.weights.h5`. The projection and prediction heads
+exist only during pretraining and are not part of the final classifier. See
+`configs/example_classification_student_teacher.toml` for a complete run.
 
 The residual U-Net replaces each ordinary convolutional block with a learned residual block and projection shortcut. U-Net++ uses nested dense skip connections between encoder and decoder nodes. Both accept the standard U-Net model options: `base_filters`, `depth`, `dropout`, `activation`, and `final_activation`. U-Net++ additionally accepts `deep_supervision = true`; its full-resolution supervision heads are averaged into one segmentation output so it remains compatible with the existing dataset, loss, evaluation, and prediction pipeline. Example configurations are provided in `configs/example_segmentation_residual_unet.toml` and `configs/example_segmentation_unet_plus_plus.toml`.
 

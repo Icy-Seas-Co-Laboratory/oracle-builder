@@ -109,8 +109,61 @@ def main() -> int:
 
         datasets, records_by_split = make_tf_datasets(args.input, config)
         log_event(training_log, run_id, "INFO", "Datasets loaded", {"splits": list(datasets)})
-        model, history = train_model(config, datasets, run_dir, training_log, run_id)
+        pretraining_dataset = None
+        if config.get("pretraining", {}).get("enabled", False):
+            from oracle_builder.training.student_teacher import make_pretraining_dataset
+
+            pretraining_x, _, pretraining_records = load_prediction_arrays(
+                args.input,
+                config,
+                split="train",
+            )
+            pretraining_dataset = make_pretraining_dataset(pretraining_x, config)
+            log_event(
+                training_log,
+                run_id,
+                "INFO",
+                "Loaded self-supervised pretraining inputs",
+                {"samples": len(pretraining_records), "split": "train"},
+            )
+        model, history = train_model(
+            config,
+            datasets,
+            run_dir,
+            training_log,
+            run_id,
+            pretraining_dataset=pretraining_dataset,
+        )
         plot_history(history, run_dir)
+        evidence_index = None
+        if (
+            config["run"]["task"] == "classification"
+            and config.get("evidence", {}).get("enabled", True)
+        ):
+            from oracle_builder.classification.evidence import build_evidence_index
+
+            evidence_x, evidence_y, evidence_records = load_arrays(
+                args.input,
+                config,
+                split="train",
+            )
+            evidence_index = build_evidence_index(
+                model,
+                evidence_x,
+                evidence_y,
+                evidence_records,
+                run_dir / "model" / "classification_evidence.npz",
+            )
+            log_event(
+                training_log,
+                run_id,
+                "INFO",
+                "Built classification prototype and KNN evidence index",
+                {
+                    "reference_count": len(evidence_records),
+                    "classes": [int(value) for value in evidence_index.prototype_labels],
+                },
+            )
         threshold_analysis = None
         if config["run"]["task"] == "segmentation" and "validation" in datasets:
             validation_x, validation_y, validation_records = load_arrays(
@@ -146,6 +199,7 @@ def main() -> int:
                 predictions_path,
                 source_sqlite=args.input,
                 prediction_set=args.output,
+                evidence_index=evidence_index,
             )
         run_metadata["status"] = "complete"
         run_metadata["evaluation_summary"] = evaluation.get("summary")

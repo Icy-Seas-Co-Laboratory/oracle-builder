@@ -1,11 +1,11 @@
 [run]
 task = "classification"
-model = "simple_cnn"
+model = "resnet"
 seed = 123
-notes = "Example classification run"
+notes = "ResNet-50 classification example"
 
 [data]
-input_shape = [128, 128, 3]
+input_shape = [224, 224, 3]
 num_classes = 3
 batch_size = 16
 shuffle_buffer = 512
@@ -22,8 +22,12 @@ interpolation = "bilinear"
 channel_mode = "auto"
 
 [model]
-dropout = 0.2
-base_filters = 32
+variant = "resnet50"
+stem_kernel_size = 7
+stem_stride = 2
+stem_pool = true
+base_filters = 64
+dropout = 0.0
 embedding_dim = 256
 normalize_embeddings = true
 
@@ -32,7 +36,7 @@ enabled = true
 knn_k = 5
 
 [training]
-epochs = 10
+epochs = 50
 optimizer = "adam"
 learning_rate = 0.001
 loss = "sparse_categorical_crossentropy"
@@ -40,24 +44,14 @@ metrics = ["accuracy"]
 
 [callbacks]
 early_stopping = true
-early_stopping_patience = 5
+early_stopping_patience = 8
 reduce_lr_on_plateau = true
 checkpoint_monitor = "val_loss"
 
 [augmentation]
 enabled = true
-repeats_per_epoch = 1
-invert = false
-rotation = 0.5
-zoom = 0.25
-translation = 0.10
-skew = 0.20
 flip_horizontal = true
-flip_vertical = true
-brightness = 0.15
-contrast = 0.15
-gaussian_noise = 0.03
-fill_value = 0.0
+rotation = 0.1
 
 [output]
 save_checkpoints = true

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 
 import numpy as np
 
+from oracle_builder.data.decoders import decode_blob
+from oracle_builder.classification.evidence import build_evidence_index
 from oracle_builder.data.sqlite_dataset import (
     create_synthetic_classification,
     create_synthetic_segmentation,
@@ -11,6 +14,7 @@ from oracle_builder.data.sqlite_dataset import (
     load_prediction_arrays,
 )
 from oracle_builder.evaluation.predictions import write_predictions_db
+from oracle_builder.registry import get_model_builder
 
 
 class FakeClassificationModel:
@@ -122,3 +126,71 @@ def test_all_roi_predictions_include_rows_without_validated_masks(tmp_path):
             "SELECT split FROM predictions WHERE uuid = ?",
             (missing_uuid,),
         ).fetchone()[0] in {"train", "validation", "test"}
+
+
+def test_classification_predictions_store_fixed_size_features(tmp_path):
+    source = tmp_path / "training.sqlite"
+    output = tmp_path / "predictions.sqlite"
+    create_synthetic_classification(source, n=3, shape=(8, 8, 1), classes=2)
+    config = {
+        "run": {"task": "classification", "model": "simple_cnn", "seed": 123},
+        "data": {
+            "input_shape": [8, 8, 1],
+            "num_classes": 2,
+            "validation_split": 0.0,
+            "test_split": 0.0,
+        },
+        "model": {
+            "base_filters": 2,
+            "dropout": 0.0,
+            "embedding_dim": 10,
+            "normalize_embeddings": True,
+        },
+    }
+    x, y, records = load_arrays(source, config, split="train")
+    model = get_model_builder("simple_cnn")(config)
+    evidence_index = build_evidence_index(
+        model,
+        x,
+        y,
+        records,
+        tmp_path / "classification_evidence.npz",
+    )
+
+    write_predictions_db(
+        model,
+        x,
+        y,
+        records,
+        config,
+        output,
+        source_sqlite=source,
+        prediction_set="features",
+        evidence_index=evidence_index,
+    )
+
+    with sqlite3.connect(output) as connection:
+        rows = connection.execute(
+            """
+            SELECT features_blob, features_encoding, features_dim
+            FROM predictions
+            ORDER BY uuid
+            """
+        ).fetchall()
+    assert len(rows) == len(records)
+    for blob, encoding, dimension in rows:
+        feature = decode_blob(blob, encoding)
+        assert dimension == 10
+        assert feature.shape == (10,)
+        norm = np.linalg.norm(feature)
+        assert np.isclose(norm, 0.0, atol=1e-5) or np.isclose(norm, 1.0, atol=1e-5)
+    with sqlite3.connect(output) as connection:
+        packets = [
+            json.loads(row[0])
+            for row in connection.execute(
+                "SELECT prediction_packet_json FROM predictions ORDER BY uuid"
+            )
+        ]
+    assert all("softmax" in packet for packet in packets)
+    assert all("prototype" in packet for packet in packets)
+    assert all("knn" in packet for packet in packets)

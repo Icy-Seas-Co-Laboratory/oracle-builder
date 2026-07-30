@@ -5,6 +5,8 @@ from typing import Any
 from tensorflow import keras
 from tensorflow.keras import layers
 
+from oracle_builder.classification.features import classification_head
+
 
 def _residual_block(x, filters: int, stride: int = 1):
     shortcut = x
@@ -20,15 +22,12 @@ def build_model(config: dict[str, Any]):
     input_shape = tuple(config["data"]["input_shape"])
     num_classes = int(config["data"]["num_classes"])
     base = int(config.get("model", {}).get("base_filters", 32))
-    dropout = float(config.get("model", {}).get("dropout", 0.2))
 
     inputs = keras.Input(shape=input_shape)
     x = layers.Conv2D(base, 3, padding="same", activation="relu")(inputs)
     x = _residual_block(x, base)
     x = _residual_block(x, base * 2, stride=2)
     x = _residual_block(x, base * 4, stride=2)
-    x = layers.GlobalAveragePooling2D()(x)
-    x = layers.Dropout(dropout)(x)
-    outputs = layers.Dense(num_classes, activation="softmax")(x)
+    x = layers.GlobalAveragePooling2D(name="global_pool")(x)
+    outputs = classification_head(x, num_classes, config, dropout_default=0.2)
     return keras.Model(inputs, outputs, name="resnet_like")
-

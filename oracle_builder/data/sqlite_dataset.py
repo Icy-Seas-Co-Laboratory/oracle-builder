@@ -10,7 +10,12 @@ from typing import Any
 import numpy as np
 from PIL import Image
 
-from oracle_builder.data.decoders import decode_blob, encode_npy, normalize_input
+from oracle_builder.data.decoders import (
+    decode_blob,
+    encode_npy,
+    normalize_input,
+    prepare_classification_input,
+)
 from oracle_builder.data.splits import assign_missing_splits
 from oracle_builder.data.signed_distance import signed_distance_field
 from oracle_builder.data.tiling import coverage_map, extract_tile, plan_tiles
@@ -57,6 +62,39 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
         )
         """
     )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS class_labels (
+            class_index INTEGER PRIMARY KEY,
+            class_name TEXT NOT NULL UNIQUE
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS classification_imports (
+            import_id TEXT PRIMARY KEY,
+            created_at TEXT NOT NULL,
+            source_root TEXT NOT NULL,
+            options_json TEXT NOT NULL,
+            summary_json TEXT NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS dataset_metadata (
+            metadata_name TEXT PRIMARY KEY,
+            source_filename TEXT NOT NULL,
+            source_format TEXT NOT NULL,
+            metadata_json TEXT NOT NULL,
+            raw_text TEXT,
+            sha256 TEXT NOT NULL,
+            import_id TEXT,
+            FOREIGN KEY (import_id) REFERENCES classification_imports(import_id)
+        )
+        """
+    )
 
 
 def read_rows(sqlite_path: str | Path) -> list[dict[str, Any]]:
@@ -80,6 +118,12 @@ def load_arrays(sqlite_path: str | Path, config: dict[str, Any], split: str | No
         config["data"].get("test_split", 0.1),
         config["run"].get("seed", 123),
     )
+    if task == "classification":
+        rows = [
+            row
+            for row in rows
+            if row.get("output_blob") is not None or row.get("label_text") is not None
+        ]
     if split:
         rows = [row for row in rows if row.get("split") == split]
     if not rows:
@@ -103,7 +147,11 @@ def load_arrays(sqlite_path: str | Path, config: dict[str, Any], split: str | No
             continue
         if task == "segmentation":
             x = prepare_segmentation_input(x, input_shape, config)
-        xs.append(normalize_input(x, input_shape))
+        xs.append(
+            prepare_classification_input(x, input_shape, config)
+            if task == "classification"
+            else normalize_input(x, input_shape)
+        )
         if task == "classification":
             ys.append(int(y if y is not None else row.get("label_text")))
         else:
@@ -180,7 +228,11 @@ def load_prediction_arrays(
             raise ValueError(f"Sample {row['uuid']} has no candidate mask required for candidate_delta prediction")
         if task == "segmentation":
             x = prepare_segmentation_input(x, input_shape, config)
-        xs.append(normalize_input(x, input_shape))
+        xs.append(
+            prepare_classification_input(x, input_shape, config)
+            if task == "classification"
+            else normalize_input(x, input_shape)
+        )
         if row.get("output_blob") is None:
             target = None
         else:

@@ -8,6 +8,7 @@ from pathlib import Path
 from oracle_builder.data.sqlite_dataset import load_prediction_arrays
 from oracle_builder.evaluation.predictions import write_predictions_db
 from oracle_builder.saving.load_test import load_model_for_run
+from oracle_builder.classification.evidence import IdentityEvidenceIndex
 
 
 def main() -> int:
@@ -21,6 +22,12 @@ def main() -> int:
     run_dir = Path(args.run)
     config = json.loads((run_dir / "resolved_config.json").read_text())
     model = load_model_for_run(run_dir, config)
+    evidence_path = run_dir / "model" / "classification_evidence.npz"
+    evidence_index = (
+        IdentityEvidenceIndex.load(evidence_path)
+        if config["run"]["task"] == "classification" and evidence_path.exists()
+        else None
+    )
     prediction_set = args.prediction_set or run_dir.name
     selected_split = None if args.split == "all" else args.split
     x, targets, records = load_prediction_arrays(args.input, config, split=selected_split)
@@ -33,6 +40,7 @@ def main() -> int:
         args.output,
         source_sqlite=args.input,
         prediction_set=prediction_set,
+        evidence_index=evidence_index,
     )
     written = len(records)
     print(f"Wrote {written} predictions as set {prediction_set!r} to {args.output}")

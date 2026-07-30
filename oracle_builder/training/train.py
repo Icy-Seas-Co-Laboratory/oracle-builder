@@ -68,10 +68,47 @@ def write_model_summary(model: keras.Model, path: str | Path) -> None:
     Path(path).write_text("\n".join(lines) + "\n")
 
 
-def train_model(config: dict[str, Any], datasets: dict[str, Any], run_dir: str | Path, training_log: str | Path, run_id: str):
+def train_model(
+    config: dict[str, Any],
+    datasets: dict[str, Any],
+    run_dir: str | Path,
+    training_log: str | Path,
+    run_id: str,
+    pretraining_dataset=None,
+):
     set_seed(int(config["run"].get("seed", 123)))
     model = build_and_compile_model(config)
     write_model_summary(model, Path(run_dir) / "model" / "model_summary.txt")
+    if config.get("pretraining", {}).get("enabled", False):
+        if pretraining_dataset is None:
+            raise ValueError("Enabled self-supervised pretraining requires a pretraining dataset")
+        from oracle_builder.training.logging_callbacks import log_event
+        from oracle_builder.training.student_teacher import run_student_teacher_pretraining
+
+        log_event(
+            training_log,
+            run_id,
+            "INFO",
+            "Started student-teacher self-supervised pretraining",
+            config["pretraining"],
+        )
+        pretraining_history = run_student_teacher_pretraining(
+            model,
+            pretraining_dataset,
+            config,
+            run_dir,
+        )
+        log_event(
+            training_log,
+            run_id,
+            "INFO",
+            "Completed student-teacher self-supervised pretraining",
+            {
+                key: float(values[-1])
+                for key, values in pretraining_history.history.items()
+                if values
+            },
+        )
     callbacks = build_callbacks(config, run_dir, training_log, run_id)
     validation_data = datasets.get("validation")
     history = model.fit(

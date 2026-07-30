@@ -7,11 +7,22 @@ import numpy as np
 import tensorflow as tf
 from tensorflow import keras
 
+from oracle_builder.classification.features import L2Normalization
 from oracle_builder.training.train import build_and_compile_model
 
 
 def _synthetic_input(config: dict[str, Any]) -> np.ndarray:
     return np.zeros((1, *config["data"]["input_shape"]), dtype="float32")
+
+
+def _load_keras_model(path: str | Path):
+    return keras.models.load_model(
+        path,
+        custom_objects={
+            "L2Normalization": L2Normalization,
+            "oracle_builder>L2Normalization": L2Normalization,
+        },
+    )
 
 
 def run_load_tests(run_dir: str | Path, config: dict[str, Any], initial_report: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -35,7 +46,7 @@ def run_load_tests(run_dir: str | Path, config: dict[str, Any], initial_report: 
     if (model_path / "final.keras").exists():
         report["final_keras_saved"] = True
         try:
-            loaded = keras.models.load_model(model_path / "final.keras")
+            loaded = _load_keras_model(model_path / "final.keras")
             loaded.predict(sample, verbose=0)
             report["final_keras_reloaded"] = True
             prediction_ok = True
@@ -75,7 +86,7 @@ def load_model_for_run(run_dir: str | Path, config: dict[str, Any]):
     model_path = Path(run_dir) / "model"
     errors = []
     try:
-        return keras.models.load_model(model_path / "final.keras")
+        return _load_keras_model(model_path / "final.keras")
     except Exception as exc:
         errors.append(f"final.keras: {exc}")
     try:
@@ -101,9 +112,20 @@ class SavedModelPredictor:
         if self.infer is None:
             raise RuntimeError("SavedModel has no serving_default signature")
         self.input_name = next(iter(self.infer.structured_input_signature[1]))
+        self.embed = self.loaded.signatures.get("embed")
 
     def predict(self, x, verbose: int = 0):
         del verbose
         output = self.infer(**{self.input_name: tf.constant(x)})
-        first = next(iter(output.values()))
-        return first.numpy()
+        probabilities = output.get("probabilities")
+        if probabilities is None:
+            probabilities = next(iter(output.values()))
+        return probabilities.numpy()
+
+    def predict_features(self, x, verbose: int = 0):
+        del verbose
+        if self.embed is None:
+            raise RuntimeError("SavedModel has no embed signature")
+        input_name = next(iter(self.embed.structured_input_signature[1]))
+        output = self.embed(**{input_name: tf.constant(x)})
+        return output["features"].numpy()

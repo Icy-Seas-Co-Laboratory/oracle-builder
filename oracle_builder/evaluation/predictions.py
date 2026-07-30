@@ -8,6 +8,8 @@ from typing import Any
 
 import numpy as np
 
+from oracle_builder.classification.features import predict_with_features
+from oracle_builder.classification.evidence import IdentityEvidenceIndex
 from oracle_builder.data.decoders import encode_npy
 from oracle_builder.evaluation.segmentation import binary_metrics
 from oracle_builder.evaluation.segmentation import predict_reassembled_segmentation
@@ -64,6 +66,10 @@ def init_predictions_db(
             target_mode TEXT NOT NULL DEFAULT 'validated_mask',
             reconstructed_pred_blob BLOB,
             reconstructed_pred_encoding TEXT,
+            features_blob BLOB,
+            features_encoding TEXT,
+            features_dim INTEGER,
+            prediction_packet_json TEXT,
             PRIMARY KEY (prediction_set, uuid),
             FOREIGN KEY (prediction_set) REFERENCES prediction_sets(prediction_set),
             FOREIGN KEY (uuid) REFERENCES samples(uuid)
@@ -75,6 +81,10 @@ def init_predictions_db(
         "target_mode": "TEXT NOT NULL DEFAULT 'validated_mask'",
         "reconstructed_pred_blob": "BLOB",
         "reconstructed_pred_encoding": "TEXT",
+        "features_blob": "BLOB",
+        "features_encoding": "TEXT",
+        "features_dim": "INTEGER",
+        "prediction_packet_json": "TEXT",
     }.items():
         if column not in prediction_columns:
             connection.execute(f"ALTER TABLE predictions ADD COLUMN {column} {definition}")
@@ -91,12 +101,14 @@ def write_predictions_db(
     *,
     source_sqlite: str | Path | None = None,
     prediction_set: str = "default",
+    evidence_index: IdentityEvidenceIndex | None = None,
 ) -> None:
     task = config["run"]["task"]
     if task == "segmentation":
         predictions, y, records = predict_reassembled_segmentation(model, x, y, records, config)
+        features = None
     else:
-        predictions = model.predict(x, verbose=0)
+        predictions, features = predict_with_features(model, x)
     connection = init_predictions_db(sqlite_path, source_sqlite=source_sqlite)
     run = config.get("run", {})
     connection.execute(
@@ -118,7 +130,9 @@ def write_predictions_db(
     )
     target_mode = segmentation_target_mode(config)
     segmentation_threshold = float(config.get("evaluation", {}).get("segmentation_threshold", 0.5))
-    for row, true_value, prediction in zip(records, y, predictions, strict=False):
+    for record_index, (row, true_value, prediction) in enumerate(
+        zip(records, y, predictions, strict=False)
+    ):
         prediction_metadata = dict(row.get("metadata", {}))
         prediction_metadata["prediction"] = {
             "tile_count": int(row.get("tile_count", 1)),
@@ -177,13 +191,31 @@ def write_predictions_db(
             y_prob_json = None
             metrics_json = json.dumps(metrics)
             true_encoding = pred_encoding = "npy"
+        feature = None
+        if features is not None:
+            feature = np.asarray(features[record_index], dtype="float32")
+            prediction_metadata["prediction"]["features_dim"] = int(feature.shape[-1])
+            prediction_metadata["prediction"]["features_normalized"] = bool(
+                config.get("model", {}).get("normalize_embeddings", True)
+            )
+        prediction_packet_json = None
+        if task == "classification" and evidence_index is not None and feature is not None:
+            prediction_packet_json = json.dumps(
+                evidence_index.packet(
+                    feature,
+                    np.asarray(prediction),
+                    query_uuid=row["uuid"],
+                    k=int(config.get("evidence", {}).get("knn_k", 5)),
+                )
+            )
         connection.execute(
             """
             INSERT OR REPLACE INTO predictions (
                 prediction_set, uuid, split, y_true_blob, y_true_encoding,
                 y_pred_blob, y_pred_encoding, y_prob_json, metrics_json, metadata_json,
-                target_mode, reconstructed_pred_blob, reconstructed_pred_encoding
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                target_mode, reconstructed_pred_blob, reconstructed_pred_encoding,
+                features_blob, features_encoding, features_dim, prediction_packet_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 prediction_set,
@@ -199,6 +231,10 @@ def write_predictions_db(
                 target_mode,
                 encode_npy(np.asarray(reconstructed_prediction)) if task == "segmentation" else None,
                 "npy" if task == "segmentation" else None,
+                encode_npy(feature) if feature is not None else None,
+                "npy" if feature is not None else None,
+                int(feature.shape[-1]) if feature is not None else None,
+                prediction_packet_json,
             ),
         )
     connection.commit()
