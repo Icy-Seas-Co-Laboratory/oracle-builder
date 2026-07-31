@@ -116,6 +116,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "save_figures": True,
         "export_savedmodel": True,
     },
+    "recovery": {
+        "enabled": True,
+        "save_every_epochs": 1,
+    },
     "evaluation": {
         "segmentation_threshold": 0.5,
         "benchmark": {
@@ -311,6 +315,9 @@ def validate_config(config: dict[str, Any]) -> None:
             raise ValueError("training.edge_weight_sigma must be greater than zero")
     if not config["training"].get("loss"):
         raise ValueError("training.loss is required")
+    recovery = config.get("recovery", {})
+    if int(recovery.get("save_every_epochs", 1)) < 1:
+        raise ValueError("recovery.save_every_epochs must be at least 1")
     benchmark = config.get("evaluation", {}).get("benchmark", {})
     if int(benchmark.get("warmup_batches", 2)) < 0:
         raise ValueError("evaluation.benchmark.warmup_batches cannot be negative")

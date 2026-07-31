@@ -17,7 +17,7 @@ from oracle_builder.artifacts.layout import RunLayout
 RUN_ARTIFACT_SCHEMA_NAME = "oracle_builder_model_run"
 RUN_ARTIFACT_SCHEMA_VERSION = "1.0.0"
 RUN_LIFECYCLES = {"working", "sealed"}
-RUN_STATUSES = {"running", "complete", "failed"}
+RUN_STATUSES = {"running", "interrupted", "complete", "failed"}
 _INVENTORY_EXCLUDES = {"artifact.json", "checksums.sha256"}
 
 
@@ -236,6 +236,14 @@ def read_run_config(run_dir: str | Path) -> dict[str, Any]:
     raise FileNotFoundError(layout.resolved_config)
 
 
+def read_run_runtime(run_dir: str | Path) -> dict[str, Any]:
+    """Return machine-local provenance such as the original dataset path."""
+    layout = RunLayout(run_dir)
+    if not layout.runtime.exists():
+        raise FileNotFoundError(layout.runtime)
+    return json.loads(layout.runtime.read_text(encoding="utf-8"))
+
+
 def write_run_config(run_dir: str | Path, config: dict[str, Any]) -> None:
     layout = RunLayout(run_dir)
     manifest = read_run_manifest(layout.root)
@@ -268,6 +276,10 @@ def update_run_artifact(
         manifest["status"] = status
         if status in {"complete", "failed"}:
             manifest["completed_at"] = _utc_now()
+        elif status in {"running", "interrupted"}:
+            manifest["completed_at"] = None
+        if status == "running":
+            manifest.pop("error", None)
     if summary is not None:
         manifest["summary"] = summary
     if error is not None:

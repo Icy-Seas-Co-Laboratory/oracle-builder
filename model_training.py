@@ -13,8 +13,14 @@ from oracle_builder.artifacts import (
     attach_split_manifest,
     create_run_artifact,
     create_split_manifest,
+    read_run_config,
+    read_run_manifest,
+    read_run_runtime,
+    read_split_manifest,
+    reopen_run_artifact,
     seal_run_artifact,
     update_run_artifact,
+    validate_run_artifact,
     write_run_config,
 )
 from oracle_builder.config import resolve_config
@@ -50,12 +56,16 @@ def plot_history(history, run_dir: Path) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train an oracle-builder model.")
-    parser.add_argument("-c", "--config", required=True)
-    parser.add_argument("-i", "--input", required=True)
-    parser.add_argument("-o", "--output", required=True)
+    parser.add_argument("-c", "--config")
+    parser.add_argument("-i", "--input")
+    parser.add_argument("-o", "--output")
     parser.add_argument("--runs-dir", default="./runs")
     parser.add_argument("--overwrite", action="store_true")
-    parser.add_argument("--resume", action="store_true", help="TODO: resume support is not implemented yet.")
+    parser.add_argument(
+        "--resume",
+        metavar="RUN_DIRECTORY",
+        help="Resume a run from its rolling recovery snapshot.",
+    )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--preflight", action="store_true", help="Validate segmentation SQLite dataset compatibility and exit.")
     parser.add_argument("--debug", action="store_true")
@@ -64,11 +74,65 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    if args.resume:
-        print("--resume is reserved for a future implementation.", file=sys.stderr)
-        return 2
-    run_dir = Path(args.runs_dir) / args.output
-    config = resolve_config(args.config, args.input, run_dir)
+    resume_state = None
+    is_resume = bool(args.resume)
+    if is_resume:
+        if args.dry_run or args.preflight:
+            raise ValueError("--dry-run and --preflight cannot be combined with --resume")
+        if args.config or args.output or args.overwrite:
+            raise ValueError("--resume uses the existing artifact; do not pass --config, --output, or --overwrite")
+        run_dir = Path(args.resume).expanduser().resolve()
+        manifest = read_run_manifest(run_dir)
+        if manifest["status"] == "complete":
+            raise ValueError("Completed runs cannot be resumed; start a new run instead")
+        report = validate_run_artifact(run_dir)
+        if not report["valid"]:
+            raise ValueError("Cannot resume an invalid run artifact: " + "; ".join(report["errors"]))
+        config = read_run_config(run_dir)
+        runtime = read_run_runtime(run_dir)
+        input_path = args.input or runtime.get("paths", {}).get("input_path")
+        if not input_path:
+            raise ValueError("The run has no recorded input path; provide --input DATASET.sqlite")
+        args.input = str(Path(input_path).expanduser().resolve())
+        args.output = str(manifest["name"])
+        config["paths"] = {
+            **runtime.get("paths", {}),
+            "input_path": args.input,
+            "run_dir": str(run_dir),
+        }
+        config["run"]["run_id"] = manifest["run_id"]
+        config["run"]["run_name"] = manifest["name"]
+        config["artifact"] = {
+            "artifact_id": manifest["artifact_id"],
+            "schema_name": manifest["artifact_schema"]["name"],
+            "schema_version": manifest["artifact_schema"]["version"],
+        }
+        split_manifest = read_split_manifest(run_dir)
+        attach_split_manifest(config, split_manifest)
+        from oracle_builder.artifacts.splits import split_manifest_matches_dataset
+        from oracle_builder.training.recovery import validate_recovery_state
+
+        if not split_manifest_matches_dataset(config, args.input):
+            raise ValueError("The supplied dataset does not exactly match this run's split manifest")
+        resume_state = validate_recovery_state(
+            run_dir,
+            config,
+            artifact_id=manifest["artifact_id"],
+            run_id=manifest["run_id"],
+        )
+        if manifest["lifecycle"] == "sealed":
+            reopen_run_artifact(run_dir, reason="resume from validated recovery snapshot")
+        update_run_artifact(run_dir, status="running")
+        print(
+            f"Resuming {run_dir.name} at supervised epoch "
+            f"{int(resume_state['completed_epoch']) + 1}",
+            flush=True,
+        )
+    else:
+        if not args.config or not args.input or not args.output:
+            raise ValueError("New training requires --config, --input, and --output")
+        run_dir = Path(args.runs_dir) / args.output
+        config = resolve_config(args.config, args.input, run_dir)
     if not args.preflight and not args.dry_run and config["dataset"]["lifecycle"] != "frozen":
         raise ValueError(
             "Model training requires a frozen dataset checkpoint. Run "
@@ -92,34 +156,51 @@ def main() -> int:
     if args.dry_run:
         print(json.dumps({"run_dir": str(run_dir), "resolved_config": config}, indent=2))
         return 0
-    if args.overwrite and run_dir.exists():
+    if args.overwrite and run_dir.exists() and not is_resume:
         shutil.rmtree(run_dir)
-    run_dir = create_run_dir(args.runs_dir, args.output)
-
-    run_id = str(uuid.uuid4())
-    config["run"]["run_id"] = run_id
-    config["run"]["run_name"] = args.output
-    manifest = create_run_artifact(
-        run_dir,
-        run_id=run_id,
-        name=args.output,
-        config=config,
-        source_config=args.config,
-    )
-    split_manifest = create_split_manifest(run_dir, args.input, config)
-    attach_split_manifest(config, split_manifest)
-    config["artifact"] = {
-        "artifact_id": manifest["artifact_id"],
-        "schema_name": manifest["artifact_schema"]["name"],
-        "schema_version": manifest["artifact_schema"]["version"],
-    }
-    write_run_config(run_dir, config)
+    if not is_resume:
+        run_dir = create_run_dir(args.runs_dir, args.output)
+        run_id = str(uuid.uuid4())
+        config["run"]["run_id"] = run_id
+        config["run"]["run_name"] = args.output
+        manifest = create_run_artifact(
+            run_dir,
+            run_id=run_id,
+            name=args.output,
+            config=config,
+            source_config=args.config,
+        )
+        split_manifest = create_split_manifest(run_dir, args.input, config)
+        attach_split_manifest(config, split_manifest)
+        config["artifact"] = {
+            "artifact_id": manifest["artifact_id"],
+            "schema_name": manifest["artifact_schema"]["name"],
+            "schema_version": manifest["artifact_schema"]["version"],
+        }
+        write_run_config(run_dir, config)
+    else:
+        run_id = config["run"]["run_id"]
     layout = RunLayout(run_dir)
     environment = write_environment(run_dir)
     training_log = layout.training_log
     from oracle_builder.training.logging_callbacks import init_training_log, log_event, mark_run_complete
 
-    init_training_log(training_log, run_id, args.output, config, environment)
+    init_training_log(
+        training_log,
+        run_id,
+        args.output,
+        config,
+        environment,
+        resume=is_resume,
+    )
+    if is_resume:
+        log_event(
+            training_log,
+            run_id,
+            "INFO",
+            "Resumed from validated rolling recovery snapshot",
+            {"completed_epoch": int(resume_state["completed_epoch"])},
+        )
 
     try:
         from oracle_builder.data.sqlite_dataset import load_arrays, load_prediction_arrays, make_tf_datasets
@@ -181,7 +262,7 @@ def main() -> int:
                     resolved_weights,
                 )
         pretraining_dataset = None
-        if config.get("pretraining", {}).get("enabled", False):
+        if config.get("pretraining", {}).get("enabled", False) and resume_state is None:
             if streaming_bundle is not None:
                 pretraining_index = build_classification_index(
                     args.input,
@@ -217,6 +298,7 @@ def main() -> int:
             training_log,
             run_id,
             pretraining_dataset=pretraining_dataset,
+            resume_state=resume_state,
         )
         from oracle_builder.inference.batching import (
             resolve_inference_batch_size,
@@ -403,11 +485,21 @@ def main() -> int:
                 key: value for key, value in threshold_analysis.items() if key != "curve"
             }
         with post_progress.stage("Finalizing and sealing the run artifact"):
+            from oracle_builder.training.recovery import clear_recovery_snapshot
+
+            clear_recovery_snapshot(run_dir)
             mark_run_complete(training_log, run_id, "complete")
             update_run_artifact(run_dir, status="complete", summary=summary)
             seal_run_artifact(run_dir)
         print(f"Training run complete: {run_dir}", flush=True)
         return 0
+    except KeyboardInterrupt:
+        log_event(training_log, run_id, "WARNING", "Training interrupted", {})
+        mark_run_complete(training_log, run_id, "interrupted")
+        update_run_artifact(run_dir, status="interrupted", error="Interrupted by user")
+        seal_run_artifact(run_dir)
+        print(f"Training interrupted; resume with --resume {run_dir}", file=sys.stderr)
+        return 130
     except Exception as exc:
         log_event(training_log, run_id, "ERROR", "Training run failed", {"error": str(exc)})
         mark_run_complete(training_log, run_id, "failed")

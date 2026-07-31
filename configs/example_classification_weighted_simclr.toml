@@ -74,6 +74,11 @@ early_stopping_patience = 8
 reduce_lr_on_plateau = true
 checkpoint_monitor = "val_loss"
 
+[recovery]
+# One rolling full-state snapshot enables restart during supervised fine-tuning.
+enabled = true
+save_every_epochs = 1
+
 [augmentation]
 # Shared by pretraining and fine-tuning. rotation=0.5 permits any orientation.
 enabled = true

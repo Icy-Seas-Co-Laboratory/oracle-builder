@@ -91,11 +91,16 @@ def train_model(
     training_log: str | Path,
     run_id: str,
     pretraining_dataset=None,
+    resume_state: dict[str, Any] | None = None,
 ):
     set_seed(int(config["run"].get("seed", 123)))
     strategy, distribution_info = select_distribution_strategy(config)
     with strategy.scope():
-        model = build_and_compile_model(config)
+        if resume_state is None:
+            model = build_and_compile_model(config)
+        else:
+            recovery_path = Path(run_dir) / resume_state["model_path"]
+            model = keras.models.load_model(recovery_path)
     write_distribution_info(distribution_info, run_dir)
     write_model_summary(model, Path(run_dir) / "model" / "model_summary.txt")
     from oracle_builder.training.logging_callbacks import log_event
@@ -115,7 +120,7 @@ def train_model(
             "cross_device_ops": distribution_info.cross_device_ops,
         },
     )
-    if config.get("pretraining", {}).get("enabled", False):
+    if config.get("pretraining", {}).get("enabled", False) and resume_state is None:
         if pretraining_dataset is None:
             raise ValueError("Enabled self-supervised pretraining requires a pretraining dataset")
         from oracle_builder.training.student_teacher import run_student_teacher_pretraining
@@ -145,27 +150,51 @@ def train_model(
                 if values
             },
         )
-    callbacks = build_callbacks(config, run_dir, training_log, run_id)
-    validation_data = datasets.get("validation")
-    history = model.fit(
-        datasets["train"],
-        validation_data=validation_data,
-        epochs=int(config["training"].get("epochs", 10)),
-        callbacks=callbacks,
-        verbose=2 if config.get("debug") else 1,
+    elif config.get("pretraining", {}).get("enabled", False):
+        log_event(
+            training_log,
+            run_id,
+            "INFO",
+            "Skipped completed self-supervised pretraining while resuming supervised training",
+        )
+    callbacks = build_callbacks(
+        config,
+        run_dir,
+        training_log,
+        run_id,
+        artifact_id=config.get("artifact", {}).get("artifact_id"),
     )
-    history_rows = []
-    for epoch, metrics in enumerate(zip(*history.history.values(), strict=False)):
-        row = {"epoch": epoch}
-        for name, value in zip(history.history.keys(), metrics, strict=False):
-            row[name] = float(value)
-        history_rows.append(row)
+    validation_data = datasets.get("validation")
+    initial_epoch = int(resume_state.get("completed_epoch", 0)) if resume_state else 0
+    total_epochs = int(config["training"].get("epochs", 10))
+    if initial_epoch > total_epochs:
+        raise ValueError("Recovery snapshot is beyond configured training.epochs")
+    if initial_epoch < total_epochs:
+        print(f"Training supervised epochs {initial_epoch + 1} through {total_epochs}", flush=True)
+        model.fit(
+            datasets["train"],
+            validation_data=validation_data,
+            initial_epoch=initial_epoch,
+            epochs=total_epochs,
+            callbacks=callbacks,
+            verbose=2 if config.get("debug") else 1,
+        )
+    else:
+        print("Supervised epochs already complete; continuing finalization.", flush=True)
     from oracle_builder.artifacts.layout import RunLayout
+    from oracle_builder.training.logging_callbacks import history_from_training_log
 
+    history_data = history_from_training_log(training_log, run_id)
+    history_rows = [
+        {"epoch": epoch, **{name: values[epoch] for name, values in history_data.items()}}
+        for epoch in range(max((len(values) for values in history_data.values()), default=0))
+    ]
     metrics_df = pd.DataFrame(history_rows)
     layout = RunLayout(run_dir)
     metrics_df.to_csv(layout.metrics_csv, index=False)
     layout.metrics_json.write_text(
-        json.dumps(history.history, indent=2, default=float) + "\n"
+        json.dumps(history_data, indent=2, default=float) + "\n"
     )
+    history = keras.callbacks.History()
+    history.history = history_data
     return model, history

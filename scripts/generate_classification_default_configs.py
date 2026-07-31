@@ -215,6 +215,12 @@ early_stopping_patience = 8
 reduce_lr_on_plateau = true
 checkpoint_monitor = "val_loss"
 
+[recovery]
+# Keep one full-state snapshot for restart after an interruption. This is not
+# the optional archive of per-epoch checkpoints above.
+enabled = true
+save_every_epochs = 1
+
 [augmentation]
 # Shared, moderately aggressive policy for fair architecture comparisons.
 # Rotation is a fraction of a full turn; 0.5 permits any orientation.

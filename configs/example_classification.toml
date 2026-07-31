@@ -59,6 +59,11 @@ early_stopping_patience = 5
 reduce_lr_on_plateau = true
 checkpoint_monitor = "val_loss"
 
+[recovery]
+# One rolling full-state snapshot enables restart without keeping every epoch.
+enabled = true
+save_every_epochs = 1
+
 [augmentation]
 # Shared classification policy. rotation=0.5 permits any orientation.
 enabled = true

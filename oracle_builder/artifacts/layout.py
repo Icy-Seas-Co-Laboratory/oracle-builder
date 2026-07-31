@@ -93,6 +93,18 @@ class RunLayout:
     def pretraining_model(self) -> Path:
         return self.root / "model" / "pretraining"
 
+    @property
+    def recovery(self) -> Path:
+        return self.model / "recovery"
+
+    @property
+    def recovery_model(self) -> Path:
+        return self.recovery / "latest.keras"
+
+    @property
+    def recovery_state(self) -> Path:
+        return self.recovery / "state.json"
+
     def create_directories(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
         for path in (
@@ -102,6 +114,7 @@ class RunLayout:
             self.training_log.parent,
             self.metrics_csv.parent,
             self.model / "checkpoints",
+            self.recovery,
             self.evaluation,
             self.predictions,
             self.figures,

@@ -972,10 +972,32 @@ Arguments:
 | `-o NAME`, `--output NAME` | Required run name under `--runs-dir`. |
 | `--runs-dir PATH` | Parent folder for runs; defaults to `./runs`. |
 | `--overwrite` | Replace an existing run directory with the same name. |
-| `--resume` | Reserved; currently exits because resume is not implemented. |
+| `--resume RUN_DIRECTORY` | Resume a failed or interrupted run from its validated rolling recovery snapshot. The original dataset path is used unless `--input` is supplied. |
 | `--dry-run` | Print resolved config and run path without training. |
 | `--preflight` | Validate segmentation SQLite compatibility and exit. |
 | `--debug` | Enable debug mode in the resolved config. |
+
+Oracle Builder keeps one rolling full-model recovery snapshot by default, while
+ordinary per-epoch checkpoints remain disabled. Recovery includes optimizer
+state and is compatible with both classification and segmentation training:
+
+```toml
+[recovery]
+enabled = true
+save_every_epochs = 1
+```
+
+After an interruption or a post-training failure, resume without re-specifying
+the config, output name, or split policy:
+
+```bash
+python3 model_training.py --resume runs/RUN_NAME
+```
+
+Resume verifies the run artifact, frozen dataset identity/fingerprint, split
+manifest, recovery checksum, and resolved training contract before continuing.
+If the database moved, provide `--input /new/path/dataset.sqlite`; it must still
+match exactly. Recovery begins after the last completed supervised epoch.
 
 ## Evaluation And Inference
 

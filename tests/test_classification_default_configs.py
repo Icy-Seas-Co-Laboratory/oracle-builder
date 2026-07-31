@@ -83,6 +83,7 @@ def test_all_classification_examples_share_high_level_defaults(path):
     assert user_config["training"]["class_weights"]["mode"] == "effective_number"
     assert user_config["augmentation"] == STANDARD_AUGMENTATION
     assert user_config["output"]["save_checkpoints"] is False
+    assert user_config["recovery"] == {"enabled": True, "save_every_epochs": 1}
 
     resolved = deep_merge(DEFAULT_CONFIG, user_config)
     resolved["data"]["num_classes"] = 3

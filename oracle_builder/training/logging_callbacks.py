@@ -9,7 +9,15 @@ from typing import Any
 from tensorflow import keras
 
 
-def init_training_log(path: str | Path, run_id: str, run_name: str, config: dict[str, Any], environment: dict[str, Any]) -> None:
+def init_training_log(
+    path: str | Path,
+    run_id: str,
+    run_name: str,
+    config: dict[str, Any],
+    environment: dict[str, Any],
+    *,
+    resume: bool = False,
+) -> None:
     connection = sqlite3.connect(path)
     connection.executescript(
         """
@@ -38,18 +46,28 @@ def init_training_log(path: str | Path, run_id: str, run_name: str, config: dict
         );
         """
     )
-    connection.execute(
-        "INSERT OR REPLACE INTO run VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (
-            run_id,
-            run_name,
-            datetime.now(timezone.utc).isoformat(),
-            None,
-            "running",
-            json.dumps(config, default=str),
-            json.dumps(environment, default=str),
-        ),
-    )
+    if resume:
+        connection.execute(
+            """
+            UPDATE run
+            SET completed_at = NULL, status = 'running', config_json = ?, environment_json = ?
+            WHERE run_id = ?
+            """,
+            (json.dumps(config, default=str), json.dumps(environment, default=str), run_id),
+        )
+    else:
+        connection.execute(
+            "INSERT OR REPLACE INTO run VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                run_id,
+                run_name,
+                datetime.now(timezone.utc).isoformat(),
+                None,
+                "running",
+                json.dumps(config, default=str),
+                json.dumps(environment, default=str),
+            ),
+        )
     connection.commit()
     connection.close()
 
@@ -91,9 +109,39 @@ class SQLiteMetricLogger(keras.callbacks.Callback):
             except (TypeError, ValueError):
                 continue
             connection.execute(
+                "DELETE FROM epoch_metrics WHERE run_id = ? AND epoch = ? AND split = ? AND metric = ?",
+                (self.run_id, int(epoch), split, metric),
+            )
+            connection.execute(
                 "INSERT INTO epoch_metrics VALUES (?, ?, ?, ?, ?)",
                 (self.run_id, int(epoch), split, metric, numeric),
             )
         connection.commit()
         connection.close()
 
+
+def history_from_training_log(path: str | Path, run_id: str) -> dict[str, list[float]]:
+    """Reconstruct one continuous supervised history, including resumed epochs."""
+    connection = sqlite3.connect(path)
+    try:
+        rows = connection.execute(
+            """
+            SELECT epoch, split, metric, value
+            FROM epoch_metrics
+            WHERE run_id = ?
+            ORDER BY epoch, split, metric
+            """,
+            (run_id,),
+        ).fetchall()
+    finally:
+        connection.close()
+    values: dict[str, dict[int, float]] = {}
+    max_epoch = -1
+    for epoch, split, metric, value in rows:
+        name = f"val_{metric}" if split == "validation" else str(metric)
+        values.setdefault(name, {})[int(epoch)] = float(value)
+        max_epoch = max(max_epoch, int(epoch))
+    return {
+        name: [by_epoch.get(epoch, float("nan")) for epoch in range(max_epoch + 1)]
+        for name, by_epoch in values.items()
+    }

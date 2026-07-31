@@ -8,7 +8,14 @@ from tensorflow import keras
 from oracle_builder.training.logging_callbacks import SQLiteMetricLogger
 
 
-def build_callbacks(config: dict[str, Any], run_dir: str | Path, training_log: str | Path, run_id: str):
+def build_callbacks(
+    config: dict[str, Any],
+    run_dir: str | Path,
+    training_log: str | Path,
+    run_id: str,
+    *,
+    artifact_id: str | None = None,
+):
     callbacks: list[keras.callbacks.Callback] = [SQLiteMetricLogger(training_log, run_id)]
     callback_config = config.get("callbacks", {})
     output_config = config.get("output", {})
@@ -17,6 +24,20 @@ def build_callbacks(config: dict[str, Any], run_dir: str | Path, training_log: s
     if output_config.get("save_checkpoints", False):
         checkpoint_path = Path(run_dir) / "model" / "checkpoints" / "epoch_{epoch:03d}.keras"
         callbacks.append(keras.callbacks.ModelCheckpoint(checkpoint_path, monitor=monitor, save_best_only=False))
+    if config.get("recovery", {}).get("enabled", True):
+        if not artifact_id:
+            raise ValueError("Recovery requires the run artifact_id")
+        from oracle_builder.training.recovery import RollingRecoveryCallback
+
+        callbacks.append(
+            RollingRecoveryCallback(
+                run_dir,
+                config,
+                training_log,
+                run_id,
+                artifact_id,
+            )
+        )
     if callback_config.get("early_stopping", False):
         callbacks.append(
             keras.callbacks.EarlyStopping(

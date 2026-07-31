@@ -104,6 +104,12 @@ class StudentTeacherPretrainer(keras.Model):
     def metrics(self):
         return [self.loss_tracker, self.cosine_similarity_tracker]
 
+    def call(self, inputs, training=False):
+        """Expose the student path so Keras can build this subclassed model."""
+        embeddings = self.student_encoder(inputs, training=training)
+        projected = self.student_projector(embeddings, training=training)
+        return self.predictor(projected, training=training)
+
     def _augment(self, x):
         dummy = tf.zeros([tf.shape(x)[0]], dtype=tf.int32)
         augmented, _ = augment_batch(x, dummy, self.view_config)
@@ -198,6 +204,11 @@ class SimCLRPretrainer(keras.Model):
     def metrics(self):
         return [self.loss_tracker, self.contrastive_accuracy]
 
+    def call(self, inputs, training=False):
+        """Expose encoder/projector inference so Keras can build before fit()."""
+        embeddings = self.encoder(inputs, training=training)
+        return self.projector(embeddings, training=training)
+
     def _augment(self, x):
         dummy = tf.zeros([tf.shape(x)[0]], dtype=tf.int32)
         augmented, _ = augment_batch(x, dummy, self.view_config)
@@ -287,6 +298,13 @@ def run_student_teacher_pretraining(
             optimizer=keras.optimizers.Adam(
                 learning_rate=float(settings.get("learning_rate", 0.001))
             )
+        )
+        # Keras 3 may try a symbolic build before the first custom train_step.
+        # Calling the explicit inference path here creates every wrapper variable
+        # for all backbones, including EfficientNet.
+        pretrainer(
+            tf.zeros([1, *config["data"]["input_shape"]], dtype=tf.float32),
+            training=False,
         )
     history = pretrainer.fit(
         dataset,

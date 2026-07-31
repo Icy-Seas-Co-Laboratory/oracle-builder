@@ -13,6 +13,7 @@ from oracle_builder.data.sqlite_dataset import (
     load_prediction_arrays,
 )
 from oracle_builder.training.student_teacher import (
+    SimCLRPretrainer,
     StudentTeacherPretrainer,
     make_pretraining_dataset,
     run_student_teacher_pretraining,
@@ -111,6 +112,18 @@ def test_teacher_starts_with_student_encoder_weights():
         np.testing.assert_allclose(student, teacher)
     assert not pretrainer.teacher_encoder.trainable
     assert not pretrainer.teacher_projector.trainable
+
+
+@pytest.mark.parametrize("pretrainer_type", [StudentTeacherPretrainer, SimCLRPretrainer])
+def test_pretraining_wrappers_expose_a_buildable_call_path(pretrainer_type):
+    config = pretraining_config()
+    classifier = build_and_compile_model(config)
+    pretrainer = pretrainer_type(classifier, config)
+
+    output = pretrainer(np.zeros((1, 16, 16, 1), dtype="float32"), training=False)
+
+    assert output.shape == (1, 4)
+    assert pretrainer.built
 
 
 @pytest.mark.parametrize(

@@ -51,6 +51,9 @@ run-name/
 │   ├── export_savedmodel/
 │   ├── pretraining/
 │   ├── checkpoints/
+│   ├── recovery/
+│   │   ├── latest.keras
+│   │   └── state.json
 │   ├── model_summary.txt
 │   └── load_test_report.json
 ├── evaluation/
@@ -106,8 +109,24 @@ reloaded and exercised before sealing.
 ## Lifecycle and integrity
 
 Runs begin with lifecycle `working` and status `running`. Training sets status to
-`complete` or `failed`, writes final execution events, and seals the artifact.
-Failed runs are also sealed so forensic information is preserved.
+`complete`, `failed`, or `interrupted`, writes final execution events, and seals
+the artifact. Failed and interrupted runs are also sealed so forensic information
+and a valid rolling recovery snapshot are preserved.
+
+Recovery uses one replaceable full Keras model snapshot, including optimizer
+state, rather than an ever-growing checkpoint directory. `state.json` records
+its checksum, completed supervised epoch, phase, artifact/run IDs, and a hash of
+the dataset, split, model, preprocessing, and training contract. Resume validates
+all of these before reopening the artifact and continuing:
+
+```bash
+oracle-train --resume runs/example
+```
+
+The default recovery cadence is one snapshot per completed epoch. It can be
+adjusted with `[recovery] save_every_epochs`; setting `recovery.enabled = false`
+disables restart support. Mid-pretraining recovery is intentionally not supported
+in V1; a completed pretraining phase is preserved before supervised training.
 
 Sealing:
 
