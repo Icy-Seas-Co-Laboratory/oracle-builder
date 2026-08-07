@@ -37,8 +37,6 @@ def test_folder_import_preserves_originals_labels_audit_and_sidecars(tmp_path):
         options_for(
             source,
             output,
-            "--split-mode",
-            "none",
             "--duplicate-policy",
             "allow",
         )
@@ -118,8 +116,6 @@ def test_materialized_import_applies_requested_preprocessing(tmp_path):
             "12",
             "3",
             "--invert",
-            "--split-mode",
-            "none",
         )
     )
 
@@ -138,22 +134,36 @@ def test_materialized_import_applies_requested_preprocessing(tmp_path):
     assert np.allclose(array[:3], 1.0)
 
 
-def test_existing_split_folders_do_not_become_dataset_state(tmp_path):
+def test_existing_source_partitions_are_provenance_not_dataset_splits(tmp_path):
     source = tmp_path / "library"
     write_image(source / "train" / "cod" / "one.jpg", (1, 2, 3))
     write_image(source / "validation" / "cod" / "two.jpg", (2, 3, 4))
     write_image(source / "test" / "cod" / "three.jpg", (3, 4, 5))
     output = tmp_path / "split.sqlite"
 
-    import_folders(
-        options_for(source, output, "--split-mode", "existing-folders")
-    )
+    summary = import_folders(options_for(source, output))
 
     with sqlite3.connect(output) as connection:
         assert "split" not in {
             row[1]
             for row in connection.execute("PRAGMA table_info(dataset_items)")
         }
+        partitions = {
+            row[0]: json.loads(row[1])["source_partition"]
+            for row in connection.execute(
+                "SELECT source_key, metadata_json FROM dataset_items ORDER BY source_key"
+            )
+        }
+    assert summary["counts_by_source_partition"] == {
+        "train": 1,
+        "validation": 1,
+        "test": 1,
+    }
+    assert partitions == {
+        "test/cod/three.jpg": "test",
+        "train/cod/one.jpg": "train",
+        "validation/cod/two.jpg": "validation",
+    }
 
 
 def test_preprocessing_supports_resize_inversion_and_channel_conversion():
@@ -183,7 +193,7 @@ def test_repeat_import_skips_existing_samples_and_preserves_labels(tmp_path):
     source = tmp_path / "library"
     write_image(source / "cod" / "one.jpg", (10, 20, 30))
     output = tmp_path / "repeat.sqlite"
-    arguments = options_for(source, output, "--split-mode", "none")
+    arguments = options_for(source, output)
 
     import_folders(arguments)
     second = import_folders(arguments)
@@ -203,7 +213,7 @@ def test_duplicate_content_is_skipped_within_a_class(tmp_path):
     write_image(source / "cod" / "two.png", (10, 20, 30))
     output = tmp_path / "duplicates.sqlite"
 
-    summary = import_folders(options_for(source, output, "--split-mode", "none"))
+    summary = import_folders(options_for(source, output))
 
     assert summary["status_counts"] == {"ready": 1, "skipped_duplicate": 1}
     with sqlite3.connect(output) as connection:

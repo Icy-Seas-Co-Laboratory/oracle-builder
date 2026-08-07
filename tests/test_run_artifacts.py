@@ -12,6 +12,7 @@ import model_training
 from oracle_builder.artifacts import (
     RunLayout,
     create_run_artifact,
+    create_split_manifest,
     create_unavailable_split_manifest,
     migrate_legacy_run,
     pack_run_artifact,
@@ -23,6 +24,7 @@ from oracle_builder.artifacts import (
     validate_run_artifact,
 )
 from oracle_builder.data.sqlite_dataset import create_synthetic_classification
+from oracle_builder.data.classification_import import build_parser, import_folders
 from oracle_builder.datasets.schema import set_dataset_lifecycle
 
 
@@ -71,6 +73,38 @@ def create_example_run(tmp_path: Path) -> tuple[Path, dict]:
         source_config=source_config,
     )
     return run, config
+
+
+def test_auto_split_manifest_honors_complete_source_partitions(tmp_path):
+    from PIL import Image
+
+    source = tmp_path / "folders"
+    partitions = (
+        ("train", (255, 0, 0)),
+        ("validation", (0, 255, 0)),
+        ("test", (0, 0, 255)),
+    )
+    for partition, color in partitions:
+        path = source / partition / "cod" / f"{partition}.png"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        Image.new("RGB", (8, 8), color).save(path)
+    database = tmp_path / "dataset.sqlite"
+    options = build_parser().parse_args(
+        ["--input", str(source), "--output", str(database)]
+    )
+    import_folders(options)
+
+    manifest = create_split_manifest(
+        tmp_path / "run",
+        database,
+        {"run": {"seed": 999}, "data": {"split_strategy": "auto"}},
+    )
+
+    assert manifest["policy"] == {
+        "method": "source_partitions",
+        "source_metadata_key": "source_partition",
+    }
+    assert manifest["counts"] == {"train": 1, "validation": 1, "test": 1}
 
 
 def add_completed_run_files(run: Path) -> None:

@@ -30,23 +30,13 @@ class Candidate:
     relative_path: str
     class_name: str
     class_index: int
-    split: str
+    source_partition: str | None
     sample_uuid: str
     sha256: str
     shape: list[int]
     mode: str
     status: str = "ready"
     error: str | None = None
-
-
-def stable_split(relative_path: str, class_name: str, seed: int, validation: float, test: float):
-    digest = hashlib.sha256(f"{seed}:{class_name}:{relative_path}".encode()).digest()
-    fraction = int.from_bytes(digest[:8], "big") / 2**64
-    if fraction < test:
-        return "test"
-    if fraction < test + validation:
-        return "validation"
-    return "train"
 
 
 def load_label_map(path: Path | None) -> dict[str, int] | None:
@@ -63,26 +53,32 @@ def load_label_map(path: Path | None) -> dict[str, int] | None:
     return result
 
 
-def discover_classes(root: Path, split_mode: str) -> tuple[dict[str, list[tuple[Path, str | None]]], list[str]]:
+def discover_classes(root: Path) -> tuple[dict[str, list[tuple[Path, str | None]]], list[str]]:
+    """Discover ordinary class folders or an explicit source-partition layout.
+
+    A partition is source provenance, not a dataset split.  A model run may
+    later elect to materialize these partitions in its own split manifest.
+    """
     classes: dict[str, list[tuple[Path, str | None]]] = {}
     warnings = []
-    if split_mode == "existing-folders":
-        split_roots = [
-            (path, SPLIT_FOLDERS[path.name.lower()])
-            for path in sorted(root.iterdir())
-            if path.is_dir() and path.name.lower() in SPLIT_FOLDERS
-        ]
-        if not split_roots:
-            raise ValueError("existing-folders mode requires train/validation/test directories")
-        for split_root, split in split_roots:
+    top_level = [path for path in sorted(root.iterdir()) if path.is_dir()]
+    partition_roots = [
+        (path, SPLIT_FOLDERS[path.name.lower()])
+        for path in top_level
+        if path.name.lower() in SPLIT_FOLDERS
+    ]
+    # Require at least two recognized top-level partitions. This avoids
+    # interpreting a legitimate class named "train" as a source layout.
+    if len(partition_roots) >= 2:
+        for split_root, partition in partition_roots:
             for class_dir in sorted(path for path in split_root.iterdir() if path.is_dir()):
                 classes.setdefault(class_dir.name, []).extend(
-                    (path, split)
+                    (path, partition)
                     for path in sorted(class_dir.rglob("*"))
                     if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES
                 )
     else:
-        for class_dir in sorted(path for path in root.iterdir() if path.is_dir()):
+        for class_dir in top_level:
             classes[class_dir.name] = [
                 (path, None)
                 for path in sorted(class_dir.rglob("*"))
@@ -105,13 +101,9 @@ def build_candidates(
 ) -> list[Candidate]:
     candidates = []
     for class_name, files in classes.items():
-        for path, explicit_split in files:
+        for path, source_partition in files:
             source_relative = path.relative_to(root)
-            relative = (
-                Path(*source_relative.parts[1:]).as_posix()
-                if explicit_split is not None
-                else source_relative.as_posix()
-            )
+            relative = source_relative.as_posix()
             try:
                 raw = path.read_bytes()
                 with Image.open(path) as image:
@@ -122,24 +114,13 @@ def build_candidates(
                     raise ValueError(f"requires RGB but image mode is {mode}")
                 if not options.allow_grayscale and mode in {"1", "L", "I", "F"}:
                     raise ValueError(f"grayscale image mode {mode} is not allowed")
-                split = explicit_split or (
-                    "train"
-                    if options.split_mode == "none"
-                    else stable_split(
-                        relative,
-                        class_name,
-                        options.seed,
-                        options.validation_fraction,
-                        options.test_fraction,
-                    )
-                )
                 candidates.append(
                     Candidate(
                         path=path,
                         relative_path=relative,
                         class_name=class_name,
                         class_index=label_map[class_name],
-                        split=split,
+                        source_partition=source_partition,
                         sample_uuid=str(uuid.uuid5(uuid.UUID(dataset_id), f"item:{relative}")),
                         sha256=hashlib.sha256(raw).hexdigest(),
                         shape=shape,
@@ -152,7 +133,7 @@ def build_candidates(
                     relative_path=relative,
                     class_name=class_name,
                     class_index=label_map[class_name],
-                    split="",
+                    source_partition=source_partition,
                     sample_uuid=str(uuid.uuid5(uuid.UUID(dataset_id), f"item:{relative}")),
                     sha256="",
                     shape=[],
@@ -217,7 +198,7 @@ def _encoded_input(candidate: Candidate, options: argparse.Namespace):
 def import_folders(options: argparse.Namespace) -> dict[str, Any]:
     root = Path(options.input).expanduser().resolve()
     output = Path(options.output).expanduser().resolve()
-    classes, warnings = discover_classes(root, options.split_mode)
+    classes, warnings = discover_classes(root)
     sidecars = discover_metadata_documents(root)
     primary_metadata = next(
         (
@@ -353,16 +334,20 @@ def import_folders(options: argparse.Namespace) -> dict[str, Any]:
         connection.close()
         raise ValueError(errors[0].error or "Import validation failed")
     counts_by_class = {
-        name: {
-            split: sum(
-                candidate.class_name == name
-                and candidate.split == split
-                and candidate.status in {"ready", "update"}
-                for candidate in candidates
-            )
-            for split in ("train", "validation", "test")
-        }
+        name: sum(
+            candidate.class_name == name and candidate.status in {"ready", "update"}
+            for candidate in candidates
+        )
         for name in sorted(classes)
+    }
+    counts_by_source_partition = {
+        partition: sum(
+            candidate.source_partition == partition
+            and candidate.status in {"ready", "update"}
+            for candidate in candidates
+        )
+        for partition in ("train", "validation", "test")
+        if any(candidate.source_partition == partition for candidate in candidates)
     }
     too_small = [
         name
@@ -384,6 +369,7 @@ def import_folders(options: argparse.Namespace) -> dict[str, Any]:
         "dry_run": bool(options.dry_run),
         "class_labels": label_map,
         "counts_by_class": counts_by_class,
+        "counts_by_source_partition": counts_by_source_partition,
         "status_counts": {
             status: sum(candidate.status == status for candidate in candidates)
             for status in sorted({candidate.status for candidate in candidates})
@@ -418,6 +404,8 @@ def import_folders(options: argparse.Namespace) -> dict[str, Any]:
                     "import_id": import_id,
                     "storage_mode": options.storage_mode,
                 }
+                if candidate.source_partition is not None:
+                    metadata["source_partition"] = candidate.source_partition
                 shape = json.loads(dimensions) if dimensions else candidate.shape
                 asset = repository.add_asset(
                     blob,
@@ -514,7 +502,7 @@ def import_folders(options: argparse.Namespace) -> dict[str, Any]:
                 "relative_path",
                 "class_name",
                 "class_index",
-                "split",
+                "source_partition",
                 "shape",
                 "mode",
                 "sha256",
@@ -547,14 +535,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--label-map")
     parser.add_argument("--allow-new-classes", action="store_true")
-    parser.add_argument(
-        "--split-mode",
-        choices=("stratified-hash", "existing-folders", "none"),
-        default="stratified-hash",
-    )
-    parser.add_argument("--validation-fraction", type=float, default=0.2)
-    parser.add_argument("--test-fraction", type=float, default=0.1)
-    parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--minimum-images-per-class", type=int, default=1)
     parser.add_argument("--require-rgb", action="store_true")
     parser.add_argument("--allow-grayscale", action=argparse.BooleanOptionalAction, default=True)
@@ -593,10 +573,6 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     options = build_parser().parse_args()
-    if not 0 <= options.validation_fraction < 1 or not 0 <= options.test_fraction < 1:
-        raise SystemExit("Split fractions must be in [0, 1)")
-    if options.validation_fraction + options.test_fraction >= 1:
-        raise SystemExit("Validation and test fractions must sum to less than 1")
     if options.storage_mode == "materialized" and not options.input_shape:
         raise SystemExit("--storage-mode materialized requires --input-shape H W C")
     summary = import_folders(options)

@@ -25,6 +25,7 @@ Choose the guide that matches what you want to do:
 - [External model products](docs/model-products.md) — ingest and promote existing Keras models.
 - [Training, evaluation, and recovery](docs/training-and-evaluation.md) — configs, augmentation, streaming, multi-GPU, metrics, and resume behavior.
 - [Operations and troubleshooting](docs/operations-and-troubleshooting.md) — validation, packages, common problems, and analysis helpers.
+- [Inference API](docs/inference-api.md) — serve resident model bundles to Pelagia and other operational callers.
 
 ## Reference
 

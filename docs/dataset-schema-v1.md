@@ -251,6 +251,11 @@ Train/validation/test membership belongs to a model run's experimental
 protocol. It is stored in `protocol/splits.json` inside the model-run artifact,
 not in the canonical folder exchange or semantic dataset fingerprint.
 
+When the convenient class-folder importer receives a conventional top-level
+`train/`, `validation/`, and/or `test/` layout, it records those names only as
+per-item `source_partition` provenance. The run's `data.split_strategy` decides
+whether to materialize that provenance into its own split manifest.
+
 The named-class folder importer remains the convenient ingestion path for de
 facto classification libraries. The canonical export format is the lossless,
 deterministic interchange format.

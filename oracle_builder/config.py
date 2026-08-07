@@ -16,6 +16,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "shuffle_buffer": 512,
         "validation_split": 0.2,
         "test_split": 0.1,
+        # "auto" honors a complete explicit source-partition layout when one
+        # was imported; otherwise it creates a deterministic random protocol.
+        # "random" always creates one; "source_partitions" requires one.
+        "split_strategy": "auto",
         "candidate_sdf": False,
         "candidate_sdf_clip_distance": 32.0,
         "streaming": {
@@ -157,6 +161,11 @@ def validate_config(config: dict[str, Any]) -> None:
     for section in ("run", "data", "training"):
         if section not in config:
             raise ValueError(f"Missing required config section [{section}]")
+    split_strategy = str(config["data"].get("split_strategy", "auto")).lower()
+    if split_strategy not in {"auto", "random", "source_partitions"}:
+        raise ValueError(
+            "data.split_strategy must be 'auto', 'random', or 'source_partitions'"
+        )
     task = config["run"].get("task")
     model = config["run"].get("model")
     if task not in {"classification", "segmentation"}:

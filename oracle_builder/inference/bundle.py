@@ -198,18 +198,74 @@ class InferenceBundle:
         *,
         source_dataset: dict[str, Any] | None = None,
     ) -> InferenceResultSet:
+        """Predict a caller-supplied batch with one classifier forward pass.
+
+        Inputs are independently prepared and outputs remain correlated to the
+        original request/item IDs.  Segmentation remains item-oriented because
+        each ROI can expand into a variable number of tiles; its batching is a
+        separate tile scheduler concern.
+        """
         result_set = InferenceResultSet(
             model=self.model_reference,
             source_dataset=source_dataset,
         )
-        for index, item in enumerate(items):
-            result_set.append(
-                self.predict(
+        materialized_items = list(items)
+        if self.model_reference.task != "classification":
+            for index, item in enumerate(materialized_items):
+                result_set.append(
+                    self.predict(
+                        item,
+                        result_set_id=result_set.result_set_id,
+                        sequence_number=index,
+                    )
+                )
+            return result_set.complete()
+
+        results: list[InferenceResult | None] = [None] * len(materialized_items)
+        prepared: list[np.ndarray] = []
+        prepared_indices: list[int] = []
+        started: dict[int, tuple[float, str]] = {}
+        for index, item in enumerate(materialized_items):
+            started[index] = (time.perf_counter(), utc_now())
+            try:
+                prepared.append(self._prepare_classification(item))
+                prepared_indices.append(index)
+            except Exception as exc:
+                results[index] = self._error_result(
                     item,
+                    exc,
                     result_set_id=result_set.result_set_id,
                     sequence_number=index,
+                    started=started[index],
                 )
-            )
+        if prepared:
+            try:
+                values = predict_classification_outputs(
+                    self.model, np.stack(prepared, axis=0)
+                )
+                for batch_index, item_index in enumerate(prepared_indices):
+                    item = materialized_items[item_index]
+                    results[item_index] = self._success_result(
+                        item,
+                        self._classification_output_from_values(
+                            item, values, batch_index
+                        ),
+                        result_set_id=result_set.result_set_id,
+                        sequence_number=item_index,
+                        started=started[item_index],
+                    )
+            except Exception as exc:
+                for item_index in prepared_indices:
+                    results[item_index] = self._error_result(
+                        materialized_items[item_index],
+                        exc,
+                        result_set_id=result_set.result_set_id,
+                        sequence_number=item_index,
+                        started=started[item_index],
+                    )
+        for result in results:
+            assert result is not None
+            result_set.append(result)
         return result_set.complete()
 
     def predict_stream(
@@ -237,6 +293,11 @@ class InferenceBundle:
             index += 1
 
     def _predict_classification(self, item: InferenceItem) -> dict[str, Any]:
+        prepared = self._prepare_classification(item)
+        values = predict_classification_outputs(self.model, prepared[None, ...])
+        return self._classification_output_from_values(item, values, 0)
+
+    def _prepare_classification(self, item: InferenceItem) -> np.ndarray:
         raw = item.inputs["image"].values
         promotion = self.config.get("promotion", {})
         embedded_preprocessing = bool(
@@ -252,12 +313,23 @@ class InferenceBundle:
             prepared = prepare_classification_input(
                 raw, self.config["data"]["input_shape"], self.config
             )
-        values = predict_classification_outputs(self.model, prepared[None, ...])
-        logits = np.asarray(values["logits"][0], dtype="float32")
-        probabilities = np.asarray(values["probabilities"][0], dtype="float32")
+        return np.asarray(prepared)
+
+    def _classification_output_from_values(
+        self,
+        item: InferenceItem,
+        values: dict[str, Any],
+        batch_index: int,
+    ) -> dict[str, Any]:
+        logits = np.asarray(values["logits"][batch_index], dtype="float32")
+        probabilities = np.asarray(
+            values["probabilities"][batch_index], dtype="float32"
+        )
         features = values["features"]
         embedding = (
-            np.asarray(features[0], dtype="float32") if features is not None else None
+            np.asarray(features[batch_index], dtype="float32")
+            if features is not None
+            else None
         )
         class_index = int(np.argmax(probabilities))
         label = _labels(self.config).get(class_index, {})
@@ -296,6 +368,56 @@ class InferenceBundle:
                     k=int(self.config.get("evidence", {}).get("knn_k", 5)),
                 )
         return output
+
+    def _success_result(
+        self,
+        item: InferenceItem,
+        output: dict[str, Any],
+        *,
+        result_set_id: str,
+        sequence_number: int,
+        started: tuple[float, str],
+    ) -> InferenceResult:
+        return InferenceResult(
+            request_id=item.request_id,
+            item_id=item.item_id,
+            source=item.source,
+            model=self.model_reference,
+            output=output,
+            input_sha256=item.input_sha256,
+            result_set_id=result_set_id,
+            sequence_number=sequence_number,
+            status="ok",
+            received_at=started[1],
+            completed_at=utc_now(),
+            duration_ms=(time.perf_counter() - started[0]) * 1000.0,
+        )
+
+    def _error_result(
+        self,
+        item: InferenceItem,
+        exc: Exception,
+        *,
+        result_set_id: str,
+        sequence_number: int,
+        started: tuple[float, str],
+    ) -> InferenceResult:
+        status = "rejected" if isinstance(exc, (TypeError, ValueError, KeyError)) else "failed"
+        return InferenceResult(
+            request_id=item.request_id,
+            item_id=item.item_id,
+            source=item.source,
+            model=self.model_reference,
+            output=None,
+            input_sha256=item.input_sha256,
+            result_set_id=result_set_id,
+            sequence_number=sequence_number,
+            status=status,
+            received_at=started[1],
+            completed_at=utc_now(),
+            duration_ms=(time.perf_counter() - started[0]) * 1000.0,
+            error={"type": type(exc).__name__, "message": str(exc)},
+        )
 
     def _predict_segmentation(self, item: InferenceItem) -> dict[str, Any]:
         raw = np.asarray(item.inputs["image"].values)

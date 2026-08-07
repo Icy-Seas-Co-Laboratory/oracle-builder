@@ -30,6 +30,7 @@ oracle-infer = "model_inference:main"
 oracle-evaluate = "model_evaluate:main"
 oracle-mask-builder = "mask_builder:main"
 oracle-model = "oracle_builder.products.cli:main"
+oracle-serve = "oracle_builder.api.cli:main"
 
 [tool.setuptools]
 py-modules = [
@@ -60,6 +61,10 @@ gui = [
   "magicgui",
   "scipy",
   "scikit-image",
+]
+api = [
+  "fastapi>=0.115,<1",
+  "uvicorn>=0.30,<1",
 ]
 
 [tool.pytest.ini_options]

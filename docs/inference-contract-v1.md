@@ -18,6 +18,12 @@ curated Oracle Builder dataset is a separate, explicit promotion operation.
 sink by default. `JSONLinesSink` and dataset prediction databases are explicit
 persistence choices.
 
+For classification, `predict_batch` independently preprocesses every supplied
+item, stacks compatible tensors, and executes one model forward pass before
+returning one correlated result per item. This is the preferred interface for a
+caller such as Pelagia that already schedules ROI batches. Segmentation remains
+item-oriented in V1 because an ROI may expand into a variable number of tiles.
+
 ## Identities and hashes
 
 - Dataset, revision, run, model artifact, input item, array asset, result, and
@@ -46,6 +52,14 @@ Every successful segmentation result includes:
 - the thresholded mask;
 - threshold and spatial transformation information;
 - reconstructed outputs for candidate-delta models.
+
+The service catalog at `GET /v1/models` describes each loaded bundle's class
+vocabulary, embedding shape, and prototype/KNN availability. This allows an
+operational client to build its review UI from the deployed artifact rather
+than duplicating model configuration. `GET /v1/models/{selector}/evidence/{item_id}`
+resolves packaged neighbor identity and class metadata. V1 evidence bundles do
+not package redistributable exemplar imagery; the catalog reports
+`visual_exemplars: false` explicitly.
 
 `logits_source` is `model` when values came from the explicit named logits
 layer. For probability-only external artifacts it records the reversible

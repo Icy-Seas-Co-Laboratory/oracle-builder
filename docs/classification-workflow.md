@@ -15,15 +15,27 @@ training-library/
 ```bash
 python3 scripts/import_classification_folders.py \
   --input "$HOME/Desktop/training-library" \
-  --output datasets/training.sqlite \
-  --validation-fraction 0.20 \
-  --test-fraction 0.10 \
-  --seed 123
+  --output datasets/training.sqlite
 ```
 
-Run with `--dry-run` first to inspect image errors, duplicates, class counts,
-and proposed split counts. Folder split hints are never stored in the dataset:
-the eventual train/validation/test assignments belong to each model run.
+Run with `--dry-run` first to inspect image errors, duplicates, and class
+counts. The importer never creates a random training split.
+
+An existing conventional source layout is also accepted without an option:
+
+```text
+training-library/
+├── train/cod/cod-001.jpg
+├── validation/cod/cod-002.jpg
+└── test/cod/cod-003.jpg
+```
+
+Those directory names are retained as `source_partition` provenance for each
+item. They do not become dataset-level split state. A training run with the
+default `data.split_strategy = "auto"` uses a complete source-partition layout;
+otherwise it creates its own deterministic assignments. Set
+`split_strategy = "random"` to ignore source partitions, or
+`"source_partitions"` to require them.
 
 Original encoded image bytes are the default and recommended storage form.
 `--storage-mode materialized` is for a deliberately fixed, preprocessed image
@@ -86,7 +98,7 @@ adds prediction sets/results. It never changes the source database.
 - Use `fit_pad` preprocessing when preserving object aspect ratio matters.
 - Keep augmentations identical across architecture comparisons.
 - Use a frozen checkpoint for every training run.
-- Treat the saved run’s split manifest—not import-time suggestions—as the
+- Treat the saved run’s split manifest—not the source-folder layout—as the
   source of truth for evaluation.
 - Use [model products](model-products.md) to ingest an externally trained
   classifier instead of retraining it.

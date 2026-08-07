@@ -83,6 +83,49 @@ def test_connector_is_in_memory_by_default(tmp_path):
     assert list(tmp_path.iterdir()) == []
 
 
+def test_classification_bundle_uses_one_model_call_for_a_supplied_batch():
+    class BatchRecordingModel:
+        def __init__(self):
+            self.batch_sizes = []
+
+        def predict_outputs(self, values, verbose=0):
+            self.batch_sizes.append(int(values.shape[0]))
+            batch = int(values.shape[0])
+            return {
+                "logits": np.tile([[1.0, 2.0]], (batch, 1)),
+                "probabilities": np.tile([[0.25, 0.75]], (batch, 1)),
+                "features": np.tile([[0.6, 0.8]], (batch, 1)),
+            }
+
+    config = {
+        "run": {"task": "classification", "model": "test"},
+        "data": {"input_shape": [4, 4, 1]},
+        "model": {"normalize_embeddings": True},
+        "preprocessing": {
+            "resize_mode": "fit_pad",
+            "normalization": "dtype",
+            "rescale": True,
+            "channel_mode": "grayscale",
+            "interpolation": "bilinear",
+        },
+    }
+    model = BatchRecordingModel()
+    bundle = InferenceBundle(model, config, model_reference())
+    items = [
+        InferenceItem.from_array(np.full((3, 5), value, dtype="uint8"))
+        for value in (20, 80, 160)
+    ]
+
+    result_set = bundle.predict_batch(items)
+
+    assert model.batch_sizes == [3]
+    assert [result.request_id for result in result_set.results] == [
+        item.request_id for item in items
+    ]
+    assert all(result.status == "ok" for result in result_set.results)
+    assert all(result.output["decision"]["class_index"] == 1 for result in result_set.results)
+
+
 def test_classification_bundle_returns_logits_probabilities_and_embedding():
     tf = pytest.importorskip("tensorflow")
     from oracle_builder.registry import get_model_builder

@@ -10,6 +10,7 @@
 | Ingest a pre-existing Keras model | [External model products](model-products.md) |
 | Configure training, evaluation, or recovery | [Training, evaluation, and recovery](training-and-evaluation.md) |
 | Diagnose installation or run problems | [Operations and troubleshooting](operations-and-troubleshooting.md) |
+| Serve models to operational systems | [Inference API](inference-api.md) |
 
 ## Contract references
 

@@ -71,14 +71,54 @@ def _assignment_rows(
     ]
 
 
+def _source_partition_assignments(
+    rows: list[tuple[str, str | None]], *, required: bool
+) -> list[dict[str, str]] | None:
+    """Convert imported source partitions into one run-owned protocol.
+
+    Source partitions are immutable import provenance in ``metadata_json``.
+    They are not model splits until this function records them in a run's
+    manifest. ``None`` means the dataset has no complete partition layout.
+    """
+    assignments: list[dict[str, str]] = []
+    missing: list[str] = []
+    invalid: set[str] = set()
+    for item_id, raw_metadata in rows:
+        try:
+            metadata = json.loads(raw_metadata) if raw_metadata else {}
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Invalid metadata_json for dataset item {item_id}") from exc
+        partition = metadata.get("source_partition")
+        if partition is None:
+            missing.append(item_id)
+            continue
+        partition = str(partition)
+        if partition not in SPLIT_NAMES:
+            invalid.add(partition)
+            continue
+        assignments.append({"item_id": str(item_id), "split": partition})
+    if invalid:
+        raise ValueError(f"Invalid source partitions: {sorted(invalid)}")
+    if missing:
+        if required:
+            preview = ", ".join(missing[:3])
+            raise ValueError(
+                "split_strategy='source_partitions' requires every item to have "
+                f"source_partition metadata; {len(missing)} missing (for example: {preview})"
+            )
+        return None
+    return sorted(assignments, key=lambda row: row["item_id"])
+
+
 def create_split_manifest(
     run_dir: str | Path,
     sqlite_path: str | Path,
     config: dict[str, Any],
 ) -> dict[str, Any]:
     """Create the immutable dataset-item assignment protocol for one model run."""
-    validation = float(config["data"].get("validation_split", 0.2))
-    test = float(config["data"].get("test_split", 0.1))
+    data = config["data"]
+    validation = float(data.get("validation_split", 0.2))
+    test = float(data.get("test_split", 0.1))
     if validation < 0 or test < 0 or validation + test >= 1:
         raise ValueError("Split fractions must be non-negative and sum to less than 1")
     seed = int(config["run"].get("seed", 123))
@@ -86,15 +126,19 @@ def create_split_manifest(
     if layout.split_manifest.exists():
         raise FileExistsError(layout.split_manifest)
 
+    strategy = str(data.get("split_strategy", "auto")).lower()
+    if strategy not in {"auto", "random", "source_partitions"}:
+        raise ValueError("data.split_strategy must be auto, random, or source_partitions")
     with sqlite3.connect(Path(sqlite_path).expanduser().resolve()) as connection:
         info = read_dataset_info(connection)
         fingerprint = dataset_fingerprint(connection)
-        item_ids = [
-            str(row[0])
+        item_rows = [
+            (str(row[0]), row[1])
             for row in connection.execute(
-                "SELECT item_id FROM dataset_items ORDER BY item_id"
+                "SELECT item_id, metadata_json FROM dataset_items ORDER BY item_id"
             )
         ]
+    item_ids = [row[0] for row in item_rows]
     expected_dataset = config.get("dataset", {})
     if (
         expected_dataset.get("dataset_id")
@@ -110,9 +154,29 @@ def create_split_manifest(
         )
     if not item_ids:
         raise ValueError("Cannot create a split manifest for an empty dataset")
-    assignments = _assignment_rows(
-        item_ids, seed=seed, validation=validation, test=test
+    source_assignments = (
+        None
+        if strategy == "random"
+        else _source_partition_assignments(
+            item_rows, required=strategy == "source_partitions"
+        )
     )
+    if source_assignments is not None:
+        assignments = source_assignments
+        policy: dict[str, Any] = {
+            "method": "source_partitions",
+            "source_metadata_key": "source_partition",
+        }
+    else:
+        assignments = _assignment_rows(
+            item_ids, seed=seed, validation=validation, test=test
+        )
+        policy = {
+            "method": "stable_sha256_rank",
+            "seed": seed,
+            "validation_fraction": validation,
+            "test_fraction": test,
+        }
     counts = {
         name: sum(row["split"] == name for row in assignments)
         for name in SPLIT_NAMES
@@ -129,12 +193,7 @@ def create_split_manifest(
             "revision_id": info["revision_id"],
             "fingerprint_sha256": fingerprint,
         },
-        "policy": {
-            "method": "stable_sha256_rank",
-            "seed": seed,
-            "validation_fraction": validation,
-            "test_fraction": test,
-        },
+        "policy": policy,
         "counts": counts,
         "assignments": assignments,
         "fingerprint_sha256": None,
