@@ -7,7 +7,8 @@ entry points. Domain code should not import repository-root scripts.
 
 | Package | Responsibility |
 |---|---|
-| `oracle_builder.datasets` | Versioned dataset contract, lifecycle, repositories, validation, and transfer. |
+| `oracle_data_contracts` | Dependency-light Dataset V1 schema/lifecycle/workspace plus model-run artifact layout, manifests, split protocol, fingerprints, repositories, and deterministic transfer. |
+| `oracle_builder.datasets`, `oracle_builder.artifacts` | Backward-compatible imports and Oracle Builder CLI integration for the shared contracts. |
 | `oracle_builder.data` | Backend-neutral decoding, preprocessing, splitting, tiling, and TensorFlow input adapters. |
 | `oracle_builder.models` | Built-in architecture definitions. |
 | `oracle_builder.training` | Distribution, augmentation, losses, metrics, pretraining, and training orchestration. |
@@ -30,10 +31,13 @@ CLI / applications
 training, evaluation, masking workflows
         |
         v
-datasets, data adapters, models, saving
+data adapters, models, saving
         |
         v
-TensorFlow / Keras / SQLite
+oracle_data_contracts
+        |
+        v
+SQLite / standard-library dependencies
 ```
 
 Dataset code must not depend on a model architecture. Model code must not query
@@ -41,10 +45,11 @@ SQLite directly. Storage-specific SQL belongs in repository or adapter modules.
 
 ## Portability boundary
 
-The dataset contract and stable identifiers are logical APIs. SQLite is the V1
-cold-storage adapter. A PostgreSQL implementation should satisfy the same
-repository behavior and typed records while mapping payloads to `bytea` or
-external object storage.
+The dataset contract and stable identifiers live in `oracle_data_contracts`,
+which intentionally has no TensorFlow, Keras, napari, Pelagia-client, or model
+architecture dependency. SQLite is its V1 cold-storage adapter. A PostgreSQL
+implementation should satisfy the same repository behavior and typed records
+while mapping payloads to `bytea` or external object storage.
 
 The model registry references `oracle_builder.models`, ensuring that installed
 packages contain every built-in architecture. Saved runs retain resolved model

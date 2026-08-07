@@ -10,18 +10,29 @@ SQLite file contains exactly one dataset and one use-case schema:
 - `mask_refinement` stores source images, optional candidate masks, and
   append-only refined-mask annotations.
 
-`ob_schema` identifies the contract as `oracle_builder_dataset` version `1.1.0`.
+`ob_schema` identifies the contract as `oracle_builder_dataset` version `1.2.0`.
 `dataset.dataset_id` is the stable lineage UUID. `dataset.revision_id` identifies
 one workspace/checkpoint revision, while `parent_revision_id` links a checkpoint
 to the workspace revision it captured. All three survive export, import, and
 future movement into warm storage.
 
-Schema 1.1 removes `dataset_items.split` entirely. Opening a 1.0 database
+Schema 1.1 removes `dataset_items.split` entirely. Schema 1.2 adds generic
+annotation-workspace tables for ROI labels, reviews, inference provenance, and
+derived evidence. Opening an older V1 database migrates it transactionally.
+Opening a 1.0 database
 transactionally rebuilds `dataset_items`, discards obsolete stored assignments
 and split-hint metadata, updates `ob_schema`, reinstalls lifecycle triggers, and
 records a `schema.migrated` event. Frozen datasets remain frozen. Training,
 validation, and test membership exists only in a model run's
 `protocol/splits.json`.
+
+## Where the executable definition lives
+
+This document is the searchable logical contract. The executable SQLite DDL,
+migrations, validation rules, and fingerprint implementation are maintained in
+[`oracle_data_contracts/datasets/schema.py`](../oracle_data_contracts/datasets/schema.py).
+Applications should use the dataset repository/schema APIs rather than relying
+on undocumented SQLite implementation details.
 
 ## Common tables
 
@@ -34,6 +45,12 @@ validation, and test membership exists only in a model run's
 | `metadata_documents` | Parsed JSON plus original sidecar text and checksum. |
 | `import_events` | Reproducible importer options and summaries. |
 | `dataset_events` | Lifecycle and checkpoint provenance. |
+| `annotation_labels` | Shared label vocabulary, including optional hierarchy. |
+| `item_label_annotations` | Append-only current/historical labels for any dataset item. |
+| `annotation_reviews` | Independent reviewer decisions about label annotations. |
+| `inference_runs` | Model-artifact and execution provenance for derived evidence. |
+| `evidence_arrays` | Deduplicated typed NPY arrays for logits, embeddings, and outputs. |
+| `model_evidence` | Indexed per-item model evidence from one inference run. |
 
 Classification adds `classification_labels`, `classification_items`, and
 `classification_annotations`. Mask refinement adds `mask_refinement_items` and
@@ -42,6 +59,16 @@ Classification adds `classification_labels`, `classification_items`, and
 Annotations are append-only. At most one annotation per item is current, while
 older accepted, rejected, or deprecated entries remain available for audit and
 review.
+
+`annotation_labels` and `item_label_annotations` are available in both dataset
+types. This permits a mask-refinement ROI dataset to carry taxonomic or QC labels
+without ceasing to be a mask-refinement dataset. Existing classification-specific
+tables remain the training-class vocabulary for current classification datasets.
+
+Model evidence is derived workspace material, not human ground truth. It is not
+included in the semantic dataset fingerprint, is excluded from deterministic
+training-dataset exchange, and should not be used as a training label without a
+human annotation/review step.
 
 Dataset and internally generated entity IDs are canonical UUID text in SQLite.
 Folder-imported items use deterministic, dataset-scoped UUIDs. `item_id` remains
@@ -79,6 +106,44 @@ revision, so the lineage remains explicit even though the SQLite file is reused.
 
 Actual model training requires `lifecycle = "frozen"`. Configuration generation,
 inspection, validation, and preflight checks may operate on a working dataset.
+
+### Annotation workspace snapshots
+
+Annotation workspaces remain editable. A snapshot is a full frozen SQLite backup
+that retains annotations, reviews, inference runs, and evidence arrays:
+
+```bash
+oracle-dataset snapshot workspaces/roi-review.sqlite \
+  --output snapshots/roi-review-2026-08-07.sqlite \
+  --note "Reviewed Calanus batch 4"
+
+oracle-dataset restore-workspace \
+  snapshots/roi-review-2026-08-07.sqlite \
+  workspaces/roi-review-restored.sqlite \
+  --reason "Continue review"
+```
+
+Snapshots preserve the dataset UUID, receive a new frozen revision UUID, and
+record a `workspace.snapshot.created` event. Restoring forks a new working
+revision from the snapshot; it never edits the snapshot in place. In addition to
+the canonical `dataset_fingerprint`, a `workspace_fingerprint` captures derived
+inference/evidence state for snapshot integrity.
+
+### Training releases from annotation workspaces
+
+Create a separate, self-contained frozen dataset before training from an active
+annotation workspace:
+
+```bash
+oracle-dataset release-training workspaces/roi-review.sqlite \
+  datasets/roi-training-v1.sqlite \
+  --name "roi-training-v1"
+```
+
+The release receives a new dataset and revision UUID, records the source
+workspace ID/fingerprint in metadata, and excludes `inference_runs`,
+`model_evidence`, and `evidence_arrays`. Human labels, reviews, masks, source
+assets, and metadata are retained.
 
 ## Legacy ROI database migration
 
@@ -146,7 +211,7 @@ A canonical folder metadata file begins:
 ```toml
 [oracle_builder]
 schema_name = "oracle_builder_dataset"
-schema_version = "1.1.0"
+schema_version = "1.2.0"
 export_format_version = "1.0.0"
 dataset_id = "11111111-1111-4111-8111-111111111111"
 revision_id = "22222222-2222-4222-8222-222222222222"

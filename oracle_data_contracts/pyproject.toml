@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "oracle-data-contracts"
+version = "0.1.0"
+description = "Dependency-light, versioned Oracle dataset and annotation-workspace contracts."
+requires-python = ">=3.10"
+dependencies = [
+  "numpy",
+  "tomli; python_version < '3.11'",
+  "tomli-w",
+  "PyYAML",
+]
+
+[tool.setuptools]
+package-dir = {oracle_data_contracts = "."}
+packages = [
+  "oracle_data_contracts",
+  "oracle_data_contracts.datasets",
+  "oracle_data_contracts.artifacts",
+]

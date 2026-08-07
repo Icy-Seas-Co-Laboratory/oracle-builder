@@ -5,15 +5,21 @@ import json
 import sqlite3
 from pathlib import Path
 
-from oracle_builder.datasets.lifecycle import save_checkpoint, thaw_database
-from oracle_builder.datasets.metadata import add_metadata_document
-from oracle_builder.datasets.schema import (
+from oracle_data_contracts.datasets.lifecycle import (
+    restore_workspace_snapshot,
+    save_checkpoint,
+    save_workspace_snapshot,
+    thaw_database,
+)
+from oracle_data_contracts.datasets.metadata import add_metadata_document
+from oracle_data_contracts.datasets.schema import (
     dataset_fingerprint,
     read_dataset_info,
     set_dataset_lifecycle,
     validate_database,
+    workspace_fingerprint,
 )
-from oracle_builder.datasets.transfer import export_dataset, import_dataset_export
+from oracle_data_contracts.datasets.transfer import export_dataset, import_dataset_export
 from oracle_builder.datasets.legacy_roi import (
     migrate_legacy_roi_database,
     migrate_legacy_roi_if_needed,
@@ -36,6 +42,28 @@ def build_parser() -> argparse.ArgumentParser:
     checkpoint.add_argument("database")
     checkpoint.add_argument("--output")
     checkpoint.add_argument("--actor")
+    snapshot = commands.add_parser(
+        "snapshot", help="Create a frozen full annotation-workspace snapshot."
+    )
+    snapshot.add_argument("database")
+    snapshot.add_argument("--output")
+    snapshot.add_argument("--actor")
+    snapshot.add_argument("--note")
+    restore_workspace = commands.add_parser(
+        "restore-workspace", help="Fork a frozen workspace snapshot into an editable database."
+    )
+    restore_workspace.add_argument("snapshot")
+    restore_workspace.add_argument("output")
+    restore_workspace.add_argument("--actor")
+    restore_workspace.add_argument("--reason")
+    release = commands.add_parser(
+        "release-training",
+        help="Create a frozen training dataset from an annotation workspace.",
+    )
+    release.add_argument("workspace")
+    release.add_argument("output")
+    release.add_argument("--name")
+    release.add_argument("--actor")
     thaw = commands.add_parser("thaw")
     thaw.add_argument("database")
     thaw.add_argument("--actor")
@@ -73,6 +101,7 @@ def main(argv: list[str] | None = None) -> int:
         "validate",
         "freeze",
         "checkpoint",
+        "snapshot",
         "thaw",
         "metadata-add",
         "export",
@@ -88,6 +117,7 @@ def main(argv: list[str] | None = None) -> int:
             if args.command == "info":
                 result = read_dataset_info(connection)
                 result["fingerprint"] = dataset_fingerprint(connection)
+                result["workspace_fingerprint"] = workspace_fingerprint(connection)
             elif args.command == "validate":
                 result = validate_database(connection)
             else:
@@ -105,6 +135,23 @@ def main(argv: list[str] | None = None) -> int:
     elif args.command == "checkpoint":
         result = save_checkpoint(
             args.database, args.output, actor=args.actor
+        )
+    elif args.command == "snapshot":
+        result = save_workspace_snapshot(
+            args.database, args.output, actor=args.actor, note=args.note
+        )
+    elif args.command == "restore-workspace":
+        result = restore_workspace_snapshot(
+            args.snapshot,
+            args.output,
+            actor=args.actor,
+            reason=args.reason,
+        )
+    elif args.command == "release-training":
+        from oracle_data_contracts.datasets.lifecycle import release_training_dataset
+
+        result = release_training_dataset(
+            args.workspace, args.output, name=args.name, actor=args.actor
         )
     elif args.command == "thaw":
         result = thaw_database(

@@ -29,6 +29,7 @@ oracle-train = "model_training:main"
 oracle-infer = "model_inference:main"
 oracle-evaluate = "model_evaluate:main"
 oracle-mask-builder = "mask_builder:main"
+oracle-model = "oracle_builder.products.cli:main"
 
 [tool.setuptools]
 py-modules = [
@@ -39,7 +40,7 @@ py-modules = [
 ]
 
 [tool.setuptools.packages.find]
-include = ["oracle_builder*"]
+include = ["oracle_builder*", "oracle_data_contracts*"]
 
 [project.optional-dependencies]
 gpu-linux = [

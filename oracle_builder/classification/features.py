@@ -114,10 +114,24 @@ def predict_classification_outputs(
             ),
             "logits_source": outputs.get("logits_source", "model"),
         }
+    # Promoted external products expose the standard tensors as a Keras output
+    # dictionary, avoiding a dependence on their original internal graph.
+    predict_options = {"verbose": 0}
+    if batch_size is not None:
+        predict_options["batch_size"] = batch_size
+    direct = model.predict(x, **predict_options)
+    if isinstance(direct, dict) and {"logits", "probabilities"}.issubset(direct):
+        return {
+            "logits": np.asarray(direct["logits"]),
+            "probabilities": np.asarray(direct["probabilities"]),
+            "features": (
+                np.asarray(direct["features"])
+                if direct.get("features") is not None
+                else None
+            ),
+            "logits_source": "model",
+        }
     try:
-        predict_options = {"verbose": 0}
-        if batch_size is not None:
-            predict_options["batch_size"] = batch_size
         outputs = build_feature_model(model).predict(
             x, **predict_options
         )

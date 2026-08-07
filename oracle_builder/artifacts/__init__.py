@@ -1,9 +1,10 @@
 """Versioned, portable Oracle Builder model-run artifacts."""
 
-from oracle_builder.artifacts.layout import RunLayout
-from oracle_builder.artifacts.run import (
+from oracle_data_contracts.artifacts.layout import RunLayout
+from oracle_data_contracts.artifacts.run import (
     RUN_ARTIFACT_SCHEMA_NAME,
     RUN_ARTIFACT_SCHEMA_VERSION,
+    ARTIFACT_TYPES,
     create_run_artifact,
     migrate_legacy_run,
     pack_run_artifact,
@@ -17,7 +18,7 @@ from oracle_builder.artifacts.run import (
     validate_run_artifact,
     write_run_config,
 )
-from oracle_builder.artifacts.splits import (
+from oracle_data_contracts.artifacts.splits import (
     SPLIT_MANIFEST_SCHEMA_NAME,
     SPLIT_MANIFEST_SCHEMA_VERSION,
     attach_split_manifest,
@@ -31,6 +32,7 @@ from oracle_builder.artifacts.splits import (
 __all__ = [
     "RUN_ARTIFACT_SCHEMA_NAME",
     "RUN_ARTIFACT_SCHEMA_VERSION",
+    "ARTIFACT_TYPES",
     "RunLayout",
     "SPLIT_MANIFEST_SCHEMA_NAME",
     "SPLIT_MANIFEST_SCHEMA_VERSION",

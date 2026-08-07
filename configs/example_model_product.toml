@@ -1,0 +1,47 @@
+# Description for an externally supplied Keras model product.  This file is
+# copied into the immutable product artifact and remains its human-readable
+# provenance record.
+
+[product]
+name = "example-external-classifier"
+# generic, classification, or segmentation. Classification and segmentation
+# enable conservative automatic promotion to Oracle Builder's inference layers.
+task = "classification"
+version = "1.0.0"
+description = "Portable external Keras model imported into Oracle Builder."
+license = ""
+tags = ["external", "keras"]
+
+# Optional labels for classification products. Order must match the model's
+# class axis. Add stable label_id values when these must map across datasets.
+# [[labels]]
+# name = "example-class"
+# label_id = "example-class"
+
+# Optional declared processing contract. The importer inspects tensor shapes;
+# these fields document the processing expected before the model is called.
+# Set embed_in_model only when the supplied model receives raw image values;
+# Oracle Builder will then save resize/channel conversion/invert/rescale in the
+# promoted Keras model itself.
+[preprocessing]
+resize_mode = "fit_pad"
+rescale = true
+channel_mode = "grayscale"
+embed_in_model = false
+# raw_input_shape = [512, 512, 1] # required with embed_in_model = true
+
+# Promotion is enabled by default for known classification/segmentation tasks.
+# Explicit layer names override automatic inspection. Leave unknown entries
+# commented out and the importer records its conservative automatic choice.
+[promotion]
+enabled = true
+# probabilities_layer = "predictions"
+# logits_layer = "logits"
+# embedding_layer = "global_average_pooling2d"
+# activation = "softmax" # softmax/linear for classification; sigmoid/linear for masks
+
+# Optional output details. The promoted model always exposes logits and
+# probabilities. Segmentation products can declare a reviewed mask threshold.
+[outputs]
+primary = "class_probabilities"
+# threshold = 0.5

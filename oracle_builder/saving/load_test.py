@@ -8,6 +8,11 @@ import tensorflow as tf
 from tensorflow import keras
 
 from oracle_builder.classification.features import L2Normalization
+from oracle_builder.products.ingest import (
+    ConvertChannels,
+    InvertIntensity,
+    ProbabilityToLogits,
+)
 from oracle_builder.training.losses import WeightedSparseCategoricalCrossentropy
 from oracle_builder.training.train import build_and_compile_model
 
@@ -25,6 +30,12 @@ def _load_keras_model(path: str | Path):
             "oracle_builder>L2Normalization": L2Normalization,
             "WeightedSparseCategoricalCrossentropy": WeightedSparseCategoricalCrossentropy,
             "oracle_builder>WeightedSparseCategoricalCrossentropy": WeightedSparseCategoricalCrossentropy,
+            "ProbabilityToLogits": ProbabilityToLogits,
+            "oracle_builder>ProbabilityToLogits": ProbabilityToLogits,
+            "InvertIntensity": InvertIntensity,
+            "oracle_builder>InvertIntensity": InvertIntensity,
+            "ConvertChannels": ConvertChannels,
+            "oracle_builder>ConvertChannels": ConvertChannels,
         },
     )
 

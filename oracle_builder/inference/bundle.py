@@ -49,6 +49,13 @@ def _segmentation_outputs(model, batch: np.ndarray, activation: str) -> dict[str
             "logits_source": outputs.get("logits_source", "model"),
         }
     try:
+        direct = model.predict(batch, verbose=0)
+        if isinstance(direct, dict) and {"logits", "probabilities"}.issubset(direct):
+            return {
+                "logits": np.asarray(direct["logits"]),
+                "probabilities": np.asarray(direct["probabilities"]),
+                "logits_source": "model",
+            }
         from tensorflow import keras
 
         view = keras.Model(
@@ -231,9 +238,20 @@ class InferenceBundle:
 
     def _predict_classification(self, item: InferenceItem) -> dict[str, Any]:
         raw = item.inputs["image"].values
-        prepared = prepare_classification_input(
-            raw, self.config["data"]["input_shape"], self.config
+        promotion = self.config.get("promotion", {})
+        embedded_preprocessing = bool(
+            promotion.get("preprocessing", {}).get("embedded", False)
         )
+        if embedded_preprocessing:
+            # The promoted Keras model owns resize/channel/intensity handling.
+            # Do not silently apply the dataset pipeline a second time.
+            prepared = np.asarray(raw)
+            if prepared.ndim == 2:
+                prepared = prepared[..., None]
+        else:
+            prepared = prepare_classification_input(
+                raw, self.config["data"]["input_shape"], self.config
+            )
         values = predict_classification_outputs(self.model, prepared[None, ...])
         logits = np.asarray(values["logits"][0], dtype="float32")
         probabilities = np.asarray(values["probabilities"][0], dtype="float32")

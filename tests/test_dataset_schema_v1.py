@@ -34,7 +34,7 @@ def test_one_sqlite_file_has_one_typed_dataset_identity():
 
     assert first["dataset_id"] == second["dataset_id"]
     assert second["dataset_type"] == "classification"
-    assert second["schema_version"] == "1.1.0"
+    assert second["schema_version"] == "1.2.0"
     assert "split" not in {
         row[1] for row in connection.execute("PRAGMA table_info(dataset_items)")
     }
@@ -157,7 +157,7 @@ def test_schema_1_0_split_column_is_removed_automatically(tmp_path: Path):
             )
         ]
 
-    assert info["schema_version"] == "1.1.0"
+    assert info["schema_version"] == "1.2.0"
     assert info["lifecycle"] == "frozen"
     assert "split" not in columns
     assert event["removed_non_null_assignments"] == 2
