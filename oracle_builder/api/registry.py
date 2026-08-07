@@ -1,11 +1,65 @@
 from __future__ import annotations
 
+import json
+import re
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
 from oracle_builder.inference import InferenceBundle
+
+
+_ALIAS_SAFE = re.compile(r"[^a-z0-9._-]+")
+
+
+def _root_alias(path: Path, root: Path, manifest: dict[str, Any]) -> str:
+    """Produce a stable HTTP-safe selector from artifact metadata or location."""
+    preferred = str(manifest.get("name") or path.relative_to(root).as_posix())
+    alias = _ALIAS_SAFE.sub("-", preferred.lower()).strip("-.")
+    return alias or "model"
+
+
+def _manifest_catalog(run_dir: Path) -> dict[str, Any]:
+    """Read display-safe model identity without loading the ML runtime."""
+
+    manifest_path = run_dir / "artifact.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    model = manifest.get("model") or {}
+    outputs = model.get("outputs") or {}
+    labels = list(outputs.get("labels") or [])
+    task = model.get("task")
+    architecture = model.get("architecture")
+    reference = {
+        "artifact_id": manifest.get("artifact_id"),
+        "run_id": manifest.get("run_id"),
+        "task": task,
+        "architecture": architecture,
+    }
+    return {
+        "task": task,
+        "architecture": architecture,
+        "model": {key: value for key, value in reference.items() if value is not None},
+        "capabilities": {
+            "contract_version": str((manifest.get("contract") or {}).get("version") or "1.0.0"),
+            "labels": labels,
+            "embedding": {
+                "available": bool(outputs.get("embedding")),
+                "dimension": outputs.get("embedding_dimension"),
+                "normalized": bool(outputs.get("embedding_normalized", True)),
+            },
+            "evidence": {
+                "available": False,
+                "schema_version": None,
+                "prototype": False,
+                "knn": False,
+                "visual_exemplars": False,
+            },
+        },
+    }
 
 
 class ModelNotFoundError(KeyError):
@@ -18,6 +72,7 @@ class RegisteredModel:
     run_dir: Path
     bundle: InferenceBundle | None = None
     load_error: str | None = None
+    catalog: dict[str, Any] = field(default_factory=dict)
     inference_lock: threading.Lock = field(default_factory=threading.Lock)
 
 
@@ -32,7 +87,7 @@ class InferenceModelRegistry:
 
     def register(self, alias: str, run_dir: str | Path) -> None:
         normalized = alias.strip()
-        if not normalized or "/" in normalized:
+        if not normalized or "/" in normalized or _ALIAS_SAFE.search(normalized.lower()):
             raise ValueError("Model alias must be a non-empty path-safe string")
         path = Path(run_dir).expanduser().resolve()
         if not path.exists():
@@ -40,7 +95,52 @@ class InferenceModelRegistry:
         with self._lock:
             if normalized in self._models:
                 raise ValueError(f"Model alias is already registered: {normalized}")
-            self._models[normalized] = RegisteredModel(normalized, path)
+            self._models[normalized] = RegisteredModel(
+                normalized,
+                path,
+                catalog=_manifest_catalog(path),
+            )
+
+    def register_root(self, root: str | Path) -> dict[str, list[dict[str, str]]]:
+        """Discover sealed Oracle Builder artifacts beneath a model root.
+
+        Discovery only registers artifacts whose manifest identifies a sealed
+        model product or model run. Loading remains lazy unless the application
+        elects to preload, so discovery does not allocate model memory.
+        """
+        root_path = Path(root).expanduser().resolve()
+        if not root_path.is_dir():
+            raise NotADirectoryError(root_path)
+        registered: list[dict[str, str]] = []
+        skipped: list[dict[str, str]] = []
+        for manifest_path in sorted(root_path.rglob("artifact.json")):
+            run_dir = manifest_path.parent
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                skipped.append({"path": str(run_dir), "reason": f"invalid manifest: {exc}"})
+                continue
+            schema = manifest.get("artifact_schema", {})
+            if schema.get("name") != "oracle_builder_model_run":
+                skipped.append({"path": str(run_dir), "reason": "unsupported artifact schema"})
+                continue
+            if manifest.get("lifecycle") != "sealed":
+                skipped.append({"path": str(run_dir), "reason": "artifact is not sealed"})
+                continue
+            if manifest.get("artifact_type", "model_run") not in {"model_run", "model_product"}:
+                skipped.append({"path": str(run_dir), "reason": "unsupported artifact type"})
+                continue
+            alias = _root_alias(run_dir, root_path, manifest)
+            with self._lock:
+                if alias in self._models:
+                    artifact_id = str(manifest.get("artifact_id", ""))
+                    alias = f"{alias}-{artifact_id[:8]}" if artifact_id else alias
+                if alias in self._models:
+                    skipped.append({"path": str(run_dir), "reason": f"duplicate alias: {alias}"})
+                    continue
+            self.register(alias, run_dir)
+            registered.append({"alias": alias, "path": str(run_dir)})
+        return {"registered": registered, "skipped": skipped}
 
     def load(self, selector: str) -> InferenceBundle:
         with self._lock:
@@ -91,6 +191,7 @@ class InferenceModelRegistry:
                 "available": registration.load_error is None,
                 "load_error": registration.load_error,
             }
+            row.update(registration.catalog)
             if registration.bundle is not None:
                 bundle = registration.bundle
                 row["model"] = bundle.model_reference.to_dict()

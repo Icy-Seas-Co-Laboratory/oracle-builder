@@ -351,7 +351,12 @@ def _completed_required_paths(layout: RunLayout) -> tuple[Path, ...]:
     )
 
 
-def _fingerprint(manifest: dict[str, Any], inventory: list[dict[str, Any]]) -> str:
+def _fingerprint(
+    manifest: dict[str, Any],
+    inventory: list[dict[str, Any]],
+    *,
+    include_product_identity: bool = True,
+) -> str:
     semantic = {
         "artifact_schema": manifest["artifact_schema"],
         "producer": manifest.get("producer"),
@@ -363,12 +368,12 @@ def _fingerprint(manifest: dict[str, Any], inventory: list[dict[str, Any]]) -> s
         "model": manifest["model"],
         "inventory": inventory,
     }
-    # Keep validation of already-sealed pre-product artifacts stable while
-    # including the new identity fields for artifacts that declare them.
-    if "artifact_type" in manifest:
-        semantic["artifact_type"] = manifest["artifact_type"]
-    if "product" in manifest:
-        semantic["product"] = manifest["product"]
+    if include_product_identity:
+        # New artifacts include product identity fields in their fingerprint.
+        if "artifact_type" in manifest:
+            semantic["artifact_type"] = manifest["artifact_type"]
+        if "product" in manifest:
+            semantic["product"] = manifest["product"]
     encoded = json.dumps(
         semantic, sort_keys=True, separators=(",", ":"), default=str
     ).encode("utf-8")
@@ -481,11 +486,19 @@ def validate_run_artifact(run_dir: str | Path) -> dict[str, Any]:
         except Exception as exc:
             errors.append(str(exc))
     if manifest.get("status") == "complete":
+        historical_split_manifest = any(
+            row.get("path") == "protocol/splits.json"
+            for row in manifest.get("inventory", [])
+        )
         for required in _completed_required_paths(layout):
             if not required.exists():
-                errors.append(
-                    f"Completed run is missing: {required.relative_to(layout.root)}"
-                )
+                relative = required.relative_to(layout.root).as_posix()
+                if relative == "protocol/splits.json" and not historical_split_manifest:
+                    warnings.append(
+                        "Legacy run has no item-level split protocol"
+                    )
+                else:
+                    errors.append(f"Completed run is missing: {relative}")
     if manifest.get("lifecycle") == "sealed":
         if not layout.checksums.exists():
             errors.append("Sealed artifact lacks checksums.sha256")
@@ -498,7 +511,19 @@ def validate_run_artifact(run_dir: str | Path) -> dict[str, Any]:
                 if expected_by_path.get(path) != observed_by_path.get(path):
                     errors.append(f"Inventory mismatch: {path}")
         if _fingerprint(manifest, expected) != manifest.get("fingerprint_sha256"):
-            errors.append("Artifact fingerprint mismatch")
+            # Early V1 runs received artifact_type during the product-schema
+            # transition, but their already-sealed fingerprints correctly used
+            # the former semantic payload. Accept that form only when its
+            # recorded inventory has already passed verification above.
+            legacy_fingerprint = _fingerprint(
+                manifest, expected, include_product_identity=False
+            )
+            if legacy_fingerprint == manifest.get("fingerprint_sha256"):
+                warnings.append(
+                    "Artifact uses the verified pre-product fingerprint form"
+                )
+            else:
+                errors.append("Artifact fingerprint mismatch")
     else:
         warnings.append("Run artifact is working and has not been sealed")
     return {

@@ -26,6 +26,7 @@ from oracle_builder.artifacts import (
 from oracle_builder.data.sqlite_dataset import create_synthetic_classification
 from oracle_builder.data.classification_import import build_parser, import_folders
 from oracle_builder.datasets.schema import set_dataset_lifecycle
+from oracle_data_contracts.artifacts.run import _fingerprint
 
 
 def example_config(tmp_path: Path) -> dict:
@@ -150,6 +151,27 @@ def test_seal_detects_changes_and_explicit_reopen_allows_reseal(tmp_path):
     assert sealed["lifecycle"] == "sealed"
     assert len(sealed["fingerprint_sha256"]) == 64
     assert validate_run_artifact(run)["valid"]
+
+
+def test_validation_accepts_verified_pre_product_fingerprint(tmp_path):
+    run, _ = create_example_run(tmp_path)
+    layout = RunLayout(run)
+    add_completed_run_files(run)
+    update_run_artifact(run, status="complete", summary={"accuracy": 0.9})
+    seal_run_artifact(run)
+
+    manifest = json.loads(layout.manifest.read_text(encoding="utf-8"))
+    manifest["fingerprint_sha256"] = _fingerprint(
+        manifest, manifest["inventory"], include_product_identity=False
+    )
+    layout.manifest.write_text(json.dumps(manifest), encoding="utf-8")
+
+    report = validate_run_artifact(run)
+
+    assert report["valid"]
+    assert report["warnings"] == [
+        "Artifact uses the verified pre-product fingerprint form"
+    ]
     layout.metrics_json.write_text('{"loss": [0.5]}\n', encoding="utf-8")
     report = validate_run_artifact(run)
     assert not report["valid"]

@@ -117,6 +117,9 @@ def create_app(
 
 def app_from_environment() -> FastAPI:
     registry = InferenceModelRegistry()
+    roots = os.environ.get("ORACLE_BUILDER_MODELS_ROOT", "")
+    for root in filter(None, (value.strip() for value in roots.split(os.pathsep))):
+        registry.register_root(root)
     registrations = os.environ.get("ORACLE_BUILDER_MODELS", "")
     for entry in filter(None, (value.strip() for value in registrations.split(","))):
         if "=" not in entry:

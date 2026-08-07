@@ -11,18 +11,30 @@ operational data.
 python -m pip install -e '.[api]'
 
 oracle-serve \
-  --model pelagia-refiner=/absolute/path/to/sealed/run \
+  --models-root ./models \
   --host 127.0.0.1 \
   --port 8100
 ```
 
-Register more than one `--model ALIAS=RUN_DIR` when needed. Aliases are
+`--models-root` recursively discovers sealed Oracle Builder model runs and
+model products below the supplied directory. It uses the artifact name as a
+normalized HTTP-safe selector, adding an artifact-ID suffix only when names
+collide. Working or malformed artifacts are skipped and reported on stderr.
+
+Use `--model ALIAS=RUN_DIR` to register a specific artifact or choose an
+explicit operational selector; repeat it to add more models. Aliases are
 operational selectors; every result reports the resolved immutable artifact ID,
 run ID, fingerprint, and contract version. Models are validated and preloaded
 before readiness succeeds. Use `--no-preload` only for development.
 
+The catalog retains manifest identity and task metadata when runtime validation
+fails. Clients can therefore show registered-but-unavailable models and their
+load errors without offering those models for inference.
+
 Set `ORACLE_BUILDER_API_TOKEN` to require a bearer token. Pelagia supplies the
-same value through `PELAGIA_ORACLE_API_TOKEN`.
+same value through `PELAGIA_ORACLE_API_TOKEN`. ASGI deployments may use
+`ORACLE_BUILDER_MODELS_ROOT`, with multiple roots separated by the platform
+path separator, instead of enumerating `ORACLE_BUILDER_MODELS`.
 
 ## Endpoints
 

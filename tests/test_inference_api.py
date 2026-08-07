@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import uuid
 from pathlib import Path
 
@@ -157,3 +158,76 @@ def test_classification_catalog_describes_evidence_and_exemplar_metadata(tmp_pat
         "label": {"class_index": 0, "label_id": label_id, "name": "copepod"},
         "image_available": False,
     }
+
+
+def test_registry_discovers_sealed_models_under_a_root(tmp_path: Path):
+    root = tmp_path / "models"
+
+    def artifact(relative: str, *, name: str, artifact_id: str, lifecycle="sealed"):
+        run_dir = root / relative
+        run_dir.mkdir(parents=True)
+        (run_dir / "artifact.json").write_text(
+            json.dumps(
+                {
+                    "artifact_schema": {"name": "oracle_builder_model_run", "version": "1.0.0"},
+                    "artifact_type": "model_run",
+                    "artifact_id": artifact_id,
+                    "name": name,
+                    "lifecycle": lifecycle,
+                }
+            ),
+            encoding="utf-8",
+        )
+        return run_dir
+
+    first = artifact("plankton-v1", name="Plankton v1", artifact_id="a" * 32)
+    second = artifact("nested/refiner", name="Plankton v1", artifact_id="b" * 32)
+    artifact("working", name="Working", artifact_id="c" * 32, lifecycle="working")
+
+    registry = InferenceModelRegistry(loader=lambda _: FakeBundle())
+    report = registry.register_root(root)
+
+    assert report["registered"] == [
+        {"alias": "plankton-v1", "path": str(second)},
+        {"alias": "plankton-v1-aaaaaaaa", "path": str(first)},
+    ]
+    assert report["skipped"] == [
+        {"path": str(root / "working"), "reason": "artifact is not sealed"}
+    ]
+    assert registry.registered_count == 2
+
+
+def test_failed_model_remains_visible_in_its_task_catalog(tmp_path: Path):
+    run_dir = tmp_path / "broken-classifier"
+    run_dir.mkdir()
+    (run_dir / "artifact.json").write_text(
+        json.dumps(
+            {
+                "artifact_schema": {"name": "oracle_builder_model_run", "version": "1.0.0"},
+                "artifact_type": "model_run",
+                "artifact_id": "artifact-1",
+                "run_id": "run-1",
+                "lifecycle": "sealed",
+                "model": {
+                    "task": "classification",
+                    "architecture": "resnet",
+                    "outputs": {"class_count": 1, "labels": [{"class_index": 0, "name": "copepod"}]},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def fail_to_load(_):
+        raise RuntimeError("integrity validation failed")
+
+    registry = InferenceModelRegistry(loader=fail_to_load)
+    registry.register("broken", run_dir)
+    registry.preload()
+
+    rows = registry.describe(task="classification")
+    assert len(rows) == 1
+    assert rows[0]["available"] is False
+    assert rows[0]["task"] == "classification"
+    assert rows[0]["model"]["artifact_id"] == "artifact-1"
+    assert rows[0]["load_error"] == "RuntimeError: integrity validation failed"
