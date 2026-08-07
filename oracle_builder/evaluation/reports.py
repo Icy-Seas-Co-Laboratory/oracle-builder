@@ -17,6 +17,18 @@ def _class_names(config: dict[str, Any]) -> dict[int, str]:
     }
 
 
+def _evaluation_context(config: dict[str, Any], split: str) -> dict[str, Any]:
+    return {
+        "artifact_id": config.get("artifact", {}).get("artifact_id"),
+        "run_id": config.get("run", {}).get("run_id"),
+        "dataset_id": config.get("dataset", {}).get("dataset_id"),
+        "dataset_fingerprint_sha256": config.get("dataset", {}).get(
+            "fingerprint_sha256"
+        ),
+        "split": split,
+    }
+
+
 def evaluate_run_model(
     model,
     config: dict[str, Any],
@@ -27,6 +39,7 @@ def evaluate_run_model(
     inference_batch_size: int | None = None,
 ) -> dict[str, Any]:
     evaluation_started = time.perf_counter()
+    evaluated_split = split
     if (
         config["run"]["task"] == "classification"
         and config.get("data", {}).get("streaming", {}).get("enabled", True)
@@ -46,6 +59,7 @@ def evaluate_run_model(
             index = build_classification_index(
                 input_path, config, "validation", labeled_only=True
             )
+            evaluated_split = "validation"
         source = SQLiteClassificationSource(input_path, config)
         if inference_batch_size is None:
             from oracle_builder.inference.batching import (
@@ -64,12 +78,15 @@ def evaluate_run_model(
             run_dir,
             class_names=_class_names(config),
             progress=bool(config.get("inference", {}).get("progress", True)),
+            evaluation_settings=config.get("evaluation", {}),
+            evaluation_context=_evaluation_context(config, evaluated_split),
         )
     else:
         try:
             x, y, records = load_arrays(input_path, config, split=split)
         except ValueError:
             x, y, records = load_arrays(input_path, config, split="validation")
+            evaluated_split = "validation"
         if config["run"]["task"] == "classification":
             result = evaluate_classification(
                 model,
@@ -82,6 +99,8 @@ def evaluate_run_model(
                 progress=bool(
                     config.get("inference", {}).get("progress", True)
                 ),
+                evaluation_settings=config.get("evaluation", {}),
+                evaluation_context=_evaluation_context(config, evaluated_split),
             )
         else:
             threshold = float(

@@ -14,6 +14,7 @@ import numpy as np
 from PIL import Image
 
 from oracle_builder.data.decoders import encode_npy, prepare_classification_input
+from oracle_builder.data.polarity import POLARITY_VALUES, resolve_polarity
 from oracle_builder.data.sqlite_dataset import ensure_schema
 from oracle_builder.datasets.metadata import discover_metadata_documents
 from oracle_builder.datasets.repository import SQLiteDatasetRepository
@@ -219,6 +220,23 @@ def import_folders(options: argparse.Namespace) -> dict[str, Any]:
         if isinstance(primary_metadata.get("oracle_builder"), dict)
         else {}
     )
+    sidecar_imaging = (
+        primary_metadata.get("imaging", {})
+        if isinstance(primary_metadata.get("imaging"), dict)
+        else {}
+    )
+    polarity = resolve_polarity(
+        options.source_polarity,
+        metadata=sidecar_imaging,
+        paths=(path for files in classes.values() for path, _ in files),
+        sample_count=options.polarity_sample_count,
+    )
+    if polarity["value"] in {"mixed", "unknown"}:
+        warnings.append(
+            "Source polarity is %r; preprocessing.invert='auto' will not invert. "
+            "Specify --source-polarity when the acquisition convention is known."
+            % polarity["value"]
+        )
     supplied_map = load_label_map(Path(options.label_map).expanduser() if options.label_map else None)
     if not options.dry_run:
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -246,9 +264,21 @@ def import_folders(options: argparse.Namespace) -> dict[str, Any]:
         title=dataset_metadata.get("dataset_title") or dataset_metadata.get("title"),
         description=dataset_metadata.get("description"),
         version=dataset_metadata.get("version"),
-        metadata={"source_metadata": primary_metadata} if primary_metadata else {},
+        metadata={
+            **({"source_metadata": primary_metadata} if primary_metadata else {}),
+            "imaging": {**sidecar_imaging, "polarity": polarity},
+        },
     )
     connection.commit()
+    if not options.dry_run:
+        current_metadata = info.get("metadata", {})
+        current_metadata["imaging"] = {**sidecar_imaging, "polarity": polarity}
+        connection.execute(
+            "UPDATE dataset SET metadata_json = ?, updated_at = ? WHERE singleton = 1",
+            (json.dumps(current_metadata, sort_keys=True), utc_now()),
+        )
+        connection.commit()
+        info = read_dataset_info(connection)
     label_connection = connection
     if options.dry_run and output.exists():
         label_connection = sqlite3.connect(output)
@@ -370,6 +400,7 @@ def import_folders(options: argparse.Namespace) -> dict[str, Any]:
         "class_labels": label_map,
         "counts_by_class": counts_by_class,
         "counts_by_source_partition": counts_by_source_partition,
+        "imaging": {**sidecar_imaging, "polarity": polarity},
         "status_counts": {
             status: sum(candidate.status == status for candidate in candidates)
             for status in sorted({candidate.status for candidate in candidates})
@@ -535,6 +566,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--label-map")
     parser.add_argument("--allow-new-classes", action="store_true")
+    parser.add_argument(
+        "--source-polarity",
+        choices=POLARITY_VALUES,
+        default="auto",
+        help="Source foreground/background polarity; auto records a conservative estimate.",
+    )
+    parser.add_argument("--polarity-sample-count", type=int, default=128)
     parser.add_argument("--minimum-images-per-class", type=int, default=1)
     parser.add_argument("--require-rgb", action="store_true")
     parser.add_argument("--allow-grayscale", action=argparse.BooleanOptionalAction, default=True)
@@ -573,6 +611,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     options = build_parser().parse_args()
+    if options.polarity_sample_count < 1:
+        raise SystemExit("--polarity-sample-count must be positive")
     if options.storage_mode == "materialized" and not options.input_shape:
         raise SystemExit("--storage-mode materialized requires --input-shape H W C")
     summary = import_folders(options)

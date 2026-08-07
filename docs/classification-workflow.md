@@ -21,6 +21,32 @@ python3 scripts/import_classification_folders.py \
 Run with `--dry-run` first to inspect image errors, duplicates, and class
 counts. The importer never creates a random training split.
 
+## Image polarity and Pelagia-compatible model inputs
+
+Oracle Builder preserves original image bytes, but its canonical model input is
+light foreground on a black background. The importer records source polarity
+at dataset level; it does not alter the originals. By default it uses a
+conservative border-versus-center estimate across representative images:
+
+```bash
+oracle-import-classification \
+  --input "$HOME/Desktop/training-library" \
+  --output datasets/training.sqlite \
+  --source-polarity auto
+```
+
+Use an explicit value when the acquisition convention is known:
+
+```bash
+--source-polarity dark_on_light   # brightfield/shadowgraph source; model inverts
+--source-polarity light_on_dark   # already Pelagia-canonical; model does not invert
+```
+
+`mixed` and `unknown` are retained as provenance but do not silently invert.
+Classification example configurations use `preprocessing.invert = "auto"`,
+which resolves against the frozen dataset polarity and is saved as a concrete
+boolean in the model artifact. Set `true` or `false` to override it for a run.
+
 An existing conventional source layout is also accepted without an option:
 
 ```text

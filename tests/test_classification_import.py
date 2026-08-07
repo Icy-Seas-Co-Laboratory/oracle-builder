@@ -9,6 +9,7 @@ from PIL import Image
 
 from oracle_builder.data.classification_import import build_parser, import_folders
 from oracle_builder.data.decoders import decode_blob, prepare_classification_input
+from oracle_builder.data.polarity import infer_source_polarity
 from oracle_builder.data.sqlite_dataset import load_arrays
 
 
@@ -98,6 +99,41 @@ def test_dry_run_writes_reports_but_not_database(tmp_path):
     assert summary["dry_run"]
     assert not output.exists()
     assert output.with_suffix(".import_report.json").exists()
+
+
+def test_import_records_explicit_source_polarity(tmp_path):
+    source = tmp_path / "library"
+    write_image(source / "copepod" / "image.jpg", (10, 10, 10))
+    output = tmp_path / "polarity.sqlite"
+
+    summary = import_folders(
+        options_for(source, output, "--source-polarity", "dark_on_light")
+    )
+
+    assert summary["imaging"]["polarity"] == {
+        "value": "dark_on_light",
+        "method": "explicit_cli",
+        "confidence": 1.0,
+        "model_polarity": "light_on_dark",
+        "model_invert": True,
+    }
+    with sqlite3.connect(output) as connection:
+        metadata = json.loads(
+            connection.execute("SELECT metadata_json FROM dataset").fetchone()[0]
+        )
+    assert metadata["imaging"]["polarity"]["model_invert"] is True
+
+
+def test_auto_polarity_detects_dark_objects_on_a_light_background(tmp_path):
+    image = np.full((32, 32), 240, dtype="uint8")
+    image[8:24, 8:24] = 20
+    path = tmp_path / "brightfield.png"
+    Image.fromarray(image).save(path)
+
+    polarity = infer_source_polarity([path])
+
+    assert polarity["value"] == "dark_on_light"
+    assert polarity["confidence"] >= 0.65
 
 
 def test_materialized_import_applies_requested_preprocessing(tmp_path):

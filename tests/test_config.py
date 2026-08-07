@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import sqlite3
 
@@ -98,6 +99,50 @@ epochs = 1
     assert config["training"]["class_weights"]["mode"] == "effective_number"
     assert config["preprocessing"]["channel_mode"] == "grayscale"
     assert config["output"]["save_checkpoints"] is False
+
+
+def test_auto_inversion_resolves_from_dataset_polarity(tmp_path: Path):
+    config_path = tmp_path / "config.toml"
+    input_path = tmp_path / "data.sqlite"
+    create_synthetic_classification(input_path, n=4, shape=(8, 8, 1), classes=2)
+    with sqlite3.connect(input_path) as connection:
+        connection.execute(
+            "UPDATE dataset SET metadata_json = ? WHERE singleton = 1",
+            (
+                json.dumps(
+                    {
+                        "imaging": {
+                            "polarity": {"value": "dark_on_light"}
+                        }
+                    }
+                ),
+            ),
+        )
+        connection.commit()
+    freeze(input_path)
+    config_path.write_text(
+        """
+[run]
+task = "classification"
+model = "simple_cnn"
+
+[data]
+input_shape = [8, 8, 1]
+
+[training]
+loss = "sparse_categorical_crossentropy"
+"""
+    )
+
+    config = resolve_config(config_path, input_path, tmp_path / "runs" / "test")
+
+    assert config["preprocessing"]["invert"] is True
+    assert config["preprocessing"]["polarity_resolution"] == {
+        "requested": "auto",
+        "source_polarity": "dark_on_light",
+        "method": "dataset_source_polarity",
+        "model_polarity": "light_on_dark",
+    }
 
 
 @pytest.mark.parametrize(

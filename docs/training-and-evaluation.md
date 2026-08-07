@@ -73,10 +73,28 @@ python3 model_inference.py \
   --prediction-set RUN_NAME --output predictions/RUN_NAME.sqlite
 ```
 
-Evaluation reports classification accuracy, balanced accuracy, F1, calibration,
-per-class metrics, and scalable confusion-matrix products. Segmentation reports
-DICE, specificity, pixel accuracy, and threshold optimization. Inference batch
-size defaults to `auto`: it is selected and verified on the inference host.
+Classification evaluation writes accuracy, micro/macro/weighted F1, balanced
+accuracy, MCC, per-class precision/recall/F1/support, one-vs-rest average
+precision and ROC-AUC, top-1/3/5 accuracy, log loss, Brier score, and expected
+calibration error. `evaluation/metrics_long.csv` is the canonical
+machine-readable results table; it includes run/dataset provenance, metric
+family, averaging method, label, support, and decision rule. Calibration bins,
+a reliability figure, and scalable confusion-matrix products are also written.
+Segmentation reports DICE, specificity, pixel accuracy, and threshold
+optimization. Inference batch size defaults to `auto`: it is selected and
+verified on the inference host.
+
+Confidence intervals are deliberately opt-in and resample a real provenance
+group, rather than treating correlated images as independent observations:
+
+```toml
+[evaluation.uncertainty]
+enabled = true
+group_metadata_key = "cruise_id" # also supports dotted metadata paths
+bootstrap_replicates = 1000
+confidence_level = 0.95
+seed = 123
+```
 
 ## Recovery and artifacts
 

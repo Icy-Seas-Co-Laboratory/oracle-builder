@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -78,7 +79,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "resize_mode": "fit_pad",
         "normalization": "dtype",
         "rescale": True,
-        "invert": False,
+        "invert": "auto",
         "pad_value": 0.0,
         "interpolation": "bilinear",
         "channel_mode": "grayscale",
@@ -126,6 +127,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "evaluation": {
         "segmentation_threshold": 0.5,
+        # Classification uses argmax by default.  Grouped bootstrap intervals
+        # are opt-in because nearby images are often not independent samples.
+        "uncertainty": {
+            "enabled": False,
+            "group_metadata_key": None,
+            "bootstrap_replicates": 1000,
+            "confidence_level": 0.95,
+            "seed": 123,
+        },
         "benchmark": {
             "enabled": True,
             "warmup_batches": 2,
@@ -143,7 +153,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
 
 
 def deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
-    merged = dict(base)
+    # Resolution adds runtime details to nested sections.  Do not share those
+    # mutable default objects across runs in a long-lived process.
+    merged = copy.deepcopy(base)
     for key, value in override.items():
         if isinstance(value, dict) and isinstance(merged.get(key), dict):
             merged[key] = deep_merge(merged[key], value)
@@ -166,6 +178,9 @@ def validate_config(config: dict[str, Any]) -> None:
         raise ValueError(
             "data.split_strategy must be 'auto', 'random', or 'source_partitions'"
         )
+    invert = config.get("preprocessing", {}).get("invert", False)
+    if not isinstance(invert, bool):
+        raise ValueError("preprocessing.invert must resolve to a boolean")
     task = config["run"].get("task")
     model = config["run"].get("model")
     if task not in {"classification", "segmentation"}:
@@ -332,6 +347,14 @@ def validate_config(config: dict[str, Any]) -> None:
         raise ValueError("evaluation.benchmark.warmup_batches cannot be negative")
     if int(benchmark.get("measured_batches", 10)) < 1:
         raise ValueError("evaluation.benchmark.measured_batches must be positive")
+    uncertainty = config.get("evaluation", {}).get("uncertainty", {})
+    if int(uncertainty.get("bootstrap_replicates", 1000)) < 1:
+        raise ValueError("evaluation.uncertainty.bootstrap_replicates must be positive")
+    confidence_level = float(uncertainty.get("confidence_level", 0.95))
+    if not 0 < confidence_level < 1:
+        raise ValueError("evaluation.uncertainty.confidence_level must be between zero and one")
+    if uncertainty.get("enabled", False) and not uncertainty.get("group_metadata_key"):
+        raise ValueError("evaluation.uncertainty.group_metadata_key is required when uncertainty is enabled")
     from oracle_builder.training.class_weights import (
         WEIGHTED_CROSS_ENTROPY_NAMES,
     )
@@ -410,6 +433,30 @@ def resolve_config(config_path: str | Path, input_path: str | Path, run_dir: str
             "lifecycle": dataset_info["lifecycle"],
             "fingerprint_sha256": dataset_fingerprint(connection),
         }
+        imaging = dataset_info.get("metadata", {}).get("imaging", {})
+        if not isinstance(imaging, dict):
+            imaging = {}
+        polarity = imaging.get("polarity", {})
+        if not isinstance(polarity, dict):
+            polarity = {}
+        source_polarity = str(polarity.get("value", "unknown"))
+        requested_invert = resolved["preprocessing"].get("invert", "auto")
+        if requested_invert == "auto":
+            resolved_invert = source_polarity == "dark_on_light"
+            invert_method = "dataset_source_polarity"
+        elif isinstance(requested_invert, bool):
+            resolved_invert = requested_invert
+            invert_method = "explicit_config"
+        else:
+            raise ValueError("preprocessing.invert must be true, false, or 'auto'")
+        resolved["preprocessing"]["invert"] = resolved_invert
+        resolved["preprocessing"]["polarity_resolution"] = {
+            "requested": requested_invert,
+            "source_polarity": source_polarity,
+            "method": invert_method,
+            "model_polarity": "light_on_dark",
+        }
+        resolved["dataset"]["imaging"] = imaging
         source_metadata = dataset_info.get("metadata", {}).get(
             "source_metadata", {}
         )
