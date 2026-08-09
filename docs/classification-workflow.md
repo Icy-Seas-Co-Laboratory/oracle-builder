@@ -67,7 +67,59 @@ Original encoded image bytes are the default and recommended storage form.
 `--storage-mode materialized` is for a deliberately fixed, preprocessed image
 representation.
 
+## Create a curated or small test subset
+
+`oracle-dataset subset` never alters its source. It creates a new editable
+classification database with a new dataset identity, source provenance, copied
+metadata documents, and reindexed retained labels. It retains current labels;
+the annotation history is intentionally not copied into a derived training or
+test subset.
+
+Retain only classes with at least 20 current observations:
+
+```bash
+oracle-dataset subset datasets/training.sqlite datasets/training-min20.sqlite \
+  --minimum-class-count 20
+```
+
+Make a repeatable small database for pipeline testing:
+
+```bash
+oracle-dataset subset datasets/training.sqlite datasets/training-smoke.sqlite \
+  --max-items 200 --seed 123 --dry-run
+
+# Remove --dry-run after reviewing the selected/excluded class report.
+```
+
+`--max-items` applies a deterministic SHA-256 ordering of eligible item IDs;
+it is useful for quick tests but does not guarantee balanced class counts. The
+result remains editable. Freeze it separately once the selection is accepted.
+
 ## 2. Add metadata and freeze a training revision
+
+## Map classifier labels to Pelagia taxonomy concepts
+
+Oracle Builder imports only the `[taxonomy]` nodes from the Pelagia controlled
+vocabulary. Target tags and image-quality tags remain metadata annotations and
+are not classifier concepts. Imported nodes receive stable UUID concept IDs;
+their existing Pelagia node IDs and external mappings, including WoRMS AphiaIDs,
+are retained.
+
+Import the vocabulary into an editable dataset, then map each model class
+explicitly. A mapping is never guessed from a display-name string.
+
+```bash
+oracle-dataset taxonomy-import datasets/training.sqlite \
+  /path/to/taxonomy_0.1.1.toml --actor "$USER"
+
+oracle-dataset taxonomy-map datasets/training.sqlite \
+  --label "copepod" --concept taxon_copepoda --relationship broader \
+  --actor "$USER"
+```
+
+`--concept` accepts either the Pelagia taxonomy node ID or its imported UUID.
+The resolved concept mapping is frozen into the training dataset and model
+artifact when the dataset is checkpointed and trained.
 
 ```bash
 oracle-dataset metadata-add datasets/training.sqlite metadata.toml --actor "$USER"

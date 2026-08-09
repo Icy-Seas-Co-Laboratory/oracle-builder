@@ -21,14 +21,29 @@ test_split = 0.10
 resize_mode = "fit_pad"
 normalization = "dtype"
 rescale = true
-invert = "auto"
+invert = true
 pad_value = 0.0
 interpolation = "bilinear"
 channel_mode = "grayscale"
 
+
+[pretraining]
+# Self-supervised pretraining initializes this same architecture before labels
+# are used. BYOL is less batch-size-sensitive. SimCLR uses in-batch negatives
+# and generally benefits from larger batches; temperature applies to SimCLR.
+enabled = true
+method = "byol" # "byol", "student_teacher" (BYOL alias), or "simclr"
+epochs = 10
+learning_rate = 0.001
+teacher_momentum = 0.99
+temperature = 0.10
+projection_dim = 128
+projection_hidden_dim = 256
+use_training_augmentation = true
+
 [model]
 # base_filters controls overall capacity; embedding_dim fixes feature size.
-base_filters = 32
+base_filters = 16
 dropout = 0.20
 embedding_dim = 256
 normalize_embeddings = true
@@ -39,7 +54,7 @@ enabled = true
 knn_k = 5
 
 [training]
-epochs = 10
+epochs = 50
 optimizer = "adam"
 learning_rate = 0.001
 # Weighted cross entropy is the default; ordinary sparse cross entropy is the

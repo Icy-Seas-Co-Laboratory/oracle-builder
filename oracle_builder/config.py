@@ -484,12 +484,18 @@ def resolve_config(config_path: str | Path, input_path: str | Path, run_dir: str
                     "label_id": row[0],
                     "class_index": int(row[1]),
                     "name": row[2],
+                    "concept_id": row[3],
+                    "concept_node_id": row[4],
+                    "concept_relationship": row[5],
                 }
                 for row in connection.execute(
                     """
-                    SELECT label_id, class_index, name
-                    FROM classification_labels
-                    ORDER BY class_index
+                    SELECT l.label_id, l.class_index, l.name,
+                           lc.concept_id, tc.vocabulary_node_id, lc.relationship
+                    FROM classification_labels l
+                    LEFT JOIN classification_label_concepts lc ON lc.label_id = l.label_id
+                    LEFT JOIN taxonomy_concepts tc ON tc.concept_id = lc.concept_id
+                    ORDER BY l.class_index
                     """
                 )
             ]

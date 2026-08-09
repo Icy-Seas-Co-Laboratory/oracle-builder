@@ -33,6 +33,7 @@ from oracle_builder.datasets.legacy_roi import (
     migrate_legacy_roi_database,
 )
 from oracle_data_contracts.datasets.transfer import export_dataset, import_dataset_export
+from oracle_data_contracts.datasets.subset import subset_classification_dataset
 from oracle_data_contracts.datasets.workspace import (
     add_annotation_label,
     add_annotation_review,
@@ -70,6 +71,7 @@ __all__ = [
     "read_dataset_info",
     "save_checkpoint",
     "save_workspace_snapshot",
+    "subset_classification_dataset",
     "set_dataset_lifecycle",
     "store_evidence_array",
     "thaw_database",

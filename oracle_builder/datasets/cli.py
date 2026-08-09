@@ -20,6 +20,11 @@ from oracle_data_contracts.datasets.schema import (
     workspace_fingerprint,
 )
 from oracle_data_contracts.datasets.transfer import export_dataset, import_dataset_export
+from oracle_data_contracts.datasets.subset import subset_classification_dataset
+from oracle_data_contracts.datasets.taxonomy import (
+    import_taxonomy_concepts,
+    map_classification_label_to_concept,
+)
 from oracle_builder.datasets.legacy_roi import (
     migrate_legacy_roi_database,
     migrate_legacy_roi_if_needed,
@@ -42,6 +47,41 @@ def build_parser() -> argparse.ArgumentParser:
     checkpoint.add_argument("database")
     checkpoint.add_argument("--output")
     checkpoint.add_argument("--actor")
+    subset = commands.add_parser(
+        "subset",
+        help="Create an editable, deterministic classification subset.",
+    )
+    subset.add_argument("database")
+    subset.add_argument("output")
+    subset.add_argument(
+        "--minimum-class-count",
+        type=int,
+        default=1,
+        help="Retain only classes with at least this many current annotations (default: 1).",
+    )
+    subset.add_argument(
+        "--max-items",
+        type=int,
+        help="Deterministically retain at most this many eligible items.",
+    )
+    subset.add_argument("--seed", type=int, default=123)
+    subset.add_argument("--include-unlabeled", action="store_true")
+    subset.add_argument("--name")
+    subset.add_argument("--dry-run", action="store_true")
+    taxonomy_import = commands.add_parser(
+        "taxonomy-import", help="Import Pelagia taxonomy concepts into an editable dataset."
+    )
+    taxonomy_import.add_argument("database")
+    taxonomy_import.add_argument("taxonomy")
+    taxonomy_import.add_argument("--actor")
+    taxonomy_map = commands.add_parser(
+        "taxonomy-map", help="Explicitly link a classifier label to an imported taxonomy concept."
+    )
+    taxonomy_map.add_argument("database")
+    taxonomy_map.add_argument("--label", required=True)
+    taxonomy_map.add_argument("--concept", required=True)
+    taxonomy_map.add_argument("--relationship", default="exact")
+    taxonomy_map.add_argument("--actor")
     snapshot = commands.add_parser(
         "snapshot", help="Create a frozen full annotation-workspace snapshot."
     )
@@ -101,6 +141,9 @@ def main(argv: list[str] | None = None) -> int:
         "validate",
         "freeze",
         "checkpoint",
+        "subset",
+        "taxonomy-import",
+        "taxonomy-map",
         "snapshot",
         "thaw",
         "metadata-add",
@@ -136,6 +179,30 @@ def main(argv: list[str] | None = None) -> int:
         result = save_checkpoint(
             args.database, args.output, actor=args.actor
         )
+    elif args.command == "subset":
+        result = subset_classification_dataset(
+            args.database,
+            args.output,
+            minimum_class_count=args.minimum_class_count,
+            max_items=args.max_items,
+            seed=args.seed,
+            include_unlabeled=args.include_unlabeled,
+            name=args.name,
+            dry_run=args.dry_run,
+        )
+    elif args.command == "taxonomy-import":
+        with sqlite3.connect(Path(args.database).expanduser().resolve()) as connection:
+            connection.execute("PRAGMA foreign_keys = ON")
+            result = import_taxonomy_concepts(connection, args.taxonomy, actor=args.actor)
+            connection.commit()
+    elif args.command == "taxonomy-map":
+        with sqlite3.connect(Path(args.database).expanduser().resolve()) as connection:
+            connection.execute("PRAGMA foreign_keys = ON")
+            result = map_classification_label_to_concept(
+                connection, args.label, args.concept,
+                relationship=args.relationship, mapped_by=args.actor,
+            )
+            connection.commit()
     elif args.command == "snapshot":
         result = save_workspace_snapshot(
             args.database, args.output, actor=args.actor, note=args.note

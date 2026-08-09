@@ -9,7 +9,7 @@ from typing import Any
 
 
 SCHEMA_NAME = "oracle_builder_dataset"
-SCHEMA_VERSION = "1.2.0"
+SCHEMA_VERSION = "1.3.0"
 DATASET_TYPES = {"classification", "mask_refinement"}
 LIFECYCLE_STATES = {"working", "frozen", "deprecated"}
 
@@ -338,6 +338,63 @@ CREATE INDEX IF NOT EXISTS idx_model_evidence_run_confidence
 """
 
 
+# Taxonomy concepts are intentionally distinct from general annotation tags.
+# They are imported from a controlled taxonomy vocabulary and have stable UUIDs
+# across dataset databases.  Target/image tags remain application metadata.
+TAXONOMY_CONCEPT_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS taxonomy_concepts (
+    concept_id TEXT PRIMARY KEY,
+    vocabulary_id TEXT NOT NULL,
+    vocabulary_version TEXT NOT NULL,
+    vocabulary_node_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    display_name TEXT,
+    scientific_name TEXT,
+    concept_type TEXT NOT NULL,
+    rank TEXT,
+    parent_concept_id TEXT,
+    selectable INTEGER NOT NULL DEFAULT 1 CHECK (selectable IN (0, 1)),
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (parent_concept_id) REFERENCES taxonomy_concepts(concept_id),
+    UNIQUE (vocabulary_id, vocabulary_node_id)
+);
+CREATE INDEX IF NOT EXISTS idx_taxonomy_concepts_parent
+    ON taxonomy_concepts(parent_concept_id);
+
+CREATE TABLE IF NOT EXISTS taxonomy_concept_mappings (
+    mapping_id TEXT PRIMARY KEY,
+    concept_id TEXT NOT NULL,
+    authority TEXT NOT NULL,
+    scheme TEXT NOT NULL,
+    identifier TEXT NOT NULL,
+    uri TEXT,
+    relationship TEXT NOT NULL DEFAULT 'exact',
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (concept_id) REFERENCES taxonomy_concepts(concept_id) ON DELETE CASCADE,
+    UNIQUE (concept_id, authority, scheme, identifier),
+    UNIQUE (authority, scheme, identifier)
+);
+CREATE INDEX IF NOT EXISTS idx_taxonomy_mappings_identifier
+    ON taxonomy_concept_mappings(authority, scheme, identifier);
+
+CREATE TABLE IF NOT EXISTS classification_label_concepts (
+    label_id TEXT PRIMARY KEY,
+    concept_id TEXT NOT NULL,
+    relationship TEXT NOT NULL DEFAULT 'exact',
+    mapped_by TEXT,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (label_id) REFERENCES classification_labels(label_id) ON DELETE CASCADE,
+    FOREIGN KEY (concept_id) REFERENCES taxonomy_concepts(concept_id),
+    CHECK (relationship IN ('exact', 'broader', 'narrower', 'related'))
+);
+CREATE INDEX IF NOT EXISTS idx_classification_label_concepts_concept
+    ON classification_label_concepts(concept_id);
+"""
+
+
 MUTABLE_TABLES = (
     "ob_schema",
     "assets",
@@ -354,6 +411,9 @@ MUTABLE_TABLES = (
     "inference_runs",
     "evidence_arrays",
     "model_evidence",
+    "taxonomy_concepts",
+    "taxonomy_concept_mappings",
+    "classification_label_concepts",
 )
 
 
@@ -423,6 +483,18 @@ def _install_touch_triggers(connection: sqlite3.Connection) -> None:
             )
 
 
+def _drop_lifecycle_triggers(connection: sqlite3.Connection) -> None:
+    """Temporarily remove enforcement triggers during an internal migration."""
+    for (trigger,) in connection.execute(
+        """
+        SELECT name FROM sqlite_master
+        WHERE type = 'trigger'
+          AND (name LIKE 'freeze_%' OR name LIKE 'touch_dataset_%')
+        """
+    ):
+        connection.execute(f'DROP TRIGGER "{str(trigger).replace(chr(34), chr(34) * 2)}"')
+
+
 def _migrate_schema_if_needed(connection: sqlite3.Connection) -> None:
     if not _table_exists(connection, "ob_schema"):
         return
@@ -433,6 +505,10 @@ def _migrate_schema_if_needed(connection: sqlite3.Connection) -> None:
         return
     if tuple(schema_row) == (SCHEMA_NAME, "1.1.0"):
         _migrate_1_1_to_1_2(connection)
+        _migrate_schema_if_needed(connection)
+        return
+    if tuple(schema_row) == (SCHEMA_NAME, "1.2.0"):
+        _migrate_1_2_to_1_3(connection)
         return
     if tuple(schema_row) != (SCHEMA_NAME, "1.0.0"):
         raise DatasetSchemaError(
@@ -447,19 +523,7 @@ def _migrate_schema_if_needed(connection: sqlite3.Connection) -> None:
     connection.execute("PRAGMA foreign_keys = OFF")
     try:
         connection.execute("BEGIN IMMEDIATE")
-        trigger_names = [
-            str(row[0])
-            for row in connection.execute(
-                """
-                SELECT name FROM sqlite_master
-                WHERE type = 'trigger'
-                  AND (name LIKE 'freeze_%' OR name LIKE 'touch_dataset_%')
-                """
-            )
-        ]
-        for trigger in trigger_names:
-            escaped = trigger.replace('"', '""')
-            connection.execute(f'DROP TRIGGER "{escaped}"')
+        _drop_lifecycle_triggers(connection)
         connection.execute("DROP INDEX IF EXISTS idx_items_dataset_split")
         removed_split_assignments = int(
             connection.execute(
@@ -578,10 +642,11 @@ def _migrate_1_1_to_1_2(connection: sqlite3.Connection) -> None:
     connection.execute("PRAGMA foreign_keys = OFF")
     try:
         connection.execute("BEGIN IMMEDIATE")
+        _drop_lifecycle_triggers(connection)
         connection.executescript(ANNOTATION_WORKSPACE_SCHEMA_SQL)
         connection.execute(
             "UPDATE ob_schema SET schema_version = ? WHERE singleton = 1",
-            (SCHEMA_VERSION,),
+            ("1.2.0",),
         )
         dataset_id, revision_id = connection.execute(
             "SELECT dataset_id, revision_id FROM dataset WHERE singleton = 1"
@@ -601,7 +666,7 @@ def _migrate_1_1_to_1_2(connection: sqlite3.Connection) -> None:
                 json.dumps(
                     {
                         "from_version": "1.1.0",
-                        "to_version": SCHEMA_VERSION,
+                        "to_version": "1.2.0",
                         "added": [
                             "annotation_labels",
                             "item_label_annotations",
@@ -609,6 +674,62 @@ def _migrate_1_1_to_1_2(connection: sqlite3.Connection) -> None:
                             "inference_runs",
                             "evidence_arrays",
                             "model_evidence",
+                        ],
+                    },
+                    sort_keys=True,
+                ),
+            ),
+        )
+        _install_freeze_triggers(connection)
+        _install_touch_triggers(connection)
+        violations = connection.execute("PRAGMA foreign_key_check").fetchall()
+        if violations:
+            raise DatasetSchemaError(
+                f"Schema migration produced {len(violations)} foreign-key violation(s)"
+            )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.execute(f"PRAGMA foreign_keys = {foreign_keys}")
+
+
+def _migrate_1_2_to_1_3(connection: sqlite3.Connection) -> None:
+    """Add the controlled taxonomy concept registry and classifier mappings."""
+    if connection.in_transaction:
+        raise DatasetSchemaError(
+            "Dataset schema migration requires a connection with no active transaction"
+        )
+    foreign_keys = int(connection.execute("PRAGMA foreign_keys").fetchone()[0])
+    connection.execute("PRAGMA foreign_keys = OFF")
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        _drop_lifecycle_triggers(connection)
+        connection.executescript(TAXONOMY_CONCEPT_SCHEMA_SQL)
+        connection.execute(
+            "UPDATE ob_schema SET schema_version = ? WHERE singleton = 1",
+            (SCHEMA_VERSION,),
+        )
+        dataset_id, revision_id = connection.execute(
+            "SELECT dataset_id, revision_id FROM dataset WHERE singleton = 1"
+        ).fetchone()
+        connection.execute(
+            """
+            INSERT INTO dataset_events (
+                event_id, dataset_id, revision_id, event_type, created_at, actor, details_json
+            ) VALUES (?, ?, ?, 'schema.migrated', ?, 'oracle-builder', ?)
+            """,
+            (
+                str(uuid.uuid4()), dataset_id, revision_id, utc_now(),
+                json.dumps(
+                    {
+                        "from_version": "1.2.0",
+                        "to_version": SCHEMA_VERSION,
+                        "added": [
+                            "taxonomy_concepts",
+                            "taxonomy_concept_mappings",
+                            "classification_label_concepts",
                         ],
                     },
                     sort_keys=True,
@@ -735,6 +856,7 @@ def initialize_database(
         else MASK_REFINEMENT_SCHEMA_SQL
     )
     connection.executescript(ANNOTATION_WORKSPACE_SCHEMA_SQL)
+    connection.executescript(TAXONOMY_CONCEPT_SCHEMA_SQL)
     _install_freeze_triggers(connection)
     _install_touch_triggers(connection)
     return read_dataset_info(connection)
@@ -869,6 +991,30 @@ def dataset_fingerprint(connection: sqlite3.Connection) -> str:
             """
             SELECT review_id, annotation_id, reviewer, decision, notes, metadata_json
             FROM annotation_reviews ORDER BY review_id
+            """,
+        ),
+        "taxonomy_concepts": _canonical_rows(
+            connection,
+            """
+            SELECT concept_id, vocabulary_id, vocabulary_version, vocabulary_node_id,
+                   name, display_name, scientific_name, concept_type, rank,
+                   parent_concept_id, selectable, metadata_json
+            FROM taxonomy_concepts ORDER BY concept_id
+            """,
+        ),
+        "taxonomy_concept_mappings": _canonical_rows(
+            connection,
+            """
+            SELECT mapping_id, concept_id, authority, scheme, identifier, uri,
+                   relationship, metadata_json
+            FROM taxonomy_concept_mappings ORDER BY mapping_id
+            """,
+        ),
+        "classification_label_concepts": _canonical_rows(
+            connection,
+            """
+            SELECT label_id, concept_id, relationship, mapped_by, metadata_json
+            FROM classification_label_concepts ORDER BY label_id
             """,
         ),
     }
@@ -1023,6 +1169,9 @@ def validate_database(connection: sqlite3.Connection) -> dict[str, Any]:
         "inference_runs",
         "evidence_arrays",
         "model_evidence",
+        "taxonomy_concepts",
+        "taxonomy_concept_mappings",
+        "classification_label_concepts",
     }
     if info["dataset_type"] == "classification":
         required_tables.update(

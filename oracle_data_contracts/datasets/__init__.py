@@ -19,6 +19,7 @@ from oracle_data_contracts.datasets.schema import (
     validate_database,
     workspace_fingerprint,
 )
+from oracle_data_contracts.datasets.subset import subset_classification_dataset
 from oracle_data_contracts.datasets.workspace import (
     add_annotation_label,
     add_annotation_review,
@@ -28,6 +29,11 @@ from oracle_data_contracts.datasets.workspace import (
     create_inference_run,
     store_evidence_array,
 )
+from oracle_data_contracts.datasets.taxonomy import (
+    import_taxonomy_concepts,
+    map_classification_label_to_concept,
+    taxonomy_concept_id,
+)
 
 __all__ = [
     "DATASET_TYPES", "SCHEMA_NAME", "SCHEMA_VERSION", "DatasetSchemaError",
@@ -36,5 +42,7 @@ __all__ = [
     "dataset_fingerprint", "initialize_database", "read_dataset_info",
     "release_training_dataset", "restore_workspace_snapshot", "save_checkpoint",
     "save_workspace_snapshot", "set_dataset_lifecycle", "store_evidence_array",
-    "thaw_database", "validate_database", "workspace_fingerprint",
+    "subset_classification_dataset", "thaw_database", "validate_database",
+    "workspace_fingerprint", "import_taxonomy_concepts",
+    "map_classification_label_to_concept", "taxonomy_concept_id",
 ]

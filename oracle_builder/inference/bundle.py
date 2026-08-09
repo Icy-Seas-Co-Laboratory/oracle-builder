@@ -339,6 +339,9 @@ class InferenceBundle:
                 "class_index": class_index,
                 "label_id": label.get("label_id"),
                 "label_name": label.get("name"),
+                "concept_id": label.get("concept_id"),
+                "concept_node_id": label.get("concept_node_id"),
+                "concept_relationship": label.get("concept_relationship"),
                 "abstained": False,
             },
             "logits": [float(value) for value in logits],
@@ -348,6 +351,9 @@ class InferenceBundle:
                     "class_index": index,
                     "label_id": _labels(self.config).get(index, {}).get("label_id"),
                     "label_name": _labels(self.config).get(index, {}).get("name"),
+                    "concept_id": _labels(self.config).get(index, {}).get("concept_id"),
+                    "concept_node_id": _labels(self.config).get(index, {}).get("concept_node_id"),
+                    "concept_relationship": _labels(self.config).get(index, {}).get("concept_relationship"),
                     "probability": float(probability),
                 }
                 for index, probability in enumerate(probabilities)

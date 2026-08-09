@@ -203,6 +203,36 @@ def export_dataset(
                     """
                 )
             ],
+            "taxonomy_concepts": [
+                dict(row)
+                for row in connection.execute(
+                    """
+                    SELECT concept_id, vocabulary_id, vocabulary_version, vocabulary_node_id,
+                           name, display_name, scientific_name, concept_type, rank,
+                           parent_concept_id, selectable, metadata_json, created_at
+                    FROM taxonomy_concepts ORDER BY concept_id
+                    """
+                )
+            ],
+            "taxonomy_concept_mappings": [
+                dict(row)
+                for row in connection.execute(
+                    """
+                    SELECT mapping_id, concept_id, authority, scheme, identifier, uri,
+                           relationship, metadata_json, created_at
+                    FROM taxonomy_concept_mappings ORDER BY mapping_id
+                    """
+                )
+            ],
+            "classification_label_concepts": [
+                dict(row)
+                for row in connection.execute(
+                    """
+                    SELECT label_id, concept_id, relationship, mapped_by, metadata_json, created_at
+                    FROM classification_label_concepts ORDER BY label_id
+                    """
+                )
+            ],
         }
         if info["dataset_type"] == "classification":
             manifest["labels"] = [
@@ -635,6 +665,57 @@ def import_dataset_export(
                             annotation.get("notes"),
                         ),
                     )
+        for concept in manifest.get("taxonomy_concepts", []):
+            connection.execute(
+                """
+                INSERT INTO taxonomy_concepts (
+                    concept_id, vocabulary_id, vocabulary_version, vocabulary_node_id,
+                    name, display_name, scientific_name, concept_type, rank,
+                    parent_concept_id, selectable, metadata_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)
+                """,
+                (
+                    concept["concept_id"], concept["vocabulary_id"], concept["vocabulary_version"],
+                    concept["vocabulary_node_id"], concept["name"], concept.get("display_name"),
+                    concept.get("scientific_name"), concept["concept_type"], concept.get("rank"),
+                    concept.get("selectable", 1), concept.get("metadata_json") or "{}",
+                    concept["created_at"],
+                ),
+            )
+        for concept in manifest.get("taxonomy_concepts", []):
+            if concept.get("parent_concept_id"):
+                connection.execute(
+                    "UPDATE taxonomy_concepts SET parent_concept_id = ? WHERE concept_id = ?",
+                    (concept["parent_concept_id"], concept["concept_id"]),
+                )
+        for mapping in manifest.get("taxonomy_concept_mappings", []):
+            connection.execute(
+                """
+                INSERT INTO taxonomy_concept_mappings (
+                    mapping_id, concept_id, authority, scheme, identifier, uri,
+                    relationship, metadata_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    mapping["mapping_id"], mapping["concept_id"], mapping["authority"],
+                    mapping["scheme"], mapping["identifier"], mapping.get("uri"),
+                    mapping.get("relationship", "exact"), mapping.get("metadata_json") or "{}",
+                    mapping["created_at"],
+                ),
+            )
+        for mapping in manifest.get("classification_label_concepts", []):
+            connection.execute(
+                """
+                INSERT INTO classification_label_concepts (
+                    label_id, concept_id, relationship, mapped_by, metadata_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    mapping["label_id"], mapping["concept_id"],
+                    mapping.get("relationship", "exact"), mapping.get("mapped_by"),
+                    mapping.get("metadata_json") or "{}", mapping["created_at"],
+                ),
+            )
         for annotation in manifest.get("item_label_annotations", []):
             connection.execute(
                 """
