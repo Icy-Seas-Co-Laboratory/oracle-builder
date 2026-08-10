@@ -21,6 +21,20 @@ model products below the supplied directory. It uses the artifact name as a
 normalized HTTP-safe selector, adding an artifact-ID suffix only when names
 collide. Working or malformed artifacts are skipped and reported on stderr.
 
+When a reverse proxy exposes the service beneath a path prefix, supply that
+external prefix so OpenAPI documentation and generated URLs remain correct:
+
+```bash
+oracle-serve \
+  --models-root ./models \
+  --root-path /oracle-builder-api \
+  --host 127.0.0.1 \
+  --port 8100
+```
+
+`ORACLE_BUILDER_ROOT_PATH` provides the same setting for ASGI and managed
+service deployments.
+
 Use `--model ALIAS=RUN_DIR` to register a specific artifact or choose an
 explicit operational selector; repeat it to add more models. Aliases are
 operational selectors; every result reports the resolved immutable artifact ID,
