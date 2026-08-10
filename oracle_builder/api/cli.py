@@ -23,9 +23,16 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8100)
     parser.add_argument("--no-preload", action="store_true")
+    parser.add_argument("--max-batch-size", type=int, default=256, help="Maximum combined inference items per model execution.")
+    parser.add_argument("--max-wait-ms", type=int, default=8, help="Maximum queueing delay while forming a micro-batch.")
+    parser.add_argument("--queue-capacity", type=int, default=1024, help="Maximum pending inference requests per model.")
     args = parser.parse_args()
 
-    registry = InferenceModelRegistry()
+    registry = InferenceModelRegistry(
+        serving_max_batch_size=args.max_batch_size,
+        serving_max_wait_ms=args.max_wait_ms,
+        serving_queue_capacity=args.queue_capacity,
+    )
     for root in args.models_root:
         try:
             report = registry.register_root(root)

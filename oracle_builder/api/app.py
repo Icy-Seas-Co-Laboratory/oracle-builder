@@ -23,16 +23,18 @@ def create_app(
     auth_token: str | None = None,
     preload: bool = True,
     max_payload_bytes: int = 256 * 1024 * 1024,
-    max_items: int = 128,
 ) -> FastAPI:
-    if max_payload_bytes < 1 or max_items < 1:
-        raise ValueError("Inference payload and item limits must be positive")
+    if max_payload_bytes < 1:
+        raise ValueError("Inference payload limit must be positive")
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         if preload:
             registry.preload()
-        yield
+        try:
+            yield
+        finally:
+            registry.close()
 
     app = FastAPI(title="Oracle Builder Inference API", version="1.0.0", lifespan=lifespan)
     app.state.registry = registry
@@ -85,11 +87,14 @@ def create_app(
         if content_type != NPZ_MEDIA_TYPE:
             raise HTTPException(status_code=415, detail=f"Expected Content-Type {NPZ_MEDIA_TYPE}")
         try:
+            max_items = registry.max_items_for(selector)
             inference_request = decode_inference_request(
                 await request.body(),
                 max_payload_bytes=max_payload_bytes,
                 max_items=max_items,
             )
+        except ModelNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=f"Unknown inference model: {selector}") from exc
         except (InferenceTransportError, KeyError, TypeError, ValueError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         try:
@@ -116,7 +121,11 @@ def create_app(
 
 
 def app_from_environment() -> FastAPI:
-    registry = InferenceModelRegistry()
+    registry = InferenceModelRegistry(
+        serving_max_batch_size=int(os.environ.get("ORACLE_BUILDER_SERVING_MAX_BATCH_SIZE", 256)),
+        serving_max_wait_ms=int(os.environ.get("ORACLE_BUILDER_SERVING_MAX_WAIT_MS", 8)),
+        serving_queue_capacity=int(os.environ.get("ORACLE_BUILDER_SERVING_QUEUE_CAPACITY", 1024)),
+    )
     roots = os.environ.get("ORACLE_BUILDER_MODELS_ROOT", "")
     for root in filter(None, (value.strip() for value in roots.split(os.pathsep))):
         registry.register_root(root)
@@ -131,7 +140,6 @@ def app_from_environment() -> FastAPI:
         auth_token=os.environ.get("ORACLE_BUILDER_API_TOKEN"),
         preload=os.environ.get("ORACLE_BUILDER_PRELOAD", "true").lower() not in {"0", "false", "no"},
         max_payload_bytes=int(os.environ.get("ORACLE_BUILDER_MAX_PAYLOAD_BYTES", 256 * 1024 * 1024)),
-        max_items=int(os.environ.get("ORACLE_BUILDER_MAX_ITEMS", 128)),
     )
 
 

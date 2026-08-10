@@ -21,7 +21,7 @@ from oracle_builder.datasets.repository import SQLiteDatasetRepository
 from oracle_builder.datasets.schema import read_dataset_info, utc_now
 
 
-IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".tif", ".tiff"}
+IMAGE_SUFFIXES = {".bmp", ".jpg", ".jpeg", ".png", ".tif", ".tiff"}
 SPLIT_FOLDERS = {"train": "train", "validation": "validation", "val": "validation", "test": "test"}
 
 

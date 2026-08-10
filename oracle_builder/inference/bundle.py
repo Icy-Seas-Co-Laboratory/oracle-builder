@@ -9,7 +9,6 @@ import numpy as np
 
 from oracle_builder.artifacts import read_run_config, read_run_manifest
 from oracle_builder.classification.evidence import IdentityEvidenceIndex
-from oracle_builder.classification.features import predict_classification_outputs
 from oracle_builder.data.decoders import (
     prepare_classification_input,
 )
@@ -30,6 +29,7 @@ from oracle_builder.inference.contracts import (
     new_uuid,
     utc_now,
 )
+from oracle_builder.inference.executor import ClassificationExecutor
 from oracle_builder.saving.load_test import load_model_for_run
 
 
@@ -122,13 +122,19 @@ class InferenceBundle:
         self.config = config
         self.model_reference = model_reference
         self.evidence_index = evidence_index
+        self._classification_executor = (
+            ClassificationExecutor(model, tuple(config["data"]["input_shape"]))
+            if model_reference.task == "classification"
+            else None
+        )
+        self.runtime_diagnostics: dict[str, Any] = {}
 
     @classmethod
     def load(cls, run_dir: str | Path) -> "InferenceBundle":
         run_dir = Path(run_dir).expanduser().resolve()
         config = read_run_config(run_dir)
         manifest = read_run_manifest(run_dir)
-        model = load_model_for_run(run_dir, config)
+        model = load_model_for_run(run_dir, config, prefer_savedmodel=True)
         evidence_path = run_dir / "model" / "classification_evidence"
         if not evidence_path.exists():
             evidence_path = run_dir / "model" / "classification_evidence.npz"
@@ -240,9 +246,7 @@ class InferenceBundle:
                 )
         if prepared:
             try:
-                values = predict_classification_outputs(
-                    self.model, np.stack(prepared, axis=0)
-                )
+                values = self._classification_executor.predict(np.stack(prepared, axis=0))
                 for batch_index, item_index in enumerate(prepared_indices):
                     item = materialized_items[item_index]
                     results[item_index] = self._success_result(
@@ -294,8 +298,36 @@ class InferenceBundle:
 
     def _predict_classification(self, item: InferenceItem) -> dict[str, Any]:
         prepared = self._prepare_classification(item)
-        values = predict_classification_outputs(self.model, prepared[None, ...])
+        values = self._classification_executor.predict(prepared[None, ...])
         return self._classification_output_from_values(item, values, 0)
+
+    def warm_for_serving(self, batch_sizes: tuple[int, ...] = (1,)) -> dict[str, Any]:
+        """Compile and exercise the resident callable without retaining input data."""
+        if self.model_reference.task != "classification" or self._classification_executor is None:
+            self.runtime_diagnostics = {"runtime": "segmentation", "warmup": []}
+            return self.runtime_diagnostics
+        warmup: list[dict[str, Any]] = []
+        for requested_size in dict.fromkeys(max(1, int(value)) for value in batch_sizes):
+            candidate = requested_size
+            while True:
+                try:
+                    warmup.append(self._classification_executor.warm(candidate))
+                    break
+                except Exception as exc:
+                    try:
+                        import tensorflow as tf
+                        is_oom = isinstance(exc, tf.errors.ResourceExhaustedError)
+                    except ImportError:  # pragma: no cover
+                        is_oom = False
+                    if not is_oom or candidate <= 1:
+                        raise
+                    candidate = max(1, candidate // 2)
+        self.runtime_diagnostics = {
+            "runtime": self._classification_executor.runtime,
+            "warmup": warmup,
+            "resolved_max_batch_size": warmup[-1]["batch_size"] if warmup else 1,
+        }
+        return self.runtime_diagnostics
 
     def _prepare_classification(self, item: InferenceItem) -> np.ndarray:
         raw = item.inputs["image"].values

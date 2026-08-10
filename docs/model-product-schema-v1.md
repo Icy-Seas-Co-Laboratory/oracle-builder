@@ -53,6 +53,7 @@ enabled = true
 # logits_layer = "logits"
 # embedding_layer = "features"
 # activation = "softmax"
+# output_name = "output_0" # SavedModel only, required for multiple outputs
 
 [outputs]
 primary = "class_probabilities"
@@ -69,10 +70,11 @@ resize, 1↔3 channel conversion, inversion, and rescaling operations.
 
 ```text
 model/
-├── source/original.keras|h5|hdf5
-├── imported.keras
-├── final.keras
-├── weights.weights.h5
+├── source/original.keras|h5|hdf5|_savedmodel/
+├── imported.keras                 # Keras products only
+├── final.keras                    # Keras products only
+├── weights.weights.h5             # Keras products only
+├── export_savedmodel/             # standard products and SavedModel imports
 ├── inspection.json
 ├── model_summary.txt
 ├── model_manifest.json
@@ -81,7 +83,10 @@ model/
 
 `source/original.*` is an unchanged copy. `imported.keras` is the normalized
 Keras import. `final.keras` is the preferred product model and may be a promoted
-wrapper. `weights.weights.h5` requires the matching final architecture.
+wrapper. `weights.weights.h5` requires the matching final architecture. A
+TensorFlow SavedModel import preserves `source/original_savedmodel/` and writes
+an `export_savedmodel/` adapter instead; it does not require that a historical
+Keras configuration remain deserializable.
 
 `inspection.json` records source hash, tensor/layer inspection, promotion
 decision and assumptions, and reload/forward-pass results. Every saved file is
@@ -103,6 +108,11 @@ an accessible logits layer receive a numerically stable derived logit. Softmax
 logits are canonical only up to an additive constant; the derivation is recorded
 in `inspection.json`. A promotion failure preserves the product rather than
 guessing its semantics.
+
+SavedModel import currently supports a single-input classification signature.
+It requires an explicit `promotion.activation` (`softmax` or `linear`) and
+wraps the selected output as named `logits` and `probabilities`. It does not
+invent an embedding when the source signature does not expose one.
 
 ## Dataset provenance
 

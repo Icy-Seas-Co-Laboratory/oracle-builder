@@ -3,13 +3,17 @@ from __future__ import annotations
 import argparse
 import json
 
-from oracle_builder.products.ingest import ingest_keras_model
+from pathlib import Path
+
+from oracle_builder.products.ingest import ingest_keras_model, ingest_savedmodel
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="oracle-model", description="Ingest portable external model products.")
     commands = parser.add_subparsers(dest="command", required=True)
-    ingest = commands.add_parser("ingest", help="Ingest a .keras or legacy .h5 Keras model.")
+    ingest = commands.add_parser(
+        "ingest", help="Ingest a .keras/.h5 Keras model or TensorFlow SavedModel directory."
+    )
     ingest.add_argument("--model", required=True)
     ingest.add_argument("--info", required=True, help="TOML product description.")
     ingest.add_argument("--output", required=True, help="New model-product artifact directory.")
@@ -17,16 +21,13 @@ def main(argv: list[str] | None = None) -> int:
     ingest.add_argument(
         "--no-promote",
         action="store_true",
-        help="Preserve the model without attempting standard named-output promotion.",
+        help="Preserve a Keras model without named-output promotion (not supported for SavedModels).",
     )
     args = parser.parse_args(argv)
-    result = ingest_keras_model(
-        args.model,
-        args.info,
-        args.output,
-        dataset=args.dataset,
-        promote=False if args.no_promote else None,
-    )
+    source = Path(args.model).expanduser()
+    ingest_function = ingest_savedmodel if source.is_dir() else ingest_keras_model
+    result = ingest_function(args.model, args.info, args.output, dataset=args.dataset,
+                             promote=False if args.no_promote else None)
     print(json.dumps(result, indent=2, sort_keys=True, default=str))
     return 0
 

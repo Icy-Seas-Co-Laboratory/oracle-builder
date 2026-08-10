@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import uuid
 from pathlib import Path
 
@@ -73,6 +74,42 @@ def test_npz_transport_round_trip_preserves_arrays_and_hashes():
     np.testing.assert_array_equal(decoded.items[0].inputs["image"].values, item.inputs["image"].values)
 
 
+def test_npz_transport_does_not_apply_an_independent_request_limit():
+    item = InferenceItem.from_array(
+        np.arange(16, dtype="uint8").reshape(4, 4),
+        candidate_mask=np.eye(4, dtype="uint8"),
+    )
+
+    decoded = decode_inference_request(
+        encode_inference_request(str(uuid.uuid4()), [item] * 256)
+    )
+
+    assert len(decoded.items) == 256
+
+
+def test_inference_api_uses_the_registry_execution_limit_for_request_validation(tmp_path: Path):
+    from fastapi.testclient import TestClient
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    registry = InferenceModelRegistry(loader=lambda _: FakeBundle(), serving_max_batch_size=2)
+    registry.register("test-refiner", run_dir)
+    item = InferenceItem.from_array(
+        np.arange(16, dtype="uint8").reshape(4, 4),
+        candidate_mask=np.eye(4, dtype="uint8"),
+    )
+
+    with TestClient(create_app(registry, preload=True)) as client:
+        response = client.post(
+            "/v1/models/test-refiner:predict",
+            content=encode_inference_request(str(uuid.uuid4()), [item] * 3),
+            headers={"Content-Type": NPZ_MEDIA_TYPE},
+        )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "Inference request exceeds the 2-item limit"
+
+
 def test_inference_api_lists_models_and_returns_npz(tmp_path: Path):
     from fastapi.testclient import TestClient
 
@@ -108,6 +145,50 @@ def test_inference_api_lists_models_and_returns_npz(tmp_path: Path):
     decoded = decode_inference_result(response.content)
     assert decoded["counts"]["succeeded"] == 1
     np.testing.assert_array_equal(decoded["results"][0]["output"]["mask"], np.eye(4, dtype="uint8"))
+
+
+def test_registry_microbatches_concurrent_requests(tmp_path: Path):
+    class RecordingBundle(FakeBundle):
+        def __init__(self):
+            super().__init__()
+            self.batch_sizes: list[int] = []
+
+        def predict_batch(self, items):
+            self.batch_sizes.append(len(items))
+            return super().predict_batch(items)
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    bundle = RecordingBundle()
+    registry = InferenceModelRegistry(
+        loader=lambda _: bundle,
+        serving_max_batch_size=4,
+        serving_max_wait_ms=40,
+    )
+    registry.register("test", run_dir)
+    registry.preload(raise_errors=True)
+    barrier = threading.Barrier(3)
+    results = []
+
+    def submit(value: int):
+        barrier.wait()
+        image = np.full((2, 2), value, dtype="uint8")
+        results.append(registry.predict("test", [InferenceItem.from_array(image, candidate_mask=np.ones_like(image))]))
+
+    first = threading.Thread(target=submit, args=(1,))
+    second = threading.Thread(target=submit, args=(2,))
+    first.start()
+    second.start()
+    barrier.wait()
+    first.join(timeout=2)
+    second.join(timeout=2)
+    try:
+        assert bundle.batch_sizes == [2]
+        assert len(results) == 2
+        assert all(result.counts["succeeded"] == 1 for result in results)
+        assert results[0].result_set_id != results[1].result_set_id
+    finally:
+        registry.close()
 
 
 def test_classification_catalog_describes_evidence_and_exemplar_metadata(tmp_path: Path):

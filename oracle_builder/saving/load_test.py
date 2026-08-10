@@ -97,7 +97,12 @@ def run_load_tests(run_dir: str | Path, config: dict[str, Any], initial_report: 
     return report
 
 
-def load_model_for_run(run_dir: str | Path, config: dict[str, Any]):
+def load_model_for_run(
+    run_dir: str | Path,
+    config: dict[str, Any],
+    *,
+    prefer_savedmodel: bool = False,
+):
     from oracle_builder.artifacts.layout import RunLayout
     from oracle_builder.artifacts.run import validate_run_artifact
 
@@ -111,6 +116,11 @@ def load_model_for_run(run_dir: str | Path, config: dict[str, Any]):
             )
     model_path = Path(run_dir) / "model"
     errors = []
+    if prefer_savedmodel:
+        try:
+            return SavedModelPredictor(model_path / "export_savedmodel")
+        except Exception as exc:
+            errors.append(f"export_savedmodel: {exc}")
     try:
         return _load_keras_model(model_path / "final.keras")
     except Exception as exc:
@@ -121,10 +131,11 @@ def load_model_for_run(run_dir: str | Path, config: dict[str, Any]):
         return model
     except Exception as exc:
         errors.append(f"weights.weights.h5: {exc}")
-    try:
-        return SavedModelPredictor(model_path / "export_savedmodel")
-    except Exception as exc:
-        errors.append(f"export_savedmodel: {exc}")
+    if not prefer_savedmodel:
+        try:
+            return SavedModelPredictor(model_path / "export_savedmodel")
+        except Exception as exc:
+            errors.append(f"export_savedmodel: {exc}")
     raise RuntimeError("No loadable Keras model found. " + " | ".join(errors))
 
 

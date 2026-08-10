@@ -13,10 +13,8 @@ license = ""
 tags = ["external", "keras"]
 
 # Optional labels for classification products. Order must match the model's
-# class axis. Add stable label_id values when these must map across datasets.
-# [[labels]]
-# name = "example-class"
-# label_id = "example-class"
+# class axis. Use stable IDs when these must map across datasets.
+# labels = ["example-class"]
 
 # Optional declared processing contract. The importer inspects tensor shapes;
 # these fields document the processing expected before the model is called.
@@ -39,6 +37,7 @@ enabled = true
 # logits_layer = "logits"
 # embedding_layer = "global_average_pooling2d"
 # activation = "softmax" # softmax/linear for classification; sigmoid/linear for masks
+# output_name = "output_0" # required only for multi-output SavedModels
 
 # Optional output details. The promoted model always exposes logits and
 # probabilities. Segmentation products can declare a reviewed mask threshold.

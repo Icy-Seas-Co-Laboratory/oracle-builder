@@ -31,10 +31,41 @@ The catalog retains manifest identity and task metadata when runtime validation
 fails. Clients can therefore show registered-but-unavailable models and their
 load errors without offering those models for inference.
 
+## Serving performance
+
+When a model is preloaded, Oracle Builder creates one resident classification
+callable. It prefers the bundle's SavedModel concrete signature and otherwise
+creates one compiled Keras named-output function. The callable is warmed with
+batch sizes 1 and 64 (or the configured maximum) before the model is ready.
+
+Each model has one bounded execution queue. Concurrent requests are combined
+for a single GPU call until the item limit is reached or the short queue
+deadline expires. Input decoding, response construction, and transport work
+remain outside that GPU-facing worker. Every caller still receives a separate,
+correlated result set.
+
+The service startup options are the single source of truth for these limits:
+
+```bash
+oracle-serve --models-root ./models \
+  --max-batch-size 256 --max-wait-ms 8 --queue-capacity 1024
+```
+
+The request limit always matches the resolved execution limit. If startup
+warmup cannot fit the requested batch in memory, Oracle Builder reduces that
+model's active limit and rejects larger requests before execution.
+
+Per-model configuration takes precedence over service defaults. `GET
+/v1/models` includes runtime warm-up and micro-batch diagnostics after loading.
+
 Set `ORACLE_BUILDER_API_TOKEN` to require a bearer token. Pelagia supplies the
 same value through `PELAGIA_ORACLE_API_TOKEN`. ASGI deployments may use
 `ORACLE_BUILDER_MODELS_ROOT`, with multiple roots separated by the platform
 path separator, instead of enumerating `ORACLE_BUILDER_MODELS`.
+Environment deployments can set the service defaults with
+`ORACLE_BUILDER_SERVING_MAX_BATCH_SIZE`,
+`ORACLE_BUILDER_SERVING_MAX_WAIT_MS`, and
+`ORACLE_BUILDER_SERVING_QUEUE_CAPACITY`.
 
 ## Endpoints
 

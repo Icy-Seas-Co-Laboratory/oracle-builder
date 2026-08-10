@@ -5,13 +5,14 @@ import sqlite3
 
 import numpy as np
 
+import tensorflow as tf
 from tensorflow import keras
 
 from oracle_builder.artifacts import validate_run_artifact
 from oracle_builder.artifacts import read_run_config
 from oracle_builder.classification.features import predict_classification_outputs
 from oracle_builder.datasets.schema import initialize_database
-from oracle_builder.products.ingest import ingest_keras_model
+from oracle_builder.products.ingest import ingest_keras_model, ingest_savedmodel
 from oracle_builder.saving.load_test import load_model_for_run
 
 
@@ -108,3 +109,36 @@ def test_ingest_promotes_a_softmax_classifier_to_standard_outputs(tmp_path):
     assert values["probabilities"].shape == (2, 3)
     assert values["features"].shape == (2, 6)
     assert (output / "model" / "imported.keras").exists()
+
+
+def test_ingest_savedmodel_creates_named_classification_contract(tmp_path):
+    class LegacyClassifier(tf.Module):
+        @tf.function
+        def serve(self, values):
+            flattened = tf.reshape(values, [tf.shape(values)[0], 16])
+            return {"output_0": tf.nn.softmax(flattened[:, :3])}
+
+    source = tmp_path / "legacy_savedmodel"
+    module = LegacyClassifier()
+    tf.saved_model.save(
+        module,
+        str(source),
+        signatures={"serving_default": module.serve.get_concrete_function(
+            tf.TensorSpec([None, 4, 4, 1], tf.float32, name="input_layer")
+        )},
+    )
+    info = tmp_path / "product.toml"
+    info.write_text(
+        '[product]\nname = "legacy"\ntask = "classification"\n\n'
+        '[[labels]]\nname = "a"\n[[labels]]\nname = "b"\n[[labels]]\nname = "c"\n\n'
+        '[promotion]\nactivation = "softmax"\n', encoding="utf-8"
+    )
+    output = tmp_path / "product"
+    ingest_savedmodel(source, info, output)
+
+    loaded = load_model_for_run(output, read_run_config(output), prefer_savedmodel=True)
+    values = predict_classification_outputs(loaded, np.zeros((2, 4, 4, 1), dtype="float32"))
+    assert validate_run_artifact(output)["valid"]
+    assert values["logits"].shape == (2, 3)
+    assert values["probabilities"].shape == (2, 3)
+    assert values["features"] is None

@@ -1,4 +1,4 @@
-"""Ingest externally supplied Keras models into Oracle Builder artifacts."""
+"""Ingest externally supplied Keras and TensorFlow SavedModels into products."""
 
 from __future__ import annotations
 
@@ -39,6 +39,42 @@ from oracle_builder.training.logging_callbacks import (
 
 
 SUPPORTED_SUFFIXES = {".keras", ".h5", ".hdf5"}
+
+
+class _SavedModelClassificationAdapter(tf.Module):
+    """Expose a legacy SavedModel through Oracle Builder's stable ABI.
+
+    The source SavedModel remains preserved verbatim.  This small wrapper only
+    assigns explicit semantics to its single class-score tensor, avoiding any
+    dependency on legacy Keras deserialization at serving time.
+    """
+
+    def __init__(self, source_model, source_signature, source_input_name: str, output_name: str, activation: str):
+        super().__init__()
+        # Keep the loaded module trackable and alive.  ConcreteFunctions use
+        # weak variable references and otherwise fail during adapter tracing.
+        self.source_model = source_model
+        self.source_signature = source_signature
+        self.source_input_name = source_input_name
+        self.output_name = output_name
+        self.activation = activation
+
+    @tf.function
+    def serve(self, inputs):
+        values = self.source_signature(**{self.source_input_name: inputs})[self.output_name]
+        if self.activation == "linear":
+            logits = values
+            probabilities = tf.nn.softmax(logits, axis=-1)
+        else:
+            probabilities = values
+            # A softmax logit vector is only identifiable up to a constant;
+            # log(p) is the canonical, numerically stable representative.
+            logits = tf.math.log(tf.clip_by_value(probabilities, 1e-7, 1.0))
+        return {"logits": logits, "probabilities": probabilities}
+
+    @tf.function
+    def classify(self, inputs):
+        return self.serve(inputs)
 
 
 @keras.utils.register_keras_serializable(package="oracle_builder")
@@ -143,6 +179,34 @@ def inspect_keras_model(model: keras.Model) -> dict[str, Any]:
     }
 
 
+def inspect_savedmodel(source: Path) -> tuple[Any, Any, str, dict[str, Any]]:
+    """Load and inspect a single-input TensorFlow SavedModel serving signature."""
+    loaded = tf.saved_model.load(str(source))
+    signature = loaded.signatures.get("serving_default") or loaded.signatures.get("serve")
+    if signature is None:
+        raise ValueError("SavedModel must expose a serving_default or serve signature")
+    positional, keyword = signature.structured_input_signature
+    if positional or len(keyword) != 1:
+        raise ValueError("SavedModel ingestion currently requires exactly one keyword input")
+    input_name, input_spec = next(iter(keyword.items()))
+    outputs = signature.structured_outputs
+    if not isinstance(outputs, dict) or not outputs:
+        raise ValueError("SavedModel serving signature must return named tensor outputs")
+    return loaded, signature, input_name, {
+        "framework": "tensorflow_savedmodel",
+        "tensorflow_version": tf.__version__,
+        "name": source.name,
+        "input_count": 1,
+        "output_count": len(outputs),
+        "inputs": [{"name": input_name, "shape": _json_shape(input_spec.shape), "dtype": input_spec.dtype.name}],
+        "outputs": [
+            {"name": name, "shape": _json_shape(value.shape), "dtype": value.dtype.name}
+            for name, value in outputs.items()
+        ],
+        "signatures": sorted(loaded.signatures),
+    }
+
+
 def _dataset_reference(path: str | Path | None, task: str) -> dict[str, Any]:
     if path is None:
         return {}
@@ -172,7 +236,15 @@ def _dataset_reference(path: str | Path | None, task: str) -> dict[str, Any]:
 
 def _declared_labels(info: dict[str, Any]) -> list[dict[str, Any]]:
     """Normalize optional TOML labels into the inference label contract."""
-    rows = info.get("labels", [])
+    # Accept top-level labels (the original API) and product-scoped labels
+    # (which reads more naturally in TOML).  The final fallback supports early
+    # product cards that placed labels beside promotion settings.
+    rows = (
+        info.get("labels")
+        or dict(info.get("product", {})).get("labels")
+        or dict(info.get("promotion", {})).get("labels")
+        or []
+    )
     if not isinstance(rows, list):
         raise ValueError("labels must be an array of TOML tables or strings")
     labels: list[dict[str, Any]] = []
@@ -431,11 +503,13 @@ def _external_contract(
     inspection: dict[str, Any],
     info: dict[str, Any],
     promotion: dict[str, Any],
+    *,
+    architecture: str = "external_keras",
 ) -> dict[str, Any]:
     declared_outputs = dict(info.get("outputs", {}))
     return {
         "task": task,
-        "architecture": "external_keras",
+        "architecture": architecture,
         "variant": info.get("model", {}).get("variant"),
         "input": {
             "tensors": inspection["inputs"],
@@ -446,7 +520,7 @@ def _external_contract(
                 "logits": True,
                 "probabilities": True,
                 "identity_embedding": promotion.get("output_layers", {}).get("features") is not None,
-                "labels": info.get("labels", []),
+                "labels": _declared_labels(info),
             }
             if promotion.get("promoted") and task == "classification"
             else {
@@ -606,3 +680,148 @@ def ingest_keras_model(
         seal_run_artifact(destination)
         raise
     return {"output": str(destination), "artifact_id": sealed["artifact_id"], "run_id": run_id, "fingerprint_sha256": sealed["fingerprint_sha256"], "inspection": inspection}
+
+
+def ingest_savedmodel(
+    source: str | Path,
+    info_path: str | Path,
+    output: str | Path,
+    *,
+    dataset: str | Path | None = None,
+    promote: bool | None = None,
+) -> dict[str, Any]:
+    """Ingest a TensorFlow SavedModel without reconstructing it as Keras.
+
+    A promoted classification product writes a compact SavedModel adapter with
+    the canonical ``logits`` and ``probabilities`` outputs.  The original
+    SavedModel is copied unchanged for provenance and future conversion.
+    """
+    source_path = Path(source).expanduser().resolve()
+    metadata_path = Path(info_path).expanduser().resolve()
+    destination = Path(output).expanduser().resolve()
+    if not source_path.is_dir() or not (source_path / "saved_model.pb").is_file():
+        raise ValueError(f"Expected a TensorFlow SavedModel directory: {source_path}")
+    if destination.exists():
+        raise FileExistsError(destination)
+    info = load_toml(metadata_path)
+    product = dict(info.get("product", {}))
+    task = str(product.get("task", "generic")).lower()
+    if task not in {"generic", "classification", "segmentation"}:
+        raise ValueError("product.task must be generic, classification, or segmentation")
+    if task != "classification":
+        raise ValueError("SavedModel ingestion currently supports classification products only")
+    requested = bool(dict(info.get("promotion", {})).get("enabled", True))
+    if promote is not None:
+        requested = promote
+    if not requested:
+        raise ValueError("SavedModel classification ingestion requires promotion to the named-output contract")
+
+    loaded, signature, input_name, inspection = inspect_savedmodel(source_path)
+    input_shape = inspection["inputs"][0]["shape"][1:]
+    if any(value is None for value in input_shape):
+        raise ValueError("SavedModel must have a concrete non-batch input shape")
+    options = dict(info.get("promotion", {}))
+    activation = str(options.get("activation", "")).lower()
+    if activation not in {"softmax", "linear"}:
+        raise ValueError("SavedModel classification requires promotion.activation = 'softmax' or 'linear'")
+    output_name = str(options.get("output_name") or "")
+    output_specs = signature.structured_outputs
+    if not output_name:
+        if len(output_specs) != 1:
+            raise ValueError("promotion.output_name is required for a multi-output SavedModel")
+        output_name = next(iter(output_specs))
+    if output_name not in output_specs:
+        raise ValueError(f"promotion.output_name {output_name!r} is not a SavedModel output")
+    output_shape = _json_shape(output_specs[output_name].shape)
+    if len(output_shape) != 2:
+        raise ValueError("SavedModel classification output must be rank-2 [batch, classes]")
+    labels = _declared_labels(info)
+    if labels and output_shape[-1] is not None and len(labels) != output_shape[-1]:
+        raise ValueError(f"TOML declares {len(labels)} labels but model output has {output_shape[-1]} classes")
+
+    name = str(product.get("name") or source_path.name)
+    run_id = str(uuid.uuid4())
+    promotion_report = {
+        "requested": True,
+        "promoted": True,
+        "activation": activation,
+        "source_signature": (
+            signature.name.decode("utf-8")
+            if isinstance(signature.name, bytes)
+            else str(signature.name)
+        ),
+        "source_input": input_name,
+        "source_output": output_name,
+        "output_layers": {"logits": "logits", "probabilities": "probabilities", "features": None},
+        "assumptions": [
+            "SavedModel has no declared penultimate embedding; no identity_embedding was exported.",
+        ],
+    }
+    dataset_info = _dataset_reference(dataset, task)
+    dataset_info["labels"] = labels
+    config: dict[str, Any] = {
+        "run": {"run_id": run_id, "run_name": name, "task": task, "model": "external_savedmodel"},
+        "data": {"input_shape": input_shape},
+        "model": {"source_format": "tensorflow_savedmodel"},
+        "preprocessing": dict(info.get("preprocessing", {})),
+        "product": product,
+        "product_metadata": info,
+        "dataset": dataset_info,
+        "promotion": promotion_report,
+        "external_model_contract": _external_contract(
+            task, inspection, info, promotion_report, architecture="external_savedmodel"
+        ),
+        "paths": {"source_model": str(source_path), "info_path": str(metadata_path), "dataset_path": str(Path(dataset).expanduser().resolve()) if dataset else None, "run_dir": str(destination)},
+    }
+    manifest = create_run_artifact(destination, run_id=run_id, name=name, config=config,
+                                   source_config=metadata_path, artifact_type="model_product")
+    layout = RunLayout(destination)
+    create_unavailable_split_manifest(destination, config,
+        reason="Externally ingested model product has no Oracle Builder training split protocol.")
+    environment = write_environment(destination)
+    init_training_log(layout.training_log, run_id, name, config, environment)
+    try:
+        original = _copy_original(source_path, layout.model / "source" / "original_savedmodel")
+        adapter = _SavedModelClassificationAdapter(loaded, signature, input_name, output_name, activation)
+        input_spec = tf.TensorSpec([None, *input_shape], tf.as_dtype(inspection["inputs"][0]["dtype"]), name="inputs")
+        tf.saved_model.save(adapter, str(layout.model / "export_savedmodel"), signatures={
+            "serving_default": adapter.serve.get_concrete_function(input_spec),
+            "classify": adapter.classify.get_concrete_function(input_spec),
+        })
+        from oracle_builder.saving.load_test import run_load_tests
+        reload_test = run_load_tests(destination, config)
+        if not reload_test["prediction_test_passed"]:
+            raise RuntimeError("The exported SavedModel adapter failed its reload prediction test")
+        inspection["source"] = {"directory": source_path.name, "sha256": _sha256(source_path),
+                                "preserved_path": original.relative_to(destination).as_posix()}
+        inspection["promotion"] = promotion_report
+        inspection["reload_test"] = reload_test
+        (layout.model / "inspection.json").write_text(json.dumps(inspection, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        exported = layout.model / "export_savedmodel"
+        model_manifest = {
+            "schema_name": "oracle_builder_inference_bundle", "schema_version": "1.0.0",
+            "model_asset_id": str(uuid.uuid4()), "artifact_id": manifest["artifact_id"], "run_id": run_id,
+            "task": task, "architecture": "external_savedmodel", "input": config["external_model_contract"]["input"],
+            "outputs": config["external_model_contract"]["outputs"],
+            "inference_runtime": {"batching": {}, "note": "Batch sizing is selected by the calling inference host."},
+            "inference_contract": {"input_schema": "oracle_builder.inference_item", "result_schema": "oracle_builder.inference_result", "result_set_schema": "oracle_builder.inference_result_set", "version": "1.0.0", "persistence": "explicit", "adapter_required": False},
+            "formats": [
+                {"asset_id": str(uuid.uuid4()), "format": "tensorflow_savedmodel", "path": "export_savedmodel", "role": "preferred_inference_model", "sha256": _sha256(exported)},
+                {"asset_id": str(uuid.uuid4()), "format": "original_tensorflow_savedmodel", "path": original.relative_to(layout.model).as_posix(), "role": "preserved_source", "sha256": _sha256(original)},
+            ], "inspection_path": "inspection.json",
+        }
+        (layout.model / "model_manifest.json").write_text(json.dumps(model_manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        (layout.model / "load_test_report.json").write_text(json.dumps(reload_test, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        layout.metrics_json.write_text("{}\n", encoding="utf-8")
+        layout.metrics_csv.write_text("epoch\n", encoding="utf-8")
+        log_event(layout.training_log, run_id, "INFO", "Imported external TensorFlow SavedModel", {"source_sha256": inspection["source"]["sha256"], "promotion": promotion_report})
+        mark_run_complete(layout.training_log, run_id, "complete")
+        update_run_artifact(destination, status="complete", summary={"product": product, "inspection": {"input_count": 1, "output_count": len(inspection["outputs"])}})
+        sealed = seal_run_artifact(destination)
+    except Exception:
+        mark_run_complete(layout.training_log, run_id, "failed")
+        update_run_artifact(destination, status="failed", error="SavedModel product ingestion failed")
+        seal_run_artifact(destination)
+        raise
+    return {"output": str(destination), "artifact_id": sealed["artifact_id"], "run_id": run_id,
+            "fingerprint_sha256": sealed["fingerprint_sha256"], "inspection": inspection}

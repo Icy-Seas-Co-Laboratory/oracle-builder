@@ -99,7 +99,7 @@ def decode_inference_request(
     payload: bytes,
     *,
     max_payload_bytes: int = 256 * 1024 * 1024,
-    max_items: int = 128,
+    max_items: int | None = None,
 ) -> InferenceRequest:
     with _load_npz(payload, max_payload_bytes=max_payload_bytes) as archive:
         manifest = _read_manifest(archive)
@@ -110,7 +110,7 @@ def decode_inference_request(
         rows = manifest.get("items")
         if not isinstance(rows, list) or not rows:
             raise InferenceTransportError("Inference request must contain at least one item")
-        if len(rows) > max_items:
+        if max_items is not None and len(rows) > max_items:
             raise InferenceTransportError(f"Inference request exceeds the {max_items}-item limit")
         items: list[InferenceItem] = []
         for row in rows:

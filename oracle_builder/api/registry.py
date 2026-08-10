@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from oracle_builder.inference import InferenceBundle
+from oracle_builder.api.microbatch import MicroBatchExecutor
 
 
 _ALIAS_SAFE = re.compile(r"[^a-z0-9._-]+")
@@ -73,17 +74,27 @@ class RegisteredModel:
     bundle: InferenceBundle | None = None
     load_error: str | None = None
     catalog: dict[str, Any] = field(default_factory=dict)
-    inference_lock: threading.Lock = field(default_factory=threading.Lock)
+    executor: MicroBatchExecutor | None = None
 
 
 class InferenceModelRegistry:
     """Thread-safe alias and immutable-artifact lookup for resident bundles."""
 
-    def __init__(self, *, loader: Callable[[Path], InferenceBundle] | None = None):
+    def __init__(
+        self,
+        *,
+        loader: Callable[[Path], InferenceBundle] | None = None,
+        serving_max_batch_size: int = 256,
+        serving_max_wait_ms: int = 8,
+        serving_queue_capacity: int = 1024,
+    ):
         self._loader = loader or InferenceBundle.load
         self._models: dict[str, RegisteredModel] = {}
         self._artifact_aliases: dict[str, str] = {}
         self._lock = threading.RLock()
+        self._serving_max_batch_size = max(1, int(serving_max_batch_size))
+        self._serving_max_wait_ms = max(0, int(serving_max_wait_ms))
+        self._serving_queue_capacity = max(1, int(serving_queue_capacity))
 
     def register(self, alias: str, run_dir: str | Path) -> None:
         normalized = alias.strip()
@@ -152,6 +163,19 @@ class InferenceModelRegistry:
                 return registration.bundle
             try:
                 registration.bundle = self._loader(registration.run_dir)
+                maximum = self._serving_max_batch_size
+                warm = getattr(registration.bundle, "warm_for_serving", None)
+                if callable(warm):
+                    diagnostics = warm(batch_sizes=(1, maximum))
+                    resolved = diagnostics.get("resolved_max_batch_size")
+                    if isinstance(resolved, int):
+                        maximum = min(maximum, max(1, resolved))
+                registration.executor = MicroBatchExecutor(
+                    registration.bundle,
+                    max_batch_size=maximum,
+                    max_wait_ms=self._serving_max_wait_ms,
+                    queue_capacity=self._serving_queue_capacity,
+                )
                 registration.load_error = None
                 reference = registration.bundle.model_reference
                 self._artifact_aliases[reference.artifact_id] = alias
@@ -171,14 +195,31 @@ class InferenceModelRegistry:
                     raise
 
     def predict(self, selector: str, items: list[Any]):
-        """Run one batch while bounding concurrency independently per model."""
+        """Submit one request to the resident model's bounded micro-batcher."""
 
-        bundle = self.load(selector)
+        self.load(selector)
         with self._lock:
             alias = self._artifact_aliases.get(selector, selector)
             registration = self._models[alias]
-        with registration.inference_lock:
-            return bundle.predict_batch(items)
+        if registration.executor is None:
+            raise RuntimeError(f"Inference executor for {selector!r} is unavailable")
+        return registration.executor.submit(items)
+
+    def max_items_for(self, selector: str) -> int:
+        """Return the startup-configured safe request size for one loaded model."""
+        self.load(selector)
+        with self._lock:
+            alias = self._artifact_aliases.get(selector, selector)
+            registration = self._models[alias]
+        if registration.executor is None:
+            raise RuntimeError(f"Inference executor for {selector!r} is unavailable")
+        return registration.executor.max_batch_size
+
+    def close(self) -> None:
+        with self._lock:
+            executors = [value.executor for value in self._models.values() if value.executor is not None]
+        for executor in executors:
+            executor.close()
 
     def describe(self, *, task: str | None = None) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
@@ -198,6 +239,10 @@ class InferenceModelRegistry:
                 row["task"] = bundle.model_reference.task
                 row["architecture"] = bundle.model_reference.architecture
                 row["capabilities"] = self._capabilities(bundle)
+                row["runtime"] = {
+                    **getattr(bundle, "runtime_diagnostics", {}),
+                    "microbatch": registration.executor.diagnostics() if registration.executor is not None else None,
+                }
             if task is None or row.get("task") == task:
                 rows.append(row)
         return sorted(rows, key=lambda value: value["alias"])
