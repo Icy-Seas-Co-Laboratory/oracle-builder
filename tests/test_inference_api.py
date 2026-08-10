@@ -87,6 +87,14 @@ def test_npz_transport_does_not_apply_an_independent_request_limit():
     assert len(decoded.items) == 256
 
 
+def test_inference_api_normalizes_proxy_root_path():
+    registry = InferenceModelRegistry()
+
+    app = create_app(registry, preload=False, root_path="oracle-builder-api/")
+
+    assert app.root_path == "/oracle-builder-api"
+
+
 def test_inference_api_uses_the_registry_execution_limit_for_request_validation(tmp_path: Path):
     from fastapi.testclient import TestClient
 

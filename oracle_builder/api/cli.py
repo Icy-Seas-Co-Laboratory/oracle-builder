@@ -22,6 +22,11 @@ def main() -> None:
     )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8100)
+    parser.add_argument(
+        "--root-path",
+        default=os.environ.get("ORACLE_BUILDER_ROOT_PATH", ""),
+        help="Externally visible path prefix when served behind a reverse proxy.",
+    )
     parser.add_argument("--no-preload", action="store_true")
     parser.add_argument("--max-batch-size", type=int, default=256, help="Maximum combined inference items per model execution.")
     parser.add_argument("--max-wait-ms", type=int, default=8, help="Maximum queueing delay while forming a micro-batch.")
@@ -58,6 +63,7 @@ def main() -> None:
             registry,
             auth_token=os.environ.get("ORACLE_BUILDER_API_TOKEN"),
             preload=not args.no_preload,
+            root_path=args.root_path,
         ),
         host=args.host,
         port=args.port,

@@ -23,6 +23,7 @@ def create_app(
     auth_token: str | None = None,
     preload: bool = True,
     max_payload_bytes: int = 256 * 1024 * 1024,
+    root_path: str = "",
 ) -> FastAPI:
     if max_payload_bytes < 1:
         raise ValueError("Inference payload limit must be positive")
@@ -36,7 +37,13 @@ def create_app(
         finally:
             registry.close()
 
-    app = FastAPI(title="Oracle Builder Inference API", version="1.0.0", lifespan=lifespan)
+    normalized_root_path = "" if root_path.strip() in {"", "/"} else f"/{root_path.strip().strip('/')}"
+    app = FastAPI(
+        title="Oracle Builder Inference API",
+        version="1.0.0",
+        lifespan=lifespan,
+        root_path=normalized_root_path,
+    )
     app.state.registry = registry
 
     def authorize(authorization: str | None) -> None:
@@ -140,6 +147,7 @@ def app_from_environment() -> FastAPI:
         auth_token=os.environ.get("ORACLE_BUILDER_API_TOKEN"),
         preload=os.environ.get("ORACLE_BUILDER_PRELOAD", "true").lower() not in {"0", "false", "no"},
         max_payload_bytes=int(os.environ.get("ORACLE_BUILDER_MAX_PAYLOAD_BYTES", 256 * 1024 * 1024)),
+        root_path=os.environ.get("ORACLE_BUILDER_ROOT_PATH", ""),
     )
 
 
