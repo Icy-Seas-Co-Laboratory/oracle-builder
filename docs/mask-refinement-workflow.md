@@ -9,10 +9,10 @@ detection IDs and are not overwritten merely by opening the editor.
 ## 1. Install the editor and choose a working database
 
 ```bash
-python3 -m pip install -r requirements-gui.txt
+uv sync --extra gui
 
 # Start a local-image workspace, or open an existing one.
-python3 mask_builder.py --database workspaces/roi-review.sqlite
+uv run python mask_builder.py --database workspaces/roi-review.sqlite
 ```
 
 `--database` is both the input and output workspace. With no image or Pelagia
@@ -20,7 +20,7 @@ option, it opens existing items. Add `--missing-masks-only` to focus review on
 items that do not yet have a current validated mask:
 
 ```bash
-python3 mask_builder.py \
+uv run python mask_builder.py \
   --database workspaces/roi-review.sqlite \
   --missing-masks-only
 ```
@@ -56,7 +56,7 @@ Pelagia request; it is not deliberately stored in the SQLite dataset.
 Before opening the editor, list the available detections and refine the query:
 
 ```bash
-python3 mask_builder.py \
+uv run python mask_builder.py \
   --api-base-url https://pelagia.example.org \
   --list-api-rois \
   --api-run-id RUN_UUID \
@@ -74,7 +74,7 @@ mode described next.
 For a known detection, open it and add it to the working database:
 
 ```bash
-python3 mask_builder.py \
+uv run python mask_builder.py \
   --api-base-url https://pelagia.example.org \
   --api-roi-id DETECTION_UUID \
   --database workspaces/roi-review.sqlite
@@ -85,7 +85,7 @@ immediately; subsequent ROIs are fetched as you navigate. Saving an ROI writes
 it to `--database`, together with Pelagia metadata and the candidate mask.
 
 ```bash
-python3 mask_builder.py \
+uv run python mask_builder.py \
   --api-base-url https://pelagia.example.org \
   --api-browse-rois \
   --database workspaces/roi-review.sqlite \
@@ -128,7 +128,7 @@ endpoint.
 For example, inspect rectangular ROIs from one asset before adding them:
 
 ```bash
-python3 mask_builder.py \
+uv run python mask_builder.py \
   --list-api-rois \
   --api-asset-id ASSET_UUID \
   --api-min-bbox-w 64 --api-max-bbox-w 512 \
@@ -147,7 +147,7 @@ audit.
 For local files, use an existing database exactly as above:
 
 ```bash
-python3 mask_builder.py \
+uv run python mask_builder.py \
   --image images/to_mask \
   --database workspaces/roi-review.sqlite
 ```
@@ -167,13 +167,13 @@ oracle-dataset snapshot workspaces/roi-review.sqlite \
 ## 5. Validate, configure, and freeze
 
 ```bash
-python3 mask_builder.py \
+uv run python mask_builder.py \
   --database workspaces/roi-review.sqlite \
   --validate-unet-dataset \
   --unet-input-shape 256,256,2 \
   --unet-output-shape 256,256,1
 
-python3 mask_builder.py \
+uv run python mask_builder.py \
   --database workspaces/roi-review.sqlite \
   --write-unet-config configs/unet_training.toml \
   --unet-input-shape 256,256,2 \
@@ -231,17 +231,21 @@ method = "grayscale_reconstruction"
 database = "datasets/classification-corpus.sqlite"
 epochs = 50
 learning_rate = 0.001
+# Bright structure is weighted above dark background during reconstruction.
+reconstruction_foreground_weight = 4.0
 ```
 
 It pretrains the selected U-Net-family encoder/decoder to reconstruct grayscale
-images, transfers matching convolution weights, and initializes candidate and
-distance-channel weights to zero during segmentation training. The segmentation
-head remains newly initialized.
+images with a disposable linear reconstruction head. Bright structure receives
+extra reconstruction weight (`reconstruction_foreground_weight`), which avoids
+the trivial all-background solution for sparse ROIs. Matching convolution
+weights transfer to segmentation; candidate and distance-channel weights start
+at zero, and the segmentation head remains newly initialized.
 
 ## 6. Train
 
 ```bash
-python3 model_training.py \
+uv run python model_training.py \
   --config configs/unet_training.toml \
   --input datasets/unet_training.v1.sqlite \
   --output unet-v1

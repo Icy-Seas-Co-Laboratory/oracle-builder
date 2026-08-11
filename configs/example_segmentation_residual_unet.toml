@@ -50,6 +50,8 @@ method = "grayscale_reconstruction"
 database = "datasets/classification-corpus.sqlite"
 epochs = 50
 learning_rate = 0.001
+# Gives bright image structure more influence than the large dark background.
+reconstruction_foreground_weight = 4.0
 
 [callbacks]
 early_stopping = true

@@ -8,9 +8,9 @@ operational data.
 ## Install and serve
 
 ```bash
-python -m pip install -e '.[api]'
+uv sync --extra api
 
-oracle-serve \
+uv run oracle-serve \
   --models-root ./models \
   --host 127.0.0.1 \
   --port 8100
@@ -25,7 +25,7 @@ When a reverse proxy exposes the service beneath a path prefix, supply that
 external prefix so OpenAPI documentation and generated URLs remain correct:
 
 ```bash
-oracle-serve \
+uv run oracle-serve \
   --models-root ./models \
   --root-path /oracle-builder-api \
   --host 127.0.0.1 \
@@ -61,7 +61,7 @@ correlated result set.
 The service startup options are the single source of truth for these limits:
 
 ```bash
-oracle-serve --models-root ./models \
+uv run oracle-serve --models-root ./models \
   --max-batch-size 256 --max-wait-ms 8 --queue-capacity 1024
 ```
 

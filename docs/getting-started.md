@@ -3,27 +3,25 @@
 ## Install and verify
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python3 -m pip install -r requirements.txt
-python3 -m pip install -e .
-python3 scripts/check_tensorflow_devices.py
+uv sync
+uv run python scripts/check_tensorflow_devices.py
 ```
 
-For NVIDIA Linux/WSL or Apple Metal, install the corresponding
-`requirements-gpu-*.txt` file before verification.
+For NVIDIA Linux/WSL or Apple Metal, synchronize the corresponding extra before
+verification, for example `uv sync --extra gpu-macos`. The available extras are
+`gpu-linux`, `gpu-wsl2`, and `gpu-macos`.
 
 ## Run a small classification example
 
 ```bash
-python3 -m oracle_builder.data.sqlite_dataset \
+uv run python -m oracle_builder.data.sqlite_dataset \
   --classification datasets/example_classification.sqlite
 
-oracle-dataset checkpoint \
+uv run oracle-dataset checkpoint \
   datasets/example_classification.sqlite \
   --output datasets/example_classification.training.sqlite
 
-python3 model_training.py \
+uv run python model_training.py \
   --config configs/example_classification.toml \
   --input datasets/example_classification.training.sqlite \
   --output example-classification-run \

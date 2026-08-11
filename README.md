@@ -11,11 +11,15 @@ tree, so other applications can share the same SQLite schema and lifecycle APIs.
 ## Start here
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python3 -m pip install -r requirements.txt
-python3 -m pip install -e .
+uv sync
 ```
+
+Run project commands through uv so they always use the synchronized environment,
+for example `uv run oracle-dataset --help` or `uv run python model_training.py --help`.
+
+For the development/test environment with the optional GUI and API features, run
+`uv sync --extra gui --extra api`, then run `uv run pytest`. Choose a GPU extra
+for your platform separately; do not install every GPU extra at once.
 
 Choose the guide that matches what you want to do:
 

@@ -37,6 +37,8 @@ method = "grayscale_reconstruction"
 database = "./datasets/ROI-Refinement/dataset.checkpoint-20260811T191330.260682Z.sqlite"
 epochs = 10
 learning_rate = 0.001
+# Gives bright image structure more influence than the large dark background.
+reconstruction_foreground_weight = 4.0
 
 [training]
 epochs = 10

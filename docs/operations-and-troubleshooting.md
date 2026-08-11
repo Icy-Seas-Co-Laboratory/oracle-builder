@@ -32,12 +32,10 @@ deterministic exchange format, metadata, and PostgreSQL mapping.
 
 ### `ModuleNotFoundError: oracle_builder`
 
-Run commands from the repository root after activating its environment, then
-install the project:
+Run commands from the repository root and synchronize the project environment:
 
 ```bash
-source .venv/bin/activate
-python3 -m pip install -e .
+uv sync
 ```
 
 ### Dataset is not trainable
@@ -46,23 +44,24 @@ Training needs a frozen Dataset V1 file and usable accepted annotations/labels.
 For segmentation, run:
 
 ```bash
-python3 mask_builder.py --database DATASET.sqlite --validate-unet-dataset
-python3 model_training.py --config CONFIG.toml --input DATASET.sqlite --output check --preflight
+uv run python mask_builder.py --database DATASET.sqlite --validate-unet-dataset
+uv run python model_training.py --config CONFIG.toml --input DATASET.sqlite --output check --preflight
 ```
 
 ### TensorFlow cannot see a GPU
 
 ```bash
-python3 scripts/check_tensorflow_devices.py
+uv run python scripts/check_tensorflow_devices.py
 ```
 
-Install the matching `requirements-gpu-linux.txt`, `requirements-gpu-wsl2.txt`,
-or `requirements-gpu-macos.txt`. On NVIDIA systems also verify `nvidia-smi`.
+Install the matching uv extra: `uv sync --extra gpu-linux`,
+`uv sync --extra gpu-wsl2`, or `uv sync --extra gpu-macos`. On NVIDIA systems
+also verify `nvidia-smi`.
 
 ### Napari or mask-editor dependencies are missing
 
 ```bash
-python3 -m pip install -r requirements-gui.txt
+uv sync --extra gui
 ```
 
 ### Matplotlib cannot write its cache

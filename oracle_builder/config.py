@@ -76,6 +76,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "projection_dim": 128,
         "projection_hidden_dim": 256,
         "temperature": 0.1,
+        "reconstruction_foreground_weight": 4.0,
         "use_training_augmentation": False,
         "augmentation": {},
     },
@@ -316,6 +317,10 @@ def validate_config(config: dict[str, Any]) -> None:
             raise ValueError("pretraining.projection_hidden_dim must be positive")
         if float(pretraining.get("temperature", 0.1)) <= 0:
             raise ValueError("pretraining.temperature must be greater than zero")
+        if float(pretraining.get("reconstruction_foreground_weight", 4.0)) < 1:
+            raise ValueError(
+                "pretraining.reconstruction_foreground_weight must be at least 1"
+            )
     if task == "segmentation" and "output_shape" not in config["data"]:
         raise ValueError("data.output_shape is required for segmentation")
     distance_mode = str(config["data"].get("candidate_distance", "none")).lower()

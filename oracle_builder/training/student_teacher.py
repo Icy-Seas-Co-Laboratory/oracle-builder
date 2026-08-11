@@ -87,18 +87,40 @@ def load_grayscale_reconstruction_dataset(database: str | Path, config: dict[str
     return tf.data.Dataset.from_tensor_slices((x, x)).shuffle(len(x), seed=int(config["run"].get("seed", 123))).batch(int(config["pretraining"].get("batch_size", config["data"].get("batch_size", 16)))).prefetch(tf.data.AUTOTUNE)
 
 
-def run_grayscale_reconstruction_pretraining(model, dataset, config, run_dir, strategy=None):
-    """Pretrain the matching U-Net family as a 1-channel reconstruction model."""
-    strategy = strategy or tf.distribute.get_strategy()
+def grayscale_reconstruction_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Return a grayscale reconstruction configuration with a disposable linear head."""
     pre_config = copy.deepcopy(config)
     pre_config["run"]["task"] = "segmentation"
     pre_config["data"]["input_shape"] = [*config["data"]["input_shape"][:2], 1]
     pre_config["data"]["output_shape"] = [*config["data"]["input_shape"][:2], 1]
     pre_config["data"]["candidate_sdf"] = False
     pre_config["data"]["candidate_distance"] = "none"
+    # This head is never transferred to segmentation. Keeping it linear prevents
+    # the reconstruction loss from becoming gradient-free if sigmoid saturates.
+    pre_config.setdefault("model", {})["final_activation"] = "linear"
+    return pre_config
+
+
+def foreground_weighted_reconstruction_mse(y_true, y_pred, foreground_weight: float = 4.0):
+    """MSE that gives bright normalized image structure additional influence."""
+    targets = tf.cast(y_true, y_pred.dtype)
+    weight = 1.0 + (float(foreground_weight) - 1.0) * tf.clip_by_value(targets, 0.0, 1.0)
+    return tf.reduce_mean(weight * tf.square(y_pred - targets), axis=[1, 2, 3])
+
+
+def run_grayscale_reconstruction_pretraining(model, dataset, config, run_dir, strategy=None):
+    """Pretrain the matching U-Net family as a 1-channel reconstruction model."""
+    strategy = strategy or tf.distribute.get_strategy()
+    pre_config = grayscale_reconstruction_config(config)
+    foreground_weight = float(config["pretraining"].get("reconstruction_foreground_weight", 4.0))
     with strategy.scope():
         pre_model = get_model_builder(config["run"]["model"])(pre_config)
-        pre_model.compile(optimizer=keras.optimizers.Adam(float(config["pretraining"].get("learning_rate", 0.001))), loss="mse")
+        pre_model.compile(
+            optimizer=keras.optimizers.Adam(float(config["pretraining"].get("learning_rate", 0.001))),
+            loss=lambda targets, prediction: foreground_weighted_reconstruction_mse(
+                targets, prediction, foreground_weight
+            ),
+        )
     history = pre_model.fit(dataset, epochs=int(config["pretraining"].get("epochs", 10)), verbose=2 if config.get("debug") else 1)
     source_convs = [layer for layer in pre_model.layers if isinstance(layer, layers.Conv2D)]
     target_convs = [layer for layer in model.layers if isinstance(layer, layers.Conv2D)]

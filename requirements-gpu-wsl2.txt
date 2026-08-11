@@ -1,5 +1,0 @@
-# Windows GPU install profile via WSL2.
-# Native Windows GPU support is not available for modern TensorFlow releases;
-# use WSL2 with NVIDIA CUDA support instead.
--r requirements.txt
-tensorflow[and-cuda]

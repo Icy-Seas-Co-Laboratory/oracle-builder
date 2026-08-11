@@ -5,6 +5,7 @@ import sqlite3
 
 import numpy as np
 import pytest
+import tensorflow as tf
 
 from oracle_builder.config import validate_config
 from oracle_builder.data.sqlite_dataset import (
@@ -15,11 +16,14 @@ from oracle_builder.data.sqlite_dataset import (
 from oracle_builder.training.student_teacher import (
     SimCLRPretrainer,
     StudentTeacherPretrainer,
+    foreground_weighted_reconstruction_mse,
+    grayscale_reconstruction_config,
     load_grayscale_reconstruction_dataset,
     make_pretraining_dataset,
     run_student_teacher_pretraining,
 )
 from oracle_builder.training.train import build_and_compile_model
+from oracle_builder.registry import get_model_builder
 
 
 def pretraining_config():
@@ -133,6 +137,7 @@ def test_pretraining_wrappers_expose_a_buildable_call_path(pretrainer_type):
         ("epochs", 0, "epochs"),
         ("teacher_momentum", 1.0, "momentum"),
         ("projection_dim", 0, "projection_dim"),
+        ("reconstruction_foreground_weight", 0.5, "foreground_weight"),
     ],
 )
 def test_invalid_pretraining_configuration_is_rejected(field, value, message):
@@ -156,6 +161,53 @@ def test_pretraining_is_rejected_for_segmentation():
 def test_grayscale_reconstruction_requires_existing_dataset(tmp_path):
     with pytest.raises(FileNotFoundError, match="does not exist"):
         load_grayscale_reconstruction_dataset(tmp_path / "missing.sqlite", pretraining_config())
+
+
+def test_grayscale_reconstruction_uses_linear_disposable_head():
+    config = pretraining_config()
+    config["run"].update({"task": "segmentation", "model": "unet"})
+    config["data"]["output_shape"] = [16, 16, 1]
+    config["model"]["final_activation"] = "sigmoid"
+
+    reconstruction = grayscale_reconstruction_config(config)
+
+    assert reconstruction["data"]["input_shape"] == [16, 16, 1]
+    assert reconstruction["model"]["final_activation"] == "linear"
+    assert config["model"]["final_activation"] == "sigmoid"
+
+
+def test_foreground_weighted_reconstruction_mse_emphasizes_bright_pixels():
+    targets = np.array([[[[0.0], [1.0]]]], dtype="float32")
+    prediction = np.zeros_like(targets)
+
+    loss = foreground_weighted_reconstruction_mse(targets, prediction, 4.0)
+
+    np.testing.assert_allclose(loss.numpy(), [2.0])
+
+
+def test_grayscale_reconstruction_pretraining_runs_with_linear_head(tmp_path):
+    from oracle_builder.training.student_teacher import (
+        run_grayscale_reconstruction_pretraining,
+    )
+
+    config = pretraining_config()
+    config["run"].update({"task": "segmentation", "model": "unet"})
+    config["data"]["output_shape"] = [16, 16, 1]
+    config["pretraining"].update(
+        {
+            "method": "grayscale_reconstruction",
+            "reconstruction_foreground_weight": 4.0,
+        }
+    )
+    images = np.zeros((2, 16, 16, 1), dtype="float32")
+    images[:, 4:12, 4:12] = 1.0
+    dataset = tf.data.Dataset.from_tensor_slices((images, images)).batch(2)
+    model = get_model_builder("unet")(config)
+
+    history = run_grayscale_reconstruction_pretraining(model, dataset, config, tmp_path)
+
+    assert np.isfinite(history.history["loss"][-1])
+    assert (tmp_path / "model" / "pretraining" / "grayscale_reconstruction.weights.h5").exists()
 
 
 def test_unlabeled_train_rois_are_available_only_to_pretraining(tmp_path):
