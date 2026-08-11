@@ -9,7 +9,14 @@ import numpy as np
 from PIL import Image
 
 from oracle_builder.masking.morphology import fill_holes, keep_largest_component, remove_small_objects
-from oracle_builder.masking.sqlite_io import create_or_update_image_sample, load_sample, open_database, save_mask_annotation
+from oracle_builder.masking.sqlite_io import (
+    create_or_update_image_sample,
+    delete_image_sample,
+    duplicate_image_sample,
+    load_sample,
+    open_database,
+    save_mask_annotation,
+)
 from oracle_builder.masking.threshold import invert_display_image, threshold_mask
 from oracle_builder.masking.validation import validate_mask
 
@@ -138,7 +145,11 @@ def launch_mask_builder_app(
     try:
         import napari
         from qtpy.QtCore import QSize, Qt
-        from qtpy.QtGui import QIcon, QImage, QPixmap
+        from qtpy.QtGui import QIcon, QImage, QKeySequence, QPixmap
+        try:
+            from qtpy.QtGui import QShortcut
+        except ImportError:  # Qt5 exposes QShortcut from QtWidgets.
+            from qtpy.QtWidgets import QShortcut
         from qtpy.QtWidgets import (
             QButtonGroup,
             QCheckBox,
@@ -148,6 +159,7 @@ def launch_mask_builder_app(
             QHBoxLayout,
             QLabel,
             QLineEdit,
+            QMessageBox,
             QPushButton,
             QScrollArea,
             QSpinBox,
@@ -418,16 +430,74 @@ def launch_mask_builder_app(
     def skip_current() -> None:
         load_queue_index(current["index"] + 1)
 
+    def delete_current() -> None:
+        if read_only:
+            set_status("Read-only mode: no SQLite writes were performed.")
+            return
+        if output_path is None:
+            set_status("No output database path is configured.")
+            return
+        sample_id = current["uuid"]
+        choice = QMessageBox.question(
+            panel,
+            "Delete image",
+            f"Delete image {sample_id} and its mask annotations from the database?\n\nThis cannot be undone.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if choice != QMessageBox.Yes:
+            return
+        try:
+            with open_database(output_path, create=False) as conn:
+                delete_image_sample(conn, sample_id)
+        except Exception as exc:
+            set_status(f"Could not delete image {sample_id}: {exc}")
+            return
+        deleted_index = current["index"]
+        del queue[deleted_index]
+        sample_cache.clear()
+        if not queue:
+            title.setText("No images remaining")
+            viewer.title = "oracle-builder mask builder: no images remaining"
+            rebuild_thumbnail_buttons()
+            set_status(f"Deleted image {sample_id}. No images remain in the queue.")
+            return
+        next_index = min(deleted_index, len(queue) - 1)
+        rebuild_thumbnail_buttons()
+        load_queue_index(next_index)
+        set_status(f"Deleted image {sample_id}.")
+
+    def duplicate_current() -> None:
+        if read_only:
+            set_status("Read-only mode: no SQLite writes were performed.")
+            return
+        if output_path is None:
+            set_status("No output database path is configured.")
+            return
+        source_index = current["index"]
+        source_id = current["uuid"]
+        try:
+            with open_database(output_path, create=False) as conn:
+                duplicate_id = duplicate_image_sample(conn, source_id)
+        except Exception as exc:
+            set_status(f"Could not duplicate image {source_id}: {exc}")
+            return
+        queue.insert(source_index + 1, {"uuid": duplicate_id})
+        sample_cache.clear()
+        rebuild_thumbnail_buttons()
+        load_queue_index(source_index + 1)
+        set_status(f"Duplicated image {source_id} as {duplicate_id}.")
+
     def add_button(label: str, callback) -> QPushButton:
         button = QPushButton(label)
         button.clicked.connect(callback)
         layout.addWidget(button)
         return button
 
-    add_button("Apply threshold", apply_threshold)
-    add_button("Fill holes", do_fill_holes)
-    add_button("Remove small objects", do_remove_small_objects)
-    add_button("Keep largest component", do_keep_largest)
+    add_button("Apply threshold (A)", apply_threshold)
+    add_button("Fill holes (F)", do_fill_holes)
+    add_button("Remove small objects (R)", do_remove_small_objects)
+    add_button("Keep largest component (L)", do_keep_largest)
     add_button("Validate", do_validate)
 
     save_buttons = QHBoxLayout()
@@ -437,13 +507,21 @@ def launch_mask_builder_app(
     save_next_button.clicked.connect(lambda: save_current(True))
     skip_button = QPushButton("Skip")
     skip_button.clicked.connect(skip_current)
+    delete_button = QPushButton("Delete image")
+    delete_button.clicked.connect(delete_current)
+    duplicate_button = QPushButton("Duplicate image")
+    duplicate_button.clicked.connect(duplicate_current)
     save_buttons.addWidget(save_button)
     save_buttons.addWidget(save_next_button)
     save_buttons.addWidget(skip_button)
+    save_buttons.addWidget(delete_button)
+    save_buttons.addWidget(duplicate_button)
     layout.addLayout(save_buttons)
     if read_only:
         save_button.setEnabled(False)
         save_next_button.setEnabled(False)
+        delete_button.setEnabled(False)
+        duplicate_button.setEnabled(False)
     if len(queue) <= 1:
         save_next_button.setEnabled(False)
         skip_button.setEnabled(False)
@@ -488,30 +566,57 @@ def launch_mask_builder_app(
         if load_queue_index(index):
             position_label.setText(f"ROI {index + 1} of {len(queue)}")
 
-    for index, info in enumerate(queue):
-        button = QToolButton()
-        button.setCheckable(True)
-        button.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
-        button.setIconSize(QSize(112, 112))
-        button.setText(str(info.get("uuid", index))[:16])
-        button.setToolTip(str(info.get("uuid", index)))
-        try:
-            thumbnail = np.ascontiguousarray(_thumbnail_rgb(load_thumbnail_sample(index)["image"]))
-            height, width, _channels = thumbnail.shape
-            qimage = QImage(thumbnail.data, width, height, width * 3, QImage.Format_RGB888).copy()
-            button.setIcon(QIcon(QPixmap.fromImage(qimage)))
-        except Exception as exc:
-            if debug:
-                print(f"Could not load thumbnail for {info.get('uuid', index)}: {exc}")
-        button.clicked.connect(lambda _checked=False, selected=index: navigate_to(selected))
-        button_group.addButton(button, index)
-        strip_layout.addWidget(button)
-        thumbnail_buttons.append(button)
+    def rebuild_thumbnail_buttons() -> None:
+        for button in thumbnail_buttons:
+            button_group.removeButton(button)
+            strip_layout.removeWidget(button)
+            button.deleteLater()
+        thumbnail_buttons.clear()
+        for index, info in enumerate(queue):
+            button = QToolButton()
+            button.setCheckable(True)
+            button.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
+            button.setIconSize(QSize(112, 112))
+            button.setText(str(index + 1))
+            button.setToolTip(f"ROI {index + 1}: {info.get('uuid', index)}")
+            try:
+                thumbnail = np.ascontiguousarray(_thumbnail_rgb(load_thumbnail_sample(index)["image"]))
+                height, width, _channels = thumbnail.shape
+                qimage = QImage(thumbnail.data, width, height, width * 3, QImage.Format_RGB888).copy()
+                button.setIcon(QIcon(QPixmap.fromImage(qimage)))
+            except Exception as exc:
+                if debug:
+                    print(f"Could not load thumbnail for {info.get('uuid', index)}: {exc}")
+            button.clicked.connect(lambda _checked=False, selected=index: navigate_to(selected))
+            button_group.addButton(button, index)
+            strip_layout.addWidget(button)
+            thumbnail_buttons.append(button)
+        if thumbnail_buttons:
+            selected_index = min(current["index"], len(thumbnail_buttons) - 1)
+            thumbnail_buttons[selected_index].setChecked(True)
+
+    rebuild_thumbnail_buttons()
     strip_layout.addStretch(1)
     scroll.setWidget(strip)
     thumbnail_panel_layout.addWidget(scroll)
     navigation["thumbnail_buttons"] = thumbnail_buttons
-    thumbnail_buttons[0].setChecked(True)
     viewer.window.add_dock_widget(thumbnail_panel, area="bottom", name="ROI Navigator")
+
+    shortcuts: list[Any] = []
+
+    def add_shortcut(key: str, callback: Callable[[], None]) -> None:
+        shortcut = QShortcut(QKeySequence(key), panel)
+        shortcut.setContext(Qt.ApplicationShortcut)
+        shortcut.activated.connect(callback)
+        shortcuts.append(shortcut)
+
+    add_shortcut("Left", lambda: navigate_to(current["index"] - 1))
+    add_shortcut("Right", lambda: navigate_to(current["index"] + 1))
+    add_shortcut("A", apply_threshold)
+    add_shortcut("F", do_fill_holes)
+    add_shortcut("R", do_remove_small_objects)
+    add_shortcut("L", do_keep_largest)
+    navigation["shortcuts"] = shortcuts
+
     set_status("Ready. Paint label 1 for foreground and label 0 to erase.")
     napari.run()

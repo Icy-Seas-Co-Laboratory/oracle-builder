@@ -229,6 +229,93 @@ def list_samples(
     ]
 
 
+def delete_image_sample(conn: sqlite3.Connection, sample_uuid: str) -> None:
+    """Remove an image item and all database records that depend on it.
+
+    Assets are intentionally retained: they are content-addressed and may be
+    shared by other items. They can be reclaimed later by a dedicated, safe
+    maintenance operation.
+    """
+    ensure_mask_builder_columns(conn)
+    conn.execute("PRAGMA foreign_keys = ON")
+    with conn:
+        cursor = conn.execute(
+            "DELETE FROM dataset_items WHERE item_id = ?", (sample_uuid,)
+        )
+        if cursor.rowcount != 1:
+            raise KeyError(f"Cannot delete image; sample does not exist: {sample_uuid}")
+
+
+def duplicate_image_sample(
+    conn: sqlite3.Connection, sample_uuid: str, new_uuid: str | None = None
+) -> str:
+    """Duplicate a mask-refinement item under a fresh UUID.
+
+    Image and mask assets are immutable and content-addressed, so the duplicate
+    safely reuses them. Its current mask is copied as one new annotation rather
+    than sharing annotation history with the original.
+    """
+    ensure_mask_builder_columns(conn)
+    repository = SQLiteDatasetRepository(conn)
+    duplicate_uuid = new_uuid or str(uuid_module.uuid4())
+    with conn:
+        source = conn.execute(
+            """
+            SELECT di.sample_weight, di.metadata_json, mi.image_asset_id,
+                   mi.candidate_mask_asset_id
+            FROM dataset_items di
+            JOIN mask_refinement_items mi ON mi.item_id = di.item_id
+            WHERE di.item_id = ?
+            """,
+            (sample_uuid,),
+        ).fetchone()
+        if source is None:
+            raise KeyError(f"Cannot duplicate image; sample does not exist: {sample_uuid}")
+        if conn.execute(
+            "SELECT 1 FROM dataset_items WHERE item_id = ?", (duplicate_uuid,)
+        ).fetchone():
+            raise ValueError(f"Duplicate UUID already exists: {duplicate_uuid}")
+        metadata = _json_loads(source[1])
+        metadata["mask_builder_duplicate"] = {
+            "duplicated_at": _utc_now(),
+            "source_uuid": sample_uuid,
+        }
+        item_id = repository.add_item(
+            item_id=duplicate_uuid,
+            source_key=duplicate_uuid,
+            sample_weight=source[0],
+            metadata=metadata,
+        )
+        repository.add_mask_item(
+            item_id=item_id,
+            image_asset_id=source[2],
+            candidate_mask_asset_id=source[3],
+        )
+        current = conn.execute(
+            """
+            SELECT * FROM mask_annotations
+            WHERE item_id = ? AND is_current = 1
+            """,
+            (sample_uuid,),
+        ).fetchone()
+        if current is not None:
+            conn.execute(
+                """
+                INSERT INTO mask_annotations (
+                    annotation_id, item_id, mask_asset_id, created_at, annotator,
+                    method, parameters_json, validation_json, status, is_current,
+                    parent_annotation_id, notes
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, NULL, ?)
+                """,
+                (
+                    str(uuid_module.uuid4()), item_id, current[2], _utc_now(),
+                    current[4], "duplicated_current_mask", current[6], current[7],
+                    current[8], current[11],
+                ),
+            )
+    return item_id
+
+
 def save_mask_annotation(
     conn: sqlite3.Connection,
     sample_uuid: str,

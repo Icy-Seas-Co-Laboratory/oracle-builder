@@ -10,6 +10,8 @@ from oracle_builder.data.decoders import decode_blob
 from oracle_builder.data.sqlite_dataset import ensure_schema
 from oracle_builder.masking.sqlite_io import (
     create_or_update_image_sample,
+    delete_image_sample,
+    duplicate_image_sample,
     decode_mask,
     ensure_mask_annotation_table,
     encode_training_input,
@@ -82,6 +84,40 @@ def test_load_sample_reads_existing_mask():
     sample = load_sample(conn, "sample-2")
     assert sample["image"].shape == (4, 4)
     assert np.array_equal(sample["mask"], mask)
+
+
+def test_delete_image_sample_removes_item_and_annotation_history():
+    conn = sqlite3.connect(":memory:")
+    ensure_schema(conn)
+    image = np.zeros((4, 4), dtype="uint8")
+    create_or_update_image_sample(conn, "bad-sample", image, "png", {})
+    save_mask_annotation(conn, "bad-sample", image, "png", "test", {}, {"valid": True})
+
+    delete_image_sample(conn, "bad-sample")
+
+    assert conn.execute("SELECT count(*) FROM dataset_items").fetchone()[0] == 0
+    assert conn.execute("SELECT count(*) FROM mask_refinement_items").fetchone()[0] == 0
+    assert conn.execute("SELECT count(*) FROM mask_annotations").fetchone()[0] == 0
+    with pytest.raises(KeyError):
+        delete_image_sample(conn, "bad-sample")
+
+
+def test_duplicate_image_sample_reuses_image_and_copies_current_mask():
+    conn = sqlite3.connect(":memory:")
+    ensure_schema(conn)
+    image = np.zeros((4, 4), dtype="uint8")
+    image[1, 1] = 255
+    create_or_update_image_sample(conn, "source", image, "png", {})
+    save_mask_annotation(conn, "source", image, "png", "test", {}, {"valid": True})
+
+    duplicate_uuid = duplicate_image_sample(conn, "source", "duplicate")
+
+    assert duplicate_uuid == "duplicate"
+    duplicate = load_sample(conn, duplicate_uuid)
+    assert np.array_equal(duplicate["image"], image)
+    assert np.array_equal(duplicate["mask"], (image > 0).astype("uint8"))
+    assert duplicate["metadata"]["mask_builder_duplicate"]["source_uuid"] == "source"
+    assert conn.execute("SELECT count(*) FROM mask_annotations WHERE item_id = 'duplicate'").fetchone()[0] == 1
 
 
 def test_candidate_mask_is_stored_as_training_input_channel_and_aux_layer():
