@@ -2,17 +2,82 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
 import os
 import shutil
 import sys
+import threading
 import uuid
 from pathlib import Path
 
 # TensorFlow's GPU timer can emit one warning per small kernel during autotuning.
-# Keep the default CLI output actionable; users can set TF_CPP_MIN_LOG_LEVEL=0
-# before invocation when they need TensorFlow's full native diagnostics.
-os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+# Do not inherit a noisy generic TensorFlow setting from a shell or conda profile.
+# Set ORACLE_BUILDER_TF_CPP_MIN_LOG_LEVEL=0 before invocation to opt into native
+# TensorFlow diagnostics.
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = os.environ.get(
+    "ORACLE_BUILDER_TF_CPP_MIN_LOG_LEVEL", "2"
+)
+
+_GPU_TIMER_WARNING = b"gpu_timer.cc"
+_GPU_TIMER_WARNING_TEXT = b"Skipping the delay kernel, measurement accuracy will be reduced"
+
+
+def _is_gpu_timer_warning(line: bytes) -> bool:
+    return _GPU_TIMER_WARNING in line and _GPU_TIMER_WARNING_TEXT in line
+
+
+def _install_gpu_timer_warning_filter() -> None:
+    """Suppress only repeated XLA timer warnings written directly to stderr."""
+    if os.environ.get("ORACLE_BUILDER_FILTER_GPU_TIMER_WARNINGS", "1") in {"0", "false", "False"}:
+        return
+    if not sys.stderr.isatty():
+        return
+    try:
+        original_stderr = os.dup(2)
+        reader, writer = os.pipe()
+        os.dup2(writer, 2)
+        os.close(writer)
+    except OSError:
+        return
+
+    suppressed = 0
+
+    def forward_stderr() -> None:
+        nonlocal suppressed
+        with os.fdopen(reader, "rb", closefd=True) as stream:
+            for line in iter(stream.readline, b""):
+                if _is_gpu_timer_warning(line):
+                    suppressed += 1
+                    if suppressed == 1:
+                        os.write(
+                            original_stderr,
+                            b"TensorFlow/XLA GPU timer warnings suppressed; "
+                            b"set ORACLE_BUILDER_FILTER_GPU_TIMER_WARNINGS=0 to show them.\n",
+                        )
+                    continue
+                os.write(original_stderr, line)
+
+    thread = threading.Thread(
+        target=forward_stderr,
+        name="gpu-timer-stderr-filter",
+        daemon=True,
+    )
+    thread.start()
+
+    def restore_stderr() -> None:
+        try:
+            sys.stderr.flush()
+            os.dup2(original_stderr, 2)
+            thread.join(timeout=1)
+            os.close(original_stderr)
+        except OSError:
+            pass
+
+    atexit.register(restore_stderr)
+
+
+_install_gpu_timer_warning_filter()
 
 from oracle_builder.artifacts import (
     RunLayout,
