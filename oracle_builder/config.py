@@ -318,6 +318,10 @@ def validate_config(config: dict[str, Any]) -> None:
             raise ValueError("pretraining.temperature must be greater than zero")
     if task == "segmentation" and "output_shape" not in config["data"]:
         raise ValueError("data.output_shape is required for segmentation")
+    distance_mode = str(config["data"].get("candidate_distance", "none")).lower()
+    if distance_mode not in {"none", "euclidean_sdf", "geodesic"}:
+        raise ValueError("data.candidate_distance must be none, euclidean_sdf, or geodesic")
+    uses_distance = distance_mode != "none" or config["data"].get("candidate_sdf", False)
     segmentation_target = str(config["training"].get("segmentation_target", "validated_mask")).lower()
     if segmentation_target not in {"validated_mask", "candidate_delta"}:
         raise ValueError("training.segmentation_target must be 'validated_mask' or 'candidate_delta'")
@@ -325,13 +329,9 @@ def validate_config(config: dict[str, Any]) -> None:
         input_shape = config["data"]["input_shape"]
         if task != "segmentation":
             raise ValueError("training.segmentation_target='candidate_delta' requires segmentation")
-        expected_channels = 3 if config["data"].get("candidate_sdf", False) else 2
+        expected_channels = 3 if uses_distance else 2
         if len(input_shape) != 3 or int(input_shape[-1]) != expected_channels:
             raise ValueError(f"candidate_delta training requires data.input_shape with {expected_channels} channels")
-    distance_mode = str(config["data"].get("candidate_distance", "none")).lower()
-    if distance_mode not in {"none", "euclidean_sdf", "geodesic"}:
-        raise ValueError("data.candidate_distance must be none, euclidean_sdf, or geodesic")
-    uses_distance = distance_mode != "none" or config["data"].get("candidate_sdf", False)
     if uses_distance:
         input_shape = config["data"]["input_shape"]
         if task != "segmentation" or len(input_shape) != 3 or int(input_shape[-1]) != 3:

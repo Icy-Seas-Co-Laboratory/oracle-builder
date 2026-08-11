@@ -15,6 +15,7 @@ from oracle_builder.data.sqlite_dataset import (
 from oracle_builder.training.student_teacher import (
     SimCLRPretrainer,
     StudentTeacherPretrainer,
+    load_grayscale_reconstruction_dataset,
     make_pretraining_dataset,
     run_student_teacher_pretraining,
 )
@@ -150,6 +151,11 @@ def test_pretraining_is_rejected_for_segmentation():
 
     with pytest.raises(ValueError, match="requires method='grayscale_reconstruction'"):
         validate_config(config)
+
+
+def test_grayscale_reconstruction_requires_existing_dataset(tmp_path):
+    with pytest.raises(FileNotFoundError, match="does not exist"):
+        load_grayscale_reconstruction_dataset(tmp_path / "missing.sqlite", pretraining_config())
 
 
 def test_unlabeled_train_rois_are_available_only_to_pretraining(tmp_path):

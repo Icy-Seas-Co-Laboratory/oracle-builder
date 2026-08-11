@@ -7,7 +7,7 @@ notes = "Example U-Net++ segmentation run"
 [data]
 input_shape = [128, 128, 3]
 output_shape = [128, 128, 1]
-batch_size = 8
+batch_size = 4
 shuffle_buffer = 128
 validation_split = 0.25
 test_split = 0.1
@@ -30,8 +30,16 @@ activation = "relu"
 final_activation = "sigmoid"
 deep_supervision = false
 
+[pretraining]
+# Optional grayscale-only reconstruction pretraining from either dataset type.
+enabled = true
+method = "grayscale_reconstruction"
+database = "./datasets/ROI-Refinement/dataset.checkpoint-20260811T191330.260682Z.sqlite"
+epochs = 10
+learning_rate = 0.001
+
 [training]
-epochs = 40
+epochs = 10
 optimizer = "adam"
 learning_rate = 0.0001
 loss = "bce_soft_tversky" # BCE plus recall-biased soft Tversky.
@@ -44,13 +52,6 @@ metrics = ["accuracy", "dice", "iou"]
 #segmentation_target = "validated_mask"
 segmentation_target = "candidate_delta"
 
-[pretraining]
-# Optional grayscale-only reconstruction pretraining from either dataset type.
-enabled = false
-method = "grayscale_reconstruction"
-database = "datasets/classification-corpus.sqlite"
-epochs = 50
-learning_rate = 0.001
 
 [callbacks]
 early_stopping = true
@@ -60,10 +61,10 @@ checkpoint_monitor = "val_loss"
 
 [augmentation]
 enabled = true
-repeats_per_epoch = 2
+repeats_per_epoch = 1
 invert = false # Assume black background and light foreground.
 rotation = 0.5
-zoom = 0.25
+zoom = 0.20
 translation = [0.25, 0.25]
 skew = 0.20
 flip_horizontal = true

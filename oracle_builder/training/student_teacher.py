@@ -48,9 +48,26 @@ def make_pretraining_dataset(x: np.ndarray, config: dict[str, Any]):
 
 def load_grayscale_reconstruction_dataset(database: str | Path, config: dict[str, Any]):
     """Load unlabeled grayscale images from either supported dataset type."""
+    database_path = Path(database).expanduser().resolve()
+    if not database_path.is_file():
+        raise FileNotFoundError(
+            "Grayscale reconstruction pretraining database does not exist: "
+            f"{database_path}. Set pretraining.database to an existing Dataset V1 "
+            "classification or mask-refinement SQLite file."
+        )
     target_shape = tuple(int(value) for value in config["data"]["input_shape"][:2])
-    with sqlite3.connect(database) as connection:
-        kind = connection.execute("SELECT dataset_type FROM dataset WHERE singleton = 1").fetchone()[0]
+    with sqlite3.connect(f"file:{database_path}?mode=ro", uri=True) as connection:
+        try:
+            row = connection.execute("SELECT dataset_type FROM dataset WHERE singleton = 1").fetchone()
+        except sqlite3.OperationalError as exc:
+            raise ValueError(
+                f"Pretraining database is not an Oracle Builder Dataset V1 file: {database_path}"
+            ) from exc
+        if row is None or row[0] not in {"classification", "mask_refinement"}:
+            raise ValueError(
+                f"Pretraining database must be classification or mask_refinement Dataset V1: {database_path}"
+            )
+        kind = row[0]
         table, key = ("classification_items", "image_asset_id") if kind == "classification" else ("mask_refinement_items", "image_asset_id")
         rows = connection.execute(
             f"SELECT a.payload, a.encoding, a.shape_json FROM {table} i JOIN assets a ON a.asset_id=i.{key} ORDER BY i.item_id"

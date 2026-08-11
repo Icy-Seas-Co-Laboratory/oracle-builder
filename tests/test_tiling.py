@@ -112,6 +112,19 @@ def test_large_roi_loader_expands_synchronized_tiles_after_split_assignment(tmp_
     assert np.array_equal(reconstructed_candidate[..., 0] > 0.5, candidate > 0)
 
 
+def test_geodesic_tiling_emits_same_three_channels_as_resized_inputs(tmp_path):
+    database = tmp_path / "large.sqlite"
+    create_large_sample(database)
+    config = tiled_config(overlap=0.0)
+    config["data"]["input_shape"] = [8, 8, 3]
+    config["data"]["candidate_distance"] = "geodesic"
+
+    x, _y, _records = load_arrays(database, config)
+
+    assert x.shape == (4, 8, 8, 3)
+    assert np.all((x[..., 2] >= 0.0) & (x[..., 2] <= 1.0))
+
+
 def test_overlap_coverage_weights_sum_to_one_per_source_pixel(tmp_path):
     database = tmp_path / "large.sqlite"
     create_large_sample(database)

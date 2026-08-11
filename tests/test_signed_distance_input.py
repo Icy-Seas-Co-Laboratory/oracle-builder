@@ -87,6 +87,14 @@ def test_candidate_sdf_config_requires_three_model_channels():
         validate_config(config)
 
 
+def test_geodesic_candidate_delta_config_requires_three_model_channels():
+    config = sdf_config()
+    config["data"].pop("candidate_sdf")
+    config["data"]["candidate_distance"] = "geodesic"
+
+    validate_config(config)
+
+
 def test_mask_builder_generates_candidate_sdf_config(monkeypatch, tmp_path):
     database = tmp_path / "sdf.sqlite"
     config_path = tmp_path / "sdf.toml"

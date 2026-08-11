@@ -308,24 +308,38 @@ def _native_model_input(array: Any, config: dict[str, Any]) -> tuple[np.ndarray,
         roi = _normalize_native_input(value[..., 0])
         candidate = (value[..., 1] > 0).astype("float32")
         channels = [roi, candidate]
-        if config.get("data", {}).get("candidate_sdf", False):
+        distance_mode = config.get("data", {}).get("candidate_distance", "none")
+        if distance_mode == "none" and config.get("data", {}).get("candidate_sdf", False):
+            distance_mode = "euclidean_sdf"
+        if distance_mode == "euclidean_sdf":
             channels.append(
                 signed_distance_field(
                     candidate,
                     float(config["data"].get("candidate_sdf_clip_distance", 32.0)),
                 )
             )
+        elif distance_mode == "geodesic":
+            from oracle_builder.data.signed_distance import geodesic_distance_field
+
+            channels.append(
+                geodesic_distance_field(
+                    roi,
+                    candidate,
+                    clip_distance=float(config["data"].get("candidate_distance_clip", 32.0)),
+                    **config["data"].get("geodesic_distance", {}),
+                )
+            )
         return np.stack(channels, axis=-1), candidate[..., None]
     return _normalize_native_input(value), candidate
 
 
-def _extract_input_tile(full_input: np.ndarray, plan: dict[str, Any], candidate_sdf: bool) -> np.ndarray:
-    if not candidate_sdf:
+def _extract_input_tile(full_input: np.ndarray, plan: dict[str, Any], distance_mode: str) -> np.ndarray:
+    if distance_mode == "none":
         return extract_tile(full_input, plan, fill_value=0.0)
     pieces = [
         extract_tile(full_input[..., 0], plan, fill_value=0.0),
         extract_tile(full_input[..., 1], plan, fill_value=0.0),
-        extract_tile(full_input[..., 2], plan, fill_value=-1.0),
+        extract_tile(full_input[..., 2], plan, fill_value=-1.0 if distance_mode == "euclidean_sdf" else 1.0),
     ]
     return np.stack(pieces, axis=-1).astype("float32")
 
@@ -402,7 +416,12 @@ def _expand_tiled_segmentation_row(
         outputs.append(
             (
                 _extract_input_tile(
-                    full_input, plan, bool(config.get("data", {}).get("candidate_sdf", False))
+                    full_input,
+                    plan,
+                    "euclidean_sdf"
+                    if config.get("data", {}).get("candidate_sdf", False)
+                    and config.get("data", {}).get("candidate_distance", "none") == "none"
+                    else str(config.get("data", {}).get("candidate_distance", "none")),
                 ),
                 extract_tile(full_target, plan, fill_value=0.0) if full_target is not None else None,
                 record,
