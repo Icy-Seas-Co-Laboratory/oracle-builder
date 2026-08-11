@@ -195,6 +195,7 @@ def test_list_pelagia_detections_parses_detection_list(monkeypatch):
     assert "asset_id=asset-1" in captured["url"]
     assert "min_area=500" in captured["url"]
     assert "max_bbox_w=80" in captured["url"]
+    assert "has_roi_payload=True" in captured["url"]
     assert "limit=2" in captured["url"]
     assert captured["token"] is None
 

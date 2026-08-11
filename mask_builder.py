@@ -152,6 +152,8 @@ def resolve_database_path(args: argparse.Namespace) -> Path | None:
 
 def pelagia_detection_filters(args: argparse.Namespace, default_sort_by: str = "asset_frame") -> dict:
     return {
+        # Mask Builder requires a stored ROI image and cannot open detection-only rows.
+        "has_roi_payload": True,
         "run_id": args.api_run_id,
         "asset_id": args.api_asset_id,
         "collection": args.api_collection,

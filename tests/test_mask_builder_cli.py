@@ -240,6 +240,7 @@ def test_api_env_token_is_passed_to_pelagia_list(monkeypatch, capsys):
     def fake_list(base_url, **filters):
         assert base_url == "http://localhost:8000"
         assert filters["token"] == "env-token"
+        assert filters["has_roi_payload"] is True
         return [{"id": "d1"}]
 
     monkeypatch.setenv("PELAGIA_API_TOKEN", "env-token")
@@ -445,6 +446,7 @@ def test_random_api_roi_selects_detection_before_loading(monkeypatch, tmp_path):
     def fake_list(base_url, **filters):
         assert filters["min_area"] == 500
         assert filters["sort_by"] == "random"
+        assert filters["has_roi_payload"] is True
         return [{"id": "random-detection"}, {"id": "second-detection"}]
 
     monkeypatch.setattr(mask_builder, "list_pelagia_detections", fake_list)

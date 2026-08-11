@@ -263,7 +263,12 @@ def main() -> int:
                 )
         pretraining_dataset = None
         if config.get("pretraining", {}).get("enabled", False) and resume_state is None:
-            if streaming_bundle is not None:
+            if str(config["pretraining"].get("method", "byol")).lower() == "grayscale_reconstruction":
+                from oracle_builder.training.student_teacher import load_grayscale_reconstruction_dataset
+                source_database = config["pretraining"].get("database", args.input)
+                pretraining_dataset = load_grayscale_reconstruction_dataset(source_database, config)
+                pretraining_count = "database"
+            elif streaming_bundle is not None:
                 pretraining_index = build_classification_index(
                     args.input,
                     config,

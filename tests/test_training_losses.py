@@ -6,6 +6,7 @@ from tensorflow import keras
 
 from oracle_builder.training.losses import (
     BinaryCrossentropySoftDice,
+    BinaryCrossentropySoftTversky,
     WeightedSparseCategoricalCrossentropy,
 )
 from oracle_builder.training.class_weights import resolve_class_weights
@@ -28,6 +29,24 @@ def test_bce_soft_dice_penalizes_incorrect_predictions_more():
     loss = BinaryCrossentropySoftDice()
 
     assert float(loss(target, good)) < float(loss(target, bad))
+
+
+def test_tversky_with_higher_false_negative_weight_favors_expansion():
+    target = tf.constant([[[[1.0], [1.0], [0.0], [0.0]]]])
+    under = tf.constant([[[[0.5], [0.5], [0.0], [0.0]]]])
+    over = tf.constant([[[[1.0], [1.0], [0.5], [0.5]]]])
+    loss = BinaryCrossentropySoftTversky(bce_weight=0.0, alpha=0.3, beta=0.7)
+
+    assert float(loss(target, over)) < float(loss(target, under))
+
+
+def test_bce_soft_tversky_can_be_saved_and_reloaded(tmp_path):
+    model = keras.Sequential([keras.layers.Input((4, 4, 1)), keras.layers.Conv2D(1, 1, activation="sigmoid")])
+    model.compile(optimizer="adam", loss=BinaryCrossentropySoftTversky())
+    path = tmp_path / "model.keras"
+    model.save(path)
+
+    assert isinstance(keras.models.load_model(path).loss, BinaryCrossentropySoftTversky)
 
 
 def test_bce_soft_dice_returns_pixelwise_values_before_reduction():

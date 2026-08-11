@@ -490,24 +490,31 @@ def prepare_segmentation_input(
     input_shape: list[int] | tuple[int, ...],
     config: dict[str, Any],
 ) -> np.ndarray:
-    if not config.get("data", {}).get("candidate_sdf", False):
+    distance_mode = config.get("data", {}).get("candidate_distance", "none")
+    if distance_mode == "none" and config.get("data", {}).get("candidate_sdf", False):
+        distance_mode = "euclidean_sdf"  # legacy configuration alias
+    if distance_mode == "none":
         return resize_segmentation_input(array, input_shape)
     value = np.asarray(array)
     target_shape = tuple(int(part) for part in input_shape)
     if value.ndim != 3 or value.shape[-1] != 2 or len(target_shape) != 3 or target_shape[-1] != 3:
         raise ValueError(
-            f"Candidate SDF input requires a raw two-channel ROI+candidate array and target shape [H, W, 3], got {value.shape} -> {target_shape}"
+            f"Candidate distance input requires raw ROI+candidate input and target shape [H, W, 3], got {value.shape} -> {target_shape}"
         )
     roi = resize_array_to_shape(value[..., 0], target_shape[:2], mask=False)
     candidate = resize_array_to_shape(value[..., 1], target_shape[:2], mask=True)
     roi = np.asarray(roi, dtype="float32")
     if value.dtype.kind in {"u", "i"} and roi.max(initial=0) > 1:
         roi /= float(np.iinfo(value.dtype).max)
-    sdf = signed_distance_field(
-        candidate,
-        clip_distance=float(config["data"].get("candidate_sdf_clip_distance", 32.0)),
-    )
-    return np.stack([roi, candidate.astype("float32"), sdf], axis=-1)
+    if distance_mode == "euclidean_sdf":
+        distance = signed_distance_field(candidate, clip_distance=float(config["data"].get("candidate_sdf_clip_distance", 32.0)))
+    elif distance_mode == "geodesic":
+        from oracle_builder.data.signed_distance import geodesic_distance_field
+        settings = config["data"].get("geodesic_distance", {})
+        distance = geodesic_distance_field(roi, candidate, clip_distance=float(config["data"].get("candidate_distance_clip", 32.0)), **settings)
+    else:
+        raise ValueError(f"Unsupported data.candidate_distance: {distance_mode}")
+    return np.stack([roi, candidate.astype("float32"), distance], axis=-1)
 
 
 def resize_array_to_shape(

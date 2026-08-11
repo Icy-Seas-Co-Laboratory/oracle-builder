@@ -11,8 +11,16 @@ batch_size = 16
 shuffle_buffer = 128
 validation_split = 0.25
 test_split = 0.1
-candidate_sdf = true
-candidate_sdf_clip_distance = 32.0
+# Input channels: grayscale ROI, binary candidate mask, and image-guided distance.
+candidate_distance = "geodesic" # "none", "euclidean_sdf", or "geodesic"
+candidate_distance_clip = 32.0
+
+[data.geodesic_distance]
+epsilon = 0.001 # Keep every graph edge traversable.
+intensity_weight = 1.0 # Dark pixels cost more to cross.
+intensity_gamma = 1.0
+gradient_weight = 1.0 # Strong intensity boundaries cost more to cross.
+connectivity = 8
 
 [model]
 base_filters = 32
@@ -25,16 +33,26 @@ final_activation = "sigmoid"
 epochs = 20
 optimizer = "adam"
 learning_rate = 0.0001
-loss = "bce_soft_dice"
+loss = "bce_soft_tversky" # Retain BCE while favoring mask expansion.
 bce_weight = 1.0
-soft_dice_weight = 1.0
-soft_dice_smooth = 0.000001
+soft_tversky_weight = 1.0
+tversky_alpha = 0.3 # False-positive penalty.
+tversky_beta = 0.7 # False-negative penalty; higher favors expansion.
+soft_tversky_smooth = 0.000001
 metrics = ["accuracy", "dice", "iou"]
 #segmentation_target = "validated_mask"
 segmentation_target = "candidate_delta"
 spatial_edge_weighting = true
 edge_weight_lambda = 1.0
 edge_weight_sigma = 6.0
+
+[pretraining]
+# Set enabled=true and point database at a classification or mask-refinement SQLite dataset.
+enabled = false
+method = "grayscale_reconstruction"
+database = "datasets/classification-corpus.sqlite"
+epochs = 50
+learning_rate = 0.001
 
 [callbacks]
 early_stopping = true

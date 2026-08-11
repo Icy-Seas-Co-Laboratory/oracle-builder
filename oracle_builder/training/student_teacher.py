@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import copy
+import sqlite3
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +13,9 @@ from tensorflow import keras
 from tensorflow.keras import layers
 
 from oracle_builder.classification.features import build_embedding_model
+from oracle_builder.data.decoders import decode_blob
+from oracle_builder.data.sqlite_dataset import resize_array_to_shape
+from oracle_builder.registry import get_model_builder
 from oracle_builder.training.augmentation import augment_batch
 
 
@@ -39,6 +44,65 @@ def make_pretraining_dataset(x: np.ndarray, config: dict[str, Any]):
         .batch(batch_size)
         .prefetch(tf.data.AUTOTUNE)
     )
+
+
+def load_grayscale_reconstruction_dataset(database: str | Path, config: dict[str, Any]):
+    """Load unlabeled grayscale images from either supported dataset type."""
+    target_shape = tuple(int(value) for value in config["data"]["input_shape"][:2])
+    with sqlite3.connect(database) as connection:
+        kind = connection.execute("SELECT dataset_type FROM dataset WHERE singleton = 1").fetchone()[0]
+        table, key = ("classification_items", "image_asset_id") if kind == "classification" else ("mask_refinement_items", "image_asset_id")
+        rows = connection.execute(
+            f"SELECT a.payload, a.encoding, a.shape_json FROM {table} i JOIN assets a ON a.asset_id=i.{key} ORDER BY i.item_id"
+        ).fetchall()
+    values = []
+    for payload, encoding, shape in rows:
+        image = np.asarray(decode_blob(payload, encoding, shape))
+        if image.ndim == 3:
+            image = image[..., 0] if image.shape[-1] == 1 else np.mean(image[..., :3], axis=-1)
+        image = resize_array_to_shape(image, target_shape, mask=False).astype("float32")
+        if image.max(initial=0) > 1:
+            image /= float(np.iinfo(np.asarray(image).dtype).max) if np.asarray(image).dtype.kind in "ui" else float(image.max())
+        values.append(image[..., None])
+    if not values:
+        raise ValueError("Pretraining database contains no image items")
+    x = np.stack(values).astype("float32")
+    return tf.data.Dataset.from_tensor_slices((x, x)).shuffle(len(x), seed=int(config["run"].get("seed", 123))).batch(int(config["pretraining"].get("batch_size", config["data"].get("batch_size", 16)))).prefetch(tf.data.AUTOTUNE)
+
+
+def run_grayscale_reconstruction_pretraining(model, dataset, config, run_dir, strategy=None):
+    """Pretrain the matching U-Net family as a 1-channel reconstruction model."""
+    strategy = strategy or tf.distribute.get_strategy()
+    pre_config = copy.deepcopy(config)
+    pre_config["run"]["task"] = "segmentation"
+    pre_config["data"]["input_shape"] = [*config["data"]["input_shape"][:2], 1]
+    pre_config["data"]["output_shape"] = [*config["data"]["input_shape"][:2], 1]
+    pre_config["data"]["candidate_sdf"] = False
+    pre_config["data"]["candidate_distance"] = "none"
+    with strategy.scope():
+        pre_model = get_model_builder(config["run"]["model"])(pre_config)
+        pre_model.compile(optimizer=keras.optimizers.Adam(float(config["pretraining"].get("learning_rate", 0.001))), loss="mse")
+    history = pre_model.fit(dataset, epochs=int(config["pretraining"].get("epochs", 10)), verbose=2 if config.get("debug") else 1)
+    source_convs = [layer for layer in pre_model.layers if isinstance(layer, layers.Conv2D)]
+    target_convs = [layer for layer in model.layers if isinstance(layer, layers.Conv2D)]
+    # Leave the reconstruction and segmentation heads independently initialized.
+    for source, target in zip(source_convs[:-1], target_convs[:-1], strict=False):
+        source_weights = source.get_weights()
+        target_weights = target.get_weights()
+        if not source_weights or not target_weights:
+            continue
+        if source_weights[0].shape == target_weights[0].shape:
+            target.set_weights(source_weights)
+        elif source_weights[0].shape[:-2] == target_weights[0].shape[:-2] and source_weights[0].shape[-2] == 1 and source_weights[0].shape[-2] < target_weights[0].shape[-2] and source_weights[0].shape[-1] == target_weights[0].shape[-1]:
+            kernel = np.zeros_like(target_weights[0])
+            kernel[..., 0, :] = source_weights[0][..., 0, :]
+            target.set_weights([kernel, source_weights[1]])
+    from oracle_builder.artifacts.layout import RunLayout
+    layout = RunLayout(run_dir); layout.pretraining_metrics.mkdir(parents=True, exist_ok=True); layout.pretraining_model.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(history.history).to_csv(layout.pretraining_metrics / "metrics.csv", index_label="epoch")
+    (layout.pretraining_metrics / "metrics.json").write_text(json.dumps(history.history, indent=2, default=float) + "\n")
+    pre_model.save_weights(layout.pretraining_model / "grayscale_reconstruction.weights.h5")
+    return history
 
 
 def _view_config(config: dict[str, Any]) -> dict[str, Any]:

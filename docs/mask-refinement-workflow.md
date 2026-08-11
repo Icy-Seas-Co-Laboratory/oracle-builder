@@ -99,7 +99,9 @@ python3 mask_builder.py \
 
 Use `--random-api-roi` instead of `--api-browse-rois` to draw a random first
 item from the filtered result set. Do not combine either option with
-`--api-roi-id`.
+`--api-roi-id`. Mask Builder always adds `has_roi_payload=true` to Pelagia
+detection-list requests because it can only open detections with stored ROI
+image data.
 
 Opening a detection whose UUID is already in the database updates its imported
 image/candidate representation; saving adds a new annotation-history entry
@@ -192,6 +194,49 @@ oracle-dataset release-training workspaces/roi-review.sqlite \
 
 Two-channel inputs conventionally contain ROI intensity then candidate mask.
 Set `data.candidate_sdf = true` to include a signed-distance candidate channel.
+
+For image-guided expansion, use a geodesic third channel instead:
+
+```toml
+[data]
+input_shape = [256, 256, 3]
+candidate_distance = "geodesic"
+candidate_distance_clip = 32.0
+
+[data.geodesic_distance]
+epsilon = 0.001
+intensity_weight = 1.0
+intensity_gamma = 1.0
+gradient_weight = 1.0
+connectivity = 8
+
+[training]
+loss = "bce_soft_tversky"
+tversky_alpha = 0.3
+tversky_beta = 0.7
+```
+
+`candidate_sdf = true` remains supported as a backwards-compatible alias for
+`candidate_distance = "euclidean_sdf"`. A geodesic channel assigns low travel
+cost to bright continuous structure and high cost to dark pixels and strong
+intensity boundaries.
+
+Optional grayscale reconstruction pretraining can use image-only records from
+either a classification or mask-refinement SQLite database:
+
+```toml
+[pretraining]
+enabled = true
+method = "grayscale_reconstruction"
+database = "datasets/classification-corpus.sqlite"
+epochs = 50
+learning_rate = 0.001
+```
+
+It pretrains the selected U-Net-family encoder/decoder to reconstruct grayscale
+images, transfers matching convolution weights, and initializes candidate and
+distance-channel weights to zero during segmentation training. The segmentation
+head remains newly initialized.
 
 ## 6. Train
 

@@ -79,3 +79,55 @@ class BinaryCrossentropySoftDice(keras.losses.Loss):
             "dice_weight": self.dice_weight,
             "smooth": self.smooth,
         }
+
+
+@keras.utils.register_keras_serializable(package="oracle_builder")
+class BinaryCrossentropySoftTversky(keras.losses.Loss):
+    """Pixelwise BCE plus a per-image soft Tversky loss.
+
+    ``beta > alpha`` penalizes false negatives more heavily, which favors
+    recall/expansion over under-segmentation.
+    """
+
+    def __init__(
+        self,
+        bce_weight: float = 1.0,
+        tversky_weight: float = 1.0,
+        alpha: float = 0.3,
+        beta: float = 0.7,
+        smooth: float = 1e-6,
+        name: str = "bce_soft_tversky",
+        **kwargs,
+    ):
+        super().__init__(name=name, **kwargs)
+        if alpha < 0 or beta < 0 or alpha + beta <= 0:
+            raise ValueError("Tversky alpha and beta must be non-negative with a positive sum")
+        self.bce_weight = float(bce_weight)
+        self.tversky_weight = float(tversky_weight)
+        self.alpha = float(alpha)
+        self.beta = float(beta)
+        self.smooth = float(smooth)
+
+    def call(self, y_true, y_pred):
+        y_true = tf.cast(y_true, y_pred.dtype)
+        y_pred = tf.cast(y_pred, y_pred.dtype)
+        bce = keras.losses.binary_crossentropy(y_true, y_pred)
+        axes = tf.range(1, tf.rank(y_true))
+        true_positive = tf.reduce_sum(y_true * y_pred, axis=axes)
+        false_positive = tf.reduce_sum((1.0 - y_true) * y_pred, axis=axes)
+        false_negative = tf.reduce_sum(y_true * (1.0 - y_pred), axis=axes)
+        tversky = (true_positive + self.smooth) / (
+            true_positive + self.alpha * false_positive + self.beta * false_negative + self.smooth
+        )
+        tversky_loss = tf.reshape(1.0 - tversky, [-1, 1, 1])
+        return self.bce_weight * bce + self.tversky_weight * tversky_loss
+
+    def get_config(self):
+        return {
+            **super().get_config(),
+            "bce_weight": self.bce_weight,
+            "tversky_weight": self.tversky_weight,
+            "alpha": self.alpha,
+            "beta": self.beta,
+            "smooth": self.smooth,
+        }

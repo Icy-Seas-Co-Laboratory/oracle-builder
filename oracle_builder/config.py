@@ -23,6 +23,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "split_strategy": "auto",
         "candidate_sdf": False,
         "candidate_sdf_clip_distance": 32.0,
+        "candidate_distance": "none",
+        "candidate_distance_clip": 32.0,
+        "geodesic_distance": {
+            "epsilon": 0.001,
+            "intensity_weight": 1.0,
+            "intensity_gamma": 1.0,
+            "gradient_weight": 1.0,
+            "connectivity": 8,
+        },
         "streaming": {
             "enabled": True,
             "reader_workers": 4,
@@ -51,6 +60,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "spatial_edge_weighting": False,
         "edge_weight_lambda": 1.0,
         "edge_weight_sigma": 5.0,
+        "bce_weight": 1.0,
+        "soft_dice_weight": 1.0,
+        "soft_tversky_weight": 1.0,
+        "tversky_alpha": 0.3,
+        "tversky_beta": 0.7,
+        "soft_tversky_smooth": 1e-6,
     },
     "pretraining": {
         "enabled": False,
@@ -276,16 +291,18 @@ def validate_config(config: dict[str, Any]) -> None:
         )
     pretraining = config.get("pretraining", {})
     if pretraining.get("enabled", False):
-        if task != "classification":
-            raise ValueError("self-supervised pretraining is only supported for classification")
-        if str(pretraining.get("method", "byol")).lower() not in {
+        method = str(pretraining.get("method", "byol")).lower()
+        if method not in {
             "byol",
             "student_teacher",
             "simclr",
+            "grayscale_reconstruction",
         }:
             raise ValueError(
-                "pretraining.method must be byol, student_teacher, or simclr"
+                "pretraining.method must be byol, student_teacher, simclr, or grayscale_reconstruction"
             )
+        if task != "classification" and method != "grayscale_reconstruction":
+            raise ValueError("segmentation pretraining requires method='grayscale_reconstruction'")
         if int(pretraining.get("epochs", 10)) < 1:
             raise ValueError("pretraining.epochs must be at least 1")
         if float(pretraining.get("learning_rate", 0.001)) <= 0:
@@ -311,12 +328,27 @@ def validate_config(config: dict[str, Any]) -> None:
         expected_channels = 3 if config["data"].get("candidate_sdf", False) else 2
         if len(input_shape) != 3 or int(input_shape[-1]) != expected_channels:
             raise ValueError(f"candidate_delta training requires data.input_shape with {expected_channels} channels")
-    if config["data"].get("candidate_sdf", False):
+    distance_mode = str(config["data"].get("candidate_distance", "none")).lower()
+    if distance_mode not in {"none", "euclidean_sdf", "geodesic"}:
+        raise ValueError("data.candidate_distance must be none, euclidean_sdf, or geodesic")
+    uses_distance = distance_mode != "none" or config["data"].get("candidate_sdf", False)
+    if uses_distance:
         input_shape = config["data"]["input_shape"]
         if task != "segmentation" or len(input_shape) != 3 or int(input_shape[-1]) != 3:
-            raise ValueError("data.candidate_sdf requires segmentation with a three-channel input_shape")
-        if float(config["data"].get("candidate_sdf_clip_distance", 32.0)) <= 0:
-            raise ValueError("data.candidate_sdf_clip_distance must be greater than zero")
+            raise ValueError("candidate distance requires segmentation with a three-channel input_shape")
+        if float(config["data"].get("candidate_distance_clip", config["data"].get("candidate_sdf_clip_distance", 32.0))) <= 0:
+            raise ValueError("candidate distance clip must be greater than zero")
+        if distance_mode == "geodesic":
+            settings = config["data"].get("geodesic_distance", {})
+            if int(settings.get("connectivity", 8)) not in {4, 8}:
+                raise ValueError("data.geodesic_distance.connectivity must be 4 or 8")
+            if float(settings.get("epsilon", 0.001)) <= 0:
+                raise ValueError("data.geodesic_distance.epsilon must be greater than zero")
+    if str(config["training"].get("loss", "")).lower() in {"bce_soft_tversky", "bce+soft_tversky", "binary_crossentropy_soft_tversky"}:
+        alpha = float(config["training"].get("tversky_alpha", 0.3))
+        beta = float(config["training"].get("tversky_beta", 0.7))
+        if alpha < 0 or beta < 0 or alpha + beta <= 0:
+            raise ValueError("training Tversky alpha and beta must be non-negative with a positive sum")
     tiling = config.get("tiling", {})
     if tiling.get("enabled", False):
         if task != "segmentation":

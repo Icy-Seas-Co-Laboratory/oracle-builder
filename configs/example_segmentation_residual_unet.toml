@@ -11,8 +11,16 @@ batch_size = 8
 shuffle_buffer = 128
 validation_split = 0.25
 test_split = 0.1
-candidate_sdf = true
-candidate_sdf_clip_distance = 32.0
+# Input channels: grayscale ROI, binary candidate mask, and image-guided distance.
+candidate_distance = "geodesic" # "none", "euclidean_sdf", or "geodesic"
+candidate_distance_clip = 32.0
+
+[data.geodesic_distance]
+epsilon = 0.001
+intensity_weight = 1.0 # Bright continuous structure is cheap to traverse.
+intensity_gamma = 1.0
+gradient_weight = 1.0 # Strong boundaries are expensive to traverse.
+connectivity = 8
 
 [model]
 base_filters = 32
@@ -25,12 +33,23 @@ final_activation = "sigmoid"
 epochs = 40
 optimizer = "adam"
 learning_rate = 0.0002
-loss = "bce_soft_dice"
+loss = "bce_soft_tversky" # BCE plus recall-biased soft Tversky.
 bce_weight = 1.0
-soft_dice_weight = 1.0
+soft_tversky_weight = 1.0
+tversky_alpha = 0.3
+tversky_beta = 0.7 # Higher false-negative cost favors expansion.
+soft_tversky_smooth = 0.000001
 metrics = ["accuracy", "dice", "iou"]
 #segmentation_target = "validated_mask"
 segmentation_target = "candidate_delta"
+
+[pretraining]
+# Optional grayscale-only reconstruction pretraining from either dataset type.
+enabled = false
+method = "grayscale_reconstruction"
+database = "datasets/classification-corpus.sqlite"
+epochs = 50
+learning_rate = 0.001
 
 [callbacks]
 early_stopping = true

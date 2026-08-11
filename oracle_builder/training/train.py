@@ -14,6 +14,7 @@ from oracle_builder.registry import get_model_builder
 from oracle_builder.training.callbacks import build_callbacks
 from oracle_builder.training.losses import (
     BinaryCrossentropySoftDice,
+    BinaryCrossentropySoftTversky,
     WeightedSparseCategoricalCrossentropy,
 )
 from oracle_builder.training.class_weights import WEIGHTED_CROSS_ENTROPY_NAMES
@@ -48,6 +49,14 @@ def compile_model(model: keras.Model, config: dict[str, Any]) -> keras.Model:
             bce_weight=float(training.get("bce_weight", 1.0)),
             dice_weight=float(training.get("soft_dice_weight", 1.0)),
             smooth=float(training.get("soft_dice_smooth", 1e-6)),
+        )
+    elif str(loss_name).lower() in {"bce_soft_tversky", "bce+soft_tversky", "binary_crossentropy_soft_tversky"}:
+        loss = BinaryCrossentropySoftTversky(
+            bce_weight=float(training.get("bce_weight", 1.0)),
+            tversky_weight=float(training.get("soft_tversky_weight", 1.0)),
+            alpha=float(training.get("tversky_alpha", 0.3)),
+            beta=float(training.get("tversky_beta", 0.7)),
+            smooth=float(training.get("soft_tversky_smooth", 1e-6)),
         )
     elif str(loss_name).lower() in WEIGHTED_CROSS_ENTROPY_NAMES:
         class_weights = training.get("class_weights", {}).get("values")
@@ -123,7 +132,7 @@ def train_model(
     if config.get("pretraining", {}).get("enabled", False) and resume_state is None:
         if pretraining_dataset is None:
             raise ValueError("Enabled self-supervised pretraining requires a pretraining dataset")
-        from oracle_builder.training.student_teacher import run_student_teacher_pretraining
+        from oracle_builder.training.student_teacher import run_grayscale_reconstruction_pretraining, run_student_teacher_pretraining
 
         log_event(
             training_log,
@@ -132,13 +141,9 @@ def train_model(
             "Started self-supervised pretraining",
             config["pretraining"],
         )
-        pretraining_history = run_student_teacher_pretraining(
-            model,
-            pretraining_dataset,
-            config,
-            run_dir,
-            strategy=strategy,
-        )
+        pretraining_history = (run_grayscale_reconstruction_pretraining(model, pretraining_dataset, config, run_dir, strategy=strategy)
+            if str(config["pretraining"].get("method", "byol")).lower() == "grayscale_reconstruction"
+            else run_student_teacher_pretraining(model, pretraining_dataset, config, run_dir, strategy=strategy))
         log_event(
             training_log,
             run_id,

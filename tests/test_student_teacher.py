@@ -148,7 +148,7 @@ def test_pretraining_is_rejected_for_segmentation():
     config["run"]["model"] = "unet"
     config["data"]["output_shape"] = [16, 16, 1]
 
-    with pytest.raises(ValueError, match="only supported for classification"):
+    with pytest.raises(ValueError, match="requires method='grayscale_reconstruction'"):
         validate_config(config)
 
 

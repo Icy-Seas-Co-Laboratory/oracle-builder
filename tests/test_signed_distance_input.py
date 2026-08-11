@@ -5,7 +5,7 @@ import pytest
 
 import mask_builder
 from oracle_builder.config import resolve_config, validate_config
-from oracle_builder.data.signed_distance import signed_distance_field
+from oracle_builder.data.signed_distance import geodesic_distance_field, signed_distance_field
 from oracle_builder.data.sqlite_dataset import load_arrays
 from oracle_builder.masking.sqlite_io import create_or_update_image_sample, open_database, save_mask_annotation
 
@@ -52,6 +52,17 @@ def test_signed_distance_is_positive_inside_and_negative_outside():
 def test_signed_distance_handles_empty_and_full_masks():
     assert np.all(signed_distance_field(np.zeros((3, 3))) == -1.0)
     assert np.all(signed_distance_field(np.ones((3, 3))) == 1.0)
+
+
+def test_geodesic_distance_prefers_bright_continuous_path():
+    image = np.zeros((5, 7), dtype="float32")
+    image[2, :] = 1.0
+    seed = np.zeros_like(image)
+    seed[2, 0] = 1
+
+    distance = geodesic_distance_field(image, seed, clip_distance=100, gradient_weight=0.0)
+
+    assert distance[2, 6] < distance[1, 6]
 
 
 def test_loader_appends_candidate_sdf_as_third_channel(tmp_path):
