@@ -3,10 +3,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import sys
 import uuid
 from pathlib import Path
+
+# TensorFlow's GPU timer can emit one warning per small kernel during autotuning.
+# Keep the default CLI output actionable; users can set TF_CPP_MIN_LOG_LEVEL=0
+# before invocation when they need TensorFlow's full native diagnostics.
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
 
 from oracle_builder.artifacts import (
     RunLayout,

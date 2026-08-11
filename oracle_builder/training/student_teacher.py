@@ -108,20 +108,64 @@ def foreground_weighted_reconstruction_mse(y_true, y_pred, foreground_weight: fl
     return tf.reduce_mean(weight * tf.square(y_pred - targets), axis=[1, 2, 3])
 
 
+def reconstruction_mse(y_true, y_pred):
+    """Unweighted per-sample reconstruction MSE for pretraining diagnostics."""
+    targets = tf.cast(y_true, y_pred.dtype)
+    return tf.reduce_mean(tf.square(y_pred - targets), axis=[1, 2, 3])
+
+
+def foreground_reconstruction_mse(y_true, y_pred):
+    """MSE over bright structure, reported separately from background pixels."""
+    targets = tf.cast(y_true, y_pred.dtype)
+    foreground = tf.cast(targets > 0.1, y_pred.dtype)
+    squared_error = tf.square(y_pred - targets)
+    numerator = tf.reduce_sum(squared_error * foreground, axis=[1, 2, 3])
+    denominator = tf.maximum(tf.reduce_sum(foreground, axis=[1, 2, 3]), 1.0)
+    return numerator / denominator
+
+
+def reconstruction_prediction_mean(_y_true, y_pred):
+    return tf.reduce_mean(y_pred)
+
+
+def reconstruction_prediction_std(_y_true, y_pred):
+    return tf.math.reduce_std(y_pred)
+
+
 def run_grayscale_reconstruction_pretraining(model, dataset, config, run_dir, strategy=None):
     """Pretrain the matching U-Net family as a 1-channel reconstruction model."""
     strategy = strategy or tf.distribute.get_strategy()
     pre_config = grayscale_reconstruction_config(config)
     foreground_weight = float(config["pretraining"].get("reconstruction_foreground_weight", 4.0))
+    epochs = int(config["pretraining"].get("epochs", 10))
+    learning_rate = float(config["pretraining"].get("learning_rate", 0.001))
+    print(
+        "Pretraining grayscale reconstruction: "
+        f"epochs={epochs}, learning_rate={learning_rate:g}, "
+        f"foreground_weight={foreground_weight:g}, reconstruction_head=linear",
+        flush=True,
+    )
     with strategy.scope():
         pre_model = get_model_builder(config["run"]["model"])(pre_config)
         pre_model.compile(
-            optimizer=keras.optimizers.Adam(float(config["pretraining"].get("learning_rate", 0.001))),
+            optimizer=keras.optimizers.Adam(learning_rate),
             loss=lambda targets, prediction: foreground_weighted_reconstruction_mse(
                 targets, prediction, foreground_weight
             ),
+            metrics=[
+                keras.metrics.MeanMetricWrapper(reconstruction_mse, name="reconstruction_mse"),
+                keras.metrics.MeanMetricWrapper(
+                    foreground_reconstruction_mse, name="foreground_mse"
+                ),
+                keras.metrics.MeanMetricWrapper(
+                    reconstruction_prediction_mean, name="prediction_mean"
+                ),
+                keras.metrics.MeanMetricWrapper(
+                    reconstruction_prediction_std, name="prediction_std"
+                ),
+            ],
         )
-    history = pre_model.fit(dataset, epochs=int(config["pretraining"].get("epochs", 10)), verbose=2 if config.get("debug") else 1)
+    history = pre_model.fit(dataset, epochs=epochs, verbose=2)
     source_convs = [layer for layer in pre_model.layers if isinstance(layer, layers.Conv2D)]
     target_convs = [layer for layer in model.layers if isinstance(layer, layers.Conv2D)]
     # Leave the reconstruction and segmentation heads independently initialized.
@@ -391,6 +435,12 @@ def run_student_teacher_pretraining(
             "pretraining.method must be byol, student_teacher, or simclr"
         )
     strategy = strategy or tf.distribute.get_strategy()
+    print(
+        "Pretraining "
+        f"{method}: epochs={int(settings.get('epochs', 10))}, "
+        f"learning_rate={float(settings.get('learning_rate', 0.001)):g}",
+        flush=True,
+    )
     with strategy.scope():
         pretrainer = (
             SimCLRPretrainer(classifier, config)
@@ -412,7 +462,7 @@ def run_student_teacher_pretraining(
     history = pretrainer.fit(
         dataset,
         epochs=int(settings.get("epochs", 10)),
-        verbose=2 if config.get("debug") else 1,
+        verbose=2,
     )
     from oracle_builder.artifacts.layout import RunLayout
 

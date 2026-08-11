@@ -207,6 +207,14 @@ def test_grayscale_reconstruction_pretraining_runs_with_linear_head(tmp_path):
     history = run_grayscale_reconstruction_pretraining(model, dataset, config, tmp_path)
 
     assert np.isfinite(history.history["loss"][-1])
+    for metric in (
+        "reconstruction_mse",
+        "foreground_mse",
+        "prediction_mean",
+        "prediction_std",
+    ):
+        assert metric in history.history
+        assert np.isfinite(history.history[metric][-1])
     assert (tmp_path / "model" / "pretraining" / "grayscale_reconstruction.weights.h5").exists()
 
 
