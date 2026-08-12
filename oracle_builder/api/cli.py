@@ -7,11 +7,12 @@ import sys
 import uvicorn
 
 from oracle_builder.api.app import create_app
+from oracle_builder.api.compute import ComputeService
 from oracle_builder.api.registry import InferenceModelRegistry
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Serve Oracle Builder inference bundles over HTTP.")
+    parser = argparse.ArgumentParser(description="Serve Oracle Builder inference bundles and compute workers over HTTP.")
     parser.add_argument("--model", action="append", default=[], metavar="ALIAS=RUN_DIR")
     parser.add_argument(
         "--models-root",
@@ -28,6 +29,9 @@ def main() -> None:
         help="Externally visible path prefix when served behind a reverse proxy.",
     )
     parser.add_argument("--no-preload", action="store_true")
+    parser.add_argument("--no-compute", action="store_true", help="Disable the local compute worker API.")
+    parser.add_argument("--compute-queue-size", type=int, default=128)
+    parser.add_argument("--worker-id", default=os.environ.get("ORACLE_BUILDER_WORKER_ID", "local"))
     parser.add_argument("--max-batch-size", type=int, default=256, help="Maximum combined inference items per model execution.")
     parser.add_argument("--max-wait-ms", type=int, default=8, help="Maximum queueing delay while forming a micro-batch.")
     parser.add_argument("--queue-capacity", type=int, default=1024, help="Maximum pending inference requests per model.")
@@ -56,11 +60,15 @@ def main() -> None:
             registry.register(alias, run_dir)
         except ValueError as exc:
             parser.error(str(exc))
-    if not registry.registered_count:
-        parser.error("Register at least one model with --model or --models-root")
+    if not registry.registered_count and args.no_compute:
+        parser.error("Register at least one model with --model or --models-root when --no-compute is set")
     uvicorn.run(
         create_app(
             registry,
+            compute=None if args.no_compute else ComputeService(
+                max_queue_size=args.compute_queue_size,
+                worker_id=args.worker_id,
+            ),
             auth_token=os.environ.get("ORACLE_BUILDER_API_TOKEN"),
             preload=not args.no_preload,
             root_path=args.root_path,

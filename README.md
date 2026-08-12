@@ -40,5 +40,22 @@ Choose the guide that matches what you want to do:
 - [Inference contract V1](docs/inference-contract-v1.md)
 - [Architecture and extension boundaries](docs/architecture.md)
 
+## Web GUI
+
+The SvelteKit orchestration interface lives in [`webgui/`](webgui/). It talks
+to the `oracle-orchestrator` service through a same-origin proxy; see its
+[setup guide](webgui/README.md) and the [Orchestrator API](docs/orchestrator-api.md).
+
+Start the local compute, orchestration, and web GUI stack together with:
+
+```bash
+scripts/start_oracle_stack.sh
+```
+
+It creates a local `.oracle-runtime/` directory for the central SQLite
+database, owned artifact root, logs, and a persisted `Local` Oracle Serve
+endpoint used by dispatch preflight. Set `ORACLE_RUNTIME_DIR`,
+`ORACLE_HOST`, or the `ORACLE_*_PORT` variables to override its defaults.
+
 The reference documents are authoritative for on-disk contracts. Workflow guides
 intentionally repeat the commands and decisions needed for a single task.

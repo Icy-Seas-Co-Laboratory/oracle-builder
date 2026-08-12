@@ -11,6 +11,8 @@
 | Configure training, evaluation, or recovery | [Training, evaluation, and recovery](training-and-evaluation.md) |
 | Diagnose installation or run problems | [Operations and troubleshooting](operations-and-troubleshooting.md) |
 | Serve models to operational systems | [Inference API](inference-api.md) |
+| Execute Oracle Builder work from an orchestrator | [Compute API](compute-api.md) |
+| Plan and catalog experiments for Pelagia | [Orchestrator API](orchestrator-api.md) |
 
 ## Contract references
 

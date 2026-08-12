@@ -6,9 +6,11 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI, Header, HTTPException, Query, Request, Response
+from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
 from oracle_builder.api.registry import InferenceModelRegistry, ModelNotFoundError
+from oracle_builder.api.compute import ComputeRequestError, ComputeService, JobAction
 from oracle_builder.inference.transport import (
     InferenceTransportError,
     NPZ_MEDIA_TYPE,
@@ -17,9 +19,19 @@ from oracle_builder.inference.transport import (
 )
 
 
+class ComputeJobRequest(BaseModel):
+    """An immutable execution specification created by the orchestrator."""
+
+    job_id: str = Field(description="UUID issued by the orchestrator")
+    action: JobAction
+    parameters: dict[str, Any] = Field(default_factory=dict)
+    resources: dict[str, Any] = Field(default_factory=dict)
+
+
 def create_app(
     registry: InferenceModelRegistry,
     *,
+    compute: ComputeService | None = None,
     auth_token: str | None = None,
     preload: bool = True,
     max_payload_bytes: int = 256 * 1024 * 1024,
@@ -36,15 +48,18 @@ def create_app(
             yield
         finally:
             registry.close()
+            if compute is not None:
+                compute.close()
 
     normalized_root_path = "" if root_path.strip() in {"", "/"} else f"/{root_path.strip().strip('/')}"
     app = FastAPI(
-        title="Oracle Builder Inference API",
+        title="Oracle Builder Compute and Inference API",
         version="1.0.0",
         lifespan=lifespan,
         root_path=normalized_root_path,
     )
     app.state.registry = registry
+    app.state.compute = compute
 
     def authorize(authorization: str | None) -> None:
         if auth_token is None:
@@ -53,15 +68,78 @@ def create_app(
         if authorization is None or not hmac.compare_digest(authorization, expected):
             raise HTTPException(status_code=401, detail="Invalid Oracle Builder bearer token")
 
+    def require_compute() -> ComputeService:
+        if compute is None:
+            raise HTTPException(status_code=503, detail="Compute execution is disabled on this oracle-serve instance")
+        return compute
+
     @app.get("/health/live")
     def live() -> dict[str, str]:
         return {"status": "ok"}
 
     @app.get("/health/ready")
     def ready() -> dict[str, Any]:
-        if not registry.healthy:
+        if not registry.healthy and compute is None:
             raise HTTPException(status_code=503, detail="No healthy inference models are registered")
-        return {"status": "ready", "registered_models": registry.registered_count}
+        return {
+            "status": "ready",
+            "registered_models": registry.registered_count,
+            "compute_enabled": compute is not None,
+        }
+
+    @app.get("/compute/workers")
+    def compute_workers(authorization: str | None = Header(default=None)) -> dict[str, Any]:
+        authorize(authorization)
+        return {"workers": require_compute().workers()}
+
+    @app.get("/compute/status")
+    def compute_status(authorization: str | None = Header(default=None)) -> dict[str, Any]:
+        authorize(authorization)
+        return require_compute().status()
+
+    @app.post("/compute/jobs", status_code=202)
+    def submit_compute_job(
+        body: ComputeJobRequest,
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        authorize(authorization)
+        try:
+            return require_compute().submit(
+                job_id=body.job_id,
+                action=body.action,
+                parameters=body.parameters,
+                resources=body.resources,
+            )
+        except ComputeRequestError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.get("/compute/jobs/{job_id}")
+    def compute_job(job_id: str, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+        authorize(authorization)
+        try:
+            return require_compute().get(job_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Compute job was not found") from exc
+
+    @app.get("/compute/jobs/{job_id}/events")
+    def compute_job_events(
+        job_id: str,
+        after: int = Query(default=0, ge=0),
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        authorize(authorization)
+        try:
+            return require_compute().events(job_id, after=after)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Compute job was not found") from exc
+
+    @app.post("/compute/jobs/{job_id}/cancel")
+    def cancel_compute_job(job_id: str, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+        authorize(authorization)
+        try:
+            return require_compute().cancel(job_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Compute job was not found") from exc
 
     @app.get("/v1/models")
     def models(
@@ -144,6 +222,10 @@ def app_from_environment() -> FastAPI:
         registry.register(alias, path)
     return create_app(
         registry,
+        compute=ComputeService(
+            max_queue_size=int(os.environ.get("ORACLE_BUILDER_COMPUTE_QUEUE_SIZE", 128)),
+            worker_id=os.environ.get("ORACLE_BUILDER_WORKER_ID", "local"),
+        ) if os.environ.get("ORACLE_BUILDER_COMPUTE_ENABLED", "true").lower() not in {"0", "false", "no"} else None,
         auth_token=os.environ.get("ORACLE_BUILDER_API_TOKEN"),
         preload=os.environ.get("ORACLE_BUILDER_PRELOAD", "true").lower() not in {"0", "false", "no"},
         max_payload_bytes=int(os.environ.get("ORACLE_BUILDER_MAX_PAYLOAD_BYTES", 256 * 1024 * 1024)),
