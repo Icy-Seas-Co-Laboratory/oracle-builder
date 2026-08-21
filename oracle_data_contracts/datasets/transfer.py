@@ -283,6 +283,7 @@ def export_dataset(
                         "metadata_json": row["metadata_json"],
                         "created_at": row["created_at"],
                         "updated_at": row["updated_at"],
+                        "geometry": _item_geometry(connection, row["item_id"]),
                         "asset": {
                             "asset_id": row["asset_id"],
                             "content_sha256": row["content_sha256"],
@@ -412,6 +413,7 @@ def _export_mask_items(
             "metadata_json": row["metadata_json"],
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
+            "geometry": _item_geometry(connection, row["item_id"]),
             "image_asset": {
                 "asset_id": row["image_asset_id"],
                 "content_sha256": row["image_sha256"],
@@ -854,6 +856,31 @@ def _restore_item(
             item["updated_at"],
         ),
     )
+    geometry = item.get("geometry")
+    if geometry:
+        connection.execute(
+            """INSERT INTO item_geometry (
+            item_id,coordinate_space,bbox_x,bbox_y,bbox_w,bbox_h,
+            crop_bbox_x,crop_bbox_y,crop_bbox_w,crop_bbox_h,metadata_json
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                item["item_id"], geometry["coordinate_space"],
+                geometry["bbox_x"], geometry["bbox_y"], geometry["bbox_w"], geometry["bbox_h"],
+                geometry["crop_bbox_x"], geometry["crop_bbox_y"],
+                geometry["crop_bbox_w"], geometry["crop_bbox_h"],
+                geometry.get("metadata_json") or "{}",
+            ),
+        )
+
+
+def _item_geometry(connection: sqlite3.Connection, item_id: str) -> dict[str, Any] | None:
+    row = connection.execute(
+        """SELECT coordinate_space,bbox_x,bbox_y,bbox_w,bbox_h,
+        crop_bbox_x,crop_bbox_y,crop_bbox_w,crop_bbox_h,metadata_json
+        FROM item_geometry WHERE item_id=?""",
+        (item_id,),
+    ).fetchone()
+    return dict(row) if row else None
 
 
 def _restore_asset(

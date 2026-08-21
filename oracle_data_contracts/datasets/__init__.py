@@ -23,6 +23,9 @@ from oracle_data_contracts.datasets.subset import subset_classification_dataset
 from oracle_data_contracts.datasets.workspace import (
     add_annotation_label,
     add_annotation_review,
+    add_classification_annotation_review,
+    add_descriptor_definition,
+    add_item_descriptor_annotation,
     add_item_label_annotation,
     add_model_evidence,
     complete_inference_run,
@@ -34,10 +37,12 @@ from oracle_data_contracts.datasets.taxonomy import (
     map_classification_label_to_concept,
     taxonomy_concept_id,
 )
+from oracle_data_contracts.datasets.spatial import box_is_within, normalize_box, normalize_item_geometry
 
 __all__ = [
     "DATASET_TYPES", "SCHEMA_NAME", "SCHEMA_VERSION", "DatasetSchemaError",
-    "add_annotation_label", "add_annotation_review", "add_item_label_annotation",
+    "add_annotation_label", "add_annotation_review", "add_classification_annotation_review",
+    "add_descriptor_definition", "add_item_descriptor_annotation", "add_item_label_annotation",
     "add_model_evidence", "complete_inference_run", "create_inference_run",
     "dataset_fingerprint", "initialize_database", "read_dataset_info",
     "release_training_dataset", "restore_workspace_snapshot", "save_checkpoint",
@@ -45,4 +50,5 @@ __all__ = [
     "subset_classification_dataset", "thaw_database", "validate_database",
     "workspace_fingerprint", "import_taxonomy_concepts",
     "map_classification_label_to_concept", "taxonomy_concept_id",
+    "box_is_within", "normalize_box", "normalize_item_geometry",
 ]

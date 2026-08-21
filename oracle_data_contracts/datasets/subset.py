@@ -82,6 +82,9 @@ def _classification_selection(
                        a.external_uri, a.encoding, a.media_type, a.shape_json,
                        a.dtype, a.original_filename,
                        a.metadata_json AS asset_metadata_json, a.created_at AS asset_created_at,
+                       g.coordinate_space, g.bbox_x, g.bbox_y, g.bbox_w, g.bbox_h,
+                       g.crop_bbox_x, g.crop_bbox_y, g.crop_bbox_w, g.crop_bbox_h,
+                       g.metadata_json AS geometry_metadata_json,
                        ca.annotation_id, ca.created_at AS annotation_created_at,
                        ca.annotator, ca.source, ca.confidence, ca.status,
                        ca.notes, ca.metadata_json AS annotation_metadata_json,
@@ -89,6 +92,7 @@ def _classification_selection(
                 FROM dataset_items di
                 JOIN classification_items ci ON ci.item_id = di.item_id
                 JOIN assets a ON a.asset_id = ci.image_asset_id
+                JOIN item_geometry g ON g.item_id = di.item_id
                 JOIN classification_annotations ca
                   ON ca.item_id = di.item_id AND ca.is_current = 1
                 WHERE ca.label_id IN ({placeholders})
@@ -106,6 +110,9 @@ def _classification_selection(
                        a.external_uri, a.encoding, a.media_type, a.shape_json,
                        a.dtype, a.original_filename,
                        a.metadata_json AS asset_metadata_json, a.created_at AS asset_created_at,
+                       g.coordinate_space, g.bbox_x, g.bbox_y, g.bbox_w, g.bbox_h,
+                       g.crop_bbox_x, g.crop_bbox_y, g.crop_bbox_w, g.crop_bbox_h,
+                       g.metadata_json AS geometry_metadata_json,
                        NULL AS annotation_id, NULL AS annotation_created_at,
                        NULL AS annotator, NULL AS source, NULL AS confidence,
                        NULL AS status, NULL AS notes,
@@ -113,6 +120,7 @@ def _classification_selection(
                 FROM dataset_items di
                 JOIN classification_items ci ON ci.item_id = di.item_id
                 JOIN assets a ON a.asset_id = ci.image_asset_id
+                JOIN item_geometry g ON g.item_id = di.item_id
                 LEFT JOIN classification_annotations ca
                   ON ca.item_id = di.item_id AND ca.is_current = 1
                 WHERE ca.annotation_id IS NULL
@@ -224,6 +232,17 @@ def _copy_selected_classification(
         destination.execute(
             "INSERT INTO classification_items (item_id, image_asset_id) VALUES (?, ?)",
             (row["item_id"], row["asset_id"]),
+        )
+        destination.execute(
+            """INSERT INTO item_geometry (
+            item_id,coordinate_space,bbox_x,bbox_y,bbox_w,bbox_h,
+            crop_bbox_x,crop_bbox_y,crop_bbox_w,crop_bbox_h,metadata_json
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                row["item_id"], row["coordinate_space"], row["bbox_x"], row["bbox_y"],
+                row["bbox_w"], row["bbox_h"], row["crop_bbox_x"], row["crop_bbox_y"],
+                row["crop_bbox_w"], row["crop_bbox_h"], row["geometry_metadata_json"],
+            ),
         )
         if row["annotation_id"] is not None:
             destination.execute(

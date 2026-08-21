@@ -213,7 +213,7 @@ def test_open_database_automatically_migrates_recognized_legacy_roi_database(tmp
 
     with pytest.warns(RuntimeWarning, match="Migrated legacy ROI database"):
         with open_database(database, create=False) as connection:
-            assert read_dataset_info(connection)["schema_version"] == "1.2.0"
+            assert read_dataset_info(connection)["schema_version"] == "1.5.0"
 
     assert list(tmp_path.glob("legacy.pre-v1-*.sqlite"))
     assert list(tmp_path.glob("legacy.migration-*.json"))
@@ -289,7 +289,7 @@ loss = "bce_soft_dice"
         )
 
     assert config["dataset"]["dataset_type"] == "mask_refinement"
-    assert config["dataset"]["schema_version"] == "1.2.0"
+    assert config["dataset"]["schema_version"] == "1.5.0"
     assert config["dataset"]["lifecycle"] == "working"
     assert inspect_dataset_kind(database) == "mask_refinement"
 
@@ -307,7 +307,7 @@ def test_unet_analysis_reports_v1_identity_and_automatic_migration(tmp_path):
 
     assert report["migration"]["migrated"]
     assert report["dataset"]["dataset_type"] == "mask_refinement"
-    assert report["dataset"]["schema_version"] == "1.2.0"
+    assert report["dataset"]["schema_version"] == "1.5.0"
     assert report["dataset"]["lifecycle"] == "working"
     assert len(report["dataset"]["dataset_id"]) == 36
     assert len(report["dataset"]["revision_id"]) == 36

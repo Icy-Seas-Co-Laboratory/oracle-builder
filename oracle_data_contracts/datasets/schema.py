@@ -7,9 +7,11 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
+from .spatial import geometry_row_values, normalize_item_geometry
+
 
 SCHEMA_NAME = "oracle_builder_dataset"
-SCHEMA_VERSION = "1.3.0"
+SCHEMA_VERSION = "1.5.0"
 DATASET_TYPES = {"classification", "mask_refinement"}
 LIFECYCLE_STATES = {"working", "frozen", "deprecated"}
 
@@ -92,6 +94,21 @@ CREATE TABLE IF NOT EXISTS dataset_items (
     updated_at TEXT NOT NULL,
     FOREIGN KEY (dataset_id) REFERENCES dataset(dataset_id),
     UNIQUE (dataset_id, source_key)
+);
+
+CREATE TABLE IF NOT EXISTS item_geometry (
+    item_id TEXT PRIMARY KEY,
+    coordinate_space TEXT NOT NULL,
+    bbox_x INTEGER NOT NULL,
+    bbox_y INTEGER NOT NULL,
+    bbox_w INTEGER NOT NULL CHECK (bbox_w > 0),
+    bbox_h INTEGER NOT NULL CHECK (bbox_h > 0),
+    crop_bbox_x INTEGER NOT NULL,
+    crop_bbox_y INTEGER NOT NULL,
+    crop_bbox_w INTEGER NOT NULL CHECK (crop_bbox_w > 0),
+    crop_bbox_h INTEGER NOT NULL CHECK (crop_bbox_h > 0),
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    FOREIGN KEY (item_id) REFERENCES dataset_items(item_id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS metadata_documents (
@@ -395,10 +412,73 @@ CREATE INDEX IF NOT EXISTS idx_classification_label_concepts_concept
 """
 
 
+# Dataset curation is part of the portable contract rather than an application
+# extension.  Descriptor assignments are multi-valued and therefore remain
+# distinct from the one-current-label annotation streams.
+CURATION_WORKSPACE_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS classification_annotation_reviews (
+    review_id TEXT PRIMARY KEY,
+    annotation_id TEXT NOT NULL,
+    reviewer TEXT NOT NULL,
+    decision TEXT NOT NULL CHECK (decision IN ('verified', 'rejected', 'needs_review')),
+    created_at TEXT NOT NULL,
+    notes TEXT,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    FOREIGN KEY (annotation_id) REFERENCES classification_annotations(annotation_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_classification_annotation_reviews_created
+    ON classification_annotation_reviews(annotation_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS descriptor_definitions (
+    descriptor_id TEXT PRIMARY KEY,
+    dataset_id TEXT NOT NULL,
+    scope TEXT NOT NULL CHECK (scope IN ('target', 'image')),
+    name TEXT NOT NULL,
+    parent_descriptor_id TEXT,
+    concept_id TEXT,
+    concept_type TEXT,
+    selectable INTEGER NOT NULL DEFAULT 1 CHECK (selectable IN (0, 1)),
+    exclusive_within_parent INTEGER NOT NULL DEFAULT 0 CHECK (exclusive_within_parent IN (0, 1)),
+    preferred INTEGER NOT NULL DEFAULT 0 CHECK (preferred IN (0, 1)),
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    deprecated_at TEXT,
+    FOREIGN KEY (dataset_id) REFERENCES dataset(dataset_id),
+    FOREIGN KEY (parent_descriptor_id) REFERENCES descriptor_definitions(descriptor_id),
+    FOREIGN KEY (concept_id) REFERENCES taxonomy_concepts(concept_id),
+    UNIQUE (dataset_id, scope, name)
+);
+CREATE INDEX IF NOT EXISTS idx_descriptor_definitions_scope_parent
+    ON descriptor_definitions(scope, parent_descriptor_id);
+
+CREATE TABLE IF NOT EXISTS item_descriptor_annotations (
+    annotation_id TEXT PRIMARY KEY,
+    item_id TEXT NOT NULL,
+    descriptor_id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    annotator TEXT,
+    status TEXT NOT NULL DEFAULT 'accepted'
+        CHECK (status IN ('accepted', 'deprecated')),
+    is_current INTEGER NOT NULL DEFAULT 1 CHECK (is_current IN (0, 1)),
+    parent_annotation_id TEXT,
+    notes TEXT,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    FOREIGN KEY (item_id) REFERENCES dataset_items(item_id) ON DELETE CASCADE,
+    FOREIGN KEY (descriptor_id) REFERENCES descriptor_definitions(descriptor_id),
+    FOREIGN KEY (parent_annotation_id) REFERENCES item_descriptor_annotations(annotation_id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_item_descriptor_current
+    ON item_descriptor_annotations(item_id, descriptor_id) WHERE is_current = 1;
+CREATE INDEX IF NOT EXISTS idx_item_descriptor_item
+    ON item_descriptor_annotations(item_id) WHERE is_current = 1;
+"""
+
+
 MUTABLE_TABLES = (
     "ob_schema",
     "assets",
     "dataset_items",
+    "item_geometry",
     "metadata_documents",
     "classification_labels",
     "classification_items",
@@ -414,6 +494,9 @@ MUTABLE_TABLES = (
     "taxonomy_concepts",
     "taxonomy_concept_mappings",
     "classification_label_concepts",
+    "classification_annotation_reviews",
+    "descriptor_definitions",
+    "item_descriptor_annotations",
 )
 
 
@@ -509,6 +592,14 @@ def _migrate_schema_if_needed(connection: sqlite3.Connection) -> None:
         return
     if tuple(schema_row) == (SCHEMA_NAME, "1.2.0"):
         _migrate_1_2_to_1_3(connection)
+        _migrate_schema_if_needed(connection)
+        return
+    if tuple(schema_row) == (SCHEMA_NAME, "1.3.0"):
+        _migrate_1_3_to_1_4(connection)
+        _migrate_schema_if_needed(connection)
+        return
+    if tuple(schema_row) == (SCHEMA_NAME, "1.4.0"):
+        _migrate_1_4_to_1_5(connection)
         return
     if tuple(schema_row) != (SCHEMA_NAME, "1.0.0"):
         raise DatasetSchemaError(
@@ -709,7 +800,7 @@ def _migrate_1_2_to_1_3(connection: sqlite3.Connection) -> None:
         connection.executescript(TAXONOMY_CONCEPT_SCHEMA_SQL)
         connection.execute(
             "UPDATE ob_schema SET schema_version = ? WHERE singleton = 1",
-            (SCHEMA_VERSION,),
+            ("1.3.0",),
         )
         dataset_id, revision_id = connection.execute(
             "SELECT dataset_id, revision_id FROM dataset WHERE singleton = 1"
@@ -725,7 +816,7 @@ def _migrate_1_2_to_1_3(connection: sqlite3.Connection) -> None:
                 json.dumps(
                     {
                         "from_version": "1.2.0",
-                        "to_version": SCHEMA_VERSION,
+                        "to_version": "1.3.0",
                         "added": [
                             "taxonomy_concepts",
                             "taxonomy_concept_mappings",
@@ -734,6 +825,191 @@ def _migrate_1_2_to_1_3(connection: sqlite3.Connection) -> None:
                     },
                     sort_keys=True,
                 ),
+            ),
+        )
+        _install_freeze_triggers(connection)
+        _install_touch_triggers(connection)
+        violations = connection.execute("PRAGMA foreign_key_check").fetchall()
+        if violations:
+            raise DatasetSchemaError(
+                f"Schema migration produced {len(violations)} foreign-key violation(s)"
+            )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.execute(f"PRAGMA foreign_keys = {foreign_keys}")
+
+
+def _migrate_1_3_to_1_4(connection: sqlite3.Connection) -> None:
+    """Promote portable curation and descriptor state into the shared contract."""
+    if connection.in_transaction:
+        raise DatasetSchemaError(
+            "Dataset schema migration requires a connection with no active transaction"
+        )
+    foreign_keys = int(connection.execute("PRAGMA foreign_keys").fetchone()[0])
+    connection.execute("PRAGMA foreign_keys = OFF")
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        _drop_lifecycle_triggers(connection)
+        connection.executescript(CURATION_WORKSPACE_SCHEMA_SQL)
+
+        migrated_descriptors = 0
+        migrated_assignments = 0
+        if _table_exists(connection, "registry_tag_definitions"):
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO descriptor_definitions (
+                    descriptor_id, dataset_id, scope, name, parent_descriptor_id,
+                    concept_type, selectable, exclusive_within_parent, preferred,
+                    metadata_json, created_at, deprecated_at
+                )
+                SELECT tag_id, dataset_id,
+                       CASE scope WHEN 'target_tags' THEN 'target' ELSE 'image' END,
+                       name, parent_tag_id, concept_type, selectable,
+                       exclusive_within_parent, preferred, metadata_json,
+                       created_at, deprecated_at
+                FROM registry_tag_definitions
+                """
+            )
+            migrated_descriptors = int(connection.execute("SELECT changes()").fetchone()[0])
+        if _table_exists(connection, "item_tag_annotations"):
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO item_descriptor_annotations (
+                    annotation_id, item_id, descriptor_id, created_at, annotator,
+                    status, is_current, parent_annotation_id, notes, metadata_json
+                )
+                SELECT annotation_id, item_id, tag_id, created_at, annotator,
+                       status, is_current, parent_annotation_id, notes, metadata_json
+                FROM item_tag_annotations
+                """
+            )
+            migrated_assignments = int(connection.execute("SELECT changes()").fetchone()[0])
+
+        connection.execute(
+            "UPDATE ob_schema SET schema_version = ? WHERE singleton = 1",
+            ("1.4.0",),
+        )
+        dataset_id, revision_id = connection.execute(
+            "SELECT dataset_id, revision_id FROM dataset WHERE singleton = 1"
+        ).fetchone()
+        connection.execute(
+            """
+            INSERT INTO dataset_events (
+                event_id, dataset_id, revision_id, event_type, created_at, actor, details_json
+            ) VALUES (?, ?, ?, 'schema.migrated', ?, 'oracle-data-contracts', ?)
+            """,
+            (
+                str(uuid.uuid4()), dataset_id, revision_id, utc_now(),
+                json.dumps(
+                    {
+                        "from_version": "1.3.0",
+                        "to_version": "1.4.0",
+                        "added": [
+                            "classification_annotation_reviews",
+                            "descriptor_definitions",
+                            "item_descriptor_annotations",
+                        ],
+                        "migrated_legacy_descriptors": migrated_descriptors,
+                        "migrated_legacy_descriptor_assignments": migrated_assignments,
+                    },
+                    sort_keys=True,
+                ),
+            ),
+        )
+        _install_freeze_triggers(connection)
+        _install_touch_triggers(connection)
+        violations = connection.execute("PRAGMA foreign_key_check").fetchall()
+        if violations:
+            raise DatasetSchemaError(
+                f"Schema migration produced {len(violations)} foreign-key violation(s)"
+            )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.execute(f"PRAGMA foreign_keys = {foreign_keys}")
+
+
+def _migrate_1_4_to_1_5(connection: sqlite3.Connection) -> None:
+    """Promote ROI crop and object bounding boxes into canonical item geometry."""
+    if connection.in_transaction:
+        raise DatasetSchemaError(
+            "Dataset schema migration requires a connection with no active transaction"
+        )
+    foreign_keys = int(connection.execute("PRAGMA foreign_keys").fetchone()[0])
+    connection.execute("PRAGMA foreign_keys = OFF")
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        _drop_lifecycle_triggers(connection)
+        connection.execute(
+            """CREATE TABLE IF NOT EXISTS item_geometry (
+                item_id TEXT PRIMARY KEY,
+                coordinate_space TEXT NOT NULL,
+                bbox_x INTEGER NOT NULL,
+                bbox_y INTEGER NOT NULL,
+                bbox_w INTEGER NOT NULL CHECK (bbox_w > 0),
+                bbox_h INTEGER NOT NULL CHECK (bbox_h > 0),
+                crop_bbox_x INTEGER NOT NULL,
+                crop_bbox_y INTEGER NOT NULL,
+                crop_bbox_w INTEGER NOT NULL CHECK (crop_bbox_w > 0),
+                crop_bbox_h INTEGER NOT NULL CHECK (crop_bbox_h > 0),
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                FOREIGN KEY (item_id) REFERENCES dataset_items(item_id) ON DELETE CASCADE
+            )"""
+        )
+        migrated = 0
+        dataset_type = connection.execute(
+            "SELECT dataset_type FROM dataset WHERE singleton=1"
+        ).fetchone()[0]
+        relation = "classification_items" if dataset_type == "classification" else "mask_refinement_items"
+        for item_id, metadata_json, shape_json in connection.execute(
+            f"""SELECT di.item_id,di.metadata_json,a.shape_json
+            FROM dataset_items di
+            LEFT JOIN {relation} task ON task.item_id=di.item_id
+            LEFT JOIN assets a ON a.asset_id=task.image_asset_id
+            ORDER BY di.item_id"""
+        ).fetchall():
+            try:
+                metadata = json.loads(metadata_json or "{}")
+            except (TypeError, json.JSONDecodeError):
+                metadata = {}
+            try:
+                shape = json.loads(shape_json) if shape_json else None
+            except (TypeError, json.JSONDecodeError):
+                shape = None
+            geometry = normalize_item_geometry(metadata, image_shape=shape)
+            if geometry is None:
+                continue
+            connection.execute(
+                """INSERT OR REPLACE INTO item_geometry (
+                item_id,coordinate_space,bbox_x,bbox_y,bbox_w,bbox_h,
+                crop_bbox_x,crop_bbox_y,crop_bbox_w,crop_bbox_h,metadata_json
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                (item_id, *geometry_row_values(geometry), json.dumps(geometry["metadata"], sort_keys=True)),
+            )
+            migrated += 1
+        connection.execute(
+            "UPDATE ob_schema SET schema_version = ? WHERE singleton = 1",
+            (SCHEMA_VERSION,),
+        )
+        dataset_id, revision_id = connection.execute(
+            "SELECT dataset_id, revision_id FROM dataset WHERE singleton = 1"
+        ).fetchone()
+        connection.execute(
+            """INSERT INTO dataset_events (
+            event_id,dataset_id,revision_id,event_type,created_at,actor,details_json
+            ) VALUES (?,?,?,'schema.migrated',?,'oracle-data-contracts',?)""",
+            (
+                str(uuid.uuid4()), dataset_id, revision_id, utc_now(),
+                json.dumps({
+                    "from_version": "1.4.0", "to_version": SCHEMA_VERSION,
+                    "added": ["item_geometry"], "normalized_item_count": migrated,
+                    "fallback": "bbox equals crop when only one compatible rectangle exists",
+                }, sort_keys=True),
             ),
         )
         _install_freeze_triggers(connection)
@@ -857,6 +1133,7 @@ def initialize_database(
     )
     connection.executescript(ANNOTATION_WORKSPACE_SCHEMA_SQL)
     connection.executescript(TAXONOMY_CONCEPT_SCHEMA_SQL)
+    connection.executescript(CURATION_WORKSPACE_SCHEMA_SQL)
     _install_freeze_triggers(connection)
     _install_touch_triggers(connection)
     return read_dataset_info(connection)
@@ -961,6 +1238,12 @@ def dataset_fingerprint(connection: sqlite3.Connection) -> str:
             FROM dataset_items ORDER BY item_id
             """,
         ),
+        "item_geometry": _canonical_rows(
+            connection,
+            """SELECT item_id,coordinate_space,bbox_x,bbox_y,bbox_w,bbox_h,
+            crop_bbox_x,crop_bbox_y,crop_bbox_w,crop_bbox_h,metadata_json
+            FROM item_geometry ORDER BY item_id""",
+        ),
         "metadata_documents": _canonical_rows(
             connection,
             """
@@ -1017,8 +1300,32 @@ def dataset_fingerprint(connection: sqlite3.Connection) -> str:
             FROM classification_label_concepts ORDER BY label_id
             """,
         ),
+        "descriptor_definitions": _canonical_rows(
+            connection,
+            """
+            SELECT descriptor_id, scope, name, parent_descriptor_id, concept_id,
+                   concept_type, selectable, exclusive_within_parent, preferred,
+                   metadata_json, deprecated_at
+            FROM descriptor_definitions ORDER BY descriptor_id
+            """,
+        ),
+        "item_descriptor_annotations": _canonical_rows(
+            connection,
+            """
+            SELECT annotation_id, item_id, descriptor_id, annotator, status,
+                   is_current, parent_annotation_id, notes, metadata_json
+            FROM item_descriptor_annotations ORDER BY annotation_id
+            """,
+        ),
     }
     if info["dataset_type"] == "classification":
+        payload["classification_annotation_reviews"] = _canonical_rows(
+            connection,
+            """
+            SELECT review_id, annotation_id, reviewer, decision, notes, metadata_json
+            FROM classification_annotation_reviews ORDER BY review_id
+            """,
+        )
         payload["assets"] = _canonical_rows(
             connection,
             """
@@ -1160,6 +1467,7 @@ def validate_database(connection: sqlite3.Connection) -> dict[str, Any]:
         "dataset",
         "assets",
         "dataset_items",
+        "item_geometry",
         "metadata_documents",
         "import_events",
         "dataset_events",
@@ -1172,6 +1480,9 @@ def validate_database(connection: sqlite3.Connection) -> dict[str, Any]:
         "taxonomy_concepts",
         "taxonomy_concept_mappings",
         "classification_label_concepts",
+        "classification_annotation_reviews",
+        "descriptor_definitions",
+        "item_descriptor_annotations",
     }
     if info["dataset_type"] == "classification":
         required_tables.update(
@@ -1230,6 +1541,21 @@ def validate_database(connection: sqlite3.Connection) -> dict[str, Any]:
     item_count = connection.execute("SELECT count(*) FROM dataset_items").fetchone()[0]
     if item_count == 0:
         warnings.append("Dataset contains no items")
+    missing_geometry = connection.execute(
+        """SELECT count(*) FROM dataset_items di
+        LEFT JOIN item_geometry geometry ON geometry.item_id=di.item_id
+        WHERE geometry.item_id IS NULL"""
+    ).fetchone()[0]
+    if missing_geometry:
+        errors.append(f"{missing_geometry} dataset item(s) lack canonical item geometry")
+    outside_crop = connection.execute(
+        """SELECT count(*) FROM item_geometry
+        WHERE bbox_x < crop_bbox_x OR bbox_y < crop_bbox_y
+          OR bbox_x+bbox_w > crop_bbox_x+crop_bbox_w
+          OR bbox_y+bbox_h > crop_bbox_y+crop_bbox_h"""
+    ).fetchone()[0]
+    if outside_crop:
+        errors.append(f"{outside_crop} item bounding box(es) fall outside their crop")
     if info["dataset_type"] == "classification":
         if _table_exists(connection, "mask_refinement_items"):
             errors.append("Classification database contains mask-refinement schema tables")

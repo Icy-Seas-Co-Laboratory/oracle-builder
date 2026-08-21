@@ -135,6 +135,111 @@ def add_annotation_review(
     return review_id
 
 
+def add_classification_annotation_review(
+    connection: sqlite3.Connection,
+    annotation_id: str,
+    reviewer: str,
+    decision: str,
+    *,
+    notes: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> str:
+    """Append a review of a classification training-label assertion."""
+    if decision not in {"verified", "rejected", "needs_review"}:
+        raise ValueError("decision must be verified, rejected, or needs_review")
+    review_id = str(uuid.uuid4())
+    connection.execute(
+        """
+        INSERT INTO classification_annotation_reviews (
+            review_id, annotation_id, reviewer, decision, created_at, notes, metadata_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            review_id, annotation_id, reviewer, decision, utc_now(), notes,
+            json.dumps(metadata or {}, sort_keys=True, default=str),
+        ),
+    )
+    return review_id
+
+
+def add_descriptor_definition(
+    connection: sqlite3.Connection,
+    name: str,
+    scope: str,
+    *,
+    descriptor_id: str | None = None,
+    parent_descriptor_id: str | None = None,
+    concept_id: str | None = None,
+    concept_type: str | None = None,
+    selectable: bool = True,
+    exclusive_within_parent: bool = False,
+    preferred: bool = False,
+    metadata: dict[str, Any] | None = None,
+) -> str:
+    """Create a reusable target or image descriptor in the dataset workspace."""
+    resolved_scope = str(scope).strip().lower().removesuffix("_tags")
+    if resolved_scope not in {"target", "image"}:
+        raise ValueError("scope must be target or image")
+    info = read_dataset_info(connection)
+    resolved_id = descriptor_id or str(uuid.uuid4())
+    connection.execute(
+        """
+        INSERT INTO descriptor_definitions (
+            descriptor_id, dataset_id, scope, name, parent_descriptor_id,
+            concept_id, concept_type, selectable, exclusive_within_parent,
+            preferred, metadata_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            resolved_id, info["dataset_id"], resolved_scope, name,
+            parent_descriptor_id, concept_id, concept_type, int(selectable),
+            int(exclusive_within_parent), int(preferred),
+            json.dumps(metadata or {}, sort_keys=True, default=str), utc_now(),
+        ),
+    )
+    return resolved_id
+
+
+def add_item_descriptor_annotation(
+    connection: sqlite3.Connection,
+    item_id: str,
+    descriptor_id: str,
+    *,
+    assigned: bool = True,
+    annotator: str | None = None,
+    notes: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> str:
+    """Append an assignment or compensating removal for one item descriptor."""
+    prior = connection.execute(
+        """
+        SELECT annotation_id FROM item_descriptor_annotations
+        WHERE item_id = ? AND descriptor_id = ? AND is_current = 1
+        """,
+        (item_id, descriptor_id),
+    ).fetchone()
+    if prior is not None:
+        connection.execute(
+            "UPDATE item_descriptor_annotations SET is_current = 0 WHERE annotation_id = ?",
+            (prior[0],),
+        )
+    annotation_id = str(uuid.uuid4())
+    connection.execute(
+        """
+        INSERT INTO item_descriptor_annotations (
+            annotation_id, item_id, descriptor_id, created_at, annotator,
+            status, is_current, parent_annotation_id, notes, metadata_json
+        ) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+        """,
+        (
+            annotation_id, item_id, descriptor_id, utc_now(), annotator,
+            "accepted" if assigned else "deprecated", prior[0] if prior else None,
+            notes, json.dumps(metadata or {}, sort_keys=True, default=str),
+        ),
+    )
+    return annotation_id
+
+
 def create_inference_run(
     connection: sqlite3.Connection,
     *,

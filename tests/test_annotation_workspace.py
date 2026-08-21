@@ -22,6 +22,8 @@ from oracle_builder.datasets.schema import (
 from oracle_builder.datasets.workspace import (
     add_annotation_label,
     add_annotation_review,
+    add_descriptor_definition,
+    add_item_descriptor_annotation,
     add_item_label_annotation,
     add_model_evidence,
     create_inference_run,
@@ -48,6 +50,13 @@ def _workspace_item(connection: sqlite3.Connection) -> str:
     connection.execute(
         "INSERT INTO mask_refinement_items (item_id, image_asset_id) VALUES (?, ?)",
         (item_id, asset_id),
+    )
+    connection.execute(
+        """INSERT INTO item_geometry (
+           item_id, coordinate_space, bbox_x, bbox_y, bbox_w, bbox_h,
+           crop_bbox_x, crop_bbox_y, crop_bbox_w, crop_bbox_h
+           ) VALUES (?, 'image_pixels', 0, 0, 1, 1, 0, 0, 1, 1)""",
+        (item_id,),
     )
     return item_id
 
@@ -78,6 +87,71 @@ def test_annotation_workspace_retains_human_and_model_evidence(tmp_path):
         assert canonical
         assert workspace and workspace != canonical
         assert connection.execute("SELECT count(*) FROM model_evidence").fetchone()[0] == 1
+
+
+def test_portable_descriptor_contract_supports_multiple_assignments(tmp_path):
+    path = tmp_path / "descriptors.sqlite"
+    with sqlite3.connect(path) as connection:
+        initialize_database(connection, "mask_refinement", name="descriptor-review")
+        item_id = _workspace_item(connection)
+        target = add_descriptor_definition(connection, "copepod", "target_tags")
+        image = add_descriptor_definition(connection, "partial", "image")
+        add_item_descriptor_annotation(connection, item_id, target, annotator="curator")
+        add_item_descriptor_annotation(connection, item_id, image, annotator="curator")
+        connection.commit()
+
+        assert connection.execute(
+            "SELECT count(*) FROM item_descriptor_annotations WHERE is_current = 1"
+        ).fetchone()[0] == 2
+        assert validate_database(connection)["valid"]
+
+
+def test_migrates_registry_descriptor_extension_to_shared_contract(tmp_path):
+    path = tmp_path / "registry-v13.sqlite"
+    with sqlite3.connect(path) as connection:
+        initialize_database(connection, "mask_refinement")
+        item_id = _workspace_item(connection)
+        info = read_dataset_info(connection)
+        connection.executescript(
+            """
+            CREATE TABLE registry_tag_definitions (
+              tag_id TEXT PRIMARY KEY, dataset_id TEXT NOT NULL, scope TEXT NOT NULL,
+              name TEXT NOT NULL, parent_tag_id TEXT, concept_type TEXT,
+              selectable INTEGER NOT NULL, exclusive_within_parent INTEGER NOT NULL,
+              preferred INTEGER NOT NULL, metadata_json TEXT NOT NULL,
+              created_at TEXT NOT NULL, deprecated_at TEXT
+            );
+            CREATE TABLE item_tag_annotations (
+              annotation_id TEXT PRIMARY KEY, item_id TEXT NOT NULL, tag_id TEXT NOT NULL,
+              created_at TEXT NOT NULL, annotator TEXT, status TEXT NOT NULL,
+              is_current INTEGER NOT NULL, parent_annotation_id TEXT, notes TEXT,
+              metadata_json TEXT NOT NULL
+            );
+            """
+        )
+        descriptor_id, annotation_id = str(uuid.uuid4()), str(uuid.uuid4())
+        connection.execute(
+            "INSERT INTO registry_tag_definitions VALUES (?,?,?,?,NULL,NULL,1,0,0,'{}','now',NULL)",
+            (descriptor_id, info["dataset_id"], "target_tags", "legacy target"),
+        )
+        connection.execute(
+            "INSERT INTO item_tag_annotations VALUES (?,?,?,'now','curator','accepted',1,NULL,NULL,'{}')",
+            (annotation_id, item_id, descriptor_id),
+        )
+        connection.execute("DROP TABLE item_descriptor_annotations")
+        connection.execute("DROP TABLE descriptor_definitions")
+        connection.execute("UPDATE ob_schema SET schema_version='1.3.0'")
+        connection.commit()
+
+        migrated = initialize_database(connection, "mask_refinement")
+        assert migrated["schema_version"] == "1.5.0"
+        assert connection.execute(
+            "SELECT scope FROM descriptor_definitions WHERE descriptor_id=?", (descriptor_id,)
+        ).fetchone()[0] == "target"
+        assert connection.execute(
+            "SELECT descriptor_id FROM item_descriptor_annotations WHERE annotation_id=?",
+            (annotation_id,),
+        ).fetchone()[0] == descriptor_id
 
 
 def test_workspace_snapshot_and_restore_preserve_evidence(tmp_path):
@@ -125,7 +199,7 @@ def test_migrates_v11_to_v12_annotation_workspace_schema(tmp_path):
             (dataset_id, revision_id),
         )
         connection.commit()
-        assert initialize_database(connection, "mask_refinement")["schema_version"] == "1.2.0"
+        assert initialize_database(connection, "mask_refinement")["schema_version"] == "1.5.0"
         assert connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'model_evidence'"
         ).fetchone()

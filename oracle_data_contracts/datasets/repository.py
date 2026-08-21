@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Any, Iterable
 
 from oracle_data_contracts.datasets.schema import read_dataset_info, utc_now
+from oracle_data_contracts.datasets.spatial import geometry_row_values, normalize_item_geometry
 
 
 @dataclass(frozen=True)
@@ -107,6 +108,10 @@ class SQLiteDatasetRepository:
         source_key: str,
         sample_weight: float | None = None,
         metadata: dict[str, Any] | None = None,
+        bbox: Any = None,
+        crop_bbox: Any = None,
+        coordinate_space: str | None = None,
+        image_shape: Iterable[int] | None = None,
     ) -> str:
         resolved_id = item_id or self.item_id(source_key)
         now = utc_now()
@@ -131,7 +136,50 @@ class SQLiteDatasetRepository:
                 now,
             ),
         )
+        geometry = normalize_item_geometry(
+            metadata, image_shape=list(image_shape) if image_shape is not None else None,
+            bbox=bbox, crop_bbox=crop_bbox, coordinate_space=coordinate_space,
+        )
+        if geometry:
+            self._upsert_item_geometry(resolved_id, geometry)
         return resolved_id
+
+    def _upsert_item_geometry(self, item_id: str, geometry: dict[str, Any]) -> None:
+        self.connection.execute(
+            """INSERT INTO item_geometry (
+            item_id,coordinate_space,bbox_x,bbox_y,bbox_w,bbox_h,
+            crop_bbox_x,crop_bbox_y,crop_bbox_w,crop_bbox_h,metadata_json
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(item_id) DO UPDATE SET
+              coordinate_space=excluded.coordinate_space,
+              bbox_x=excluded.bbox_x,bbox_y=excluded.bbox_y,
+              bbox_w=excluded.bbox_w,bbox_h=excluded.bbox_h,
+              crop_bbox_x=excluded.crop_bbox_x,crop_bbox_y=excluded.crop_bbox_y,
+              crop_bbox_w=excluded.crop_bbox_w,crop_bbox_h=excluded.crop_bbox_h,
+              metadata_json=excluded.metadata_json""",
+            (item_id, *geometry_row_values(geometry),
+             json.dumps(geometry.get("metadata") or {}, sort_keys=True, default=str)),
+        )
+
+    def _ensure_item_geometry(self, item_id: str, image_asset_id: str) -> None:
+        row = self.connection.execute(
+            """SELECT di.metadata_json,a.shape_json FROM dataset_items di
+            JOIN assets a ON a.asset_id=? WHERE di.item_id=?""",
+            (image_asset_id, item_id),
+        ).fetchone()
+        if row is None:
+            return
+        try:
+            metadata = json.loads(row["metadata_json"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            metadata = {}
+        try:
+            shape = json.loads(row["shape_json"]) if row["shape_json"] else None
+        except (TypeError, json.JSONDecodeError):
+            shape = None
+        geometry = normalize_item_geometry(metadata, image_shape=shape)
+        if geometry:
+            self._upsert_item_geometry(item_id, geometry)
 
     def add_classification_label(
         self,
@@ -187,6 +235,7 @@ class SQLiteDatasetRepository:
             """,
             (item_id, image_asset_id),
         )
+        self._ensure_item_geometry(item_id, image_asset_id)
         current = self.connection.execute(
             """
             SELECT annotation_id, label_id FROM classification_annotations
@@ -241,6 +290,7 @@ class SQLiteDatasetRepository:
             """,
             (item_id, image_asset_id, candidate_mask_asset_id),
         )
+        self._ensure_item_geometry(item_id, image_asset_id)
 
     def classification_rows(self) -> list[dict[str, Any]]:
         rows = self.connection.execute(

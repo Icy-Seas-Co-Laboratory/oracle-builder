@@ -10,7 +10,7 @@ SQLite file contains exactly one dataset and one use-case schema:
 - `mask_refinement` stores source images, optional candidate masks, and
   append-only refined-mask annotations.
 
-`ob_schema` identifies the contract as `oracle_builder_dataset` version `1.2.0`.
+`ob_schema` identifies the contract as `oracle_builder_dataset` version `1.5.0`.
 `dataset.dataset_id` is the stable lineage UUID. `dataset.revision_id` identifies
 one workspace/checkpoint revision, while `parent_revision_id` links a checkpoint
 to the workspace revision it captured. All three survive export, import, and
@@ -18,7 +18,9 @@ future movement into warm storage.
 
 Schema 1.1 removes `dataset_items.split` entirely. Schema 1.2 adds generic
 annotation-workspace tables for ROI labels, reviews, inference provenance, and
-derived evidence. Opening an older V1 database migrates it transactionally.
+derived evidence. Schema 1.3 adds shared taxonomy concepts, Schema 1.4 promotes
+classification review and descriptor curation, and Schema 1.5 adds canonical
+item geometry. Opening an older V1 database migrates it transactionally.
 Opening a 1.0 database
 transactionally rebuilds `dataset_items`, discards obsolete stored assignments
 and split-hint metadata, updates `ob_schema`, reinstalls lifecycle triggers, and
@@ -42,6 +44,7 @@ on undocumented SQLite implementation details.
 | `dataset` | Singleton identity, type, descriptive metadata, and lifecycle. |
 | `assets` | Content-addressed encoded bytes or an external URI, with checksum and representation metadata. |
 | `dataset_items` | Stable item identity, weight, source key, and item metadata. |
+| `item_geometry` | Object bounding box and stored crop bounds in one named pixel coordinate space. |
 | `metadata_documents` | Parsed JSON plus original sidecar text and checksum. |
 | `import_events` | Reproducible importer options and summaries. |
 | `dataset_events` | Lifecycle and checkpoint provenance. |
@@ -77,6 +80,15 @@ preserved losslessly; PostgreSQL should key these by `(dataset_id, item_id)`.
 JSON fields contain canonical JSON text and timestamps are UTC ISO-8601 text.
 The other logical types map directly to PostgreSQL `uuid`, `jsonb`, and
 `timestamptz`.
+
+`item_geometry` uses integer `x, y, width, height` rectangles. For Pelagia ROI
+datasets both rectangles use `source_frame_pixels`: `bbox` is the detected
+object extent and `crop_bbox` is the possibly padded image crop stored as the
+item asset. Importers that have only one compatible rectangle use it for both
+concepts; when only a shaped ROI image is available, its full extent is used for
+both. Application-specific spatial and provenance documents remain intact in
+`dataset_items.metadata_json`; normalization details are recorded separately in
+`item_geometry.metadata_json`.
 
 ## Lifecycle
 
