@@ -59,8 +59,31 @@ def _model_contract(config: dict[str, Any]) -> dict[str, Any]:
             "embedding_normalized": config.get("model", {}).get(
                 "normalize_embeddings", True
             ),
+            "cluster_evidence": bool(
+                config.get("clustering", {}).get("enabled", False)
+                or config.get("clustering", {}).get("structure")
+            ),
+            "cluster_count": config.get("clustering", {}).get("structure", {}).get(
+                "cluster_count"
+            ),
         }
         if task == "classification"
+        else {
+            "primary": "roi_cluster_evidence",
+            "embedding": "identity_embedding",
+            "embedding_dimension": config.get("model", {}).get("embedding_dim", 256),
+            "embedding_normalized": config.get("model", {}).get(
+                "normalize_embeddings", True
+            ),
+            "cluster_evidence": True,
+            "cluster_count": config.get("clustering", {}).get("structure", {}).get(
+                "cluster_count"
+            ),
+            "cluster_method": config.get("clustering", {}).get(
+                "method", "spherical_kmeans"
+            ),
+        }
+        if task == "clustering"
         else {
             "primary": config.get("training", {}).get(
                 "segmentation_target", "validated_mask"

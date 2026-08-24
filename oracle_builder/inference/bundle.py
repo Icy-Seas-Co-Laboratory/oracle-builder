@@ -8,6 +8,7 @@ from typing import Any
 import numpy as np
 
 from oracle_builder.artifacts import read_run_config, read_run_manifest
+from oracle_builder.clustering.evidence import ClusterEvidenceIndex
 from oracle_builder.classification.evidence import IdentityEvidenceIndex
 from oracle_builder.data.decoders import (
     prepare_classification_input,
@@ -117,14 +118,16 @@ class InferenceBundle:
         model_reference: ModelReference,
         *,
         evidence_index: IdentityEvidenceIndex | None = None,
+        cluster_index: ClusterEvidenceIndex | None = None,
     ):
         self.model = model
         self.config = config
         self.model_reference = model_reference
         self.evidence_index = evidence_index
+        self.cluster_index = cluster_index
         self._classification_executor = (
             ClassificationExecutor(model, tuple(config["data"]["input_shape"]))
-            if model_reference.task == "classification"
+            if model_reference.task in {"classification", "clustering"}
             else None
         )
         self.runtime_diagnostics: dict[str, Any] = {}
@@ -143,6 +146,12 @@ class InferenceBundle:
             if evidence_path.exists()
             else None
         )
+        cluster_path = run_dir / "model" / "clustering_evidence"
+        cluster_index = (
+            ClusterEvidenceIndex.load(cluster_path)
+            if cluster_path.exists()
+            else None
+        )
         return cls(
             model,
             config,
@@ -154,6 +163,7 @@ class InferenceBundle:
                 architecture=config["run"]["model"],
             ),
             evidence_index=evidence,
+            cluster_index=cluster_index,
         )
 
     def predict(
@@ -169,7 +179,7 @@ class InferenceBundle:
         try:
             output = (
                 self._predict_classification(item)
-                if self.model_reference.task == "classification"
+                if self.model_reference.task in {"classification", "clustering"}
                 else self._predict_segmentation(item)
             )
             status = "ok"
@@ -216,7 +226,7 @@ class InferenceBundle:
             source_dataset=source_dataset,
         )
         materialized_items = list(items)
-        if self.model_reference.task != "classification":
+        if self.model_reference.task not in {"classification", "clustering"}:
             for index, item in enumerate(materialized_items):
                 result_set.append(
                     self.predict(
@@ -247,12 +257,33 @@ class InferenceBundle:
         if prepared:
             try:
                 values = self._classification_executor.predict(np.stack(prepared, axis=0))
+                cluster_packets = None
+                if self.cluster_index is not None and values["features"] is not None:
+                    embeddings = np.asarray(values["features"], dtype="float32")
+                    query_uuids = [
+                        materialized_items[item_index].source.resource_id
+                        if materialized_items[item_index].source is not None
+                        else None
+                        for item_index in prepared_indices
+                    ]
+                    cluster_packets = self.cluster_index.packet_many(
+                        embeddings,
+                        query_uuids=query_uuids,
+                        top_k=int(self.config.get("clustering", {}).get("top_k", 5)),
+                    )
                 for batch_index, item_index in enumerate(prepared_indices):
                     item = materialized_items[item_index]
                     results[item_index] = self._success_result(
                         item,
                         self._classification_output_from_values(
-                            item, values, batch_index
+                            item,
+                            values,
+                            batch_index,
+                            cluster_packet=(
+                                cluster_packets[batch_index]
+                                if cluster_packets is not None
+                                else None
+                            ),
                         ),
                         result_set_id=result_set.result_set_id,
                         sequence_number=item_index,
@@ -303,7 +334,7 @@ class InferenceBundle:
 
     def warm_for_serving(self, batch_sizes: tuple[int, ...] = (1,)) -> dict[str, Any]:
         """Compile and exercise the resident callable without retaining input data."""
-        if self.model_reference.task != "classification" or self._classification_executor is None:
+        if self.model_reference.task not in {"classification", "clustering"} or self._classification_executor is None:
             self.runtime_diagnostics = {"runtime": "segmentation", "warmup": []}
             return self.runtime_diagnostics
         warmup: list[dict[str, Any]] = []
@@ -352,6 +383,7 @@ class InferenceBundle:
         item: InferenceItem,
         values: dict[str, Any],
         batch_index: int,
+        cluster_packet: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         logits = np.asarray(values["logits"][batch_index], dtype="float32")
         probabilities = np.asarray(
@@ -363,6 +395,23 @@ class InferenceBundle:
             if features is not None
             else None
         )
+        if self.model_reference.task == "clustering":
+            if embedding is None:
+                raise ValueError("Clustering model does not expose an embedding")
+            if self.cluster_index is None:
+                raise ValueError("Clustering model is missing its clustering evidence index")
+            return {
+                "type": "clustering",
+                "embedding": ArrayPayload(embedding),
+                "embedding_normalized": bool(
+                    self.config.get("model", {}).get("normalize_embeddings", True)
+                ),
+                "evidence": cluster_packet or self.cluster_index.packet(
+                    embedding,
+                    query_uuid=(item.source.resource_id if item.source is not None else None),
+                    top_k=int(self.config.get("clustering", {}).get("top_k", 5)),
+                ),
+            }
         class_index = int(np.argmax(probabilities))
         label = _labels(self.config).get(class_index, {})
         output: dict[str, Any] = {
@@ -404,6 +453,12 @@ class InferenceBundle:
                         item.source.resource_id if item.source is not None else None
                     ),
                     k=int(self.config.get("evidence", {}).get("knn_k", 5)),
+                )
+            if self.cluster_index is not None:
+                output["clustering_evidence"] = cluster_packet or self.cluster_index.packet(
+                    embedding,
+                    query_uuid=(item.source.resource_id if item.source is not None else None),
+                    top_k=int(self.config.get("clustering", {}).get("top_k", 5)),
                 )
         return output
 

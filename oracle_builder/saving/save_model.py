@@ -133,7 +133,7 @@ def save_model_artifacts(model: keras.Model, run_dir: str | Path, config: dict[s
     if config.get("output", {}).get("export_savedmodel", True):
         try:
             export_dir = model_path / "export_savedmodel"
-            if config.get("run", {}).get("task") == "classification":
+            if config.get("run", {}).get("task") in {"classification", "clustering"}:
                 _export_classification_model(model, export_dir, config)
             else:
                 _export_segmentation_model(model, export_dir, config)
@@ -202,8 +202,32 @@ def save_model_artifacts(model: keras.Model, run_dir: str | Path, config: dict[s
                 "embedding_dimension": config.get("model", {}).get(
                     "embedding_dim", 256
                 ),
+                "cluster_evidence": bool(
+                    config.get("clustering", {}).get("enabled", False)
+                    or config.get("clustering", {}).get("structure")
+                ),
+                "cluster_count": config.get("clustering", {}).get(
+                    "structure", {}
+                ).get("cluster_count"),
             }
             if config.get("run", {}).get("task") == "classification"
+            else {
+                "embedding": True,
+                "embedding_dimension": config.get("model", {}).get(
+                    "embedding_dim", 256
+                ),
+                "embedding_normalized": config.get("model", {}).get(
+                    "normalize_embeddings", True
+                ),
+                "cluster_evidence": True,
+                "cluster_count": config.get("clustering", {}).get(
+                    "structure", {}
+                ).get("cluster_count"),
+                "cluster_method": config.get("clustering", {}).get(
+                    "method", "spherical_kmeans"
+                ),
+            }
+            if config.get("run", {}).get("task") == "clustering"
             else {
                 "logits": True,
                 "probability_map": True,
@@ -218,6 +242,7 @@ def save_model_artifacts(model: keras.Model, run_dir: str | Path, config: dict[s
         ),
         "postprocessing": {
             "classification_evidence": config.get("evidence", {}),
+            "clustering_evidence": config.get("clustering", {}),
             "segmentation_threshold": config.get("evaluation", {}).get(
                 "segmentation_threshold", 0.5
             ),

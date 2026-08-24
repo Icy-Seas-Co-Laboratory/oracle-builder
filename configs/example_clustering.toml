@@ -1,0 +1,64 @@
+# Self-supervised unlabeled ROI organization with spherical k-means.
+# The input may contain existing annotations; they are ignored for training.
+
+[run]
+task = "clustering"
+model = "resnet"
+seed = 123
+notes = "BYOL encoder followed by cosine-space ROI clustering"
+
+[data]
+input_shape = [224, 224, 1]
+batch_size = 16
+shuffle_buffer = 4096
+
+[preprocessing]
+resize_mode = "fit_pad"
+normalization = "dtype"
+rescale = true
+invert = "auto"
+pad_value = 0.0
+interpolation = "bilinear"
+channel_mode = "grayscale"
+
+[model]
+variant = "resnet18"
+base_filters = 64
+embedding_dim = 256
+normalize_embeddings = true
+
+[pretraining]
+enabled = true
+method = "byol" # simclr is also supported
+epochs = 50
+learning_rate = 0.001
+teacher_momentum = 0.99
+projection_dim = 128
+projection_hidden_dim = 256
+use_training_augmentation = true
+
+[clustering]
+method = "spherical_kmeans"
+n_clusters = 8
+novelty_percentile = 5.0
+top_k = 5
+# Bound both the diagnostic cost and persistent neighbor set for large runs.
+silhouette_max_samples = 2000
+reference_neighbors_per_cluster = 64 # set to "all" only if full neighbors are required
+fit_batch_size = 4096
+
+[augmentation]
+enabled = true
+rotation = 0.5
+zoom = 0.20
+translation = [0.15, 0.15]
+skew = 0.20
+flip_horizontal = true
+flip_vertical = true
+brightness = 0.20
+contrast = 0.20
+gaussian_noise = 0.05
+fill_value = 0.0
+
+[output]
+export_savedmodel = true

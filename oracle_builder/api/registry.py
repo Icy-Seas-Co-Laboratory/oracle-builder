@@ -53,11 +53,13 @@ def _manifest_catalog(run_dir: Path) -> dict[str, Any]:
                 "normalized": bool(outputs.get("embedding_normalized", True)),
             },
             "evidence": {
-                "available": False,
-                "schema_version": None,
-                "prototype": False,
-                "knn": False,
+                "available": bool(outputs.get("cluster_evidence")),
+                "schema_version": 2 if outputs.get("cluster_evidence") else None,
+                "prototype": bool(outputs.get("cluster_evidence")),
+                "knn": bool(outputs.get("cluster_evidence")),
                 "visual_exemplars": False,
+                "type": "roi_clustering" if outputs.get("cluster_evidence") else None,
+                "cluster_count": outputs.get("cluster_count"),
             },
         },
     }
@@ -254,7 +256,28 @@ class InferenceModelRegistry:
         model = config.get("model") or {}
         evidence = config.get("evidence") or {}
         evidence_index = getattr(bundle, "evidence_index", None)
-        return {
+        cluster_index = getattr(bundle, "cluster_index", None)
+        if cluster_index is not None and bundle.model_reference.task == "clustering":
+            return {
+                "contract_version": "1.0.0",
+                "labels": [],
+                "embedding": {
+                    "available": True,
+                    "dimension": cluster_index.embedding_dim,
+                    "normalized": True,
+                },
+                "evidence": {
+                    "available": True,
+                    "schema_version": 1,
+                    "prototype": True,
+                    "knn": True,
+                    "visual_exemplars": False,
+                    "type": "roi_clustering",
+                    "cluster_count": cluster_index.cluster_count,
+                    "method": cluster_index.method,
+                },
+            }
+        result = {
             "contract_version": "1.0.0",
             "labels": [
                 {
@@ -278,13 +301,32 @@ class InferenceModelRegistry:
                 "visual_exemplars": False,
             },
         }
+        if cluster_index is not None:
+            result["clustering"] = {
+                "available": True,
+                "schema_version": 1,
+                "cluster_count": cluster_index.cluster_count,
+                "method": cluster_index.method,
+                "embedding_dimension": cluster_index.embedding_dim,
+            }
+        return result
 
     def evidence_item(self, selector: str, item_id: str) -> dict[str, Any]:
         """Return metadata for a packaged evidence exemplar without exposing arrays."""
 
         bundle = self.load(selector)
         index = getattr(bundle, "evidence_index", None)
+        cluster_index = getattr(bundle, "cluster_index", None)
+        if cluster_index is not None and bundle.model_reference.task == "clustering":
+            exemplar = cluster_index.exemplar(item_id)
+            if exemplar is None:
+                raise ModelNotFoundError(item_id)
+            return exemplar
         if index is None:
+            if cluster_index is not None:
+                exemplar = cluster_index.exemplar(item_id)
+                if exemplar is not None:
+                    return exemplar
             raise ModelNotFoundError(item_id)
         matches = [position for position, value in enumerate(index.uuids) if str(value) == item_id]
         if not matches:
@@ -293,12 +335,15 @@ class InferenceModelRegistry:
         class_index = int(index.labels[position])
         labels = self._capabilities(bundle)["labels"]
         label = next((value for value in labels if value["class_index"] == class_index), None)
-        return {
+        result = {
             "item_id": item_id,
             "class_index": class_index,
             "label": label,
             "image_available": False,
         }
+        if cluster_index is not None:
+            result["clustering"] = cluster_index.exemplar(item_id)
+        return result
 
     @property
     def registered_count(self) -> int:

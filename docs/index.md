@@ -6,6 +6,7 @@
 |---|---|
 | Install and run a first model | [Getting started](getting-started.md) |
 | Train an image classifier from labeled folders | [Classification workflow](classification-workflow.md) |
+| Organize unlabeled ROIs into embedding clusters | [Unlabeled ROI clustering workflow](clustering-workflow.md) |
 | Curate ROIs and refine masks | [Mask-refinement workflow](mask-refinement-workflow.md) |
 | Ingest a pre-existing Keras model | [External model products](model-products.md) |
 | Configure training, evaluation, or recovery | [Training, evaluation, and recovery](training-and-evaluation.md) |
