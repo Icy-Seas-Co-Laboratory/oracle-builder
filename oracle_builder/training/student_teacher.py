@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import copy
 import sqlite3
+import time
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +18,7 @@ from oracle_builder.data.decoders import decode_blob
 from oracle_builder.data.sqlite_dataset import resize_array_to_shape
 from oracle_builder.registry import get_model_builder
 from oracle_builder.training.augmentation import augment_batch
+from oracle_builder.training.logging_callbacks import log_event
 
 
 DEFAULT_VIEW_AUGMENTATION = {
@@ -132,7 +134,79 @@ def reconstruction_prediction_std(_y_true, y_pred):
     return tf.math.reduce_std(y_pred)
 
 
-def run_grayscale_reconstruction_pretraining(model, dataset, config, run_dir, strategy=None):
+class PretrainingStatusCallback(keras.callbacks.Callback):
+    """Emit stream-friendly, structured status for each pretraining epoch."""
+
+    def __init__(
+        self,
+        *,
+        method: str,
+        epochs: int,
+        training_log: str | Path | None = None,
+        run_id: str | None = None,
+    ):
+        super().__init__()
+        self.method = method
+        self.epochs = int(epochs)
+        self.training_log = training_log
+        self.run_id = run_id
+        self._started_at: float | None = None
+
+    def _event(self, message: str, details: dict[str, Any]) -> None:
+        if self.training_log is not None and self.run_id is not None:
+            log_event(self.training_log, self.run_id, "INFO", message, details)
+
+    def on_epoch_begin(self, epoch: int, logs=None):
+        del logs
+        self._started_at = time.perf_counter()
+        details = {
+            "phase": "pretraining",
+            "method": self.method,
+            "epoch": int(epoch) + 1,
+            "epochs": self.epochs,
+        }
+        print(
+            f"[pretraining {self.method} {epoch + 1}/{self.epochs}] started",
+            flush=True,
+        )
+        self._event("Pretraining epoch started", details)
+
+    def on_epoch_end(self, epoch: int, logs=None):
+        metrics: dict[str, float] = {}
+        for name, value in (logs or {}).items():
+            try:
+                metrics[str(name)] = float(value)
+            except (TypeError, ValueError):
+                continue
+        elapsed = time.perf_counter() - (self._started_at or time.perf_counter())
+        details = {
+            "phase": "pretraining",
+            "method": self.method,
+            "epoch": int(epoch) + 1,
+            "epochs": self.epochs,
+            "elapsed_seconds": elapsed,
+            "metrics": metrics,
+        }
+        rendered = ", ".join(f"{name}={value:.5g}" for name, value in metrics.items())
+        suffix = f": {rendered}" if rendered else ""
+        print(
+            f"[pretraining {self.method} {epoch + 1}/{self.epochs}] "
+            f"completed in {elapsed:.1f}s{suffix}",
+            flush=True,
+        )
+        self._event("Pretraining epoch completed", details)
+
+
+def run_grayscale_reconstruction_pretraining(
+    model,
+    dataset,
+    config,
+    run_dir,
+    strategy=None,
+    *,
+    training_log: str | Path | None = None,
+    run_id: str | None = None,
+):
     """Pretrain the matching U-Net family as a 1-channel reconstruction model."""
     strategy = strategy or tf.distribute.get_strategy()
     pre_config = grayscale_reconstruction_config(config)
@@ -165,7 +239,19 @@ def run_grayscale_reconstruction_pretraining(model, dataset, config, run_dir, st
                 ),
             ],
         )
-    history = pre_model.fit(dataset, epochs=epochs, verbose=2)
+    history = pre_model.fit(
+        dataset,
+        epochs=epochs,
+        verbose=0,
+        callbacks=[
+            PretrainingStatusCallback(
+                method="grayscale_reconstruction",
+                epochs=epochs,
+                training_log=training_log,
+                run_id=run_id,
+            )
+        ],
+    )
     source_convs = [layer for layer in pre_model.layers if isinstance(layer, layers.Conv2D)]
     target_convs = [layer for layer in model.layers if isinstance(layer, layers.Conv2D)]
     # Leave the reconstruction and segmentation heads independently initialized.
@@ -427,6 +513,9 @@ def run_student_teacher_pretraining(
     config: dict[str, Any],
     run_dir: str | Path,
     strategy: tf.distribute.Strategy | None = None,
+    *,
+    training_log: str | Path | None = None,
+    run_id: str | None = None,
 ):
     settings = config.get("pretraining", {})
     method = str(settings.get("method", "byol")).lower()
@@ -459,10 +548,19 @@ def run_student_teacher_pretraining(
             tf.zeros([1, *config["data"]["input_shape"]], dtype=tf.float32),
             training=False,
         )
+    epochs = int(settings.get("epochs", 10))
     history = pretrainer.fit(
         dataset,
-        epochs=int(settings.get("epochs", 10)),
-        verbose=2,
+        epochs=epochs,
+        verbose=0,
+        callbacks=[
+            PretrainingStatusCallback(
+                method=method,
+                epochs=epochs,
+                training_log=training_log,
+                run_id=run_id,
+            )
+        ],
     )
     from oracle_builder.artifacts.layout import RunLayout
 

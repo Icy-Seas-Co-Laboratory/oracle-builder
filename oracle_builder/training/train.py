@@ -141,9 +141,28 @@ def train_model(
             "Started self-supervised pretraining",
             config["pretraining"],
         )
-        pretraining_history = (run_grayscale_reconstruction_pretraining(model, pretraining_dataset, config, run_dir, strategy=strategy)
-            if str(config["pretraining"].get("method", "byol")).lower() == "grayscale_reconstruction"
-            else run_student_teacher_pretraining(model, pretraining_dataset, config, run_dir, strategy=strategy))
+        pretraining_history = (
+            run_grayscale_reconstruction_pretraining(
+                model,
+                pretraining_dataset,
+                config,
+                run_dir,
+                strategy=strategy,
+                training_log=training_log,
+                run_id=run_id,
+            )
+            if str(config["pretraining"].get("method", "byol")).lower()
+            == "grayscale_reconstruction"
+            else run_student_teacher_pretraining(
+                model,
+                pretraining_dataset,
+                config,
+                run_dir,
+                strategy=strategy,
+                training_log=training_log,
+                run_id=run_id,
+            )
+        )
         log_event(
             training_log,
             run_id,

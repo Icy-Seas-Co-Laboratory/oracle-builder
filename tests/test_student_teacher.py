@@ -71,7 +71,7 @@ def pretraining_config():
 
 @pytest.mark.parametrize("method", ["byol", "simclr"])
 def test_student_teacher_pretraining_updates_shared_classifier_encoder(
-    tmp_path, method
+    tmp_path, method, capsys
 ):
     config = pretraining_config()
     config["pretraining"]["method"] = method
@@ -81,6 +81,10 @@ def test_student_teacher_pretraining_updates_shared_classifier_encoder(
     before = classifier.get_layer("embedding_projection").get_weights()[0].copy()
 
     history = run_student_teacher_pretraining(classifier, dataset, config, tmp_path)
+
+    output = capsys.readouterr().out
+    assert f"[pretraining {method} 1/1] started" in output
+    assert f"[pretraining {method} 1/1] completed" in output
 
     after = classifier.get_layer("embedding_projection").get_weights()[0]
     assert "loss" in history.history

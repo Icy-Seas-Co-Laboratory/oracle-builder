@@ -293,7 +293,13 @@ def train_clustering_run(
             {"method": config["pretraining"]["method"], "samples": len(index.refs)},
         )
         history = run_student_teacher_pretraining(
-            model, pretraining_dataset, config, output, strategy=strategy
+            model,
+            pretraining_dataset,
+            config,
+            output,
+            strategy=strategy,
+            training_log=output / "logs" / "training.sqlite",
+            run_id=run_id,
         )
         history_path = output / "metrics" / "history.json"
         history_path.parent.mkdir(parents=True, exist_ok=True)
