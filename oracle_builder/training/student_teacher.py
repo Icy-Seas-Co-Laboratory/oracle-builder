@@ -13,7 +13,7 @@ import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers
 
-from oracle_builder.classification.features import build_embedding_model
+from oracle_builder.classification.features import build_pretraining_embedding_model
 from oracle_builder.data.decoders import decode_blob
 from oracle_builder.data.sqlite_dataset import resize_array_to_shape
 from oracle_builder.registry import get_model_builder
@@ -303,6 +303,68 @@ def _projection_head(input_dim: int, hidden_dim: int, output_dim: int, name: str
     )
 
 
+def vicreg_regularization(
+    representations: tf.Tensor,
+    *,
+    target_std: float = 1.0,
+    epsilon: float = 1e-4,
+) -> tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
+    """Return VICReg variance/covariance penalties and mean feature stddev.
+
+    The covariance term is normalized by feature dimension, so its scale remains
+    bounded as projection dimensions change.  A one-example local batch has no
+    off-diagonal covariance signal, but still receives the variance penalty.
+    """
+    representations = tf.convert_to_tensor(representations)
+    centered = representations - tf.reduce_mean(representations, axis=0, keepdims=True)
+    variance = tf.reduce_mean(tf.square(centered), axis=0)
+    stabilized_stddev = tf.sqrt(variance + tf.cast(epsilon, representations.dtype))
+    raw_stddev = tf.sqrt(tf.maximum(variance, tf.cast(0.0, representations.dtype)))
+    variance_loss = tf.reduce_mean(
+        tf.nn.relu(tf.cast(target_std, representations.dtype) - stabilized_stddev)
+    )
+    batch_size = tf.cast(tf.shape(representations)[0], representations.dtype)
+    covariance = tf.matmul(centered, centered, transpose_a=True) / tf.maximum(
+        batch_size - 1.0, 1.0
+    )
+    feature_dim = tf.cast(tf.shape(representations)[1], representations.dtype)
+    off_diagonal = covariance - tf.linalg.diag(tf.linalg.diag_part(covariance))
+    covariance_loss = tf.reduce_sum(tf.square(off_diagonal)) / tf.maximum(
+        feature_dim, 1.0
+    )
+    return variance_loss, covariance_loss, tf.reduce_mean(raw_stddev)
+
+
+def _all_gather_representations(representations: tf.Tensor) -> tf.Tensor:
+    """Gather equal-sized per-replica representations for global SSL statistics."""
+    replica_context = tf.distribute.get_replica_context()
+    if replica_context is None:
+        return representations
+    return replica_context.all_gather(representations, axis=0)
+
+
+def _pretraining_optimizer(settings: dict[str, Any]) -> keras.optimizers.Optimizer:
+    """Build the SSL optimizer while retaining Adam as the historical default."""
+    learning_rate = float(settings.get("learning_rate", 0.001))
+    optimizer_name = str(
+        settings.get("ssl_optimizer", settings.get("optimizer", "adam"))
+    ).lower()
+    optimizer_kwargs = {
+        "learning_rate": learning_rate,
+        "beta_1": float(settings.get("beta_1", 0.9)),
+        "beta_2": float(settings.get("beta_2", 0.999)),
+        "epsilon": float(settings.get("optimizer_epsilon", 1e-7)),
+    }
+    if optimizer_name == "adam":
+        return keras.optimizers.Adam(**optimizer_kwargs)
+    if optimizer_name == "adamw":
+        return keras.optimizers.AdamW(
+            weight_decay=float(settings.get("weight_decay", 1e-4)),
+            **optimizer_kwargs,
+        )
+    raise ValueError("pretraining.ssl_optimizer must be 'adam' or 'adamw'")
+
+
 class StudentTeacherPretrainer(keras.Model):
     """BYOL-style student predictor trained against an EMA teacher."""
 
@@ -311,11 +373,23 @@ class StudentTeacherPretrainer(keras.Model):
         settings = config.get("pretraining", {})
         self.view_config = _view_config(config)
         self.momentum = float(settings.get("teacher_momentum", 0.99))
-        embedding_dim = int(classifier.get_layer("features").output.shape[-1])
+        embedding_dim = int(classifier.get_layer("embedding_projection").output.shape[-1])
         projection_dim = int(settings.get("projection_dim", 128))
         hidden_dim = int(settings.get("projection_hidden_dim", max(embedding_dim, 256)))
+        self.vicreg_variance_weight = float(settings.get("vicreg_variance_weight", 25.0))
+        self.vicreg_covariance_weight = float(settings.get("vicreg_covariance_weight", 1.0))
+        self.vicreg_target_std = float(settings.get("vicreg_target_std", 1.0))
+        self.collapse_std_threshold = float(
+            settings.get("collapse_std_threshold", 1e-3)
+        )
+        if self.vicreg_variance_weight < 0 or self.vicreg_covariance_weight < 0:
+            raise ValueError("VICReg regularization weights must be non-negative")
+        if self.vicreg_target_std <= 0:
+            raise ValueError("vicreg_target_std must be greater than zero")
+        if self.collapse_std_threshold <= 0:
+            raise ValueError("collapse_std_threshold must be greater than zero")
 
-        self.student_encoder = build_embedding_model(classifier)
+        self.student_encoder = build_pretraining_embedding_model(classifier)
         self.teacher_encoder = keras.models.clone_model(self.student_encoder)
         self.teacher_encoder.set_weights(self.student_encoder.get_weights())
         self.teacher_encoder.trainable = False
@@ -332,10 +406,21 @@ class StudentTeacherPretrainer(keras.Model):
         )
         self.loss_tracker = keras.metrics.Mean(name="loss")
         self.cosine_similarity_tracker = keras.metrics.Mean(name="cosine_similarity")
+        self.variance_loss_tracker = keras.metrics.Mean(name="variance_loss")
+        self.covariance_loss_tracker = keras.metrics.Mean(name="covariance_loss")
+        self.representation_std_tracker = keras.metrics.Mean(name="representation_std")
+        self.collapse_indicator_tracker = keras.metrics.Mean(name="collapse_indicator")
 
     @property
     def metrics(self):
-        return [self.loss_tracker, self.cosine_similarity_tracker]
+        return [
+            self.loss_tracker,
+            self.cosine_similarity_tracker,
+            self.variance_loss_tracker,
+            self.covariance_loss_tracker,
+            self.representation_std_tracker,
+            self.collapse_indicator_tracker,
+        ]
 
     def call(self, inputs, training=False):
         """Expose the student path so Keras can build this subclassed model."""
@@ -359,12 +444,18 @@ class StudentTeacherPretrainer(keras.Model):
         view_one = self._augment(tf.cast(x, tf.float32))
         view_two = self._augment(tf.cast(x, tf.float32))
         with tf.GradientTape() as tape:
+            projected_one = self.student_projector(
+                self.student_encoder(view_one, training=True), training=True
+            )
+            projected_two = self.student_projector(
+                self.student_encoder(view_two, training=True), training=True
+            )
             student_one = self.predictor(
-                self.student_projector(self.student_encoder(view_one, training=True), training=True),
+                projected_one,
                 training=True,
             )
             student_two = self.predictor(
-                self.student_projector(self.student_encoder(view_two, training=True), training=True),
+                projected_two,
                 training=True,
             )
             teacher_one = self.teacher_projector(
@@ -373,9 +464,27 @@ class StudentTeacherPretrainer(keras.Model):
             teacher_two = self.teacher_projector(
                 self.teacher_encoder(view_two, training=False), training=False
             )
-            loss = 0.5 * (
+            alignment_loss = 0.5 * (
                 self._cosine_loss(student_one, teacher_two)
                 + self._cosine_loss(student_two, teacher_one)
+            )
+            global_projected_one = _all_gather_representations(projected_one)
+            global_projected_two = _all_gather_representations(projected_two)
+            variance_one, covariance_one, std_one = vicreg_regularization(
+                global_projected_one,
+                target_std=self.vicreg_target_std,
+            )
+            variance_two, covariance_two, std_two = vicreg_regularization(
+                global_projected_two,
+                target_std=self.vicreg_target_std,
+            )
+            variance_loss = 0.5 * (variance_one + variance_two)
+            covariance_loss = 0.5 * (covariance_one + covariance_two)
+            representation_std = 0.5 * (std_one + std_two)
+            loss = (
+                alignment_loss
+                + self.vicreg_variance_weight * variance_loss
+                + self.vicreg_covariance_weight * covariance_loss
             )
             optimization_loss = loss / tf.cast(
                 tf.distribute.get_strategy().num_replicas_in_sync,
@@ -388,9 +497,18 @@ class StudentTeacherPretrainer(keras.Model):
             if gradient is not None
         )
         self._update_teacher()
-        cosine_similarity = 1.0 - loss / 2.0
+        cosine_similarity = 1.0 - alignment_loss / 2.0
         self.loss_tracker.update_state(loss)
         self.cosine_similarity_tracker.update_state(cosine_similarity)
+        self.variance_loss_tracker.update_state(variance_loss)
+        self.covariance_loss_tracker.update_state(covariance_loss)
+        self.representation_std_tracker.update_state(representation_std)
+        self.collapse_indicator_tracker.update_state(
+            tf.cast(
+                representation_std < self.collapse_std_threshold,
+                representation_std.dtype,
+            )
+        )
         return {metric.name: metric.result() for metric in self.metrics}
 
     def _update_teacher(self):
@@ -416,12 +534,12 @@ class SimCLRPretrainer(keras.Model):
         settings = config.get("pretraining", {})
         self.view_config = _view_config(config)
         self.temperature = float(settings.get("temperature", 0.1))
-        embedding_dim = int(classifier.get_layer("features").output.shape[-1])
+        embedding_dim = int(classifier.get_layer("embedding_projection").output.shape[-1])
         projection_dim = int(settings.get("projection_dim", 128))
         hidden_dim = int(
             settings.get("projection_hidden_dim", max(embedding_dim, 256))
         )
-        self.encoder = build_embedding_model(classifier)
+        self.encoder = build_pretraining_embedding_model(classifier)
         self.projector = _projection_head(
             embedding_dim,
             hidden_dim,
@@ -432,10 +550,22 @@ class SimCLRPretrainer(keras.Model):
         self.contrastive_accuracy = keras.metrics.Mean(
             name="contrastive_accuracy"
         )
+        self.representation_std_tracker = keras.metrics.Mean(name="representation_std")
+        self.collapse_indicator_tracker = keras.metrics.Mean(name="collapse_indicator")
+        self.collapse_std_threshold = float(
+            settings.get("collapse_std_threshold", 1e-3)
+        )
+        if self.collapse_std_threshold <= 0:
+            raise ValueError("collapse_std_threshold must be greater than zero")
 
     @property
     def metrics(self):
-        return [self.loss_tracker, self.contrastive_accuracy]
+        return [
+            self.loss_tracker,
+            self.contrastive_accuracy,
+            self.representation_std_tracker,
+            self.collapse_indicator_tracker,
+        ]
 
     def call(self, inputs, training=False):
         """Expose encoder/projector inference so Keras can build before fit()."""
@@ -450,22 +580,36 @@ class SimCLRPretrainer(keras.Model):
     def _nt_xent(self, first, second):
         first = tf.math.l2_normalize(first, axis=-1)
         second = tf.math.l2_normalize(second, axis=-1)
-        batch_size = tf.shape(first)[0]
-        representations = tf.concat([first, second], axis=0)
+        local_batch_size = tf.shape(first)[0]
+        global_first = _all_gather_representations(first)
+        global_second = _all_gather_representations(second)
+        global_batch_size = tf.shape(global_first)[0]
+        anchors = tf.concat([first, second], axis=0)
+        representations = tf.concat([global_first, global_second], axis=0)
         logits = tf.matmul(
-            representations, representations, transpose_b=True
+            anchors, representations, transpose_b=True
         ) / tf.cast(self.temperature, representations.dtype)
-        count = 2 * batch_size
-        logits = logits - tf.eye(
-            count, dtype=logits.dtype
-        ) * tf.cast(1e9, logits.dtype)
+        replica_context = tf.distribute.get_replica_context()
+        replica_id = (
+            tf.cast(replica_context.replica_id_in_sync_group, tf.int32)
+            if replica_context is not None
+            else tf.constant(0, dtype=tf.int32)
+        )
+        offset = replica_id * local_batch_size
+        local_indices = tf.range(local_batch_size, dtype=tf.int32) + offset
         positives = tf.concat(
             [
-                tf.range(batch_size, count),
-                tf.range(0, batch_size),
+                global_batch_size + local_indices,
+                local_indices,
             ],
             axis=0,
         )
+        self_indices = tf.concat([local_indices, global_batch_size + local_indices], axis=0)
+        logits = logits - tf.one_hot(
+            self_indices,
+            depth=2 * global_batch_size,
+            dtype=logits.dtype,
+        ) * tf.cast(1e9, logits.dtype)
         loss = tf.reduce_mean(
             keras.losses.sparse_categorical_crossentropy(
                 positives, logits, from_logits=True
@@ -484,13 +628,25 @@ class SimCLRPretrainer(keras.Model):
         view_one = self._augment(tf.cast(x, tf.float32))
         view_two = self._augment(tf.cast(x, tf.float32))
         with tf.GradientTape() as tape:
+            first_embedding = self.encoder(view_one, training=True)
+            second_embedding = self.encoder(view_two, training=True)
             first = self.projector(
-                self.encoder(view_one, training=True), training=True
+                first_embedding, training=True
             )
             second = self.projector(
-                self.encoder(view_two, training=True), training=True
+                second_embedding, training=True
             )
             loss, accuracy = self._nt_xent(first, second)
+            global_embeddings = tf.concat(
+                [
+                    _all_gather_representations(first_embedding),
+                    _all_gather_representations(second_embedding),
+                ],
+                axis=0,
+            )
+            representation_std = tf.reduce_mean(
+                tf.math.reduce_std(global_embeddings, axis=0)
+            )
             optimization_loss = loss / tf.cast(
                 tf.distribute.get_strategy().num_replicas_in_sync,
                 loss.dtype,
@@ -504,6 +660,13 @@ class SimCLRPretrainer(keras.Model):
         )
         self.loss_tracker.update_state(loss)
         self.contrastive_accuracy.update_state(accuracy)
+        self.representation_std_tracker.update_state(representation_std)
+        self.collapse_indicator_tracker.update_state(
+            tf.cast(
+                representation_std < self.collapse_std_threshold,
+                representation_std.dtype,
+            )
+        )
         return {metric.name: metric.result() for metric in self.metrics}
 
 
@@ -522,8 +685,24 @@ def run_student_teacher_pretraining(
     if method not in {"byol", "student_teacher", "simclr"}:
         raise ValueError(
             "pretraining.method must be byol, student_teacher, or simclr"
-        )
+    )
     strategy = strategy or tf.distribute.get_strategy()
+    if method == "simclr":
+        batch_size = int(config.get("data", {}).get("batch_size", 16))
+        replicas = int(strategy.num_replicas_in_sync)
+        minimum_global_batch = int(
+            settings.get("minimum_global_batch_size", 2)
+        )
+        if batch_size < minimum_global_batch:
+            raise ValueError(
+                "data.batch_size must be at least "
+                "pretraining.minimum_global_batch_size"
+            )
+        if batch_size // replicas < 2:
+            raise ValueError(
+                "SimCLR requires at least two samples per synchronized replica; "
+                f"global batch size is {batch_size} across {replicas} replicas"
+            )
     print(
         "Pretraining "
         f"{method}: epochs={int(settings.get('epochs', 10))}, "
@@ -536,11 +715,7 @@ def run_student_teacher_pretraining(
             if method == "simclr"
             else StudentTeacherPretrainer(classifier, config)
         )
-        pretrainer.compile(
-            optimizer=keras.optimizers.Adam(
-                learning_rate=float(settings.get("learning_rate", 0.001))
-            )
-        )
+        pretrainer.compile(optimizer=_pretraining_optimizer(settings))
         # Keras 3 may try a symbolic build before the first custom train_step.
         # Calling the explicit inference path here creates every wrapper variable
         # for all backbones, including EfficientNet.

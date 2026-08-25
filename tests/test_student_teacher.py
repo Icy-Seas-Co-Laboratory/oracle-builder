@@ -8,6 +8,10 @@ import pytest
 import tensorflow as tf
 
 from oracle_builder.config import validate_config
+from oracle_builder.classification.features import (
+    build_embedding_model,
+    build_pretraining_embedding_model,
+)
 from oracle_builder.data.sqlite_dataset import (
     create_synthetic_classification,
     load_arrays,
@@ -20,7 +24,9 @@ from oracle_builder.training.student_teacher import (
     grayscale_reconstruction_config,
     load_grayscale_reconstruction_dataset,
     make_pretraining_dataset,
+    _pretraining_optimizer,
     run_student_teacher_pretraining,
+    vicreg_regularization,
 )
 from oracle_builder.training.train import build_and_compile_model
 from oracle_builder.registry import get_model_builder
@@ -106,6 +112,15 @@ def test_student_teacher_pretraining_updates_shared_classifier_encoder(
         (tmp_path / "metrics" / "pretraining" / "metrics.json").read_text()
     )
     assert len(metrics["loss"]) == 1
+    if method == "byol":
+        for metric in (
+            "variance_loss",
+            "covariance_loss",
+            "representation_std",
+            "collapse_indicator",
+        ):
+            assert metric in history.history
+            assert np.isfinite(history.history[metric][-1])
 
 
 def test_teacher_starts_with_student_encoder_weights():
@@ -121,6 +136,51 @@ def test_teacher_starts_with_student_encoder_weights():
         np.testing.assert_allclose(student, teacher)
     assert not pretrainer.teacher_encoder.trainable
     assert not pretrainer.teacher_projector.trainable
+
+
+def test_ssl_encoder_uses_unnormalized_embedding_projection():
+    config = pretraining_config()
+    classifier = build_and_compile_model(config)
+    projection = classifier.get_layer("embedding_projection")
+    kernel, bias = projection.get_weights()
+    projection.set_weights([np.zeros_like(kernel), np.full_like(bias, 2.0)])
+    inputs = np.zeros((2, 16, 16, 1), dtype="float32")
+
+    serving_embeddings = build_embedding_model(classifier)(inputs, training=False)
+    ssl_embeddings = build_pretraining_embedding_model(classifier)(inputs, training=False)
+    pretrainer = StudentTeacherPretrainer(classifier, config)
+    pretrainer_embeddings = pretrainer.student_encoder(inputs, training=False)
+
+    np.testing.assert_allclose(np.linalg.norm(serving_embeddings.numpy(), axis=1), 1.0)
+    np.testing.assert_allclose(ssl_embeddings.numpy(), 2.0)
+    np.testing.assert_allclose(pretrainer_embeddings.numpy(), ssl_embeddings.numpy())
+
+
+def test_vicreg_regularization_detects_collapsed_representations():
+    collapsed = tf.ones((4, 3), dtype=tf.float32)
+    varied = tf.constant(
+        [[-2.0, -1.0, 0.0], [-1.0, 0.0, 1.0], [1.0, 0.0, -1.0], [2.0, 1.0, 0.0]],
+        dtype=tf.float32,
+    )
+
+    collapsed_variance, collapsed_covariance, collapsed_std = vicreg_regularization(collapsed)
+    varied_variance, varied_covariance, varied_std = vicreg_regularization(varied)
+
+    assert collapsed_variance.numpy() > varied_variance.numpy()
+    assert collapsed_std.numpy() < varied_std.numpy()
+    assert np.isfinite(collapsed_covariance.numpy())
+    assert np.isfinite(varied_covariance.numpy())
+
+
+def test_ssl_optimizer_supports_adamw_without_changing_adam_default():
+    adam = _pretraining_optimizer(pretraining_config()["pretraining"])
+    adamw = _pretraining_optimizer(
+        {**pretraining_config()["pretraining"], "ssl_optimizer": "adamw", "weight_decay": 0.01}
+    )
+
+    assert isinstance(adam, tf.keras.optimizers.Adam)
+    assert isinstance(adamw, tf.keras.optimizers.AdamW)
+    assert float(adamw.weight_decay) == pytest.approx(0.01)
 
 
 @pytest.mark.parametrize("pretrainer_type", [StudentTeacherPretrainer, SimCLRPretrainer])

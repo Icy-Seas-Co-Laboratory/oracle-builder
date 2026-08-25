@@ -16,12 +16,29 @@ RESNET_VARIANTS = {
     "resnet152": ("bottleneck", [3, 8, 36, 3]),
 }
 
+# Keep the baseline independent of framework defaults. These values match the
+# common reference ResNet training convention and are more stable than Keras's
+# default moving-statistics update for the small batches typical of ROI data.
+_BATCH_NORM_MOMENTUM = 0.9
+_BATCH_NORM_EPSILON = 1e-5
+_KERNEL_INITIALIZER = "he_normal"
+
 
 def _conv_bn(x, filters, kernel_size, stride=1, activation=True, name="conv"):
     x = layers.Conv2D(
-        filters, kernel_size, strides=stride, padding="same", use_bias=False, name=name
+        filters,
+        kernel_size,
+        strides=stride,
+        padding="same",
+        use_bias=False,
+        kernel_initializer=_KERNEL_INITIALIZER,
+        name=name,
     )(x)
-    x = layers.BatchNormalization(name=f"{name}_bn")(x)
+    x = layers.BatchNormalization(
+        momentum=_BATCH_NORM_MOMENTUM,
+        epsilon=_BATCH_NORM_EPSILON,
+        name=f"{name}_bn",
+    )(x)
     if activation:
         x = layers.Activation("relu", name=f"{name}_relu")(x)
     return x

@@ -153,6 +153,23 @@ def test_streaming_bundle_uses_bounded_dataset_pipeline(tmp_path):
     assert labels.shape == (2,)
 
 
+def test_pretraining_shuffle_changes_order_without_affecting_indexed_order(tmp_path):
+    database = tmp_path / "classification.sqlite"
+    create_synthetic_classification(database, n=10, shape=(12, 12, 1), classes=3)
+    config = stream_config()
+    index = build_all_classification_index(database, {**config, "_external_inference": True}, labeled_only=False)
+    source = SQLiteClassificationSource(database, config)
+
+    ordered = np.concatenate([np.asarray(batch[1]) for batch in source.indexed_image_dataset(index, batch_size=2)])
+    shuffled = source.image_dataset(index, batch_size=2, shuffle=True)
+    first = np.concatenate([np.asarray(batch)[:, 0, 0, 0] for batch in shuffled])
+    second = np.concatenate([np.asarray(batch)[:, 0, 0, 0] for batch in shuffled])
+
+    assert np.array_equal(ordered, np.arange(len(index)))
+    assert set(first) == set(second)
+    assert not np.array_equal(first, second)
+
+
 def test_streaming_evidence_and_predictions_are_disk_backed(tmp_path):
     database = tmp_path / "classification.sqlite"
     output = tmp_path / "predictions.sqlite"

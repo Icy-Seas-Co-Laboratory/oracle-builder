@@ -5,6 +5,8 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 try:
     import tomllib
 except ModuleNotFoundError:  # pragma: no cover
@@ -79,6 +81,14 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "reconstruction_foreground_weight": 4.0,
         "use_training_augmentation": False,
         "augmentation": {},
+        "minimum_global_batch_size": 2,
+        "collapse_std_threshold": 1e-3,
+        "collapse_embedding_spread_threshold": 0.005,
+        "ssl_optimizer": "adam",
+        "weight_decay": 1e-4,
+        "vicreg_variance_weight": 25.0,
+        "vicreg_covariance_weight": 1.0,
+        "vicreg_target_std": 1.0,
     },
     "evidence": {
         "enabled": True,
@@ -321,6 +331,32 @@ def validate_config(config: dict[str, Any]) -> None:
             raise ValueError(
                 "pretraining.reconstruction_foreground_weight must be at least 1"
             )
+        minimum_batch = pretraining.get("minimum_global_batch_size", 2)
+        if isinstance(minimum_batch, bool) or int(minimum_batch) < 2:
+            raise ValueError("pretraining.minimum_global_batch_size must be at least 2")
+        collapse_threshold = float(pretraining.get("collapse_std_threshold", 1e-3))
+        if not np.isfinite(collapse_threshold) or collapse_threshold <= 0:
+            raise ValueError("pretraining.collapse_std_threshold must be finite and positive")
+        spread_threshold = float(
+            pretraining.get("collapse_embedding_spread_threshold", 0.005)
+        )
+        if not np.isfinite(spread_threshold) or spread_threshold <= 0:
+            raise ValueError(
+                "pretraining.collapse_embedding_spread_threshold must be finite and positive"
+            )
+        optimizer = str(pretraining.get("ssl_optimizer", "adam")).lower()
+        if optimizer not in {"adam", "adamw"}:
+            raise ValueError("pretraining.ssl_optimizer must be 'adam' or 'adamw'")
+        weight_decay = float(pretraining.get("weight_decay", 1e-4))
+        if not np.isfinite(weight_decay) or weight_decay < 0:
+            raise ValueError("pretraining.weight_decay must be finite and non-negative")
+        for name in ("vicreg_variance_weight", "vicreg_covariance_weight"):
+            value = float(pretraining.get(name, 0.0))
+            if not np.isfinite(value) or value < 0:
+                raise ValueError(f"pretraining.{name} must be finite and non-negative")
+        target_std = float(pretraining.get("vicreg_target_std", 1.0))
+        if not np.isfinite(target_std) or target_std <= 0:
+            raise ValueError("pretraining.vicreg_target_std must be finite and positive")
     if task == "segmentation" and "output_shape" not in config["data"]:
         raise ValueError("data.output_shape is required for segmentation")
     distance_mode = str(config["data"].get("candidate_distance", "none")).lower()

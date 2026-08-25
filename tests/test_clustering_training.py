@@ -2,13 +2,17 @@ from __future__ import annotations
 
 import sqlite3
 
+import numpy as np
 import pytest
 
 from oracle_builder.clustering.training import (
     _frozen_classification_index,
+    _validate_pretraining_history,
+    _validate_serving_embeddings,
     fit_clustering_evidence_from_encoder,
     resolve_clustering_config,
 )
+from oracle_builder.config import DEFAULT_CONFIG, deep_merge, validate_config
 from oracle_builder.data.sqlite_dataset import create_synthetic_classification
 from oracle_builder.datasets.schema import set_dataset_lifecycle
 
@@ -87,3 +91,44 @@ def test_existing_encoder_attachment_requires_explicit_reopen_and_reseal(tmp_pat
             tmp_path / "rois.sqlite",
             tmp_path / "encoder-run",
         )
+
+
+@pytest.mark.parametrize(
+    ("key", "value", "message"),
+    [
+        ("minimum_global_batch_size", 1, "minimum_global_batch_size"),
+        ("collapse_std_threshold", -1, "collapse_std_threshold"),
+    ],
+)
+def test_ssl_config_rejects_unsafe_robustness_settings(key, value, message):
+    config = deep_merge(DEFAULT_CONFIG, {"run": {"task": "classification", "model": "simple_cnn"}, "data": {"input_shape": [8, 8, 1], "num_classes": 2}, "preprocessing": {"invert": False}, "pretraining": {"enabled": True, key: value}})
+    with pytest.raises(ValueError, match=message):
+        validate_config(config)
+
+
+def test_clustering_rejects_missing_or_collapsed_ssl_diagnostics():
+    config = deep_merge(
+        DEFAULT_CONFIG,
+        {"pretraining": {"collapse_std_threshold": 1e-3}},
+    )
+
+    class History:
+        history = {"loss": [1.0]}
+
+    with pytest.raises(ValueError, match="representation_std"):
+        _validate_pretraining_history(History(), config)
+
+    History.history = {"representation_std": [0.0]}
+    with pytest.raises(ValueError, match="collapsed"):
+        _validate_pretraining_history(History(), config)
+
+
+def test_clustering_rejects_collapsed_serving_embeddings():
+    config = deep_merge(
+        DEFAULT_CONFIG,
+        {"pretraining": {"collapse_embedding_spread_threshold": 0.005}},
+    )
+    collapsed = np.tile(np.array([[1.0, 0.0, 0.0, 0.0]], dtype="float32"), (8, 1))
+
+    with pytest.raises(ValueError, match="collapsed serving embeddings"):
+        _validate_serving_embeddings(collapsed, config)

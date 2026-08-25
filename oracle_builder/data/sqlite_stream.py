@@ -225,11 +225,21 @@ class SQLiteClassificationSource:
         index: SQLiteSplitIndex,
         *,
         batch_size: int | None = None,
+        shuffle: bool = False,
     ) -> tf.data.Dataset:
         item_ids = np.asarray([ref.item_id for ref in index.refs], dtype=str)
         positions = np.arange(len(index.refs), dtype="int64")
         dataset = tf.data.Dataset.from_tensor_slices((item_ids, positions))
         streaming = self.config.get("data", {}).get("streaming", {})
+        if shuffle:
+            dataset = dataset.shuffle(
+                min(
+                    max(1, int(self.config["data"].get("shuffle_buffer", 512))),
+                    max(1, len(index)),
+                ),
+                seed=int(self.config.get("run", {}).get("seed", 123)),
+                reshuffle_each_iteration=True,
+            )
         dataset = dataset.map(
             lambda item_id, position: (self._tf_read_image(item_id), position),
             num_parallel_calls=max(1, int(streaming.get("reader_workers", 4))),
@@ -245,8 +255,14 @@ class SQLiteClassificationSource:
         index: SQLiteSplitIndex,
         *,
         batch_size: int | None = None,
+        shuffle: bool = False,
     ) -> tf.data.Dataset:
-        return self.indexed_image_dataset(index, batch_size=batch_size).map(
+        dataset = self.indexed_image_dataset(
+            index,
+            batch_size=batch_size,
+            shuffle=shuffle,
+        )
+        return dataset.map(
             lambda image, _position: image,
             deterministic=True,
         )

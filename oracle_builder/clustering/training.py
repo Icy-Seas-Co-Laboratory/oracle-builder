@@ -106,6 +106,60 @@ def _validate_clustering_config(config: dict[str, Any], *, sample_count: int | N
     if not np.isfinite(percentile) or not 0.0 <= percentile <= 100.0:
         raise ValueError("clustering.novelty_percentile must be a number from 0 through 100")
     settings["novelty_percentile"] = percentile
+    pretraining = config.get("pretraining", {})
+    minimum_batch = _positive_int(
+        pretraining.get("minimum_global_batch_size", 2),
+        "pretraining.minimum_global_batch_size",
+        minimum=2,
+    )
+    batch_size = _positive_int(config.get("data", {}).get("batch_size", 16), "data.batch_size")
+    if batch_size < minimum_batch:
+        raise ValueError(
+            "data.batch_size must be at least pretraining.minimum_global_batch_size"
+        )
+    config["data"]["batch_size"] = batch_size
+    threshold = float(pretraining.get("collapse_std_threshold", 1e-3))
+    if not np.isfinite(threshold) or threshold <= 0:
+        raise ValueError("pretraining.collapse_std_threshold must be finite and positive")
+    pretraining["collapse_std_threshold"] = threshold
+    spread_threshold = float(
+        pretraining.get("collapse_embedding_spread_threshold", 0.005)
+    )
+    if not np.isfinite(spread_threshold) or spread_threshold <= 0:
+        raise ValueError(
+            "pretraining.collapse_embedding_spread_threshold must be finite and positive"
+        )
+    pretraining["collapse_embedding_spread_threshold"] = spread_threshold
+
+
+def _validate_pretraining_history(history: Any, config: dict[str, Any]) -> None:
+    values = getattr(history, "history", {})
+    for name, series in values.items():
+        if not np.all(np.isfinite(np.asarray(series, dtype="float64"))):
+            raise ValueError(f"Clustering self-supervised pretraining produced non-finite {name}")
+    series = values.get("representation_std")
+    if not series:
+        raise ValueError(
+            "Clustering self-supervised pretraining did not report representation_std"
+        )
+    if float(series[-1]) <= float(config["pretraining"]["collapse_std_threshold"]):
+        raise ValueError("Clustering self-supervised pretraining collapsed")
+
+
+def _validate_serving_embeddings(embeddings: np.ndarray, config: dict[str, Any]) -> None:
+    values = np.asarray(embeddings, dtype="float32")
+    if values.ndim != 2 or not np.isfinite(values).all():
+        raise ValueError("Clustering produced non-finite serving embeddings")
+    norms = np.linalg.norm(values, axis=1)
+    if np.any(norms <= 0):
+        raise ValueError("Clustering produced zero-norm serving embeddings")
+    centered_rms = float(np.sqrt(np.mean(np.square(values - values.mean(axis=0)))))
+    threshold = float(config["pretraining"]["collapse_embedding_spread_threshold"])
+    if centered_rms <= threshold:
+        raise ValueError(
+            "Clustering produced collapsed serving embeddings: "
+            f"centered_rms={centered_rms:.6g} <= threshold={threshold:.6g}"
+        )
 
 
 def _frozen_classification_index(input_path: str | Path, config: dict[str, Any]):
@@ -272,9 +326,18 @@ def train_clustering_run(
         index = _frozen_classification_index(input_path, config)
         source = SQLiteClassificationSource(input_path, config)
         batch_size = int(config["data"].get("batch_size", 16))
-        pretraining_dataset = source.image_dataset(index, batch_size=batch_size)
+        pretraining_dataset = source.image_dataset(index, batch_size=batch_size, shuffle=True)
         set_seed(int(config["run"].get("seed", 123)))
         strategy, distribution_info = select_distribution_strategy(config)
+        if (
+            str(config["pretraining"].get("method", "byol")).lower() == "simclr"
+            and batch_size // int(strategy.num_replicas_in_sync) < 2
+        ):
+            raise ValueError(
+                "SimCLR requires at least two samples per synchronized replica; "
+                f"global batch size is {batch_size} across "
+                f"{strategy.num_replicas_in_sync} replicas"
+            )
         with strategy.scope():
             model = get_model_builder(config["run"]["model"])(config)
         write_distribution_info(distribution_info, output)
@@ -309,6 +372,7 @@ def train_clustering_run(
             training_log=output / "logs" / "training.sqlite",
             run_id=run_id,
         )
+        _validate_pretraining_history(history, config)
         history_path = output / "metrics" / "history.json"
         history_path.parent.mkdir(parents=True, exist_ok=True)
         history_path.write_text(json.dumps(history.history, indent=2, default=float) + "\n")
@@ -317,6 +381,7 @@ def train_clustering_run(
         extraction_dataset = source.indexed_image_dataset(index, batch_size=inference_plan.batch_size)
         embedding_dim = int(model.get_layer("features").output.shape[-1])
         embeddings = _extract_embeddings(model, extraction_dataset, len(index.refs), embedding_dim)
+        _validate_serving_embeddings(embeddings, config)
         cluster_index = ClusterEvidenceIndex.fit(
             embeddings,
             [ref.uuid for ref in index.refs],
@@ -327,6 +392,11 @@ def train_clustering_run(
             reference_neighbors_per_cluster=config["clustering"]["reference_neighbors_per_cluster"],
             fit_batch_size=int(config["clustering"]["fit_batch_size"]),
         )
+        if cluster_index.silhouette is not None and cluster_index.silhouette <= 0:
+            raise ValueError(
+                "Clustering produced non-positive cosine silhouette: "
+                f"{cluster_index.silhouette:.6g}"
+            )
         cluster_path = output / "model" / "clustering_evidence"
         cluster_index.save(cluster_path)
         config["clustering"]["structure"] = cluster_index.summary()

@@ -36,6 +36,16 @@ teacher_momentum = 0.99
 projection_dim = 128
 projection_hidden_dim = 256
 use_training_augmentation = true
+# SSL safety controls. The run is rejected if either the raw SSL representation
+# or the normalized serving embedding collapses.
+ssl_optimizer = "adamw"
+weight_decay = 0.0001
+minimum_global_batch_size = 2
+collapse_std_threshold = 0.001
+collapse_embedding_spread_threshold = 0.005
+vicreg_variance_weight = 25.0
+vicreg_covariance_weight = 1.0
+vicreg_target_std = 1.0
 
 [clustering]
 method = "spherical_kmeans"

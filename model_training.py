@@ -347,7 +347,8 @@ def main() -> int:
                     labeled_only=False,
                 )
                 pretraining_dataset = streaming_bundle.source.image_dataset(
-                    pretraining_index
+                    pretraining_index,
+                    shuffle=True,
                 )
                 pretraining_count = len(pretraining_index)
             else:
