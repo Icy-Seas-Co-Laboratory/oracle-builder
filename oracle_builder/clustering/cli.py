@@ -14,7 +14,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-c", "--config", required=True, help="TOML clustering configuration")
     parser.add_argument("-i", "--input", required=True, help="Frozen classification Dataset V1 SQLite file")
     parser.add_argument("-o", "--output", help="Sealed clustering run artifact directory (train mode)")
-    parser.add_argument("--mode", choices=("train", "fit"), default="train")
+    parser.add_argument(
+        "--mode",
+        choices=("train", "fit"),
+        help="Operation mode; inferred as fit when --encoder-run is supplied",
+    )
     parser.add_argument("--encoder-run", help="Existing sealed encoder artifact (fit mode)")
     parser.add_argument(
         "--reopen-reseal",
@@ -26,8 +30,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
-    if args.mode == "fit":
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    mode = args.mode or ("fit" if args.encoder_run else "train")
+    if mode == "fit":
         if not args.encoder_run:
             parser.error("--encoder-run is required in fit mode")
         if args.output:

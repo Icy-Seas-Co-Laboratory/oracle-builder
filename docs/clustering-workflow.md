@@ -66,5 +66,6 @@ oracle-cluster --mode fit \
 ```
 
 This is intentionally in-place and refuses to overwrite an existing index.
+`--mode fit` is optional when `--encoder-run` is supplied.
 The resulting classifier continues to return its normal classification output;
 `oracle-serve` adds a separate `output.clustering_evidence` packet.
