@@ -63,6 +63,23 @@ def test_cluster_count_is_checked_against_frozen_roi_count(tmp_path):
         _frozen_classification_index(database, config)
 
 
+def test_clustering_index_ignores_an_encoder_split_manifest(tmp_path):
+    database = tmp_path / "rois.sqlite"
+    create_synthetic_classification(database, n=3, shape=(8, 8, 1), classes=2)
+    with sqlite3.connect(database) as connection:
+        set_dataset_lifecycle(connection, "frozen")
+        connection.commit()
+    config_path = tmp_path / "clustering.toml"
+    _write_config(config_path, "n_clusters = 2")
+    config = resolve_clustering_config(config_path, database, tmp_path / "run")
+    config["_split_manifest"] = {"assignments": {"an-unrelated-item": "train"}}
+
+    index = _frozen_classification_index(database, config)
+
+    assert len(index.refs) == 3
+    assert {ref.split for ref in index.refs} == {"inference"}
+
+
 def test_existing_encoder_attachment_requires_explicit_reopen_and_reseal(tmp_path):
     with pytest.raises(ValueError, match="reopen_and_reseal=True"):
         fit_clustering_evidence_from_encoder(

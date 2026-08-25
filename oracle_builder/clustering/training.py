@@ -109,12 +109,20 @@ def _validate_clustering_config(config: dict[str, Any], *, sample_count: int | N
 
 
 def _frozen_classification_index(input_path: str | Path, config: dict[str, Any]):
-    """Return the all-ROI index after validating the dataset lifecycle."""
+    """Return every frozen ROI without applying a supervised split manifest."""
     with sqlite3.connect(Path(input_path).expanduser().resolve()) as connection:
         lifecycle = str(connection.execute("SELECT lifecycle FROM dataset WHERE singleton = 1").fetchone()[0])
     if lifecycle != "frozen":
         raise ValueError("Clustering requires a frozen dataset checkpoint")
-    index = build_all_classification_index(input_path, config, labeled_only=False)
+    # An encoder artifact may carry a train/validation/test manifest from the
+    # dataset it was trained on. That manifest is intentionally irrelevant to
+    # de novo fitting, including when the target ROI database is different.
+    # The scoped external-inference flag makes build_all_classification_index
+    # assign each item to its all-inclusive inference view without mutating the
+    # resolved artifact configuration.
+    index_config = dict(config)
+    index_config["_external_inference"] = True
+    index = build_all_classification_index(input_path, index_config, labeled_only=False)
     if not index.refs:
         raise ValueError("Clustering dataset contains no ROI items")
     _validate_clustering_config(config, sample_count=len(index.refs))
