@@ -30,6 +30,10 @@ class RunLayout:
         return self.root / "MODEL_CARD.md"
 
     @property
+    def model_contract(self) -> Path:
+        return self.root / "model" / "contract.json"
+
+    @property
     def source_config(self) -> Path:
         return self.root / "config" / "source.toml"
 
@@ -62,12 +66,20 @@ class RunLayout:
         return self.root / "logs" / "training.sqlite"
 
     @property
+    def events_jsonl(self) -> Path:
+        return self.root / "logs" / "events.jsonl"
+
+    @property
     def metrics_csv(self) -> Path:
         return self.root / "metrics" / "history.csv"
 
     @property
     def metrics_json(self) -> Path:
         return self.root / "metrics" / "history.json"
+
+    @property
+    def metrics_jsonl(self) -> Path:
+        return self.root / "metrics" / "metrics.jsonl"
 
     @property
     def model(self) -> Path:
@@ -86,12 +98,30 @@ class RunLayout:
         return self.root / "figures"
 
     @property
-    def pretraining_metrics(self) -> Path:
+    def self_supervised_metrics(self) -> Path:
         return self.root / "metrics" / "pretraining"
 
     @property
-    def pretraining_model(self) -> Path:
+    def self_supervised_metrics_jsonl(self) -> Path:
+        return self.self_supervised_metrics / "metrics.jsonl"
+
+    @property
+    def self_supervised_model(self) -> Path:
         return self.root / "model" / "pretraining"
+
+    # Legacy path names remain aliases so V1 readers and existing tooling keep
+    # working while new code can describe the phase accurately.
+    @property
+    def pretraining_metrics(self) -> Path:
+        return self.self_supervised_metrics
+
+    @property
+    def pretraining_metrics_jsonl(self) -> Path:
+        return self.self_supervised_metrics_jsonl
+
+    @property
+    def pretraining_model(self) -> Path:
+        return self.self_supervised_model
 
     @property
     def recovery(self) -> Path:

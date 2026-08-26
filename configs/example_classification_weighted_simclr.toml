@@ -5,7 +5,7 @@
 task = "classification"
 model = "simple_cnn"
 seed = 123
-notes = "SimpleCNN with SimCLR pretraining and weighted cross entropy"
+notes = "SimpleCNN with SimCLR self-supervised training and weighted cross entropy"
 
 [data]
 # Grayscale is assumed. Class count and splits are derived at run time.
@@ -39,7 +39,7 @@ embedding_dim = 256
 normalize_embeddings = true
 dropout = 0.20
 
-[pretraining]
+[self_supervised]
 # SimCLR uses contrastive negatives and benefits from larger effective batches.
 # BYOL is the less batch-size-sensitive alternative.
 enabled = true
@@ -49,7 +49,6 @@ learning_rate = 0.001
 temperature = 0.10
 projection_dim = 128
 projection_hidden_dim = 256
-use_training_augmentation = true
 
 [training]
 epochs = 50
@@ -80,7 +79,7 @@ enabled = true
 save_every_epochs = 1
 
 [augmentation]
-# Shared by pretraining and fine-tuning. rotation=0.5 permits any orientation.
+# Self-supervised view augmentation is independent of supervised augmentation. rotation=0.5 permits any orientation.
 enabled = true
 repeats_per_epoch = 1
 invert = false # Assume black background and light foreground.

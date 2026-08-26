@@ -81,8 +81,8 @@ def build_embedding_model(model: keras.Model) -> keras.Model:
     )
 
 
-def build_pretraining_embedding_model(model: keras.Model) -> keras.Model:
-    """Return the classifier encoder before its serving-time feature normalization.
+def build_self_supervised_embedding_model(model: keras.Model) -> keras.Model:
+    """Return the classifier encoder before serving-time feature normalization.
 
     Classifier exports intentionally use ``features`` so downstream consumers get
     the configured (usually L2-normalized) embedding contract.  SSL projection
@@ -93,8 +93,12 @@ def build_pretraining_embedding_model(model: keras.Model) -> keras.Model:
     return keras.Model(
         model.input,
         model.get_layer("embedding_projection").output,
-        name=f"{model.name}_pretraining_encoder",
+        name=f"{model.name}_self_supervised_encoder",
     )
+
+
+# Legacy import compatibility.
+build_pretraining_embedding_model = build_self_supervised_embedding_model
 
 
 def predict_with_features(model, x: np.ndarray) -> tuple[np.ndarray, np.ndarray | None]:

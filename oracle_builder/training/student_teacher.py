@@ -13,12 +13,13 @@ import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers
 
-from oracle_builder.classification.features import build_pretraining_embedding_model
+from oracle_builder.classification.features import build_self_supervised_embedding_model
+from oracle_builder.config import self_supervised_settings
 from oracle_builder.data.decoders import decode_blob
 from oracle_builder.data.sqlite_dataset import resize_array_to_shape
 from oracle_builder.registry import get_model_builder
 from oracle_builder.training.augmentation import augment_batch
-from oracle_builder.training.logging_callbacks import log_event
+from oracle_builder.training.logging_callbacks import log_event, write_history_jsonl
 
 
 DEFAULT_VIEW_AUGMENTATION = {
@@ -36,7 +37,7 @@ DEFAULT_VIEW_AUGMENTATION = {
 }
 
 
-def make_pretraining_dataset(x: np.ndarray, config: dict[str, Any]):
+def make_self_supervised_dataset(x: np.ndarray, config: dict[str, Any]):
     batch_size = int(config["data"].get("batch_size", 16))
     buffer_size = int(config["data"].get("shuffle_buffer", 512))
     seed = int(config["run"].get("seed", 123))
@@ -48,13 +49,17 @@ def make_pretraining_dataset(x: np.ndarray, config: dict[str, Any]):
     )
 
 
-def load_grayscale_reconstruction_dataset(database: str | Path, config: dict[str, Any]):
+# Legacy import compatibility.
+make_pretraining_dataset = make_self_supervised_dataset
+
+
+def load_grayscale_self_supervised_dataset(database: str | Path, config: dict[str, Any]):
     """Load unlabeled grayscale images from either supported dataset type."""
     database_path = Path(database).expanduser().resolve()
     if not database_path.is_file():
         raise FileNotFoundError(
-            "Grayscale reconstruction pretraining database does not exist: "
-            f"{database_path}. Set pretraining.database to an existing Dataset V1 "
+            "Grayscale reconstruction self-supervised database does not exist: "
+            f"{database_path}. Set self_supervised.database to an existing Dataset V1 "
             "classification or mask-refinement SQLite file."
         )
     target_shape = tuple(int(value) for value in config["data"]["input_shape"][:2])
@@ -63,11 +68,11 @@ def load_grayscale_reconstruction_dataset(database: str | Path, config: dict[str
             row = connection.execute("SELECT dataset_type FROM dataset WHERE singleton = 1").fetchone()
         except sqlite3.OperationalError as exc:
             raise ValueError(
-                f"Pretraining database is not an Oracle Builder Dataset V1 file: {database_path}"
+                f"Self-supervised database is not an Oracle Builder Dataset V1 file: {database_path}"
             ) from exc
         if row is None or row[0] not in {"classification", "mask_refinement"}:
             raise ValueError(
-                f"Pretraining database must be classification or mask_refinement Dataset V1: {database_path}"
+                f"Self-supervised database must be classification or mask_refinement Dataset V1: {database_path}"
             )
         kind = row[0]
         table, key = ("classification_items", "image_asset_id") if kind == "classification" else ("mask_refinement_items", "image_asset_id")
@@ -84,9 +89,14 @@ def load_grayscale_reconstruction_dataset(database: str | Path, config: dict[str
             image /= float(np.iinfo(np.asarray(image).dtype).max) if np.asarray(image).dtype.kind in "ui" else float(image.max())
         values.append(image[..., None])
     if not values:
-        raise ValueError("Pretraining database contains no image items")
+        raise ValueError("Self-supervised database contains no image items")
     x = np.stack(values).astype("float32")
-    return tf.data.Dataset.from_tensor_slices((x, x)).shuffle(len(x), seed=int(config["run"].get("seed", 123))).batch(int(config["pretraining"].get("batch_size", config["data"].get("batch_size", 16)))).prefetch(tf.data.AUTOTUNE)
+    settings = self_supervised_settings(config)
+    return tf.data.Dataset.from_tensor_slices((x, x)).shuffle(len(x), seed=int(config["run"].get("seed", 123))).batch(int(settings.get("batch_size", config["data"].get("batch_size", 16)))).prefetch(tf.data.AUTOTUNE)
+
+
+# Legacy import compatibility.
+load_grayscale_reconstruction_dataset = load_grayscale_self_supervised_dataset
 
 
 def grayscale_reconstruction_config(config: dict[str, Any]) -> dict[str, Any]:
@@ -134,8 +144,8 @@ def reconstruction_prediction_std(_y_true, y_pred):
     return tf.math.reduce_std(y_pred)
 
 
-class PretrainingStatusCallback(keras.callbacks.Callback):
-    """Emit stream-friendly, structured status for each pretraining epoch."""
+class SelfSupervisedStatusCallback(keras.callbacks.Callback):
+    """Emit stream-friendly, structured status for each self-supervised epoch."""
 
     def __init__(
         self,
@@ -160,16 +170,16 @@ class PretrainingStatusCallback(keras.callbacks.Callback):
         del logs
         self._started_at = time.perf_counter()
         details = {
-            "phase": "pretraining",
+            "phase": "self_supervised",
             "method": self.method,
             "epoch": int(epoch) + 1,
             "epochs": self.epochs,
         }
         print(
-            f"[pretraining {self.method} {epoch + 1}/{self.epochs}] started",
+            f"[self-supervised {self.method} {epoch + 1}/{self.epochs}] started",
             flush=True,
         )
-        self._event("Pretraining epoch started", details)
+        self._event("Self-supervised epoch started", details)
 
     def on_epoch_end(self, epoch: int, logs=None):
         metrics: dict[str, float] = {}
@@ -180,7 +190,7 @@ class PretrainingStatusCallback(keras.callbacks.Callback):
                 continue
         elapsed = time.perf_counter() - (self._started_at or time.perf_counter())
         details = {
-            "phase": "pretraining",
+            "phase": "self_supervised",
             "method": self.method,
             "epoch": int(epoch) + 1,
             "epochs": self.epochs,
@@ -190,14 +200,18 @@ class PretrainingStatusCallback(keras.callbacks.Callback):
         rendered = ", ".join(f"{name}={value:.5g}" for name, value in metrics.items())
         suffix = f": {rendered}" if rendered else ""
         print(
-            f"[pretraining {self.method} {epoch + 1}/{self.epochs}] "
+            f"[self-supervised {self.method} {epoch + 1}/{self.epochs}] "
             f"completed in {elapsed:.1f}s{suffix}",
             flush=True,
         )
-        self._event("Pretraining epoch completed", details)
+        self._event("Self-supervised epoch completed", details)
 
 
-def run_grayscale_reconstruction_pretraining(
+# Legacy import compatibility for callers that used the old phase name.
+PretrainingStatusCallback = SelfSupervisedStatusCallback
+
+
+def run_grayscale_reconstruction_self_supervised(
     model,
     dataset,
     config,
@@ -207,14 +221,15 @@ def run_grayscale_reconstruction_pretraining(
     training_log: str | Path | None = None,
     run_id: str | None = None,
 ):
-    """Pretrain the matching U-Net family as a 1-channel reconstruction model."""
+    """Train the matching U-Net family as a 1-channel self-supervised reconstruction model."""
     strategy = strategy or tf.distribute.get_strategy()
     pre_config = grayscale_reconstruction_config(config)
-    foreground_weight = float(config["pretraining"].get("reconstruction_foreground_weight", 4.0))
-    epochs = int(config["pretraining"].get("epochs", 10))
-    learning_rate = float(config["pretraining"].get("learning_rate", 0.001))
+    settings = self_supervised_settings(config)
+    foreground_weight = float(settings.get("reconstruction_foreground_weight", 4.0))
+    epochs = int(settings.get("epochs", 10))
+    learning_rate = float(settings.get("learning_rate", 0.001))
     print(
-        "Pretraining grayscale reconstruction: "
+        "Self-supervised grayscale reconstruction: "
         f"epochs={epochs}, learning_rate={learning_rate:g}, "
         f"foreground_weight={foreground_weight:g}, reconstruction_head=linear",
         flush=True,
@@ -244,7 +259,7 @@ def run_grayscale_reconstruction_pretraining(
         epochs=epochs,
         verbose=0,
         callbacks=[
-            PretrainingStatusCallback(
+            SelfSupervisedStatusCallback(
                 method="grayscale_reconstruction",
                 epochs=epochs,
                 training_log=training_log,
@@ -267,23 +282,28 @@ def run_grayscale_reconstruction_pretraining(
             kernel[..., 0, :] = source_weights[0][..., 0, :]
             target.set_weights([kernel, source_weights[1]])
     from oracle_builder.artifacts.layout import RunLayout
-    layout = RunLayout(run_dir); layout.pretraining_metrics.mkdir(parents=True, exist_ok=True); layout.pretraining_model.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame(history.history).to_csv(layout.pretraining_metrics / "metrics.csv", index_label="epoch")
-    (layout.pretraining_metrics / "metrics.json").write_text(json.dumps(history.history, indent=2, default=float) + "\n")
-    pre_model.save_weights(layout.pretraining_model / "grayscale_reconstruction.weights.h5")
+    layout = RunLayout(run_dir); layout.self_supervised_metrics.mkdir(parents=True, exist_ok=True); layout.self_supervised_model.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(history.history).to_csv(layout.self_supervised_metrics / "metrics.csv", index_label="epoch")
+    (layout.self_supervised_metrics / "metrics.json").write_text(json.dumps(history.history, indent=2, default=float) + "\n")
+    write_history_jsonl(
+        history.history,
+        layout.self_supervised_metrics_jsonl,
+        run_id=run_id,
+        phase="self_supervised",
+    )
+    pre_model.save_weights(layout.self_supervised_model / "grayscale_reconstruction.weights.h5")
     return history
 
 
+# Legacy import compatibility.
+run_grayscale_reconstruction_pretraining = run_grayscale_reconstruction_self_supervised
+
+
 def _view_config(config: dict[str, Any]) -> dict[str, Any]:
-    pretraining = config.get("pretraining", {})
+    self_supervised = self_supervised_settings(config)
     view_augmentation = dict(DEFAULT_VIEW_AUGMENTATION)
-    if pretraining.get("use_training_augmentation", False):
-        training_augmentation = dict(config.get("augmentation", {}))
-        training_augmentation.pop("repeats_per_epoch", None)
-        training_augmentation.pop("enabled", None)
-        view_augmentation.update(training_augmentation)
-    view_augmentation.update(pretraining.get("augmentation", {}))
-    view_augmentation["enabled"] = True
+    view_augmentation.update(self_supervised.get("augmentation", {}))
+    view_augmentation["enabled"] = bool(view_augmentation.get("enabled", True))
     return {
         "run": {**config["run"], "task": "classification"},
         "augmentation": view_augmentation,
@@ -343,7 +363,7 @@ def _all_gather_representations(representations: tf.Tensor) -> tf.Tensor:
     return replica_context.all_gather(representations, axis=0)
 
 
-def _pretraining_optimizer(settings: dict[str, Any]) -> keras.optimizers.Optimizer:
+def _self_supervised_optimizer(settings: dict[str, Any]) -> keras.optimizers.Optimizer:
     """Build the SSL optimizer while retaining Adam as the historical default."""
     learning_rate = float(settings.get("learning_rate", 0.001))
     optimizer_name = str(
@@ -362,7 +382,7 @@ def _pretraining_optimizer(settings: dict[str, Any]) -> keras.optimizers.Optimiz
             weight_decay=float(settings.get("weight_decay", 1e-4)),
             **optimizer_kwargs,
         )
-    raise ValueError("pretraining.ssl_optimizer must be 'adam' or 'adamw'")
+    raise ValueError("self_supervised.ssl_optimizer must be 'adam' or 'adamw'")
 
 
 class StudentTeacherPretrainer(keras.Model):
@@ -370,7 +390,7 @@ class StudentTeacherPretrainer(keras.Model):
 
     def __init__(self, classifier: keras.Model, config: dict[str, Any]):
         super().__init__(name="student_teacher_pretrainer")
-        settings = config.get("pretraining", {})
+        settings = self_supervised_settings(config)
         self.view_config = _view_config(config)
         self.momentum = float(settings.get("teacher_momentum", 0.99))
         embedding_dim = int(classifier.get_layer("embedding_projection").output.shape[-1])
@@ -389,7 +409,7 @@ class StudentTeacherPretrainer(keras.Model):
         if self.collapse_std_threshold <= 0:
             raise ValueError("collapse_std_threshold must be greater than zero")
 
-        self.student_encoder = build_pretraining_embedding_model(classifier)
+        self.student_encoder = build_self_supervised_embedding_model(classifier)
         self.teacher_encoder = keras.models.clone_model(self.student_encoder)
         self.teacher_encoder.set_weights(self.student_encoder.get_weights())
         self.teacher_encoder.trainable = False
@@ -531,7 +551,7 @@ class SimCLRPretrainer(keras.Model):
 
     def __init__(self, classifier: keras.Model, config: dict[str, Any]):
         super().__init__(name="simclr_pretrainer")
-        settings = config.get("pretraining", {})
+        settings = self_supervised_settings(config)
         self.view_config = _view_config(config)
         self.temperature = float(settings.get("temperature", 0.1))
         embedding_dim = int(classifier.get_layer("embedding_projection").output.shape[-1])
@@ -539,7 +559,7 @@ class SimCLRPretrainer(keras.Model):
         hidden_dim = int(
             settings.get("projection_hidden_dim", max(embedding_dim, 256))
         )
-        self.encoder = build_pretraining_embedding_model(classifier)
+        self.encoder = build_self_supervised_embedding_model(classifier)
         self.projector = _projection_head(
             embedding_dim,
             hidden_dim,
@@ -670,7 +690,7 @@ class SimCLRPretrainer(keras.Model):
         return {metric.name: metric.result() for metric in self.metrics}
 
 
-def run_student_teacher_pretraining(
+def run_self_supervised_training(
     classifier: keras.Model,
     dataset,
     config: dict[str, Any],
@@ -680,11 +700,11 @@ def run_student_teacher_pretraining(
     training_log: str | Path | None = None,
     run_id: str | None = None,
 ):
-    settings = config.get("pretraining", {})
+    settings = self_supervised_settings(config)
     method = str(settings.get("method", "byol")).lower()
     if method not in {"byol", "student_teacher", "simclr"}:
         raise ValueError(
-            "pretraining.method must be byol, student_teacher, or simclr"
+            "self_supervised.method must be byol, student_teacher, or simclr"
     )
     strategy = strategy or tf.distribute.get_strategy()
     if method == "simclr":
@@ -696,7 +716,7 @@ def run_student_teacher_pretraining(
         if batch_size < minimum_global_batch:
             raise ValueError(
                 "data.batch_size must be at least "
-                "pretraining.minimum_global_batch_size"
+                "self_supervised.minimum_global_batch_size"
             )
         if batch_size // replicas < 2:
             raise ValueError(
@@ -704,7 +724,7 @@ def run_student_teacher_pretraining(
                 f"global batch size is {batch_size} across {replicas} replicas"
             )
     print(
-        "Pretraining "
+        "Self-supervised training "
         f"{method}: epochs={int(settings.get('epochs', 10))}, "
         f"learning_rate={float(settings.get('learning_rate', 0.001)):g}",
         flush=True,
@@ -715,7 +735,7 @@ def run_student_teacher_pretraining(
             if method == "simclr"
             else StudentTeacherPretrainer(classifier, config)
         )
-        pretrainer.compile(optimizer=_pretraining_optimizer(settings))
+        pretrainer.compile(optimizer=_self_supervised_optimizer(settings))
         # Keras 3 may try a symbolic build before the first custom train_step.
         # Calling the explicit inference path here creates every wrapper variable
         # for all backbones, including EfficientNet.
@@ -729,7 +749,7 @@ def run_student_teacher_pretraining(
         epochs=epochs,
         verbose=0,
         callbacks=[
-            PretrainingStatusCallback(
+            SelfSupervisedStatusCallback(
                 method=method,
                 epochs=epochs,
                 training_log=training_log,
@@ -740,8 +760,8 @@ def run_student_teacher_pretraining(
     from oracle_builder.artifacts.layout import RunLayout
 
     layout = RunLayout(run_dir)
-    metrics_dir = layout.pretraining_metrics
-    model_dir = layout.pretraining_model
+    metrics_dir = layout.self_supervised_metrics
+    model_dir = layout.self_supervised_model
     metrics_dir.mkdir(parents=True, exist_ok=True)
     model_dir.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(history.history).to_csv(
@@ -750,5 +770,16 @@ def run_student_teacher_pretraining(
     (metrics_dir / "metrics.json").write_text(
         json.dumps(history.history, indent=2, default=float) + "\n"
     )
+    write_history_jsonl(
+        history.history,
+        layout.self_supervised_metrics_jsonl,
+        run_id=run_id,
+        phase="self_supervised",
+    )
     classifier.save_weights(model_dir / "student_pretrained.weights.h5")
     return history
+
+
+# Legacy import compatibility.
+run_student_teacher_pretraining = run_self_supervised_training
+_pretraining_optimizer = _self_supervised_optimizer

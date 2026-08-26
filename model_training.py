@@ -94,7 +94,7 @@ from oracle_builder.artifacts import (
     validate_run_artifact,
     write_run_config,
 )
-from oracle_builder.config import resolve_config
+from oracle_builder.config import resolve_config, self_supervised_settings
 from oracle_builder.environment import write_environment
 from oracle_builder.paths import create_run_dir
 
@@ -332,13 +332,14 @@ def main() -> int:
                     "Resolved weighted cross entropy class weights",
                     resolved_weights,
                 )
-        pretraining_dataset = None
-        if config.get("pretraining", {}).get("enabled", False) and resume_state is None:
-            if str(config["pretraining"].get("method", "byol")).lower() == "grayscale_reconstruction":
-                from oracle_builder.training.student_teacher import load_grayscale_reconstruction_dataset
-                source_database = config["pretraining"].get("database", args.input)
-                pretraining_dataset = load_grayscale_reconstruction_dataset(source_database, config)
-                pretraining_count = "database"
+        self_supervised_dataset = None
+        self_supervised = self_supervised_settings(config)
+        if self_supervised.get("enabled", False) and resume_state is None:
+            if str(self_supervised.get("method", "byol")).lower() == "grayscale_reconstruction":
+                from oracle_builder.training.student_teacher import load_grayscale_self_supervised_dataset
+                source_database = self_supervised.get("database", args.input)
+                self_supervised_dataset = load_grayscale_self_supervised_dataset(source_database, config)
+                self_supervised_count = "database"
             elif streaming_bundle is not None:
                 pretraining_index = build_classification_index(
                     args.input,
@@ -346,27 +347,27 @@ def main() -> int:
                     "train",
                     labeled_only=False,
                 )
-                pretraining_dataset = streaming_bundle.source.image_dataset(
+                self_supervised_dataset = streaming_bundle.source.image_dataset(
                     pretraining_index,
                     shuffle=True,
                 )
-                pretraining_count = len(pretraining_index)
+                self_supervised_count = len(pretraining_index)
             else:
-                from oracle_builder.training.student_teacher import make_pretraining_dataset
+                from oracle_builder.training.student_teacher import make_self_supervised_dataset
 
-                pretraining_x, _, pretraining_records = load_prediction_arrays(
+                self_supervised_x, _, self_supervised_records = load_prediction_arrays(
                     args.input,
                     config,
                     split="train",
                 )
-                pretraining_dataset = make_pretraining_dataset(pretraining_x, config)
-                pretraining_count = len(pretraining_records)
+                self_supervised_dataset = make_self_supervised_dataset(self_supervised_x, config)
+                self_supervised_count = len(self_supervised_records)
             log_event(
                 training_log,
                 run_id,
                 "INFO",
-                "Loaded self-supervised pretraining inputs",
-                {"samples": pretraining_count, "split": "train"},
+        "Loaded self-supervised training inputs",
+                {"samples": self_supervised_count, "split": "train"},
             )
         model, history = train_model(
             config,
@@ -374,7 +375,7 @@ def main() -> int:
             run_dir,
             training_log,
             run_id,
-            pretraining_dataset=pretraining_dataset,
+            pretraining_dataset=self_supervised_dataset,
             resume_state=resume_state,
         )
         from oracle_builder.inference.batching import (

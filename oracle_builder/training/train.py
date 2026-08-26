@@ -10,6 +10,7 @@ import pandas as pd
 import tensorflow as tf
 from tensorflow import keras
 
+from oracle_builder.config import self_supervised_settings
 from oracle_builder.registry import get_model_builder
 from oracle_builder.training.callbacks import build_callbacks
 from oracle_builder.training.losses import (
@@ -129,20 +130,24 @@ def train_model(
             "cross_device_ops": distribution_info.cross_device_ops,
         },
     )
-    if config.get("pretraining", {}).get("enabled", False) and resume_state is None:
+    self_supervised = self_supervised_settings(config)
+    if self_supervised.get("enabled", False) and resume_state is None:
         if pretraining_dataset is None:
-            raise ValueError("Enabled self-supervised pretraining requires a pretraining dataset")
-        from oracle_builder.training.student_teacher import run_grayscale_reconstruction_pretraining, run_student_teacher_pretraining
+            raise ValueError("Enabled self-supervised training requires a self-supervised dataset")
+        from oracle_builder.training.student_teacher import (
+            run_grayscale_reconstruction_self_supervised,
+            run_self_supervised_training,
+        )
 
         log_event(
             training_log,
             run_id,
             "INFO",
-            "Started self-supervised pretraining",
-            config["pretraining"],
+            "Started self-supervised training",
+            self_supervised,
         )
-        pretraining_history = (
-            run_grayscale_reconstruction_pretraining(
+        self_supervised_history = (
+            run_grayscale_reconstruction_self_supervised(
                 model,
                 pretraining_dataset,
                 config,
@@ -151,9 +156,9 @@ def train_model(
                 training_log=training_log,
                 run_id=run_id,
             )
-            if str(config["pretraining"].get("method", "byol")).lower()
+            if str(self_supervised.get("method", "byol")).lower()
             == "grayscale_reconstruction"
-            else run_student_teacher_pretraining(
+            else run_self_supervised_training(
                 model,
                 pretraining_dataset,
                 config,
@@ -167,19 +172,19 @@ def train_model(
             training_log,
             run_id,
             "INFO",
-            "Completed self-supervised pretraining",
+            "Completed self-supervised training",
             {
                 key: float(values[-1])
-                for key, values in pretraining_history.history.items()
+                for key, values in self_supervised_history.history.items()
                 if values
             },
         )
-    elif config.get("pretraining", {}).get("enabled", False):
+    elif self_supervised.get("enabled", False):
         log_event(
             training_log,
             run_id,
             "INFO",
-            "Skipped completed self-supervised pretraining while resuming supervised training",
+            "Skipped completed self-supervised training while resuming supervised training",
         )
     callbacks = build_callbacks(
         config,
@@ -206,7 +211,10 @@ def train_model(
     else:
         print("Supervised epochs already complete; continuing finalization.", flush=True)
     from oracle_builder.artifacts.layout import RunLayout
-    from oracle_builder.training.logging_callbacks import history_from_training_log
+    from oracle_builder.training.logging_callbacks import (
+        history_from_training_log,
+        write_history_jsonl,
+    )
 
     history_data = history_from_training_log(training_log, run_id)
     history_rows = [
@@ -218,6 +226,12 @@ def train_model(
     metrics_df.to_csv(layout.metrics_csv, index=False)
     layout.metrics_json.write_text(
         json.dumps(history_data, indent=2, default=float) + "\n"
+    )
+    write_history_jsonl(
+        history_data,
+        layout.metrics_jsonl,
+        run_id=run_id,
+        phase="training",
     )
     history = keras.callbacks.History()
     history.history = history_data

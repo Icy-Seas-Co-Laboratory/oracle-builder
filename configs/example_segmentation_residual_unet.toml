@@ -43,8 +43,8 @@ metrics = ["accuracy", "dice", "iou"]
 #segmentation_target = "validated_mask"
 segmentation_target = "candidate_delta"
 
-[pretraining]
-# Optional grayscale-only reconstruction pretraining from either dataset type.
+[self_supervised]
+# Optional grayscale-only reconstruction self-supervised training from either dataset type.
 enabled = false
 method = "grayscale_reconstruction"
 database = "datasets/classification-corpus.sqlite"

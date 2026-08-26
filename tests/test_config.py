@@ -70,6 +70,36 @@ loss = "sparse_categorical_crossentropy"
     assert config["data"]["num_classes"] == 3
 
 
+def test_resolve_config_accepts_canonical_self_supervised_section(tmp_path: Path):
+    config_path = tmp_path / "config.toml"
+    input_path = tmp_path / "data.sqlite"
+    create_synthetic_classification(input_path, n=6, shape=(16, 16, 1), classes=2)
+    freeze(input_path)
+    config_path.write_text(
+        """
+[run]
+task = "classification"
+model = "simple_cnn"
+
+[data]
+input_shape = [16, 16, 1]
+
+[self_supervised]
+enabled = true
+method = "byol"
+epochs = 1
+
+[training]
+loss = "sparse_categorical_crossentropy"
+"""
+    )
+
+    config = resolve_config(config_path, input_path, tmp_path / "runs" / "test")
+
+    assert config["self_supervised"]["enabled"] is True
+    assert "pretraining" not in config
+
+
 def test_classification_defaults_to_weighted_loss_grayscale_and_no_checkpoints(
     tmp_path: Path,
 ):

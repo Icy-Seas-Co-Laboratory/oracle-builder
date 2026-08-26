@@ -158,7 +158,7 @@ def test_validation_accepts_verified_pre_product_fingerprint(tmp_path):
     layout = RunLayout(run)
     add_completed_run_files(run)
     update_run_artifact(run, status="complete", summary={"accuracy": 0.9})
-    seal_run_artifact(run)
+    sealed = seal_run_artifact(run)
 
     manifest = json.loads(layout.manifest.read_text(encoding="utf-8"))
     manifest["fingerprint_sha256"] = _fingerprint(

@@ -79,7 +79,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "projection_hidden_dim": 256,
         "temperature": 0.1,
         "reconstruction_foreground_weight": 4.0,
-        "use_training_augmentation": False,
         "augmentation": {},
         "minimum_global_batch_size": 2,
         "collapse_std_threshold": 1e-3,
@@ -188,6 +187,31 @@ def deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]
         else:
             merged[key] = value
     return merged
+
+
+def self_supervised_settings(config: dict[str, Any]) -> dict[str, Any]:
+    """Return the canonical self-supervised settings with legacy fallback.
+
+    ``pretraining`` remains readable for existing configurations and artifacts,
+    but new configurations should use ``self_supervised``.  When both sections
+    are present, the canonical section wins.
+    """
+    canonical = config.get("self_supervised")
+    if isinstance(canonical, dict):
+        return canonical
+    legacy = config.get("pretraining")
+    return legacy if isinstance(legacy, dict) else {}
+
+
+def normalize_self_supervised_config(
+    config: dict[str, Any],
+    user_config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Prefer the new config section while preserving legacy input support."""
+    source = user_config if user_config is not None else config
+    if isinstance(source.get("self_supervised"), dict):
+        config.pop("pretraining", None)
+    return config
 
 
 def load_toml(path: str | Path) -> dict[str, Any]:
@@ -300,9 +324,9 @@ def validate_config(config: dict[str, Any]) -> None:
         raise ValueError(
             "distribution.cross_device_ops must be auto, nccl, or hierarchical_copy"
         )
-    pretraining = config.get("pretraining", {})
-    if pretraining.get("enabled", False):
-        method = str(pretraining.get("method", "byol")).lower()
+    self_supervised = self_supervised_settings(config)
+    if self_supervised.get("enabled", False):
+        method = str(self_supervised.get("method", "byol")).lower()
         if method not in {
             "byol",
             "student_teacher",
@@ -310,53 +334,53 @@ def validate_config(config: dict[str, Any]) -> None:
             "grayscale_reconstruction",
         }:
             raise ValueError(
-                "pretraining.method must be byol, student_teacher, simclr, or grayscale_reconstruction"
+                "self_supervised.method must be byol, student_teacher, simclr, or grayscale_reconstruction"
             )
         if task != "classification" and method != "grayscale_reconstruction":
             raise ValueError("segmentation pretraining requires method='grayscale_reconstruction'")
-        if int(pretraining.get("epochs", 10)) < 1:
-            raise ValueError("pretraining.epochs must be at least 1")
-        if float(pretraining.get("learning_rate", 0.001)) <= 0:
-            raise ValueError("pretraining.learning_rate must be greater than zero")
-        momentum = float(pretraining.get("teacher_momentum", 0.99))
+        if int(self_supervised.get("epochs", 10)) < 1:
+            raise ValueError("self_supervised.epochs must be at least 1")
+        if float(self_supervised.get("learning_rate", 0.001)) <= 0:
+            raise ValueError("self_supervised.learning_rate must be greater than zero")
+        momentum = float(self_supervised.get("teacher_momentum", 0.99))
         if not 0 <= momentum < 1:
-            raise ValueError("pretraining.teacher_momentum must be in [0, 1)")
-        if int(pretraining.get("projection_dim", 128)) < 1:
-            raise ValueError("pretraining.projection_dim must be positive")
-        if int(pretraining.get("projection_hidden_dim", 256)) < 1:
-            raise ValueError("pretraining.projection_hidden_dim must be positive")
-        if float(pretraining.get("temperature", 0.1)) <= 0:
-            raise ValueError("pretraining.temperature must be greater than zero")
-        if float(pretraining.get("reconstruction_foreground_weight", 4.0)) < 1:
+            raise ValueError("self_supervised.teacher_momentum must be in [0, 1)")
+        if int(self_supervised.get("projection_dim", 128)) < 1:
+            raise ValueError("self_supervised.projection_dim must be positive")
+        if int(self_supervised.get("projection_hidden_dim", 256)) < 1:
+            raise ValueError("self_supervised.projection_hidden_dim must be positive")
+        if float(self_supervised.get("temperature", 0.1)) <= 0:
+            raise ValueError("self_supervised.temperature must be greater than zero")
+        if float(self_supervised.get("reconstruction_foreground_weight", 4.0)) < 1:
             raise ValueError(
-                "pretraining.reconstruction_foreground_weight must be at least 1"
+                "self_supervised.reconstruction_foreground_weight must be at least 1"
             )
-        minimum_batch = pretraining.get("minimum_global_batch_size", 2)
+        minimum_batch = self_supervised.get("minimum_global_batch_size", 2)
         if isinstance(minimum_batch, bool) or int(minimum_batch) < 2:
-            raise ValueError("pretraining.minimum_global_batch_size must be at least 2")
-        collapse_threshold = float(pretraining.get("collapse_std_threshold", 1e-3))
+            raise ValueError("self_supervised.minimum_global_batch_size must be at least 2")
+        collapse_threshold = float(self_supervised.get("collapse_std_threshold", 1e-3))
         if not np.isfinite(collapse_threshold) or collapse_threshold <= 0:
-            raise ValueError("pretraining.collapse_std_threshold must be finite and positive")
+            raise ValueError("self_supervised.collapse_std_threshold must be finite and positive")
         spread_threshold = float(
-            pretraining.get("collapse_embedding_spread_threshold", 0.005)
+            self_supervised.get("collapse_embedding_spread_threshold", 0.005)
         )
         if not np.isfinite(spread_threshold) or spread_threshold <= 0:
             raise ValueError(
-                "pretraining.collapse_embedding_spread_threshold must be finite and positive"
+                "self_supervised.collapse_embedding_spread_threshold must be finite and positive"
             )
-        optimizer = str(pretraining.get("ssl_optimizer", "adam")).lower()
+        optimizer = str(self_supervised.get("ssl_optimizer", "adam")).lower()
         if optimizer not in {"adam", "adamw"}:
-            raise ValueError("pretraining.ssl_optimizer must be 'adam' or 'adamw'")
-        weight_decay = float(pretraining.get("weight_decay", 1e-4))
+            raise ValueError("self_supervised.ssl_optimizer must be 'adam' or 'adamw'")
+        weight_decay = float(self_supervised.get("weight_decay", 1e-4))
         if not np.isfinite(weight_decay) or weight_decay < 0:
-            raise ValueError("pretraining.weight_decay must be finite and non-negative")
+            raise ValueError("self_supervised.weight_decay must be finite and non-negative")
         for name in ("vicreg_variance_weight", "vicreg_covariance_weight"):
-            value = float(pretraining.get(name, 0.0))
+            value = float(self_supervised.get(name, 0.0))
             if not np.isfinite(value) or value < 0:
-                raise ValueError(f"pretraining.{name} must be finite and non-negative")
-        target_std = float(pretraining.get("vicreg_target_std", 1.0))
+                raise ValueError(f"self_supervised.{name} must be finite and non-negative")
+        target_std = float(self_supervised.get("vicreg_target_std", 1.0))
         if not np.isfinite(target_std) or target_std <= 0:
-            raise ValueError("pretraining.vicreg_target_std must be finite and positive")
+            raise ValueError("self_supervised.vicreg_target_std must be finite and positive")
     if task == "segmentation" and "output_shape" not in config["data"]:
         raise ValueError("data.output_shape is required for segmentation")
     distance_mode = str(config["data"].get("candidate_distance", "none")).lower()
@@ -453,6 +477,7 @@ def validate_config(config: dict[str, Any]) -> None:
 def resolve_config(config_path: str | Path, input_path: str | Path, run_dir: str | Path) -> dict[str, Any]:
     user_config = load_toml(config_path)
     resolved = deep_merge(DEFAULT_CONFIG, user_config)
+    normalize_self_supervised_config(resolved, user_config)
     task = resolved.get("run", {}).get("task")
     if task == "classification":
         if not resolved.get("training", {}).get("loss"):

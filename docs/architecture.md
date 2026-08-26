@@ -11,7 +11,7 @@ entry points. Domain code should not import repository-root scripts.
 | `oracle_builder.datasets`, `oracle_builder.artifacts` | Backward-compatible imports and Oracle Builder CLI integration for the shared contracts. |
 | `oracle_builder.data` | Backend-neutral decoding, preprocessing, splitting, tiling, and TensorFlow input adapters. |
 | `oracle_builder.models` | Built-in architecture definitions. |
-| `oracle_builder.training` | Distribution, augmentation, losses, metrics, pretraining, and training orchestration. |
+| `oracle_builder.training` | Distribution, augmentation, losses, metrics, self-supervised training, and training orchestration. |
 | `oracle_builder.evaluation` | Predictions, thresholds, evidence, and reports. |
 | `oracle_builder.classification` | Classification feature and evidence semantics. |
 | `oracle_builder.inference` | Storage-neutral inference bundles, contracts, connectors, and sinks. |

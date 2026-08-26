@@ -27,7 +27,7 @@ interpolation = "bilinear"
 channel_mode = "grayscale"
 
 
-[pretraining]
+[self_supervised]
 # Self-supervised pretraining initializes this same architecture before labels
 # are used. BYOL is less batch-size-sensitive. SimCLR uses in-batch negatives
 # and generally benefits from larger batches; temperature applies to SimCLR.
@@ -39,7 +39,6 @@ teacher_momentum = 0.99
 temperature = 0.10
 projection_dim = 128
 projection_hidden_dim = 256
-use_training_augmentation = true
 
 [model]
 # base_filters controls overall capacity; embedding_dim fixes feature size.

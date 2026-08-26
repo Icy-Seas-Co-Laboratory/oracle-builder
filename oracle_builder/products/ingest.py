@@ -20,9 +20,9 @@ from oracle_builder.classification.features import L2Normalization
 from oracle_builder.artifacts import (
     RunLayout,
     create_run_artifact,
-    create_unavailable_split_manifest,
     seal_run_artifact,
     update_run_artifact,
+    write_model_contract,
 )
 from oracle_builder.config import load_toml
 from oracle_builder.datasets.schema import (
@@ -31,11 +31,7 @@ from oracle_builder.datasets.schema import (
     validate_database,
 )
 from oracle_builder.environment import write_environment
-from oracle_builder.training.logging_callbacks import (
-    init_training_log,
-    log_event,
-    mark_run_complete,
-)
+from oracle_builder.training.logging_callbacks import append_jsonl_event
 
 
 SUPPORTED_SUFFIXES = {".keras", ".h5", ".hdf5"}
@@ -611,13 +607,14 @@ def ingest_keras_model(
         artifact_type="model_product",
     )
     layout = RunLayout(destination)
-    create_unavailable_split_manifest(
-        destination,
-        config,
-        reason="Externally ingested model product has no Oracle Builder training split protocol.",
-    )
     environment = write_environment(destination)
-    init_training_log(layout.training_log, run_id, name, config, environment)
+    append_jsonl_event(
+        layout.events_jsonl,
+        run_id,
+        "INFO",
+        "deployment_asset_started",
+        {"environment": bool(environment)},
+    )
     try:
         original = _copy_original(source_path, layout.model / "source" / "original")
         _save_keras_atomic(source_model, layout.model / "imported.keras")
@@ -665,17 +662,16 @@ def ingest_keras_model(
                 {"asset_id": str(uuid.uuid4()), "format": "original_keras_source", "path": original.relative_to(layout.model).as_posix(), "role": "preserved_source", "sha256": _sha256(original)},
             ],
             "inspection_path": "inspection.json",
+            "contract_path": "contract.json",
         }
         (layout.model / "model_manifest.json").write_text(json.dumps(model_manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        write_model_contract(destination, config["external_model_contract"])
         (layout.model / "load_test_report.json").write_text(json.dumps(inspection["reload_test"], indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        layout.metrics_json.write_text("{}\n", encoding="utf-8")
-        layout.metrics_csv.write_text("epoch\n", encoding="utf-8")
-        log_event(layout.training_log, run_id, "INFO", "Imported external Keras model", {"source_sha256": inspection["source"]["sha256"], "parameter_count": inspection["parameter_count"], "promotion": promotion})
-        mark_run_complete(layout.training_log, run_id, "complete")
+        append_jsonl_event(layout.events_jsonl, run_id, "INFO", "deployment_asset_created", {"source_sha256": inspection["source"]["sha256"], "parameter_count": inspection["parameter_count"], "promotion": promotion})
         update_run_artifact(destination, status="complete", summary={"product": product, "inspection": {"parameter_count": inspection["parameter_count"], "input_count": inspection["input_count"], "output_count": inspection["output_count"]}})
         sealed = seal_run_artifact(destination)
     except Exception:
-        mark_run_complete(layout.training_log, run_id, "failed")
+        append_jsonl_event(layout.events_jsonl, run_id, "ERROR", "deployment_asset_failed", {})
         update_run_artifact(destination, status="failed", error="Model product ingestion failed")
         seal_run_artifact(destination)
         raise
@@ -776,10 +772,14 @@ def ingest_savedmodel(
     manifest = create_run_artifact(destination, run_id=run_id, name=name, config=config,
                                    source_config=metadata_path, artifact_type="model_product")
     layout = RunLayout(destination)
-    create_unavailable_split_manifest(destination, config,
-        reason="Externally ingested model product has no Oracle Builder training split protocol.")
     environment = write_environment(destination)
-    init_training_log(layout.training_log, run_id, name, config, environment)
+    append_jsonl_event(
+        layout.events_jsonl,
+        run_id,
+        "INFO",
+        "deployment_asset_started",
+        {"environment": bool(environment)},
+    )
     try:
         original = _copy_original(source_path, layout.model / "source" / "original_savedmodel")
         adapter = _SavedModelClassificationAdapter(loaded, signature, input_name, output_name, activation)
@@ -808,18 +808,16 @@ def ingest_savedmodel(
             "formats": [
                 {"asset_id": str(uuid.uuid4()), "format": "tensorflow_savedmodel", "path": "export_savedmodel", "role": "preferred_inference_model", "sha256": _sha256(exported)},
                 {"asset_id": str(uuid.uuid4()), "format": "original_tensorflow_savedmodel", "path": original.relative_to(layout.model).as_posix(), "role": "preserved_source", "sha256": _sha256(original)},
-            ], "inspection_path": "inspection.json",
+            ], "inspection_path": "inspection.json", "contract_path": "contract.json",
         }
         (layout.model / "model_manifest.json").write_text(json.dumps(model_manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        write_model_contract(destination, config["external_model_contract"])
         (layout.model / "load_test_report.json").write_text(json.dumps(reload_test, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        layout.metrics_json.write_text("{}\n", encoding="utf-8")
-        layout.metrics_csv.write_text("epoch\n", encoding="utf-8")
-        log_event(layout.training_log, run_id, "INFO", "Imported external TensorFlow SavedModel", {"source_sha256": inspection["source"]["sha256"], "promotion": promotion_report})
-        mark_run_complete(layout.training_log, run_id, "complete")
+        append_jsonl_event(layout.events_jsonl, run_id, "INFO", "deployment_asset_created", {"source_sha256": inspection["source"]["sha256"], "promotion": promotion_report})
         update_run_artifact(destination, status="complete", summary={"product": product, "inspection": {"input_count": 1, "output_count": len(inspection["outputs"])}})
         sealed = seal_run_artifact(destination)
     except Exception:
-        mark_run_complete(layout.training_log, run_id, "failed")
+        append_jsonl_event(layout.events_jsonl, run_id, "ERROR", "deployment_asset_failed", {})
         update_run_artifact(destination, status="failed", error="SavedModel product ingestion failed")
         seal_run_artifact(destination)
         raise

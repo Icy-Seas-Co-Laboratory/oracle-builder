@@ -1,5 +1,8 @@
 # Oracle Builder model-run artifact V1
 
+New artifacts also carry the profiled [Oracle Model Artifact Standard V2](model-artifact-standard-v2.md).
+V1 readers remain supported for compatibility.
+
 ## Purpose
 
 A model run is a durable scientific artifact, not merely a directory of files
@@ -96,6 +99,8 @@ exact dataset revision and fingerprint recorded by the manifest.
 
 `model/model_manifest.json` describes the input shape, preprocessing, output
 semantics, task, architecture, run identity, and saved formats.
+New artifacts additionally write `model/contract.json`, which is the
+authoritative self-describing inference contract.
 
 - `final.keras` is the preferred full Keras representation.
 - `weights.weights.h5` supports deterministic architecture rebuilds.
@@ -138,6 +143,10 @@ Sealing:
 
 Loading a V1 model validates the sealed artifact first. Evaluation and inference
 outputs created after sealing must be written outside the run directory.
+
+Training records write canonical lifecycle events and metric rows as JSONL in
+`logs/events.jsonl` and `metrics/metrics.jsonl`. SQLite and CSV files are
+compatibility views for existing tooling.
 
 An explicit reopen removes the active checksum seal and records a lifecycle
 event. Resealing produces a new fingerprint:

@@ -13,8 +13,10 @@ oracle-cluster \
 
 The input must be a frozen classification Dataset V1 database. Existing
 classification annotations are ignored; every classification item is used for
-self-supervised training and cluster fitting. BYOL is the default training
-method and SimCLR is also supported.
+self-supervised training and cluster fitting. BYOL is the default method and
+SimCLR is also supported. Self-supervised view augmentation is configured only
+under `[self_supervised.augmentation]`; it never inherits supervised training
+augmentation settings.
 
 The artifact contains:
 

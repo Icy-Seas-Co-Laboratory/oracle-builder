@@ -17,9 +17,11 @@ from oracle_builder.data.sqlite_dataset import (
     load_arrays,
     load_prediction_arrays,
 )
+from oracle_builder.training.augmentation import augment_batch
 from oracle_builder.training.student_teacher import (
     SimCLRPretrainer,
     StudentTeacherPretrainer,
+    _view_config,
     foreground_weighted_reconstruction_mse,
     grayscale_reconstruction_config,
     load_grayscale_reconstruction_dataset,
@@ -75,6 +77,59 @@ def pretraining_config():
     }
 
 
+def test_ssl_view_augmentation_can_be_disabled():
+    config = pretraining_config()
+    config["pretraining"]["use_training_augmentation"] = True
+    config.setdefault("augmentation", {}).update(
+        {
+            "enabled": True,
+            "rotation": 0.5,
+            "zoom": 0.2,
+            "translation": 0.15,
+        }
+    )
+    config["pretraining"]["augmentation"] = {
+        "enabled": False,
+        "rotation": 0.5,
+        "zoom": 0.2,
+        "translation": 0.15,
+    }
+
+    view_config = _view_config(config)
+    assert view_config["augmentation"]["enabled"] is False
+
+    values = tf.reshape(tf.range(16, dtype=tf.float32), [1, 4, 4, 1])
+    labels = tf.zeros([1], dtype=tf.int32)
+    unchanged, unchanged_labels = augment_batch(values, labels, view_config)
+
+    np.testing.assert_array_equal(unchanged.numpy(), values.numpy())
+    np.testing.assert_array_equal(unchanged_labels.numpy(), labels.numpy())
+
+
+def test_self_supervised_views_do_not_inherit_training_augmentation():
+    config = pretraining_config()
+    config["pretraining"]["use_training_augmentation"] = True
+    config.setdefault("augmentation", {}).update(
+        {"enabled": False, "rotation": 0.5, "zoom": 0.2}
+    )
+
+    view_config = _view_config(config)
+
+    assert view_config["augmentation"]["enabled"] is True
+    assert view_config["augmentation"]["rotation"] == 0.0
+    assert view_config["augmentation"]["zoom"] == 0.0
+
+
+def test_self_supervised_config_section_is_supported():
+    config = pretraining_config()
+    config["self_supervised"] = config.pop("pretraining")
+    config["self_supervised"]["augmentation"] = {"enabled": False}
+
+    view_config = _view_config(config)
+
+    assert view_config["augmentation"]["enabled"] is False
+
+
 @pytest.mark.parametrize("method", ["byol", "simclr"])
 def test_student_teacher_pretraining_updates_shared_classifier_encoder(
     tmp_path, method, capsys
@@ -89,8 +144,8 @@ def test_student_teacher_pretraining_updates_shared_classifier_encoder(
     history = run_student_teacher_pretraining(classifier, dataset, config, tmp_path)
 
     output = capsys.readouterr().out
-    assert f"[pretraining {method} 1/1] started" in output
-    assert f"[pretraining {method} 1/1] completed" in output
+    assert f"[self-supervised {method} 1/1] started" in output
+    assert f"[self-supervised {method} 1/1] completed" in output
 
     after = classifier.get_layer("embedding_projection").get_weights()[0]
     assert "loss" in history.history

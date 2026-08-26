@@ -221,11 +221,11 @@ tversky_beta = 0.7
 cost to bright continuous structure and high cost to dark pixels and strong
 intensity boundaries.
 
-Optional grayscale reconstruction pretraining can use image-only records from
+Optional grayscale reconstruction self-supervised training can use image-only records from
 either a classification or mask-refinement SQLite database:
 
 ```toml
-[pretraining]
+[self_supervised]
 enabled = true
 method = "grayscale_reconstruction"
 database = "datasets/classification-corpus.sqlite"

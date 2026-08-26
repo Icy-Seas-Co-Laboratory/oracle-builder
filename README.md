@@ -37,6 +37,7 @@ Choose the guide that matches what you want to do:
 - [Dataset schema V1](docs/dataset-schema-v1.md)
 - [Model-product schema V1](docs/model-product-schema-v1.md)
 - [Model-run artifact V1](docs/run-artifact-v1.md)
+- [Oracle Model Artifact Standard V2](docs/model-artifact-standard-v2.md)
 - [Inference contract V1](docs/inference-contract-v1.md)
 - [Architecture and extension boundaries](docs/architecture.md)
 

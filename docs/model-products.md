@@ -1,12 +1,17 @@
 # External model products
 
 `oracle-model ingest` turns a supplied model into a sealed, portable Oracle
-Builder **model product**. It accepts native Keras `.keras` files, legacy
+Builder **deployment asset**. It accepts native Keras `.keras` files, legacy
 Keras `.h5` / `.hdf5` files, and TensorFlow SavedModel directories.
 
 Use [Model-product schema V1](model-product-schema-v1.md) as the authoritative
 reference for the artifact layout, TOML fields, promotion contract, identities,
 and optional dataset provenance.
+
+New products use the `deployment_asset` profile of the shared [Oracle Model
+Artifact Standard V2](model-artifact-standard-v2.md). They do not fabricate a
+training split, training history, or training log. `model/contract.json` is the
+authoritative self-describing inference contract.
 
 ```bash
 oracle-model ingest \

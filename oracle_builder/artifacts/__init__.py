@@ -28,6 +28,21 @@ from oracle_data_contracts.artifacts.splits import (
     split_assignments,
     split_manifest_matches_dataset,
 )
+from oracle_data_contracts.artifacts.standard import (
+    MODEL_ARTIFACT_PROFILES,
+    MODEL_ARTIFACT_SCHEMA_NAME,
+    MODEL_ARTIFACT_SCHEMA_VERSION,
+    profile_for_artifact_type,
+    standard_descriptor,
+    write_model_contract,
+)
+
+
+def publish_deployment_asset(*args, **kwargs):
+    """Lazily publish a lean deployment asset from a sealed training record."""
+    from oracle_builder.artifacts.deployment import publish_deployment_asset as publish
+
+    return publish(*args, **kwargs)
 
 __all__ = [
     "RUN_ARTIFACT_SCHEMA_NAME",
@@ -54,4 +69,11 @@ __all__ = [
     "update_run_artifact",
     "validate_run_artifact",
     "write_run_config",
+    "MODEL_ARTIFACT_PROFILES",
+    "MODEL_ARTIFACT_SCHEMA_NAME",
+    "MODEL_ARTIFACT_SCHEMA_VERSION",
+    "profile_for_artifact_type",
+    "standard_descriptor",
+    "write_model_contract",
+    "publish_deployment_asset",
 ]

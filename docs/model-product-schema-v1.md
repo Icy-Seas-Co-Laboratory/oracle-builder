@@ -118,5 +118,6 @@ invent an embedding when the source signature does not expose one.
 
 `--dataset DATASET.sqlite` is optional. When supplied, the manifest records the
 dataset/revision UUIDs, type, schema/version, lifecycle, and semantic SHA-256.
-No split manifest is inferred from an imported model: the artifact stores an
-explicit unavailable split protocol instead.
+V1 products stored an explicit unavailable split protocol for this case. New
+products use the V2 `deployment_asset` profile and omit training-only split and
+history files entirely.

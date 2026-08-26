@@ -2,11 +2,95 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from tensorflow import keras
+
+
+EVENT_SCHEMA = "oracle_training_event"
+METRIC_SCHEMA = "oracle_training_metric"
+
+
+def _events_path(path: str | Path) -> Path:
+    value = Path(path)
+    return value if value.suffix == ".jsonl" else value.parent / "events.jsonl"
+
+
+def _metrics_path(path: str | Path) -> Path:
+    value = Path(path)
+    return value if value.suffix == ".jsonl" else value.parent.parent / "metrics" / "metrics.jsonl"
+
+
+def _append_jsonl(path: str | Path, value: dict[str, Any]) -> None:
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with target.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(value, sort_keys=True, default=str, allow_nan=False) + "\n")
+
+
+def append_jsonl_event(
+    path: str | Path,
+    run_id: str,
+    level: str,
+    event: str,
+    data: dict[str, Any] | None = None,
+) -> None:
+    _append_jsonl(
+        path,
+        {
+            "schema": EVENT_SCHEMA,
+            "schema_version": "1.0.0",
+            "event_id": str(uuid.uuid4()),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "run_id": str(run_id),
+            "level": str(level),
+            "event": str(event),
+            "data": data or {},
+        },
+    )
+
+
+def write_history_jsonl(
+    history: dict[str, list[float]],
+    path: str | Path,
+    *,
+    run_id: str | None = None,
+    phase: str = "training",
+) -> None:
+    target = Path(path)
+    if target.exists():
+        target.unlink()
+    names = sorted(history)
+    for epoch in range(max((len(values) for values in history.values()), default=0)):
+        for name in names:
+            values = history[name]
+            if epoch >= len(values):
+                continue
+            value = values[epoch]
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                continue
+            if value != value:
+                continue
+            _append_jsonl(
+                target,
+                {
+                    "schema": METRIC_SCHEMA,
+                    "schema_version": "1.0.0",
+                    "metric_id": str(uuid.uuid4()),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "run_id": run_id,
+                    "phase": phase,
+                    "epoch": epoch,
+                    "metric": name[4:] if name.startswith("val_") else name,
+                    "split": "validation" if name.startswith("val_") else "train",
+                    "value": value,
+                },
+            )
 
 
 def init_training_log(
@@ -70,6 +154,13 @@ def init_training_log(
         )
     connection.commit()
     connection.close()
+    append_jsonl_event(
+        _events_path(path),
+        run_id,
+        "INFO",
+        "run_resumed" if resume else "run_started",
+        {"run_name": run_name},
+    )
 
 
 def log_event(path: str | Path, run_id: str, level: str, message: str, details: dict[str, Any] | None = None) -> None:
@@ -80,6 +171,7 @@ def log_event(path: str | Path, run_id: str, level: str, message: str, details: 
     )
     connection.commit()
     connection.close()
+    append_jsonl_event(_events_path(path), run_id, level, message, details)
 
 
 def mark_run_complete(path: str | Path, run_id: str, status: str) -> None:
@@ -90,6 +182,7 @@ def mark_run_complete(path: str | Path, run_id: str, status: str) -> None:
     )
     connection.commit()
     connection.close()
+    append_jsonl_event(_events_path(path), run_id, "INFO", "run_finished", {"status": status})
 
 
 class SQLiteMetricLogger(keras.callbacks.Callback):
@@ -115,6 +208,21 @@ class SQLiteMetricLogger(keras.callbacks.Callback):
             connection.execute(
                 "INSERT INTO epoch_metrics VALUES (?, ?, ?, ?, ?)",
                 (self.run_id, int(epoch), split, metric, numeric),
+            )
+            _append_jsonl(
+                _metrics_path(self.sqlite_path),
+                {
+                    "schema": METRIC_SCHEMA,
+                    "schema_version": "1.0.0",
+                    "metric_id": str(uuid.uuid4()),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "run_id": self.run_id,
+                    "phase": "training",
+                    "epoch": int(epoch),
+                    "metric": metric,
+                    "split": split,
+                    "value": numeric,
+                },
             )
         connection.commit()
         connection.close()

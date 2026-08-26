@@ -147,7 +147,7 @@ from the frozen database. Classification model families include simple CNN,
 ResNet, DenseNet, and EfficientNet variants. Every native classifier exposes
 probabilities, logits, and a fixed-size L2-normalized `features` embedding.
 
-To enable weighted loss and student–teacher/SimCLR pretraining, start with
+To enable weighted loss and student–teacher/SimCLR self-supervised training, start with
 `configs/example_classification_weighted_simclr.toml` or see
 [training and evaluation](training-and-evaluation.md).
 

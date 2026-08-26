@@ -42,8 +42,13 @@ between images and masks; photometric transforms never change masks.
 
 Classification defaults use `weighted_sparse_categorical_crossentropy`. Class
 weights are calculated from the run’s training assignment only. Student–teacher
-BYOL or SimCLR pretraining uses `[pretraining]`; it is available for every
+BYOL or SimCLR self-supervised training uses `[self_supervised]`; it is available for every
 classification family, not just ResNet.
+
+Self-supervised view augmentation is configured independently under
+`[self_supervised.augmentation]`. It does not inherit the supervised
+`[augmentation]` section. Existing `[pretraining]` configurations remain
+supported as a legacy alias.
 
 ## Streaming and multiple GPUs
 

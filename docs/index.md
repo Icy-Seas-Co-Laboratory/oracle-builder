@@ -22,6 +22,7 @@
 | SQLite classification or mask-refinement dataset | [Dataset schema V1](dataset-schema-v1.md) |
 | Imported/published model product and its TOML | [Model-product schema V1](model-product-schema-v1.md) |
 | Training run, split protocol, integrity, and package | [Model-run artifact V1](run-artifact-v1.md) |
+| Shared deployment/training artifact profiles | [Oracle Model Artifact Standard V2](model-artifact-standard-v2.md) |
 | In-memory and persisted inference packet | [Inference contract V1](inference-contract-v1.md) |
 
 ## Configuration examples

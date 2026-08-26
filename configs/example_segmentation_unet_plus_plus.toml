@@ -30,8 +30,8 @@ activation = "relu"
 final_activation = "sigmoid"
 deep_supervision = false
 
-[pretraining]
-# Optional grayscale-only reconstruction pretraining from either dataset type.
+[self_supervised]
+# Optional grayscale-only reconstruction self-supervised training from either dataset type.
 enabled = true
 method = "grayscale_reconstruction"
 database = "./datasets/ROI-Refinement/dataset.checkpoint-20260811T191330.260682Z.sqlite"

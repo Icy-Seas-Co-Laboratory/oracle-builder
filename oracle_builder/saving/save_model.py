@@ -9,6 +9,7 @@ from typing import Any
 import tensorflow as tf
 from tensorflow import keras
 
+from oracle_builder.artifacts import write_model_contract
 from oracle_builder.classification.features import build_feature_model
 
 
@@ -266,9 +267,22 @@ def save_model_artifacts(model: keras.Model, run_dir: str | Path, config: dict[s
         },
         "formats": formats,
         "save_report": report,
+        "contract_path": "contract.json",
     }
     (model_path / "model_manifest.json").write_text(
         json.dumps(model_manifest, indent=2, sort_keys=True, default=str) + "\n"
+    )
+    write_model_contract(
+        run_dir,
+        {
+            "task": model_manifest["task"],
+            "architecture": model_manifest["architecture"],
+            "inputs": {"image": model_manifest["input"]},
+            "outputs": model_manifest["outputs"],
+            "preprocessing": model_manifest["input"].get("preprocessing", {}),
+            "postprocessing": model_manifest.get("postprocessing", {}),
+            "inference": model_manifest["inference_contract"],
+        },
     )
     return report
 

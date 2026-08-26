@@ -34,6 +34,22 @@ def build_parser() -> argparse.ArgumentParser:
     migrate = commands.add_parser("migrate-legacy")
     migrate.add_argument("source")
     migrate.add_argument("output")
+    publish = commands.add_parser(
+        "publish-deployment",
+        help="Create a lean sealed deployment asset from a sealed training record.",
+    )
+    publish.add_argument("training_run")
+    publish.add_argument("output")
+    publish.add_argument("--include-weights", action="store_true")
+    publish.add_argument("--no-evidence", action="store_true")
+    materialize = commands.add_parser(
+        "materialize-training",
+        help="Copy a sealed training record and embed retraining resources.",
+    )
+    materialize.add_argument("training_record")
+    materialize.add_argument("output")
+    materialize.add_argument("--dataset")
+    materialize.add_argument("--source-root")
     return parser
 
 
@@ -51,6 +67,24 @@ def main(argv: list[str] | None = None) -> int:
         result = pack_run_artifact(args.run, args.output)
     elif args.command == "migrate-legacy":
         result = migrate_legacy_run(args.source, args.output)
+    elif args.command == "publish-deployment":
+        from oracle_builder.artifacts.deployment import publish_deployment_asset
+
+        result = publish_deployment_asset(
+            args.training_run,
+            args.output,
+            include_weights=args.include_weights,
+            include_evidence=not args.no_evidence,
+        )
+    elif args.command == "materialize-training":
+        from oracle_builder.artifacts.training import materialize_training_record
+
+        result = materialize_training_record(
+            args.training_record,
+            args.output,
+            dataset=args.dataset,
+            source_root=args.source_root,
+        )
     else:
         result = unpack_run_artifact(args.package, args.output)
     print(json.dumps(result, indent=2, sort_keys=True, default=str))

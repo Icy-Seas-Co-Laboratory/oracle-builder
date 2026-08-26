@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from oracle_data_contracts.artifacts.layout import RunLayout
+from oracle_data_contracts.artifacts.standard import standard_descriptor
 
 
 RUN_ARTIFACT_SCHEMA_NAME = "oracle_builder_model_run"
@@ -192,6 +193,7 @@ def create_run_artifact(
     config: dict[str, Any],
     source_config: str | Path,
     artifact_type: str = "model_run",
+    lineage: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if artifact_type not in ARTIFACT_TYPES:
         raise ValueError(f"Unsupported artifact type: {artifact_type}")
@@ -204,7 +206,33 @@ def create_run_artifact(
     _write_json(layout.resolved_config, portable)
     _write_json(layout.runtime, runtime)
     now = _utc_now()
+    paths = {
+        "readme": "README.md",
+        "model_card": "MODEL_CARD.md",
+        "model_contract": "model/contract.json",
+        "source_config": "config/source.toml",
+        "resolved_config": "config/resolved.json",
+        "runtime_provenance": "provenance/runtime.json",
+        "environment": "provenance/environment.json",
+        "requirements": "provenance/requirements.txt",
+        "events": "logs/events.jsonl",
+        "model": "model",
+        "figures": "figures",
+    }
+    if artifact_type == "model_run":
+        paths.update(
+            {
+                "split_manifest": "protocol/splits.json",
+                "training_log": "logs/training.sqlite",
+                "training_metrics": "metrics",
+                "metrics_jsonl": "metrics/metrics.jsonl",
+                "evaluation": "evaluation",
+                "predictions": "predictions",
+                "training_library": "library",
+            }
+        )
     manifest = {
+        "standard": standard_descriptor(artifact_type),
         "artifact_schema": {
             "name": RUN_ARTIFACT_SCHEMA_NAME,
             "version": RUN_ARTIFACT_SCHEMA_VERSION,
@@ -219,25 +247,11 @@ def create_run_artifact(
         "created_at": now,
         "updated_at": now,
         "completed_at": None,
+        "lineage": dict(lineage or config.get("lineage", {})),
         "dataset": dict(config.get("dataset", {})),
         "product": dict(config.get("product", {})),
         "model": _model_contract(config),
-        "paths": {
-            "readme": "README.md",
-            "model_card": "MODEL_CARD.md",
-            "source_config": "config/source.toml",
-            "resolved_config": "config/resolved.json",
-            "split_manifest": "protocol/splits.json",
-            "runtime_provenance": "provenance/runtime.json",
-            "environment": "provenance/environment.json",
-            "requirements": "provenance/requirements.txt",
-            "training_log": "logs/training.sqlite",
-            "training_metrics": "metrics",
-            "model": "model",
-            "evaluation": "evaluation",
-            "predictions": "predictions",
-            "figures": "figures",
-        },
+        "paths": paths,
         "summary": {},
         "inventory": [],
         "fingerprint_sha256": None,
@@ -362,7 +376,19 @@ def _inventory(root: Path) -> list[dict[str, Any]]:
     return rows
 
 
-def _completed_required_paths(layout: RunLayout) -> tuple[Path, ...]:
+def _completed_required_paths(
+    layout: RunLayout, manifest: dict[str, Any] | None = None
+) -> tuple[Path, ...]:
+    # Deployment assets are deliberately lean: they do not pretend to have a
+    # training split, training log, or history.  Keep the V1 training contract
+    # unchanged for model-run artifacts and legacy readers.
+    if manifest and manifest.get("standard", {}).get("profile") == "deployment_asset":
+        return (
+            layout.environment,
+            layout.requirements,
+            layout.model / "model_manifest.json",
+            layout.model / "load_test_report.json",
+        )
     return (
         layout.environment,
         layout.requirements,
@@ -411,7 +437,7 @@ def seal_run_artifact(run_dir: str | Path) -> dict[str, Any]:
     if manifest["status"] == "complete":
         missing = [
             path.relative_to(layout.root).as_posix()
-            for path in _completed_required_paths(layout)
+            for path in _completed_required_paths(layout, manifest)
             if not path.exists()
         ]
         if missing:
@@ -473,6 +499,12 @@ def validate_run_artifact(run_dir: str | Path) -> dict[str, Any]:
         "version": RUN_ARTIFACT_SCHEMA_VERSION,
     }:
         errors.append(f"Unsupported run artifact schema: {schema}")
+    standard = manifest.get("standard")
+    if standard is not None:
+        if standard.get("profile") not in {"deployment_asset", "training_record"}:
+            errors.append("Unsupported model-artifact profile")
+        if standard.get("name") != "oracle_model_artifact":
+            errors.append("Unsupported model-artifact standard")
     # Artifacts produced before the explicit type field was introduced are
     # ordinary model runs.
     if manifest.get("artifact_type", "model_run") not in ARTIFACT_TYPES:
@@ -513,7 +545,7 @@ def validate_run_artifact(run_dir: str | Path) -> dict[str, Any]:
             row.get("path") == "protocol/splits.json"
             for row in manifest.get("inventory", [])
         )
-        for required in _completed_required_paths(layout):
+        for required in _completed_required_paths(layout, manifest):
             if not required.exists():
                 relative = required.relative_to(layout.root).as_posix()
                 if relative == "protocol/splits.json" and not historical_split_manifest:

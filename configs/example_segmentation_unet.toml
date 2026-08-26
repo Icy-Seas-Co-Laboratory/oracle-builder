@@ -46,7 +46,7 @@ spatial_edge_weighting = true
 edge_weight_lambda = 1.0
 edge_weight_sigma = 6.0
 
-[pretraining]
+[self_supervised]
 # Set enabled=true and point database at a classification or mask-refinement SQLite dataset.
 enabled = false
 method = "grayscale_reconstruction"

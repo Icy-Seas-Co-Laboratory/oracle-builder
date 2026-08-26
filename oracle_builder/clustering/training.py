@@ -21,7 +21,13 @@ from oracle_builder.artifacts import (
 )
 from oracle_builder.artifacts.splits import create_unavailable_split_manifest
 from oracle_builder.classification.features import build_feature_model
-from oracle_builder.config import DEFAULT_CONFIG, deep_merge, load_toml
+from oracle_builder.config import (
+    DEFAULT_CONFIG,
+    deep_merge,
+    load_toml,
+    normalize_self_supervised_config,
+    self_supervised_settings,
+)
 from oracle_builder.data.sqlite_stream import (
     SQLiteClassificationSource,
     build_all_classification_index,
@@ -40,8 +46,9 @@ from oracle_builder.training.logging_callbacks import (
     init_training_log,
     log_event,
     mark_run_complete,
+    write_history_jsonl,
 )
-from oracle_builder.training.student_teacher import run_student_teacher_pretraining
+from oracle_builder.training.student_teacher import run_self_supervised_training
 from oracle_builder.training.train import set_seed
 from oracle_builder.training.distribution import select_distribution_strategy, write_distribution_info
 
@@ -106,44 +113,48 @@ def _validate_clustering_config(config: dict[str, Any], *, sample_count: int | N
     if not np.isfinite(percentile) or not 0.0 <= percentile <= 100.0:
         raise ValueError("clustering.novelty_percentile must be a number from 0 through 100")
     settings["novelty_percentile"] = percentile
-    pretraining = config.get("pretraining", {})
+    self_supervised = self_supervised_settings(config)
     minimum_batch = _positive_int(
-        pretraining.get("minimum_global_batch_size", 2),
-        "pretraining.minimum_global_batch_size",
+        self_supervised.get("minimum_global_batch_size", 2),
+        "self_supervised.minimum_global_batch_size",
         minimum=2,
     )
     batch_size = _positive_int(config.get("data", {}).get("batch_size", 16), "data.batch_size")
     if batch_size < minimum_batch:
         raise ValueError(
-            "data.batch_size must be at least pretraining.minimum_global_batch_size"
+            "data.batch_size must be at least self_supervised.minimum_global_batch_size"
         )
     config["data"]["batch_size"] = batch_size
-    threshold = float(pretraining.get("collapse_std_threshold", 1e-3))
+    threshold = float(self_supervised.get("collapse_std_threshold", 1e-3))
     if not np.isfinite(threshold) or threshold <= 0:
-        raise ValueError("pretraining.collapse_std_threshold must be finite and positive")
-    pretraining["collapse_std_threshold"] = threshold
+        raise ValueError("self_supervised.collapse_std_threshold must be finite and positive")
+    self_supervised["collapse_std_threshold"] = threshold
     spread_threshold = float(
-        pretraining.get("collapse_embedding_spread_threshold", 0.005)
+        self_supervised.get("collapse_embedding_spread_threshold", 0.005)
     )
     if not np.isfinite(spread_threshold) or spread_threshold <= 0:
         raise ValueError(
-            "pretraining.collapse_embedding_spread_threshold must be finite and positive"
+            "self_supervised.collapse_embedding_spread_threshold must be finite and positive"
         )
-    pretraining["collapse_embedding_spread_threshold"] = spread_threshold
+    self_supervised["collapse_embedding_spread_threshold"] = spread_threshold
 
 
-def _validate_pretraining_history(history: Any, config: dict[str, Any]) -> None:
+def _validate_self_supervised_history(history: Any, config: dict[str, Any]) -> None:
     values = getattr(history, "history", {})
     for name, series in values.items():
         if not np.all(np.isfinite(np.asarray(series, dtype="float64"))):
-            raise ValueError(f"Clustering self-supervised pretraining produced non-finite {name}")
+            raise ValueError(f"Clustering self-supervised training produced non-finite {name}")
     series = values.get("representation_std")
     if not series:
         raise ValueError(
-            "Clustering self-supervised pretraining did not report representation_std"
+            "Clustering self-supervised training did not report representation_std"
         )
-    if float(series[-1]) <= float(config["pretraining"]["collapse_std_threshold"]):
-        raise ValueError("Clustering self-supervised pretraining collapsed")
+    if float(series[-1]) <= float(self_supervised_settings(config)["collapse_std_threshold"]):
+        raise ValueError("Clustering self-supervised training collapsed")
+
+
+# Legacy import compatibility.
+_validate_pretraining_history = _validate_self_supervised_history
 
 
 def _validate_serving_embeddings(embeddings: np.ndarray, config: dict[str, Any]) -> None:
@@ -154,7 +165,7 @@ def _validate_serving_embeddings(embeddings: np.ndarray, config: dict[str, Any])
     if np.any(norms <= 0):
         raise ValueError("Clustering produced zero-norm serving embeddings")
     centered_rms = float(np.sqrt(np.mean(np.square(values - values.mean(axis=0)))))
-    threshold = float(config["pretraining"]["collapse_embedding_spread_threshold"])
+    threshold = float(self_supervised_settings(config)["collapse_embedding_spread_threshold"])
     if centered_rms <= threshold:
         raise ValueError(
             "Clustering produced collapsed serving embeddings: "
@@ -216,6 +227,7 @@ def resolve_clustering_config(
     """Resolve a clustering config without requiring classification labels."""
     user = load_toml(config_path)
     config = deep_merge(DEFAULT_CONFIG, user)
+    normalize_self_supervised_config(config, user)
     config.setdefault("run", {})["task"] = "clustering"
     config["run"].setdefault("model", "resnet")
     if "input_shape" not in config.get("data", {}):
@@ -226,10 +238,11 @@ def resolve_clustering_config(
     config["data"]["num_classes"] = 2
     config["training"]["loss"] = "sparse_categorical_crossentropy"
     config["training"]["metrics"] = []
-    config["pretraining"]["enabled"] = True
-    method = str(config["pretraining"].get("method", "byol")).lower()
+    self_supervised = self_supervised_settings(config)
+    self_supervised["enabled"] = True
+    method = str(self_supervised.get("method", "byol")).lower()
     if method not in {"byol", "student_teacher", "simclr"}:
-        raise ValueError("Clustering pretraining.method must be byol, student_teacher, or simclr")
+        raise ValueError("Clustering self_supervised.method must be byol, student_teacher, or simclr")
     config.setdefault("clustering", {})
     config["clustering"].setdefault("method", "spherical_kmeans")
     config["clustering"].setdefault("n_clusters", 8)
@@ -330,7 +343,7 @@ def train_clustering_run(
         set_seed(int(config["run"].get("seed", 123)))
         strategy, distribution_info = select_distribution_strategy(config)
         if (
-            str(config["pretraining"].get("method", "byol")).lower() == "simclr"
+            str(self_supervised_settings(config).get("method", "byol")).lower() == "simclr"
             and batch_size // int(strategy.num_replicas_in_sync) < 2
         ):
             raise ValueError(
@@ -361,9 +374,9 @@ def train_clustering_run(
             run_id,
             "INFO",
             "Started self-supervised clustering encoder training",
-            {"method": config["pretraining"]["method"], "samples": len(index.refs)},
+            {"method": self_supervised_settings(config)["method"], "samples": len(index.refs)},
         )
-        history = run_student_teacher_pretraining(
+        history = run_self_supervised_training(
             model,
             pretraining_dataset,
             config,
@@ -372,10 +385,16 @@ def train_clustering_run(
             training_log=output / "logs" / "training.sqlite",
             run_id=run_id,
         )
-        _validate_pretraining_history(history, config)
+        _validate_self_supervised_history(history, config)
         history_path = output / "metrics" / "history.json"
         history_path.parent.mkdir(parents=True, exist_ok=True)
         history_path.write_text(json.dumps(history.history, indent=2, default=float) + "\n")
+        write_history_jsonl(
+            history.history,
+            output / "metrics" / "metrics.jsonl",
+            run_id=run_id,
+            phase="self_supervised",
+        )
 
         inference_plan = resolve_inference_batch_size(model, config, announce=None)
         extraction_dataset = source.indexed_image_dataset(index, batch_size=inference_plan.batch_size)

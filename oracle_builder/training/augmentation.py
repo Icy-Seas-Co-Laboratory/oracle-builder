@@ -21,6 +21,10 @@ def apply_training_augmentation(dataset, config: dict[str, Any]):
 
 def augment_batch(x, y, config: dict[str, Any], sample_weight=None):
     augmentation = config.get("augmentation", {})
+    if not augmentation.get("enabled", False):
+        if sample_weight is None:
+            return x, y
+        return x, y, sample_weight
     task = config["run"]["task"]
     x = tf.cast(x, tf.float32)
     y_dtype = y.dtype

@@ -33,7 +33,7 @@ Choose `inverse_frequency` for stronger balancing. Use `explicit` only when
 domain knowledge supports hand-selected weights. To opt out of weighting, use
 `loss = "sparse_categorical_crossentropy"`.
 
-To enable self-supervised pretraining, set `pretraining.enabled = true`. Choose
+To enable self-supervised training, set `self_supervised.enabled = true`. Choose
 `byol` for the student-teacher approach without negative examples, or `simclr`
-for NT-Xent contrastive pretraining. Both transfer the learned encoder into the
+for NT-Xent contrastive training. Both transfer the learned encoder into the
 selected classification family before supervised training.
