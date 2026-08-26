@@ -50,6 +50,17 @@ Self-supervised view augmentation is configured independently under
 `[augmentation]` section. Existing `[pretraining]` configurations remain
 supported as a legacy alias.
 
+Self-supervised epoch logs report `related_cosine_similarity` for the two views
+of the same ROI and `unrelated_cosine_similarity` for views from other ROIs in
+the synchronized batch. Productive training should generally keep related
+similarity above unrelated similarity while `representation_std` remains
+healthy and `collapse_indicator` stays zero. BYOL's older `cosine_similarity`
+field remains as an alias for the related value.
+
+Batch-level live progress is enabled by default with
+`self_supervised.verbose = 1`. Use `0` for quiet operation or `2` for one
+completed line per epoch.
+
 ## Streaming and multiple GPUs
 
 Classification SQLite loading is streaming by default: images are decoded and

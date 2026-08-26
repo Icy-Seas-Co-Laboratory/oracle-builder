@@ -22,6 +22,7 @@ from oracle_builder.training.student_teacher import (
     SimCLRPretrainer,
     StudentTeacherPretrainer,
     _view_config,
+    _cross_view_cosine_statistics,
     foreground_weighted_reconstruction_mse,
     grayscale_reconstruction_config,
     load_grayscale_reconstruction_dataset,
@@ -130,6 +131,16 @@ def test_self_supervised_config_section_is_supported():
     assert view_config["augmentation"]["enabled"] is False
 
 
+def test_self_supervised_verbose_mode_is_validated():
+    config = pretraining_config()
+    config["pretraining"]["verbose"] = 0
+    validate_config(config)
+
+    config["pretraining"]["verbose"] = 3
+    with pytest.raises(ValueError, match="self_supervised.verbose"):
+        validate_config(config)
+
+
 @pytest.mark.parametrize("method", ["byol", "simclr"])
 def test_student_teacher_pretraining_updates_shared_classifier_encoder(
     tmp_path, method, capsys
@@ -146,6 +157,9 @@ def test_student_teacher_pretraining_updates_shared_classifier_encoder(
     output = capsys.readouterr().out
     assert f"[self-supervised {method} 1/1] started" in output
     assert f"[self-supervised {method} 1/1] completed" in output
+    assert "2/2" in output
+    assert "related_cosine_similarity=" in output
+    assert "unrelated_cosine_similarity=" in output
 
     after = classifier.get_layer("embedding_projection").get_weights()[0]
     assert "loss" in history.history
@@ -176,6 +190,27 @@ def test_student_teacher_pretraining_updates_shared_classifier_encoder(
         ):
             assert metric in history.history
             assert np.isfinite(history.history[metric][-1])
+    for metric in (
+        "related_cosine_similarity",
+        "unrelated_cosine_similarity",
+    ):
+        assert metric in history.history
+        assert np.isfinite(history.history[metric][-1])
+
+
+def test_cross_view_cosine_statistics_excludes_matching_sample():
+    first = tf.constant([[1.0, 0.0], [0.0, 1.0]])
+    second = tf.constant([[1.0, 0.0], [0.0, 1.0]])
+
+    related, unrelated = _cross_view_cosine_statistics(
+        first,
+        second,
+        first,
+        second,
+    )
+
+    assert float(related) == pytest.approx(1.0)
+    assert float(unrelated) == pytest.approx(0.0)
 
 
 def test_teacher_starts_with_student_encoder_weights():

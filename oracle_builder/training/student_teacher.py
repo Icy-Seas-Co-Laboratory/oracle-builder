@@ -37,6 +37,14 @@ DEFAULT_VIEW_AUGMENTATION = {
 }
 
 
+def _self_supervised_fit_verbose(settings: dict[str, Any]) -> int:
+    """Return the Keras progress mode for self-supervised training."""
+    value = settings.get("verbose", 1)
+    if isinstance(value, bool) or value not in {0, 1, 2}:
+        raise ValueError("self_supervised.verbose must be 0, 1, or 2")
+    return int(value)
+
+
 def make_self_supervised_dataset(x: np.ndarray, config: dict[str, Any]):
     batch_size = int(config["data"].get("batch_size", 16))
     buffer_size = int(config["data"].get("shuffle_buffer", 512))
@@ -257,7 +265,7 @@ def run_grayscale_reconstruction_self_supervised(
     history = pre_model.fit(
         dataset,
         epochs=epochs,
-        verbose=0,
+        verbose=_self_supervised_fit_verbose(settings),
         callbacks=[
             SelfSupervisedStatusCallback(
                 method="grayscale_reconstruction",
@@ -363,6 +371,59 @@ def _all_gather_representations(representations: tf.Tensor) -> tf.Tensor:
     return replica_context.all_gather(representations, axis=0)
 
 
+def _cross_view_cosine_statistics(
+    anchor_one: tf.Tensor,
+    anchor_two: tf.Tensor,
+    target_one: tf.Tensor,
+    target_two: tf.Tensor,
+    *,
+    global_target_one: tf.Tensor | None = None,
+    global_target_two: tf.Tensor | None = None,
+) -> tuple[tf.Tensor, tf.Tensor]:
+    """Return related and unrelated cross-view cosine similarity.
+
+    Related pairs are the two views of the same sample. Unrelated similarity
+    is the mean similarity to both views of every other sample in the global
+    synchronized batch. The latter is computed from a global vector sum so it
+    does not add another quadratic similarity matrix to the SSL step.
+    """
+    anchor_one = tf.math.l2_normalize(anchor_one, axis=-1)
+    anchor_two = tf.math.l2_normalize(anchor_two, axis=-1)
+    target_one = tf.math.l2_normalize(target_one, axis=-1)
+    target_two = tf.math.l2_normalize(target_two, axis=-1)
+    if global_target_one is None:
+        global_target_one = _all_gather_representations(target_one)
+    if global_target_two is None:
+        global_target_two = _all_gather_representations(target_two)
+
+    related = 0.5 * (
+        tf.reduce_mean(tf.reduce_sum(anchor_one * target_two, axis=-1))
+        + tf.reduce_mean(tf.reduce_sum(anchor_two * target_one, axis=-1))
+    )
+
+    global_target_sum = tf.reduce_sum(
+        tf.concat([global_target_one, global_target_two], axis=0), axis=0
+    )
+    unrelated_count = tf.cast(
+        tf.maximum(2 * tf.shape(global_target_one)[0] - 2, 1),
+        anchor_one.dtype,
+    )
+    unrelated_one = tf.reduce_sum(
+        anchor_one
+        * (global_target_sum - target_one - target_two),
+        axis=-1,
+    ) / unrelated_count
+    unrelated_two = tf.reduce_sum(
+        anchor_two
+        * (global_target_sum - target_one - target_two),
+        axis=-1,
+    ) / unrelated_count
+    unrelated = 0.5 * (
+        tf.reduce_mean(unrelated_one) + tf.reduce_mean(unrelated_two)
+    )
+    return related, unrelated
+
+
 def _self_supervised_optimizer(settings: dict[str, Any]) -> keras.optimizers.Optimizer:
     """Build the SSL optimizer while retaining Adam as the historical default."""
     learning_rate = float(settings.get("learning_rate", 0.001))
@@ -426,6 +487,12 @@ class StudentTeacherPretrainer(keras.Model):
         )
         self.loss_tracker = keras.metrics.Mean(name="loss")
         self.cosine_similarity_tracker = keras.metrics.Mean(name="cosine_similarity")
+        self.related_cosine_similarity_tracker = keras.metrics.Mean(
+            name="related_cosine_similarity"
+        )
+        self.unrelated_cosine_similarity_tracker = keras.metrics.Mean(
+            name="unrelated_cosine_similarity"
+        )
         self.variance_loss_tracker = keras.metrics.Mean(name="variance_loss")
         self.covariance_loss_tracker = keras.metrics.Mean(name="covariance_loss")
         self.representation_std_tracker = keras.metrics.Mean(name="representation_std")
@@ -436,6 +503,8 @@ class StudentTeacherPretrainer(keras.Model):
         return [
             self.loss_tracker,
             self.cosine_similarity_tracker,
+            self.related_cosine_similarity_tracker,
+            self.unrelated_cosine_similarity_tracker,
             self.variance_loss_tracker,
             self.covariance_loss_tracker,
             self.representation_std_tracker,
@@ -517,9 +586,23 @@ class StudentTeacherPretrainer(keras.Model):
             if gradient is not None
         )
         self._update_teacher()
-        cosine_similarity = 1.0 - alignment_loss / 2.0
+        related_cosine_similarity, unrelated_cosine_similarity = (
+            _cross_view_cosine_statistics(
+                student_one,
+                student_two,
+                teacher_one,
+                teacher_two,
+            )
+        )
+        cosine_similarity = related_cosine_similarity
         self.loss_tracker.update_state(loss)
         self.cosine_similarity_tracker.update_state(cosine_similarity)
+        self.related_cosine_similarity_tracker.update_state(
+            related_cosine_similarity
+        )
+        self.unrelated_cosine_similarity_tracker.update_state(
+            unrelated_cosine_similarity
+        )
         self.variance_loss_tracker.update_state(variance_loss)
         self.covariance_loss_tracker.update_state(covariance_loss)
         self.representation_std_tracker.update_state(representation_std)
@@ -570,6 +653,12 @@ class SimCLRPretrainer(keras.Model):
         self.contrastive_accuracy = keras.metrics.Mean(
             name="contrastive_accuracy"
         )
+        self.related_cosine_similarity_tracker = keras.metrics.Mean(
+            name="related_cosine_similarity"
+        )
+        self.unrelated_cosine_similarity_tracker = keras.metrics.Mean(
+            name="unrelated_cosine_similarity"
+        )
         self.representation_std_tracker = keras.metrics.Mean(name="representation_std")
         self.collapse_indicator_tracker = keras.metrics.Mean(name="collapse_indicator")
         self.collapse_std_threshold = float(
@@ -583,6 +672,8 @@ class SimCLRPretrainer(keras.Model):
         return [
             self.loss_tracker,
             self.contrastive_accuracy,
+            self.related_cosine_similarity_tracker,
+            self.unrelated_cosine_similarity_tracker,
             self.representation_std_tracker,
             self.collapse_indicator_tracker,
         ]
@@ -597,12 +688,21 @@ class SimCLRPretrainer(keras.Model):
         augmented, _ = augment_batch(x, dummy, self.view_config)
         return augmented
 
-    def _nt_xent(self, first, second):
+    def _nt_xent(
+        self,
+        first,
+        second,
+        *,
+        global_first=None,
+        global_second=None,
+    ):
         first = tf.math.l2_normalize(first, axis=-1)
         second = tf.math.l2_normalize(second, axis=-1)
         local_batch_size = tf.shape(first)[0]
-        global_first = _all_gather_representations(first)
-        global_second = _all_gather_representations(second)
+        if global_first is None:
+            global_first = _all_gather_representations(first)
+        if global_second is None:
+            global_second = _all_gather_representations(second)
         global_batch_size = tf.shape(global_first)[0]
         anchors = tf.concat([first, second], axis=0)
         representations = tf.concat([global_first, global_second], axis=0)
@@ -656,7 +756,26 @@ class SimCLRPretrainer(keras.Model):
             second = self.projector(
                 second_embedding, training=True
             )
-            loss, accuracy = self._nt_xent(first, second)
+            normalized_first = tf.math.l2_normalize(first, axis=-1)
+            normalized_second = tf.math.l2_normalize(second, axis=-1)
+            global_first = _all_gather_representations(normalized_first)
+            global_second = _all_gather_representations(normalized_second)
+            loss, accuracy = self._nt_xent(
+                first,
+                second,
+                global_first=global_first,
+                global_second=global_second,
+            )
+            related_cosine_similarity, unrelated_cosine_similarity = (
+                _cross_view_cosine_statistics(
+                    first,
+                    second,
+                    first,
+                    second,
+                    global_target_one=global_first,
+                    global_target_two=global_second,
+                )
+            )
             global_embeddings = tf.concat(
                 [
                     _all_gather_representations(first_embedding),
@@ -680,6 +799,12 @@ class SimCLRPretrainer(keras.Model):
         )
         self.loss_tracker.update_state(loss)
         self.contrastive_accuracy.update_state(accuracy)
+        self.related_cosine_similarity_tracker.update_state(
+            related_cosine_similarity
+        )
+        self.unrelated_cosine_similarity_tracker.update_state(
+            unrelated_cosine_similarity
+        )
         self.representation_std_tracker.update_state(representation_std)
         self.collapse_indicator_tracker.update_state(
             tf.cast(
@@ -747,7 +872,7 @@ def run_self_supervised_training(
     history = pretrainer.fit(
         dataset,
         epochs=epochs,
-        verbose=0,
+        verbose=_self_supervised_fit_verbose(settings),
         callbacks=[
             SelfSupervisedStatusCallback(
                 method=method,

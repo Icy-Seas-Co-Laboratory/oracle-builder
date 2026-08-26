@@ -1,18 +1,32 @@
-# Self-supervised unlabeled ROI organization with spherical k-means.
-# The input may contain existing annotations; they are ignored for training.
+# High-throughput self-supervised ROI organization with spherical k-means.
+# The input must be a frozen classification Dataset V1 SQLite database. Existing
+# annotations are ignored: every ROI is used for encoder training and clustering.
 
 [run]
 task = "clustering"
-model = "resnet"
+model = "simple_cnn"
 seed = 123
-notes = "BYOL encoder followed by cosine-space ROI clustering"
+notes = "High-throughput BYOL SimpleCNN encoder followed by cosine-space ROI clustering"
 
 [data]
+# Keep this resolution aligned with the standard ROI contract. A global batch of
+# 1024 is divided across visible replicas by TensorFlow (512 per GPU on two GPUs).
 input_shape = [224, 224, 1]
-batch_size = 16
-shuffle_buffer = 4096
+batch_size = 1024
+shuffle_buffer = 16384
+
+[data.streaming]
+# Parallel SQLite decoding and bounded prefetch keep the GPUs supplied without
+# retaining the complete ROI collection in memory.
+enabled = true
+reader_workers = 8
+prefetch_batches = 4
+deterministic = false
+sqlite_cache_kib = 262144
 
 [preprocessing]
+# These values are part of the eventual sealed encoder contract. "auto" polarity
+# uses the source dataset's recorded imaging polarity.
 resize_mode = "fit_pad"
 normalization = "dtype"
 rescale = true
@@ -20,27 +34,47 @@ invert = "auto"
 pad_value = 0.0
 interpolation = "bilinear"
 channel_mode = "grayscale"
+percentile_low = 1.0
+percentile_high = 99.0
+
+[distribution]
+# "auto" uses all visible GPUs through MirroredStrategy and falls back to one
+# device when necessary. The global data.batch_size must divide across replicas.
+strategy = "auto"
+devices = []
+cross_device_ops = "auto"
+fallback_to_single = true
+memory_growth = true
 
 [model]
-variant = "resnet18"
-base_filters = 64
+# SimpleCNN is the fastest useful baseline for typical ROI clustering runs.
+# base_filters controls the three convolution widths: 32, 64, and 128.
+base_filters = 32
+dropout = 0.0
 embedding_dim = 256
 normalize_embeddings = true
 
 [self_supervised]
+# BYOL avoids explicit negative-pair sampling and is a good default for large
+# global batches. View augmentation is scoped here and does not use [augmentation].
 enabled = true
-method = "byol" # simclr is also supported
+method = "byol"
 epochs = 50
+verbose = 1
 learning_rate = 0.001
 teacher_momentum = 0.99
 projection_dim = 128
 projection_hidden_dim = 256
-# View augmentation is scoped to self-supervised training and is independent
-# of the supervised [augmentation] section.
-# SSL safety controls. The run is rejected if either the raw SSL representation
-# or the normalized serving embedding collapses.
+temperature = 0.10
+
+# AdamW is a stable general-purpose optimizer for the encoder and projection heads.
 ssl_optimizer = "adamw"
 weight_decay = 0.0001
+beta_1 = 0.9
+beta_2 = 0.999
+optimizer_epsilon = 0.0000001
+
+# SSL diagnostics and collapse safeguards.
 minimum_global_batch_size = 2
 collapse_std_threshold = 0.001
 collapse_embedding_spread_threshold = 0.005
@@ -48,28 +82,51 @@ vicreg_variance_weight = 25.0
 vicreg_covariance_weight = 1.0
 vicreg_target_std = 1.0
 
+[self_supervised.augmentation]
+# Moderate, domain-agnostic ROI perturbations. Adjust only these values when
+# orientation, scale, or intensity is known to carry semantic information.
+enabled = true
+invert = false
+rotation = 0.08
+zoom = 0.15
+translation = 0.10
+skew = 0.05
+flip_horizontal = true
+flip_vertical = false
+brightness = 0.20
+contrast = 0.20
+gaussian_noise = 0.03
+fill_value = 0.0
+
 [clustering]
 method = "spherical_kmeans"
 n_clusters = 8
 novelty_percentile = 5.0
 top_k = 5
-# Bound both the diagnostic cost and persistent neighbor set for large runs.
+
+# Bound the expensive silhouette calculation and the persistent serving index.
+# All ROIs still contribute to centroids, cluster sizes, and novelty thresholds.
 silhouette_max_samples = 2000
-reference_neighbors_per_cluster = 64 # set to "all" only if full neighbors are required
+reference_neighbors_per_cluster = 64
 fit_batch_size = 4096
 
-[augmentation]
-enabled = true
-rotation = 0.5
-zoom = 0.20
-translation = [0.15, 0.15]
-skew = 0.20
-flip_horizontal = true
-flip_vertical = true
-brightness = 0.20
-contrast = 0.20
-gaussian_noise = 0.05
-fill_value = 0.0
+[inference]
+# Auto probing chooses the largest verified extraction batch up to 1024 while
+# retaining a bounded memory budget. This affects embedding extraction only.
+batch_size = "auto"
+minimum_batch_size = 64
+maximum_batch_size = 1024
+memory_budget_mb = 4096
+progress = false
 
 [output]
+save_checkpoints = false
+save_predictions = false
+save_figures = false
 export_savedmodel = true
+prediction_commit_batches = 20
+
+[evaluation.benchmark]
+enabled = true
+warmup_batches = 2
+measured_batches = 10

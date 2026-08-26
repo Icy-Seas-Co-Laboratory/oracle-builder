@@ -73,6 +73,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "enabled": False,
         "method": "byol",
         "epochs": 10,
+        "verbose": 1,
         "learning_rate": 0.001,
         "teacher_momentum": 0.99,
         "projection_dim": 128,
@@ -340,6 +341,9 @@ def validate_config(config: dict[str, Any]) -> None:
             raise ValueError("segmentation pretraining requires method='grayscale_reconstruction'")
         if int(self_supervised.get("epochs", 10)) < 1:
             raise ValueError("self_supervised.epochs must be at least 1")
+        verbose = self_supervised.get("verbose", 1)
+        if isinstance(verbose, bool) or verbose not in {0, 1, 2}:
+            raise ValueError("self_supervised.verbose must be 0, 1, or 2")
         if float(self_supervised.get("learning_rate", 0.001)) <= 0:
             raise ValueError("self_supervised.learning_rate must be greater than zero")
         momentum = float(self_supervised.get("teacher_momentum", 0.99))
