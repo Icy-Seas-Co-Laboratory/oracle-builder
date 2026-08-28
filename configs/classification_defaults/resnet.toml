@@ -14,7 +14,7 @@ notes = "Documented resnet baseline"
 [data]
 # Classification defaults assume one-channel images. Increase height/width when
 # fine detail matters, recognizing that memory use grows roughly with image area.
-input_shape = [224, 224, 1]
+input_shape = [128, 128, 1]
 batch_size = 8
 shuffle_buffer = 4096
 
@@ -60,11 +60,11 @@ memory_growth = true
 variant = "resnet18"
 base_filters = 64
 
-# The stem downsamples by stem_stride and, when enabled, another 2x in stem_pool.
-# For small objects or low-resolution inputs, try kernel 3, stride 1, pool false.
-stem_kernel_size = 7
-stem_stride = 2
-stem_pool = true
+# Preserve ROI-scale morphology before the residual stages.  This 3x3,
+# stride-1 stem deliberately omits the conventional ImageNet max-pool.
+stem_kernel_size = 3
+stem_stride = 1
+stem_pool = false
 
 # Optional expert override; four positive stage depths are required. Leaving
 # this commented uses the selected variant's canonical layout.
@@ -73,7 +73,7 @@ stem_pool = true
 # Every classifier exposes a fixed-size penultimate embedding named "features",
 # plus logits and softmax probabilities. 256 is a portable default for KNN.
 embedding_dim = 256
-normalize_embeddings = true
+normalize_embeddings = false
 # Dropout applied before the final classifier.
 dropout = 0.20
 

@@ -150,6 +150,16 @@ def test_embedding_normalization_can_be_disabled():
     assert model.get_layer("features").output.shape[-1] == 7
 
 
+def test_resnet_programmatic_defaults_are_roi_friendly():
+    model = get_model_builder("resnet")(classification_config("resnet"))
+
+    assert model.name == "resnet18"
+    assert model.get_layer("stem_conv").kernel_size == (3, 3)
+    assert model.get_layer("stem_conv").strides == (1, 1)
+    assert "stem_pool" not in {layer.name for layer in model.layers}
+    assert model.get_layer("features").__class__.__name__ == "Activation"
+
+
 @pytest.mark.parametrize(
     ("variant", "block_type", "stage_depths"),
     [
@@ -205,5 +215,5 @@ def test_canonical_resnet_variants_have_expected_stages_and_shortcuts(
     assert conv_layers
     assert batch_norm_layers
     assert all(isinstance(layer.kernel_initializer, keras.initializers.HeNormal) for layer in conv_layers)
-    assert all(layer.momentum == pytest.approx(0.9) for layer in batch_norm_layers)
-    assert all(layer.epsilon == pytest.approx(1e-5) for layer in batch_norm_layers)
+    assert all(layer.momentum == pytest.approx(0.99) for layer in batch_norm_layers)
+    assert all(layer.epsilon == pytest.approx(1e-3) for layer in batch_norm_layers)

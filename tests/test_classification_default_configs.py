@@ -65,6 +65,24 @@ def test_family_defaults_share_the_same_augmentation_policy():
     assert all(policy == policies[0] for policy in policies[1:])
 
 
+def test_resnet_default_preserves_roi_detail_and_uses_raw_classifier_embeddings():
+    config = load_toml(CONFIG_DIR / "resnet.toml")
+
+    assert config["data"]["input_shape"] == [128, 128, 1]
+    assert config["model"]["variant"] == "resnet18"
+    assert config["model"]["stem_kernel_size"] == 3
+    assert config["model"]["stem_stride"] == 1
+    assert config["model"]["stem_pool"] is False
+    assert config["model"]["normalize_embeddings"] is False
+
+
+def test_resnet_like_default_uses_roi_input_and_raw_classifier_embeddings():
+    config = load_toml(CONFIG_DIR / "resnet_like.toml")
+
+    assert config["data"]["input_shape"] == [128, 128, 1]
+    assert config["model"]["normalize_embeddings"] is False
+
+
 @pytest.mark.parametrize(
     "path",
     classification_config_paths(),

@@ -5,11 +5,11 @@
 task = "classification"
 model = "resnet"
 seed = 123
-notes = "ResNet-50 classification example"
+notes = "ROI-friendly ResNet-18 classification example"
 
 [data]
 # Grayscale is assumed. Class count comes from the SQLite dataset.
-input_shape = [224, 224, 1]
+input_shape = [128, 128, 1]
 batch_size = 16
 shuffle_buffer = 512
 validation_split = 0.20
@@ -26,15 +26,15 @@ channel_mode = "grayscale"
 
 [model]
 # Variants: resnet18, resnet34, resnet50, resnet101, resnet152.
-# Start with 18 for speed or smaller datasets; 50 is a balanced larger model.
-variant = "resnet50"
-stem_kernel_size = 7
-stem_stride = 2
-stem_pool = true
+# Start with 18 for from-scratch ROI training; scale up only after it learns.
+variant = "resnet18"
+stem_kernel_size = 3
+stem_stride = 1
+stem_pool = false
 base_filters = 64
 dropout = 0.0
 embedding_dim = 256
-normalize_embeddings = true
+normalize_embeddings = false
 
 [evidence]
 enabled = true

@@ -34,11 +34,12 @@ def classification_head(
     config: dict[str, Any],
     *,
     dropout_default: float = 0.0,
+    normalize_default: bool = True,
 ):
     """Attach the standard fixed-size embedding and classification head."""
     model_config = config.get("model", {})
     embedding_dim = int(model_config.get("embedding_dim", DEFAULT_EMBEDDING_DIM))
-    normalize = bool(model_config.get("normalize_embeddings", True))
+    normalize = bool(model_config.get("normalize_embeddings", normalize_default))
     dropout = float(model_config.get("dropout", dropout_default))
     if embedding_dim < 1:
         raise ValueError("model.embedding_dim must be a positive integer")

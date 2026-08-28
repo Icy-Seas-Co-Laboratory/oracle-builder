@@ -19,6 +19,7 @@ dependencies = [
   "scikit-learn",
   "scipy",
   "PyYAML",
+  "fastapi>=0.141.1",
 ]
 
 [project.scripts]

@@ -16,11 +16,11 @@ RESNET_VARIANTS = {
     "resnet152": ("bottleneck", [3, 8, 36, 3]),
 }
 
-# Keep the baseline independent of framework defaults. These values match the
-# common reference ResNet training convention and are more stable than Keras's
-# default moving-statistics update for the small batches typical of ROI data.
-_BATCH_NORM_MOMENTUM = 0.9
-_BATCH_NORM_EPSILON = 1e-5
+# ROI classification commonly uses small batches.  Retain moving statistics
+# more conservatively than the ImageNet-style 0.9 setting so validation and
+# inference do not track an individual mini-batch too closely.
+_BATCH_NORM_MOMENTUM = 0.99
+_BATCH_NORM_EPSILON = 1e-3
 _KERNEL_INITIALIZER = "he_normal"
 
 
@@ -78,7 +78,7 @@ def _bottleneck_block(x, filters: int, stride: int, name: str):
 def build_model(config: dict[str, Any]):
     model_config = config.get("model", {})
     requested_model = str(config.get("run", {}).get("model", "resnet")).lower()
-    default_variant = requested_model if requested_model in RESNET_VARIANTS else "resnet50"
+    default_variant = requested_model if requested_model in RESNET_VARIANTS else "resnet18"
     variant = str(model_config.get("variant", default_variant)).lower()
     if variant not in RESNET_VARIANTS:
         raise ValueError(f"Unknown ResNet variant {variant!r}; choose from {sorted(RESNET_VARIANTS)}")
@@ -90,9 +90,9 @@ def build_model(config: dict[str, Any]):
     input_shape = tuple(config["data"]["input_shape"])
     num_classes = int(config["data"]["num_classes"])
     base_filters = int(model_config.get("base_filters", 64))
-    stem_kernel = int(model_config.get("stem_kernel_size", 7))
-    stem_stride = int(model_config.get("stem_stride", 2))
-    stem_pool = bool(model_config.get("stem_pool", True))
+    stem_kernel = int(model_config.get("stem_kernel_size", 3))
+    stem_stride = int(model_config.get("stem_stride", 1))
+    stem_pool = bool(model_config.get("stem_pool", False))
     if base_filters < 1 or stem_kernel < 1 or stem_stride < 1:
         raise ValueError("ResNet filter, stem kernel, and stem stride parameters must be positive")
     block = _basic_block if block_type == "basic" else _bottleneck_block
@@ -107,5 +107,5 @@ def build_model(config: dict[str, Any]):
             stride = 2 if stage > 0 and index == 0 else 1
             x = block(x, filters, stride, name=f"stage{stage + 1}_block{index + 1}")
     x = layers.GlobalAveragePooling2D(name="global_pool")(x)
-    outputs = classification_head(x, num_classes, config)
+    outputs = classification_head(x, num_classes, config, normalize_default=False)
     return keras.Model(inputs, outputs, name=variant)
