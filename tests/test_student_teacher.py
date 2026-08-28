@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import io
 import sqlite3
 
 import numpy as np
@@ -20,6 +21,7 @@ from oracle_builder.data.sqlite_dataset import (
 from oracle_builder.training.augmentation import augment_batch
 from oracle_builder.training.student_teacher import (
     SimCLRPretrainer,
+    SelfSupervisedStatusCallback,
     StudentTeacherPretrainer,
     _view_config,
     _cross_view_cosine_statistics,
@@ -142,6 +144,29 @@ def test_self_supervised_verbose_mode_is_validated():
         validate_config(config)
 
 
+def test_self_supervised_progress_updates_one_interactive_line():
+    class TTYBuffer(io.StringIO):
+        def isatty(self):
+            return True
+
+    stream = TTYBuffer()
+    callback = SelfSupervisedStatusCallback(
+        method="byol", epochs=1, verbose=1, stream=stream
+    )
+    callback.set_params({"steps": 2})
+    callback.on_epoch_begin(0)
+    callback.on_train_batch_end(0, {"loss": 1.0})
+    callback.on_train_batch_end(1, {"loss": 0.5})
+    callback.on_epoch_end(0, {"loss": 0.5})
+
+    output = stream.getvalue()
+    assert output.count("\r") == 4
+    assert output.count("\n") == 1
+    assert "1/2 - loss: 1" in output
+    assert "2/2 - loss: 0.5" in output
+    assert "completed" in output
+
+
 @pytest.mark.parametrize("method", ["byol", "simclr"])
 def test_student_teacher_pretraining_updates_shared_classifier_encoder(
     tmp_path, method, capsys
@@ -158,7 +183,9 @@ def test_student_teacher_pretraining_updates_shared_classifier_encoder(
     output = capsys.readouterr().out
     assert f"[self-supervised {method} 1/1] started" in output
     assert f"[self-supervised {method} 1/1] completed" in output
-    assert "2/2" in output
+    # Captured output must not contain one progress line per batch. Interactive
+    # terminals use carriage-return updates; non-TTY logs remain epoch-level.
+    assert output.count("[self-supervised") == 2
     assert "related_cosine_similarity=" in output
     assert "unrelated_cosine_similarity=" in output
 

@@ -100,6 +100,20 @@ loss = "sparse_categorical_crossentropy"
     assert "pretraining" not in config
 
 
+def test_resolve_config_explains_legacy_clustering_task(tmp_path: Path):
+    config_path = tmp_path / "legacy-clustering.toml"
+    config_path.write_text(
+        """
+[run]
+task = "clustering"
+model = "simple_cnn"
+"""
+    )
+
+    with pytest.raises(ValueError, match="Legacy task 'clustering'.*oracle-embed"):
+        resolve_config(config_path, tmp_path / "missing.sqlite", tmp_path / "run")
+
+
 def test_classification_defaults_to_weighted_loss_grayscale_and_no_checkpoints(
     tmp_path: Path,
 ):

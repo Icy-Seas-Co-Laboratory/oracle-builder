@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import copy
 import sqlite3
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -153,7 +154,14 @@ def reconstruction_prediction_std(_y_true, y_pred):
 
 
 class SelfSupervisedStatusCallback(keras.callbacks.Callback):
-    """Emit stream-friendly, structured status for each self-supervised epoch."""
+    """Emit structured status with one mutable progress line per epoch.
+
+    Keras' built-in ``verbose=1`` progress bar is line-oriented when stdout is
+    captured by a remote runner, so every batch update becomes a new log line.
+    Keep Keras quiet and render the progress bar here: interactive terminals
+    receive carriage-return updates, while captured/non-TTY logs receive only
+    the epoch start and completion records. JSONL logging is unaffected.
+    """
 
     def __init__(
         self,
@@ -162,13 +170,26 @@ class SelfSupervisedStatusCallback(keras.callbacks.Callback):
         epochs: int,
         training_log: str | Path | None = None,
         run_id: str | None = None,
+        verbose: int = 1,
+        stream=None,
     ):
         super().__init__()
         self.method = method
         self.epochs = int(epochs)
         self.training_log = training_log
         self.run_id = run_id
+        if isinstance(verbose, bool) or int(verbose) not in {0, 1, 2}:
+            raise ValueError("self_supervised.verbose must be 0, 1, or 2")
+        self.verbose = int(verbose)
+        self.stream = stream if stream is not None else sys.stdout
+        self._interactive = bool(
+            self.verbose == 1
+            and getattr(self.stream, "isatty", lambda: False)()
+        )
         self._started_at: float | None = None
+        self._epoch = 0
+        self._steps = None
+        self._last_progress_length = 0
 
     def _event(self, message: str, details: dict[str, Any]) -> None:
         if self.training_log is not None and self.run_id is not None:
@@ -177,25 +198,57 @@ class SelfSupervisedStatusCallback(keras.callbacks.Callback):
     def on_epoch_begin(self, epoch: int, logs=None):
         del logs
         self._started_at = time.perf_counter()
+        self._epoch = int(epoch) + 1
+        self._steps = self.params.get("steps")
         details = {
             "phase": "self_supervised",
             "method": self.method,
-            "epoch": int(epoch) + 1,
+            "epoch": self._epoch,
             "epochs": self.epochs,
         }
-        print(
-            f"[self-supervised {self.method} {epoch + 1}/{self.epochs}] started",
-            flush=True,
-        )
+        if self.verbose == 1:
+            self._write(
+                f"[self-supervised {self.method} {self._epoch}/{self.epochs}] started"
+            )
         self._event("Self-supervised epoch started", details)
 
-    def on_epoch_end(self, epoch: int, logs=None):
+    @staticmethod
+    def _metrics(logs) -> dict[str, float]:
         metrics: dict[str, float] = {}
         for name, value in (logs or {}).items():
             try:
                 metrics[str(name)] = float(value)
             except (TypeError, ValueError):
                 continue
+        return metrics
+
+    def _write(self, message: str, *, final: bool = False) -> None:
+        if self._interactive:
+            padding = " " * max(0, self._last_progress_length - len(message))
+            suffix = "\n" if final else ""
+            self.stream.write(f"\r{message}{padding}{suffix}")
+            self.stream.flush()
+            self._last_progress_length = 0 if final else len(message)
+        else:
+            print(message, file=self.stream, flush=True)
+
+    def on_train_batch_end(self, batch: int, logs=None):
+        if not self._interactive:
+            return
+        current = int(batch) + 1
+        total = self._steps if self._steps not in (None, -1) else "?"
+        metrics = self._metrics(logs)
+        rendered = " - ".join(
+            f"{name}: {value:.4g}" for name, value in metrics.items()
+        )
+        suffix = f" - {rendered}" if rendered else ""
+        self._write(
+            f"[self-supervised {self.method} {self._epoch}/{self.epochs}] "
+            f"{current}/{total}{suffix}"
+        )
+
+    def on_epoch_end(self, epoch: int, logs=None):
+        metrics = self._metrics(logs)
         elapsed = time.perf_counter() - (self._started_at or time.perf_counter())
         details = {
             "phase": "self_supervised",
@@ -207,12 +260,21 @@ class SelfSupervisedStatusCallback(keras.callbacks.Callback):
         }
         rendered = ", ".join(f"{name}={value:.5g}" for name, value in metrics.items())
         suffix = f": {rendered}" if rendered else ""
-        print(
-            f"[self-supervised {self.method} {epoch + 1}/{self.epochs}] "
-            f"completed in {elapsed:.1f}s{suffix}",
-            flush=True,
-        )
+        if self.verbose:
+            self._write(
+                f"[self-supervised {self.method} {epoch + 1}/{self.epochs}] "
+                f"completed in {elapsed:.1f}s{suffix}",
+                final=True,
+            )
         self._event("Self-supervised epoch completed", details)
+
+    def on_train_end(self, logs=None):
+        """Terminate an in-progress interactive line on interruption/stop."""
+        del logs
+        if self._interactive and self._last_progress_length:
+            self.stream.write("\n")
+            self.stream.flush()
+            self._last_progress_length = 0
 
 
 # Legacy import compatibility for callers that used the old phase name.
@@ -265,13 +327,14 @@ def run_grayscale_reconstruction_self_supervised(
     history = pre_model.fit(
         dataset,
         epochs=epochs,
-        verbose=_self_supervised_fit_verbose(settings),
+        verbose=0,
         callbacks=[
             SelfSupervisedStatusCallback(
                 method="grayscale_reconstruction",
                 epochs=epochs,
                 training_log=training_log,
                 run_id=run_id,
+                verbose=_self_supervised_fit_verbose(settings),
             )
         ],
     )
@@ -1037,13 +1100,14 @@ def run_self_supervised_training(
     history = pretrainer.fit(
         dataset,
         epochs=epochs,
-        verbose=_self_supervised_fit_verbose(settings),
+        verbose=0,
         callbacks=[
             SelfSupervisedStatusCallback(
                 method=method,
                 epochs=epochs,
                 training_log=training_log,
                 run_id=run_id,
+                verbose=_self_supervised_fit_verbose(settings),
             )
         ],
     )

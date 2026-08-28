@@ -544,6 +544,16 @@ def resolve_config(config_path: str | Path, input_path: str | Path, run_dir: str
     resolved = deep_merge(DEFAULT_CONFIG, user_config)
     normalize_self_supervised_config(resolved, user_config)
     task = resolved.get("run", {}).get("task")
+    if task not in {"classification", "embedding", "segmentation"}:
+        if task == "clustering":
+            raise ValueError(
+                "Legacy task 'clustering' is not a supported model-training task; "
+                "use oracle-embed with task='embedding', then define clusters downstream"
+            )
+        raise ValueError(
+            f"Unsupported training task {task!r}; choose 'classification', "
+            "'embedding', or 'segmentation'"
+        )
     if task == "classification":
         if not resolved.get("training", {}).get("loss"):
             resolved["training"]["loss"] = (
@@ -583,7 +593,7 @@ def resolve_config(config_path: str | Path, input_path: str | Path, run_dir: str
             )
         expected_type = (
             "classification"
-            if resolved.get("run", {}).get("task") in {"classification", "embedding"}
+            if task in {"classification", "embedding"}
             else "mask_refinement"
         )
         if dataset_info["dataset_type"] != expected_type:
