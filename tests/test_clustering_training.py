@@ -7,6 +7,7 @@ import pytest
 
 from oracle_builder.clustering.training import (
     _frozen_classification_index,
+    _serving_embedding_health,
     _validate_pretraining_history,
     _validate_serving_embeddings,
     fit_clustering_evidence_from_encoder,
@@ -132,3 +133,48 @@ def test_clustering_rejects_collapsed_serving_embeddings():
 
     with pytest.raises(ValueError, match="collapsed serving embeddings"):
         _validate_serving_embeddings(collapsed, config)
+
+
+def test_serving_embedding_health_reports_healthy_geometry():
+    config = deep_merge(DEFAULT_CONFIG, {"pretraining": {"embedding_health": {"enabled": True}}})
+    embeddings = np.eye(16, dtype="float32")
+
+    diagnostics = _serving_embedding_health(embeddings, config)
+
+    assert diagnostics["embedding_dimension"] == 16
+    assert diagnostics["sample_count"] == 16
+    # Centering removes the all-ones direction from this orthogonal set.
+    assert diagnostics["effective_rank"] == pytest.approx(15.0)
+    assert diagnostics["mean_direction_norm"] == pytest.approx(0.25)
+    assert diagnostics["mean_pairwise_cosine"] == pytest.approx(0.0)
+    _validate_serving_embeddings(embeddings, config)
+
+
+def test_serving_embedding_health_rejects_a_narrow_high_cosine_cone():
+    rng = np.random.default_rng(123)
+    embeddings = np.column_stack(
+        [np.ones(64), 0.03 * rng.normal(size=(64, 15))]
+    ).astype("float32")
+    embeddings /= np.linalg.norm(embeddings, axis=1, keepdims=True)
+    config = deep_merge(
+        DEFAULT_CONFIG,
+        {
+            "pretraining": {
+                "collapse_embedding_spread_threshold": 0.005,
+                "embedding_health": {
+                    "enabled": True,
+                    "minimum_effective_rank": 1.0,
+                    "maximum_mean_pairwise_cosine": 0.90,
+                    "maximum_p95_pairwise_cosine": 0.99999,
+                    "maximum_mean_direction_norm": 1.0,
+                },
+            }
+        },
+    )
+
+    diagnostics = _serving_embedding_health(embeddings, config)
+
+    assert diagnostics["centered_rms"] > 0.005
+    assert diagnostics["mean_pairwise_cosine"] > 0.90
+    with pytest.raises(ValueError, match="mean_pairwise_cosine"):
+        _validate_serving_embeddings(embeddings, config)

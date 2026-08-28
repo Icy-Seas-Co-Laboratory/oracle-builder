@@ -106,7 +106,12 @@ authoritative self-describing inference contract.
 - `weights.weights.h5` supports deterministic architecture rebuilds.
 - `export_savedmodel/` is the inference-oriented TensorFlow representation.
 - Classification SavedModels expose probability and identity-embedding
-  signatures.
+  signatures. A reusable encoder may instead expose a representation signature.
+- Embedding runs use `task = "embedding"` and expose only the normalized (or
+  explicitly non-normalized) representation through `embed` and
+  `serving_default`.
+- Cluster assignments and cluster evidence are downstream analysis provenance;
+  they are not a first-class output of a newly created model product.
 
 The independent load test report documents which formats were successfully
 reloaded and exercised before sealing.

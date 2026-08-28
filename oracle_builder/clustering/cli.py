@@ -10,7 +10,9 @@ from oracle_builder.clustering.training import (
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Train or attach unlabeled ROI clustering evidence.")
+    parser = argparse.ArgumentParser(
+        description="Legacy clustering compatibility CLI; new runs should use oracle-embed."
+    )
     parser.add_argument("-c", "--config", required=True, help="TOML clustering configuration")
     parser.add_argument("-i", "--input", required=True, help="Frozen classification Dataset V1 SQLite file")
     parser.add_argument("-o", "--output", help="Sealed clustering run artifact directory (train mode)")

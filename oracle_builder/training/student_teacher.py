@@ -363,6 +363,33 @@ def vicreg_regularization(
     return variance_loss, covariance_loss, tf.reduce_mean(raw_stddev)
 
 
+def serving_feature_representations(representations: tf.Tensor) -> tf.Tensor:
+    """Apply the classifier's serving-time unit-vector representation contract.
+
+    SSL encoders intentionally expose ``embedding_projection`` (before the
+    classifier's ``features`` normalization) so the projection head can retain
+    magnitude information.  Collapse checks and encoder regularization must,
+    however, operate in the same unit-vector space that clustering and
+    inference export.  Match :class:`L2Normalization`'s zero-vector fallback
+    here rather than letting ``l2_normalize`` turn an all-zero vector into a
+    misleading zero vector.
+    """
+    representations = tf.convert_to_tensor(representations)
+    norm = tf.norm(representations, axis=-1, keepdims=True)
+    normalized = tf.math.divide_no_nan(representations, norm)
+    fallback = tf.one_hot(
+        tf.zeros(tf.shape(representations)[:-1], dtype=tf.int32),
+        depth=tf.shape(representations)[-1],
+        dtype=representations.dtype,
+    )
+    return tf.where(norm > 0, normalized, fallback)
+
+
+def _mean_direction_norm(representations: tf.Tensor) -> tf.Tensor:
+    """Return the norm of the batch mean for unit-vector health diagnostics."""
+    return tf.norm(tf.reduce_mean(representations, axis=0))
+
+
 def _all_gather_representations(representations: tf.Tensor) -> tf.Tensor:
     """Gather equal-sized per-replica representations for global SSL statistics."""
     replica_context = tf.distribute.get_replica_context()
@@ -460,6 +487,9 @@ class StudentTeacherPretrainer(keras.Model):
         self.vicreg_variance_weight = float(settings.get("vicreg_variance_weight", 25.0))
         self.vicreg_covariance_weight = float(settings.get("vicreg_covariance_weight", 1.0))
         self.vicreg_target_std = float(settings.get("vicreg_target_std", 1.0))
+        self.encoder_variance_weight = float(settings.get("encoder_variance_weight", 25.0))
+        self.encoder_covariance_weight = float(settings.get("encoder_covariance_weight", 1.0))
+        self.encoder_target_std = float(settings.get("encoder_target_std", 0.05))
         self.collapse_std_threshold = float(
             settings.get("collapse_std_threshold", 1e-3)
         )
@@ -467,6 +497,10 @@ class StudentTeacherPretrainer(keras.Model):
             raise ValueError("VICReg regularization weights must be non-negative")
         if self.vicreg_target_std <= 0:
             raise ValueError("vicreg_target_std must be greater than zero")
+        if self.encoder_variance_weight < 0 or self.encoder_covariance_weight < 0:
+            raise ValueError("encoder regularization weights must be non-negative")
+        if self.encoder_target_std <= 0:
+            raise ValueError("encoder_target_std must be greater than zero")
         if self.collapse_std_threshold <= 0:
             raise ValueError("collapse_std_threshold must be greater than zero")
 
@@ -496,6 +530,17 @@ class StudentTeacherPretrainer(keras.Model):
         self.variance_loss_tracker = keras.metrics.Mean(name="variance_loss")
         self.covariance_loss_tracker = keras.metrics.Mean(name="covariance_loss")
         self.representation_std_tracker = keras.metrics.Mean(name="representation_std")
+        # The historic VICReg metrics describe the projector.  Keep them for
+        # compatibility, but also expose the encoder/product space explicitly.
+        self.encoder_variance_loss_tracker = keras.metrics.Mean(name="encoder_variance_loss")
+        self.encoder_covariance_loss_tracker = keras.metrics.Mean(name="encoder_covariance_loss")
+        self.encoder_representation_std_tracker = keras.metrics.Mean(name="encoder_representation_std")
+        self.encoder_mean_direction_norm_tracker = keras.metrics.Mean(name="encoder_mean_direction_norm")
+        self.encoder_related_cosine_similarity_tracker = keras.metrics.Mean(name="encoder_related_cosine_similarity")
+        self.encoder_unrelated_cosine_similarity_tracker = keras.metrics.Mean(name="encoder_unrelated_cosine_similarity")
+        self.projector_representation_std_tracker = keras.metrics.Mean(name="projector_representation_std")
+        self.projector_related_cosine_similarity_tracker = keras.metrics.Mean(name="projector_related_cosine_similarity")
+        self.projector_unrelated_cosine_similarity_tracker = keras.metrics.Mean(name="projector_unrelated_cosine_similarity")
         self.collapse_indicator_tracker = keras.metrics.Mean(name="collapse_indicator")
 
     @property
@@ -508,6 +553,15 @@ class StudentTeacherPretrainer(keras.Model):
             self.variance_loss_tracker,
             self.covariance_loss_tracker,
             self.representation_std_tracker,
+            self.encoder_variance_loss_tracker,
+            self.encoder_covariance_loss_tracker,
+            self.encoder_representation_std_tracker,
+            self.encoder_mean_direction_norm_tracker,
+            self.encoder_related_cosine_similarity_tracker,
+            self.encoder_unrelated_cosine_similarity_tracker,
+            self.projector_representation_std_tracker,
+            self.projector_related_cosine_similarity_tracker,
+            self.projector_unrelated_cosine_similarity_tracker,
             self.collapse_indicator_tracker,
         ]
 
@@ -533,12 +587,10 @@ class StudentTeacherPretrainer(keras.Model):
         view_one = self._augment(tf.cast(x, tf.float32))
         view_two = self._augment(tf.cast(x, tf.float32))
         with tf.GradientTape() as tape:
-            projected_one = self.student_projector(
-                self.student_encoder(view_one, training=True), training=True
-            )
-            projected_two = self.student_projector(
-                self.student_encoder(view_two, training=True), training=True
-            )
+            student_embedding_one = self.student_encoder(view_one, training=True)
+            student_embedding_two = self.student_encoder(view_two, training=True)
+            projected_one = self.student_projector(student_embedding_one, training=True)
+            projected_two = self.student_projector(student_embedding_two, training=True)
             student_one = self.predictor(
                 projected_one,
                 training=True,
@@ -570,10 +622,29 @@ class StudentTeacherPretrainer(keras.Model):
             variance_loss = 0.5 * (variance_one + variance_two)
             covariance_loss = 0.5 * (covariance_one + covariance_two)
             representation_std = 0.5 * (std_one + std_two)
+            encoder_one = serving_feature_representations(student_embedding_one)
+            encoder_two = serving_feature_representations(student_embedding_two)
+            global_encoder_one = _all_gather_representations(encoder_one)
+            global_encoder_two = _all_gather_representations(encoder_two)
+            encoder_variance_one, encoder_covariance_one, encoder_std_one = vicreg_regularization(
+                global_encoder_one, target_std=self.encoder_target_std
+            )
+            encoder_variance_two, encoder_covariance_two, encoder_std_two = vicreg_regularization(
+                global_encoder_two, target_std=self.encoder_target_std
+            )
+            encoder_variance_loss = 0.5 * (encoder_variance_one + encoder_variance_two)
+            encoder_covariance_loss = 0.5 * (encoder_covariance_one + encoder_covariance_two)
+            encoder_representation_std = 0.5 * (encoder_std_one + encoder_std_two)
+            encoder_mean_direction_norm = 0.5 * (
+                _mean_direction_norm(global_encoder_one)
+                + _mean_direction_norm(global_encoder_two)
+            )
             loss = (
                 alignment_loss
                 + self.vicreg_variance_weight * variance_loss
                 + self.vicreg_covariance_weight * covariance_loss
+                + self.encoder_variance_weight * encoder_variance_loss
+                + self.encoder_covariance_weight * encoder_covariance_loss
             )
             optimization_loss = loss / tf.cast(
                 tf.distribute.get_strategy().num_replicas_in_sync,
@@ -594,6 +665,9 @@ class StudentTeacherPretrainer(keras.Model):
                 teacher_two,
             )
         )
+        encoder_related_cosine_similarity, encoder_unrelated_cosine_similarity = (
+            _cross_view_cosine_statistics(encoder_one, encoder_two, encoder_one, encoder_two)
+        )
         cosine_similarity = related_cosine_similarity
         self.loss_tracker.update_state(loss)
         self.cosine_similarity_tracker.update_state(cosine_similarity)
@@ -605,11 +679,20 @@ class StudentTeacherPretrainer(keras.Model):
         )
         self.variance_loss_tracker.update_state(variance_loss)
         self.covariance_loss_tracker.update_state(covariance_loss)
-        self.representation_std_tracker.update_state(representation_std)
+        self.representation_std_tracker.update_state(encoder_representation_std)
+        self.encoder_variance_loss_tracker.update_state(encoder_variance_loss)
+        self.encoder_covariance_loss_tracker.update_state(encoder_covariance_loss)
+        self.encoder_representation_std_tracker.update_state(encoder_representation_std)
+        self.encoder_mean_direction_norm_tracker.update_state(encoder_mean_direction_norm)
+        self.encoder_related_cosine_similarity_tracker.update_state(encoder_related_cosine_similarity)
+        self.encoder_unrelated_cosine_similarity_tracker.update_state(encoder_unrelated_cosine_similarity)
+        self.projector_representation_std_tracker.update_state(representation_std)
+        self.projector_related_cosine_similarity_tracker.update_state(related_cosine_similarity)
+        self.projector_unrelated_cosine_similarity_tracker.update_state(unrelated_cosine_similarity)
         self.collapse_indicator_tracker.update_state(
             tf.cast(
-                representation_std < self.collapse_std_threshold,
-                representation_std.dtype,
+                encoder_representation_std < self.collapse_std_threshold,
+                encoder_representation_std.dtype,
             )
         )
         return {metric.name: metric.result() for metric in self.metrics}
@@ -650,6 +733,7 @@ class SimCLRPretrainer(keras.Model):
             "simclr_projector",
         )
         self.loss_tracker = keras.metrics.Mean(name="loss")
+        self.simclr_loss_tracker = keras.metrics.Mean(name="simclr_loss")
         self.contrastive_accuracy = keras.metrics.Mean(
             name="contrastive_accuracy"
         )
@@ -659,6 +743,31 @@ class SimCLRPretrainer(keras.Model):
         self.unrelated_cosine_similarity_tracker = keras.metrics.Mean(
             name="unrelated_cosine_similarity"
         )
+        self.encoder_variance_weight = float(
+            settings.get("encoder_variance_weight", 25.0)
+        )
+        self.encoder_covariance_weight = float(
+            settings.get("encoder_covariance_weight", 1.0)
+        )
+        self.encoder_target_std = float(settings.get("encoder_target_std", 0.05))
+        if self.encoder_variance_weight < 0 or self.encoder_covariance_weight < 0:
+            raise ValueError("encoder regularization weights must be non-negative")
+        if self.encoder_target_std <= 0:
+            raise ValueError("encoder_target_std must be greater than zero")
+
+        # Legacy metric names remain available, while the explicit names make
+        # it impossible for projector success to hide a collapsed serving
+        # encoder. ``representation_std`` now follows the exported encoder
+        # representation, so existing collapse gates inspect the right space.
+        self.encoder_variance_loss_tracker = keras.metrics.Mean(name="encoder_variance_loss")
+        self.encoder_covariance_loss_tracker = keras.metrics.Mean(name="encoder_covariance_loss")
+        self.encoder_representation_std_tracker = keras.metrics.Mean(name="encoder_representation_std")
+        self.encoder_mean_direction_norm_tracker = keras.metrics.Mean(name="encoder_mean_direction_norm")
+        self.encoder_related_cosine_similarity_tracker = keras.metrics.Mean(name="encoder_related_cosine_similarity")
+        self.encoder_unrelated_cosine_similarity_tracker = keras.metrics.Mean(name="encoder_unrelated_cosine_similarity")
+        self.projector_representation_std_tracker = keras.metrics.Mean(name="projector_representation_std")
+        self.projector_related_cosine_similarity_tracker = keras.metrics.Mean(name="projector_related_cosine_similarity")
+        self.projector_unrelated_cosine_similarity_tracker = keras.metrics.Mean(name="projector_unrelated_cosine_similarity")
         self.representation_std_tracker = keras.metrics.Mean(name="representation_std")
         self.collapse_indicator_tracker = keras.metrics.Mean(name="collapse_indicator")
         self.collapse_std_threshold = float(
@@ -671,9 +780,19 @@ class SimCLRPretrainer(keras.Model):
     def metrics(self):
         return [
             self.loss_tracker,
+            self.simclr_loss_tracker,
             self.contrastive_accuracy,
             self.related_cosine_similarity_tracker,
             self.unrelated_cosine_similarity_tracker,
+            self.encoder_variance_loss_tracker,
+            self.encoder_covariance_loss_tracker,
+            self.encoder_representation_std_tracker,
+            self.encoder_mean_direction_norm_tracker,
+            self.encoder_related_cosine_similarity_tracker,
+            self.encoder_unrelated_cosine_similarity_tracker,
+            self.projector_representation_std_tracker,
+            self.projector_related_cosine_similarity_tracker,
+            self.projector_unrelated_cosine_similarity_tracker,
             self.representation_std_tracker,
             self.collapse_indicator_tracker,
         ]
@@ -776,19 +895,45 @@ class SimCLRPretrainer(keras.Model):
                     global_target_two=global_second,
                 )
             )
-            global_embeddings = tf.concat(
+            # The projector is deliberately allowed to differ from the
+            # product embedding space.  Its NT-Xent objective alone can look
+            # healthy while the exported unit vectors collapse into one cone.
+            # Regularize the serving representation directly to prevent that.
+            serving_first_embedding = serving_feature_representations(first_embedding)
+            serving_second_embedding = serving_feature_representations(second_embedding)
+            global_serving_first = _all_gather_representations(serving_first_embedding)
+            global_serving_second = _all_gather_representations(serving_second_embedding)
+            encoder_variance_one, encoder_covariance_one, encoder_std_one = vicreg_regularization(
+                global_serving_first, target_std=self.encoder_target_std
+            )
+            encoder_variance_two, encoder_covariance_two, encoder_std_two = vicreg_regularization(
+                global_serving_second, target_std=self.encoder_target_std
+            )
+            encoder_variance_loss = 0.5 * (encoder_variance_one + encoder_variance_two)
+            encoder_covariance_loss = 0.5 * (encoder_covariance_one + encoder_covariance_two)
+            representation_std = 0.5 * (encoder_std_one + encoder_std_two)
+            encoder_mean_direction_norm = 0.5 * (
+                _mean_direction_norm(global_serving_first)
+                + _mean_direction_norm(global_serving_second)
+            )
+            global_projected_embeddings = tf.concat(
                 [
-                    _all_gather_representations(first_embedding),
-                    _all_gather_representations(second_embedding),
+                    _all_gather_representations(first),
+                    _all_gather_representations(second),
                 ],
                 axis=0,
             )
-            representation_std = tf.reduce_mean(
-                tf.math.reduce_std(global_embeddings, axis=0)
+            projector_representation_std = tf.reduce_mean(
+                tf.math.reduce_std(global_projected_embeddings, axis=0)
             )
-            optimization_loss = loss / tf.cast(
+            total_loss = (
+                loss
+                + self.encoder_variance_weight * encoder_variance_loss
+                + self.encoder_covariance_weight * encoder_covariance_loss
+            )
+            optimization_loss = total_loss / tf.cast(
                 tf.distribute.get_strategy().num_replicas_in_sync,
-                loss.dtype,
+                total_loss.dtype,
             )
         variables = self.encoder.trainable_variables + self.projector.trainable_variables
         gradients = tape.gradient(optimization_loss, variables)
@@ -797,7 +942,8 @@ class SimCLRPretrainer(keras.Model):
             for gradient, variable in zip(gradients, variables, strict=True)
             if gradient is not None
         )
-        self.loss_tracker.update_state(loss)
+        self.loss_tracker.update_state(total_loss)
+        self.simclr_loss_tracker.update_state(loss)
         self.contrastive_accuracy.update_state(accuracy)
         self.related_cosine_similarity_tracker.update_state(
             related_cosine_similarity
@@ -805,6 +951,25 @@ class SimCLRPretrainer(keras.Model):
         self.unrelated_cosine_similarity_tracker.update_state(
             unrelated_cosine_similarity
         )
+        encoder_related_cosine_similarity, encoder_unrelated_cosine_similarity = (
+            _cross_view_cosine_statistics(
+                serving_first_embedding,
+                serving_second_embedding,
+                serving_first_embedding,
+                serving_second_embedding,
+                global_target_one=global_serving_first,
+                global_target_two=global_serving_second,
+            )
+        )
+        self.encoder_variance_loss_tracker.update_state(encoder_variance_loss)
+        self.encoder_covariance_loss_tracker.update_state(encoder_covariance_loss)
+        self.encoder_representation_std_tracker.update_state(representation_std)
+        self.encoder_mean_direction_norm_tracker.update_state(encoder_mean_direction_norm)
+        self.encoder_related_cosine_similarity_tracker.update_state(encoder_related_cosine_similarity)
+        self.encoder_unrelated_cosine_similarity_tracker.update_state(encoder_unrelated_cosine_similarity)
+        self.projector_representation_std_tracker.update_state(projector_representation_std)
+        self.projector_related_cosine_similarity_tracker.update_state(related_cosine_similarity)
+        self.projector_unrelated_cosine_similarity_tracker.update_state(unrelated_cosine_similarity)
         self.representation_std_tracker.update_state(representation_std)
         self.collapse_indicator_tracker.update_state(
             tf.cast(

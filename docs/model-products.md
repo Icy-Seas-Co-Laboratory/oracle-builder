@@ -56,6 +56,26 @@ an explicit `logits_layer` takes precedence. Specify `probabilities_layer`,
 `logits_layer`, `embedding_layer`, or `activation` when automatic inspection
 would be ambiguous. Use `--no-promote` to retain a generic product unchanged.
 
+## Representation products and clustering
+
+An encoder or embedding model is imported as a `generic` product with a
+declared representation output. For example, use `primary = "representation"`
+and declare its tensor name, dimension, and normalization under `[outputs]`.
+This makes the reusable vector contract explicit without claiming a class or
+cluster taxonomy. Generic representation products require an explicit serving
+adapter unless a future named-output promotion supports the source model.
+
+Clustering is not a model-product task or model-product output. A clustering
+operation consumes a specific representation product (or representation output
+from another product) and creates downstream derived evidence. That evidence
+must record the source model artifact ID and fingerprint, representation name,
+dimension and normalization, the dataset/revision fingerprint, and the fitting
+method and parameters. Cluster IDs are local to that derived result; they are
+not stable product labels and are never promoted to a product's primary output.
+Legacy clustering packages remain readable for compatibility. Their one-way
+migration is documented as legacy preservation, not a way to create a new
+clustering product.
+
 See `configs/example_model_product.toml` for the complete annotated template.
 
 Each product preserves the original source model, records SHA-256 hashes, and

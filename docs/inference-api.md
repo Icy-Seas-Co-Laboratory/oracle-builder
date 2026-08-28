@@ -48,8 +48,8 @@ load errors without offering those models for inference.
 ## Serving performance
 
 When a model is preloaded, Oracle Builder creates one resident classification
-callable. It prefers the bundle's SavedModel concrete signature and otherwise
-creates one compiled Keras named-output function. The callable is warmed with
+or embedding callable. It prefers the bundle's SavedModel concrete signature
+and otherwise creates one compiled Keras named-output function. The callable is warmed with
 batch sizes 1 and 64 (or the configured maximum) before the model is ready.
 
 Each model has one bounded execution queue. Concurrent requests are combined
@@ -71,6 +71,12 @@ model's active limit and rejects larger requests before execution.
 
 Per-model configuration takes precedence over service defaults. `GET
 /v1/models` includes runtime warm-up and micro-batch diagnostics after loading.
+
+The model catalog and every prediction result set expose an `execution` object
+with `gpu_accelerated`, `accelerator`, `device_type`, `device_name`, and
+`device_count`. This tells Pelagia whether TensorFlow selected a GPU or CPU for
+the resident inference callable. The prediction response also repeats the
+object at `parameters.execution` for callers that consume service parameters.
 
 Set `ORACLE_BUILDER_API_TOKEN` to require a bearer token. Pelagia supplies the
 same value through `PELAGIA_ORACLE_API_TOKEN`. ASGI deployments may use

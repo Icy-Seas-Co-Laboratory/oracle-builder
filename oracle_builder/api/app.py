@@ -192,6 +192,7 @@ def create_app(
                 {
                     "transport_request_id": inference_request.request_id,
                     "model_selector": selector,
+                    "execution": result_set.execution,
                 }
             )
             return Response(

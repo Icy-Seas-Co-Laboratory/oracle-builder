@@ -273,6 +273,7 @@ class InferenceResultSet:
     parameters: dict[str, Any] = field(default_factory=dict)
     started_at: str = field(default_factory=utc_now)
     completed_at: str | None = None
+    execution: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self.result_set_id = str(uuid.UUID(self.result_set_id))
@@ -305,6 +306,7 @@ class InferenceResultSet:
             "model": self.model.to_dict(),
             "source_dataset": self.source_dataset,
             "parameters": self.parameters,
+            "execution": self.execution,
             "started_at": self.started_at,
             "completed_at": self.completed_at,
             "counts": self.counts,
@@ -321,6 +323,7 @@ class InferenceResultSet:
                 "schema_version": INFERENCE_SCHEMA_VERSION,
                 "result_set_id": self.result_set_id,
                 "model": self.model.to_dict(),
+                "execution": self.execution,
                 "started_at": self.started_at,
             },
             sort_keys=True,

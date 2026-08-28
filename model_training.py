@@ -178,6 +178,11 @@ def main() -> int:
             "schema_name": manifest["artifact_schema"]["name"],
             "schema_version": manifest["artifact_schema"]["version"],
         }
+        if config.get("run", {}).get("task") == "embedding":
+            raise ValueError(
+                "Embedding runs currently restart from their sealed training record; "
+                "use oracle-embed with a new output"
+            )
         split_manifest = read_split_manifest(run_dir)
         attach_split_manifest(config, split_manifest)
         from oracle_builder.artifacts.splits import split_manifest_matches_dataset
@@ -226,6 +231,17 @@ def main() -> int:
         return 0 if report["valid"] else 2
     if args.dry_run:
         print(json.dumps({"run_dir": str(run_dir), "resolved_config": config}, indent=2))
+        return 0
+    if not is_resume and config["run"]["task"] == "embedding":
+        from oracle_builder.embedding.training import train_embedding_run
+
+        result = train_embedding_run(
+            args.config,
+            args.input,
+            run_dir,
+            overwrite=args.overwrite,
+        )
+        print(json.dumps(result, indent=2, sort_keys=True, default=str))
         return 0
     if args.overwrite and run_dir.exists() and not is_resume:
         shutil.rmtree(run_dir)

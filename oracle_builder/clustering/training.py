@@ -137,6 +137,7 @@ def _validate_clustering_config(config: dict[str, Any], *, sample_count: int | N
             "self_supervised.collapse_embedding_spread_threshold must be finite and positive"
         )
     self_supervised["collapse_embedding_spread_threshold"] = spread_threshold
+    _embedding_health_settings(config)
 
 
 def _validate_self_supervised_history(history: Any, config: dict[str, Any]) -> None:
@@ -157,20 +158,166 @@ def _validate_self_supervised_history(history: Any, config: dict[str, Any]) -> N
 _validate_pretraining_history = _validate_self_supervised_history
 
 
-def _validate_serving_embeddings(embeddings: np.ndarray, config: dict[str, Any]) -> None:
+def _embedding_health_settings(config: dict[str, Any]) -> dict[str, Any]:
+    """Resolve the geometry checks for the embeddings shipped in an artifact.
+
+    These checks intentionally live next to clustering rather than in the SSL
+    training loop: the tensor checked here is the normalized ``features``
+    output actually used by cluster fitting and inference, not a projection
+    head used only while training.
+    """
+    self_supervised = self_supervised_settings(config)
+    configured = self_supervised.get("embedding_health", {})
+    if configured is None:
+        configured = {}
+    if not isinstance(configured, dict):
+        raise ValueError("self_supervised.embedding_health must be a table")
+    defaults = {
+        "enabled": True,
+        "sample_count": 4_096,
+        "pair_count": 32_768,
+        "minimum_effective_rank": 8.0,
+        "maximum_mean_pairwise_cosine": 0.95,
+        "maximum_p95_pairwise_cosine": 0.995,
+        "maximum_mean_direction_norm": 0.95,
+    }
+    settings = {**defaults, **configured}
+    if not isinstance(settings["enabled"], bool):
+        raise ValueError("self_supervised.embedding_health.enabled must be a boolean")
+    for name, minimum in (("sample_count", 2), ("pair_count", 1)):
+        settings[name] = _positive_int(
+            settings[name], f"self_supervised.embedding_health.{name}", minimum=minimum
+        )
+    for name in (
+        "minimum_effective_rank",
+        "maximum_mean_pairwise_cosine",
+        "maximum_p95_pairwise_cosine",
+        "maximum_mean_direction_norm",
+    ):
+        try:
+            value = float(settings[name])
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"self_supervised.embedding_health.{name} must be a number") from exc
+        if not np.isfinite(value):
+            raise ValueError(f"self_supervised.embedding_health.{name} must be finite")
+        settings[name] = value
+    if settings["minimum_effective_rank"] < 1.0:
+        raise ValueError("self_supervised.embedding_health.minimum_effective_rank must be at least 1")
+    for name in (
+        "maximum_mean_pairwise_cosine",
+        "maximum_p95_pairwise_cosine",
+        "maximum_mean_direction_norm",
+    ):
+        if not -1.0 <= settings[name] <= 1.0:
+            raise ValueError(f"self_supervised.embedding_health.{name} must be from -1 through 1")
+    # Persist a fully resolved table in run_config.json so a future consumer
+    # can distinguish inherited defaults from an intentionally disabled gate.
+    self_supervised["embedding_health"] = settings
+    return settings
+
+
+def _serving_embedding_health(embeddings: np.ndarray, config: dict[str, Any]) -> dict[str, Any]:
+    """Compute deterministic product-space geometry diagnostics.
+
+    Pairwise metrics are sampled deterministically to remain bounded for large
+    ROI datasets while still exposing narrow-cone collapse that coordinate
+    standard deviation alone can miss.
+    """
     values = np.asarray(embeddings, dtype="float32")
     if values.ndim != 2 or not np.isfinite(values).all():
         raise ValueError("Clustering produced non-finite serving embeddings")
+    if values.shape[0] < 2 or values.shape[1] < 1:
+        raise ValueError("Clustering requires at least two non-empty serving embeddings")
     norms = np.linalg.norm(values, axis=1)
     if np.any(norms <= 0):
         raise ValueError("Clustering produced zero-norm serving embeddings")
-    centered_rms = float(np.sqrt(np.mean(np.square(values - values.mean(axis=0)))))
-    threshold = float(self_supervised_settings(config)["collapse_embedding_spread_threshold"])
-    if centered_rms <= threshold:
+
+    # Extraction normalizes already, but normalize again here so direct callers
+    # cannot accidentally validate a differently scaled representation.
+    normalized = values / norms[:, None]
+    settings = _embedding_health_settings(config)
+    total = normalized.shape[0]
+    sample_count = min(int(settings["sample_count"]), total)
+    # Evenly spaced positions are deterministic and avoid a seed-dependent
+    # selection bias in persisted artifact diagnostics.
+    positions = (np.arange(sample_count, dtype="int64") * total) // sample_count
+    sample = normalized[positions]
+    mean_direction_norm = float(np.linalg.norm(sample.mean(axis=0)))
+    centered = sample - sample.mean(axis=0, keepdims=True)
+    centered_rms = float(np.sqrt(np.mean(np.square(centered))))
+
+    # The effective rank of the centered covariance measures how many product
+    # embedding directions are materially represented. Eigendecomposition is
+    # only over embedding dimension, not ROI count.
+    covariance = (centered.T @ centered) / float(max(sample_count - 1, 1))
+    eigenvalues = np.linalg.eigvalsh(covariance.astype("float64", copy=False))
+    eigenvalues = np.clip(eigenvalues, 0.0, None)
+    total_variance = float(eigenvalues.sum())
+    if total_variance <= np.finfo("float64").eps:
+        effective_rank = 0.0
+    else:
+        probabilities = eigenvalues[eigenvalues > 0.0] / total_variance
+        effective_rank = float(np.exp(-np.sum(probabilities * np.log(probabilities))))
+
+    requested_pairs = int(settings["pair_count"])
+    # A fixed seed provides reproducibility independent of Python hash randomization.
+    generator = np.random.default_rng(int(config.get("run", {}).get("seed", 123)) ^ 0x5EED)
+    left = generator.integers(0, sample_count, size=requested_pairs)
+    right = generator.integers(0, sample_count - 1, size=requested_pairs)
+    right += (right >= left)
+    cosine = np.einsum("ij,ij->i", sample[left], sample[right])
+    cosine = np.clip(cosine, -1.0, 1.0)
+    diagnostics = {
+        "sample_count": int(sample_count),
+        "pair_count": int(requested_pairs),
+        "embedding_dimension": int(normalized.shape[1]),
+        "centered_rms": centered_rms,
+        "mean_direction_norm": mean_direction_norm,
+        "effective_rank": effective_rank,
+        "mean_pairwise_cosine": float(np.mean(cosine)),
+        "p95_pairwise_cosine": float(np.percentile(cosine, 95)),
+        "thresholds": {
+            "minimum_effective_rank": settings["minimum_effective_rank"],
+            "maximum_mean_pairwise_cosine": settings["maximum_mean_pairwise_cosine"],
+            "maximum_p95_pairwise_cosine": settings["maximum_p95_pairwise_cosine"],
+            "maximum_mean_direction_norm": settings["maximum_mean_direction_norm"],
+            "minimum_centered_rms": float(
+                self_supervised_settings(config)["collapse_embedding_spread_threshold"]
+            ),
+        },
+        "enabled": bool(settings["enabled"]),
+    }
+    return diagnostics
+
+
+def _validate_serving_embeddings(embeddings: np.ndarray, config: dict[str, Any]) -> dict[str, Any]:
+    diagnostics = _serving_embedding_health(embeddings, config)
+    threshold = diagnostics["thresholds"]["minimum_centered_rms"]
+    if diagnostics["centered_rms"] <= threshold:
         raise ValueError(
             "Clustering produced collapsed serving embeddings: "
-            f"centered_rms={centered_rms:.6g} <= threshold={threshold:.6g}"
+            f"centered_rms={diagnostics['centered_rms']:.6g} <= threshold={threshold:.6g}"
         )
+    if not diagnostics["enabled"]:
+        return diagnostics
+    failures: list[str] = []
+    comparisons = (
+        ("effective_rank", ">=", "minimum_effective_rank"),
+        ("mean_pairwise_cosine", "<=", "maximum_mean_pairwise_cosine"),
+        ("p95_pairwise_cosine", "<=", "maximum_p95_pairwise_cosine"),
+        ("mean_direction_norm", "<=", "maximum_mean_direction_norm"),
+    )
+    for metric, operator, limit in comparisons:
+        value = diagnostics[metric]
+        threshold = diagnostics["thresholds"][limit]
+        invalid = value < threshold if operator == ">=" else value > threshold
+        if invalid:
+            failures.append(f"{metric}={value:.6g} {operator} {threshold:.6g}")
+    if failures:
+        raise ValueError(
+            "Clustering produced collapsed serving embeddings: " + "; ".join(failures)
+        )
+    return diagnostics
 
 
 def _frozen_classification_index(input_path: str | Path, config: dict[str, Any]):
@@ -400,6 +547,19 @@ def train_clustering_run(
         extraction_dataset = source.indexed_image_dataset(index, batch_size=inference_plan.batch_size)
         embedding_dim = int(model.get_layer("features").output.shape[-1])
         embeddings = _extract_embeddings(model, extraction_dataset, len(index.refs), embedding_dim)
+        embedding_health = _serving_embedding_health(embeddings, config)
+        health_path = output / "metrics" / "serving_embedding_health.json"
+        health_path.parent.mkdir(parents=True, exist_ok=True)
+        health_path.write_text(json.dumps(embedding_health, indent=2, sort_keys=True) + "\n")
+        config["clustering"]["serving_embedding_health"] = embedding_health
+        write_run_config(output, config)
+        log_event(
+            output / "logs" / "training.sqlite",
+            run_id,
+            "INFO",
+            "Computed serving embedding health diagnostics",
+            embedding_health,
+        )
         _validate_serving_embeddings(embeddings, config)
         cluster_index = ClusterEvidenceIndex.fit(
             embeddings,
@@ -433,6 +593,7 @@ def train_clustering_run(
         write_load_test_report(output, load_report)
         summary = {
             "clustering": cluster_index.summary(),
+            "serving_embedding_health": embedding_health,
             "training": {key: values[-1] for key, values in history.history.items() if values},
             "inference_batching": inference_plan.to_dict(),
             "distribution": {
@@ -527,6 +688,8 @@ def fit_clustering_evidence_from_encoder(
     inference_plan = resolve_inference_batch_size(model, config, announce=None)
     extraction_dataset = source.indexed_image_dataset(index, batch_size=inference_plan.batch_size)
     embeddings = _extract_embeddings(model, extraction_dataset, len(index.refs), embedding_dim)
+    embedding_health = _serving_embedding_health(embeddings, config)
+    _validate_serving_embeddings(embeddings, config)
     cluster_index = ClusterEvidenceIndex.fit(
         embeddings,
         [ref.uuid for ref in index.refs],
@@ -558,6 +721,7 @@ def fit_clustering_evidence_from_encoder(
         try:
             shutil.move(str(staged_cluster_path), str(cluster_path))
             config["clustering"]["structure"] = cluster_index.summary()
+            config["clustering"]["serving_embedding_health"] = embedding_health
             config["clustering"]["encoder_artifact"] = {
                 "artifact_id": manifest["artifact_id"],
                 "run_id": manifest["run_id"],
@@ -594,6 +758,7 @@ def fit_clustering_evidence_from_encoder(
         "run_dir": str(encoder_run),
         "artifact_id": sealed["artifact_id"],
         "clustering": cluster_index.summary(),
+        "serving_embedding_health": embedding_health,
         "inference_batching": inference_plan.to_dict(),
         "attached": True,
     }

@@ -34,6 +34,12 @@ def build_parser() -> argparse.ArgumentParser:
     migrate = commands.add_parser("migrate-legacy")
     migrate.add_argument("source")
     migrate.add_argument("output")
+    migrate_clustering = commands.add_parser(
+        "migrate-clustering",
+        help="Extract a sealed legacy clustering package as a downstream record.",
+    )
+    migrate_clustering.add_argument("source")
+    migrate_clustering.add_argument("output")
     publish = commands.add_parser(
         "publish-deployment",
         help="Create a lean sealed deployment asset from a sealed training record.",
@@ -67,6 +73,10 @@ def main(argv: list[str] | None = None) -> int:
         result = pack_run_artifact(args.run, args.output)
     elif args.command == "migrate-legacy":
         result = migrate_legacy_run(args.source, args.output)
+    elif args.command == "migrate-clustering":
+        from oracle_builder.clustering.migration import migrate_sealed_clustering_package
+
+        result = migrate_sealed_clustering_package(args.source, args.output)
     elif args.command == "publish-deployment":
         from oracle_builder.artifacts.deployment import publish_deployment_asset
 

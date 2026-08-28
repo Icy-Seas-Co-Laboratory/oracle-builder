@@ -96,13 +96,48 @@ def publish_deployment_asset(
         if include_weights and (model_source / "weights.weights.h5").exists():
             shutil.copy2(model_source / "weights.weights.h5", layout.model / "weights.weights.h5")
         if include_evidence:
-            for name in ("classification_evidence", "clustering_evidence"):
+            # Classification evidence is an optional serving aid.  Clustering
+            # evidence is dataset-specific downstream state and is never part
+            # of a new model product; legacy packages are migrated separately.
+            for name in ("classification_evidence",):
                 source_path = model_source / name
                 if source_path.is_dir():
                     shutil.copytree(source_path, layout.model / name)
 
         model_manifest_path = layout.model / "model_manifest.json"
         model_manifest = json.loads(model_manifest_path.read_text(encoding="utf-8"))
+        # A deployment asset contains model capabilities only.  Dataset-bound
+        # clustering state is a downstream record and must not survive this
+        # boundary, including when publishing an older clustering run.
+        if model_manifest.get("task") == "clustering":
+            model_manifest["task"] = "embedding"
+            model_manifest["outputs"] = {
+                "primary": "embedding",
+                "embedding": True,
+                "embedding_dimension": model_manifest.get("outputs", {}).get(
+                    "embedding_dimension",
+                    deployment_config.get("model", {}).get("embedding_dim", 256),
+                ),
+                "embedding_normalized": model_manifest.get("outputs", {}).get(
+                    "embedding_normalized", True
+                ),
+            }
+            model_manifest["postprocessing"] = {
+                key: value
+                for key, value in model_manifest.get("postprocessing", {}).items()
+                if key != "clustering_evidence"
+            }
+            deployment_config.setdefault("run", {})["task"] = "embedding"
+            deployment_config.pop("clustering", None)
+            write_run_config(destination, deployment_config)
+        else:
+            outputs = dict(model_manifest.get("outputs", {}))
+            for key in ("cluster_evidence", "cluster_count", "cluster_method"):
+                outputs.pop(key, None)
+            model_manifest["outputs"] = outputs
+            postprocessing = dict(model_manifest.get("postprocessing", {}))
+            postprocessing.pop("clustering_evidence", None)
+            model_manifest["postprocessing"] = postprocessing
         model_manifest["artifact_id"] = manifest["artifact_id"]
         model_manifest["run_id"] = deployment_run_id
         model_manifest["training_record_id"] = source_manifest["artifact_id"]
@@ -112,7 +147,11 @@ def publish_deployment_asset(
         )
         source_contract = model_source / "contract.json"
         if source_contract.exists():
-            shutil.copy2(source_contract, layout.model / "contract.json")
+            contract = json.loads(source_contract.read_text(encoding="utf-8"))
+            contract["task"] = model_manifest.get("task")
+            contract["outputs"] = model_manifest.get("outputs", {})
+            contract["postprocessing"] = model_manifest.get("postprocessing", {})
+            write_model_contract(destination, contract)
         else:
             write_model_contract(
                 destination,

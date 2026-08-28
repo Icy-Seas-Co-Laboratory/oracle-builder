@@ -4,6 +4,7 @@ import json
 import sqlite3
 
 import numpy as np
+import pytest
 
 import tensorflow as tf
 from tensorflow import keras
@@ -109,6 +110,59 @@ def test_ingest_promotes_a_softmax_classifier_to_standard_outputs(tmp_path):
     assert values["probabilities"].shape == (2, 3)
     assert values["features"].shape == (2, 6)
     assert (output / "model" / "imported.keras").exists()
+
+
+def test_ingest_preserves_a_generic_representation_contract_without_clustering(
+    tmp_path,
+):
+    source = tmp_path / "encoder.keras"
+    info = tmp_path / "product.toml"
+    output = tmp_path / "product"
+    inputs = keras.Input(shape=(4,), name="input")
+    features = keras.layers.Dense(6, name="features")(inputs)
+    keras.Model(inputs, features, name="encoder").save(source)
+    info.write_text(
+        """
+[product]
+name = "representation"
+task = "generic"
+
+[outputs]
+primary = "representation"
+representation = "features"
+dimension = 6
+normalized = true
+""".lstrip(),
+        encoding="utf-8",
+    )
+
+    ingest_keras_model(source, info, output)
+
+    contract = json.loads((output / "model" / "contract.json").read_text())
+    manifest = json.loads((output / "artifact.json").read_text())
+    assert contract["task"] == "generic"
+    assert contract["outputs"] == {
+        "primary": "representation",
+        "representation": "features",
+        "dimension": 6,
+        "normalized": True,
+    }
+    assert "cluster_evidence" not in contract["outputs"]
+    assert manifest["model"]["outputs"] == contract["outputs"]
+
+
+def test_ingest_rejects_clustering_as_a_model_product_task(tmp_path):
+    source = tmp_path / "encoder.keras"
+    info = tmp_path / "product.toml"
+    inputs = keras.Input(shape=(4,), name="input")
+    keras.Model(inputs, keras.layers.Dense(6, name="features")(inputs)).save(source)
+    info.write_text('[product]\nname = "clusterer"\ntask = "clustering"\n')
+
+    with pytest.raises(
+        ValueError,
+        match="product.task must be generic, classification, or segmentation",
+    ):
+        ingest_keras_model(source, info, tmp_path / "product")
 
 
 def test_ingest_savedmodel_creates_named_classification_contract(tmp_path):

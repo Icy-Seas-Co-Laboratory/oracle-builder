@@ -9,6 +9,7 @@ from typing import Any, Callable
 
 from oracle_builder.inference import InferenceBundle
 from oracle_builder.api.microbatch import MicroBatchExecutor
+from oracle_builder.inference.executor import execution_device_diagnostics
 
 
 _ALIAS_SAFE = re.compile(r"[^a-z0-9._-]+")
@@ -235,16 +236,19 @@ class InferenceModelRegistry:
                 "load_error": registration.load_error,
             }
             row.update(registration.catalog)
+            runtime = {"execution": execution_device_diagnostics()}
             if registration.bundle is not None:
                 bundle = registration.bundle
                 row["model"] = bundle.model_reference.to_dict()
                 row["task"] = bundle.model_reference.task
                 row["architecture"] = bundle.model_reference.architecture
                 row["capabilities"] = self._capabilities(bundle)
-                row["runtime"] = {
+                runtime = {
+                    **runtime,
                     **getattr(bundle, "runtime_diagnostics", {}),
                     "microbatch": registration.executor.diagnostics() if registration.executor is not None else None,
                 }
+            row["runtime"] = runtime
             if task is None or row.get("task") == task:
                 rows.append(row)
         return sorted(rows, key=lambda value: value["alias"])
@@ -257,6 +261,23 @@ class InferenceModelRegistry:
         evidence = config.get("evidence") or {}
         evidence_index = getattr(bundle, "evidence_index", None)
         cluster_index = getattr(bundle, "cluster_index", None)
+        if bundle.model_reference.task == "embedding":
+            return {
+                "contract_version": "1.0.0",
+                "labels": [],
+                "embedding": {
+                    "available": True,
+                    "dimension": model.get("embedding_dim"),
+                    "normalized": bool(model.get("normalize_embeddings", True)),
+                },
+                "evidence": {
+                    "available": False,
+                    "schema_version": None,
+                    "prototype": False,
+                    "knn": False,
+                    "visual_exemplars": False,
+                },
+            }
         if cluster_index is not None and bundle.model_reference.task == "clustering":
             return {
                 "contract_version": "1.0.0",

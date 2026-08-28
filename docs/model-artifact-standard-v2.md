@@ -28,7 +28,11 @@ oracle-run publish-deployment \
 ```
 
 Use `--include-weights` for an optional rebuild representation and
-`--no-evidence` to omit packaged classification or clustering evidence.
+`--no-evidence` to omit packaged classification evidence. Clustering evidence
+is a separately versioned downstream analysis product and is never part of a
+new deployment asset. A dedicated migration may preserve clustering evidence
+from a sealed legacy clustering package for compatibility; it does not create a
+new first-class clustering product.
 
 ## Training records
 

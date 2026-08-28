@@ -1,0 +1,79 @@
+# Self-supervised representation model.  This produces an embedding model;
+# downstream consumers own clustering, labels, and cluster provenance.
+
+[run]
+task = "embedding"
+model = "simple_cnn"
+seed = 123
+notes = "Self-supervised ROI representation model"
+
+[data]
+input_shape = [64, 64, 1]
+batch_size = 1024
+shuffle_buffer = 16384
+split_strategy = "auto"
+
+[preprocessing]
+resize_mode = "fit_pad"
+normalization = "dtype"
+rescale = true
+invert = "auto"
+pad_value = 0.0
+interpolation = "bilinear"
+channel_mode = "grayscale"
+
+[model]
+base_filters = 32
+embedding_dim = 256
+normalize_embeddings = true
+dropout = 0.0
+
+[self_supervised]
+enabled = true
+method = "byol"
+epochs = 50
+verbose = 1
+learning_rate = 0.001
+teacher_momentum = 0.99
+projection_dim = 128
+projection_hidden_dim = 256
+ssl_optimizer = "adamw"
+weight_decay = 0.0001
+vicreg_variance_weight = 2.0
+vicreg_covariance_weight = 1.0
+vicreg_target_std = 1.0
+minimum_global_batch_size = 2
+collapse_std_threshold = 0.001
+collapse_embedding_spread_threshold = 0.002
+
+[self_supervised.augmentation]
+enabled = true
+rotation = 0.08
+zoom = 0.15
+translation = 0.1
+skew = 0.05
+flip_horizontal = true
+flip_vertical = false
+brightness = 0.2
+contrast = 0.2
+gaussian_noise = 0.03
+invert = false
+fill_value = 0.0
+
+[distribution]
+strategy = "auto"
+fallback_to_single = true
+memory_growth = true
+
+[inference]
+batch_size = "auto"
+minimum_batch_size = 64
+maximum_batch_size = 1024
+memory_budget_mb = 4096
+progress = false
+
+[output]
+export_savedmodel = true
+save_checkpoints = false
+save_predictions = false
+save_figures = false

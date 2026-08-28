@@ -38,6 +38,15 @@ interchangeable.
 
 ## Outputs
 
+Every successful embedding result includes:
+
+- the fixed-size embedding vector;
+- its dimension and normalization declaration from the model contract; and
+- the model and input provenance shared by all inference results.
+
+Embedding products do not return cluster assignments, cluster labels, or
+dataset-specific nearest-neighbor evidence. Those belong to downstream records.
+
 Every successful classification result includes:
 
 - exact pre-softmax logits from new Oracle Builder models;
@@ -65,6 +74,24 @@ not package redistributable exemplar imagery; the catalog reports
 layer. For probability-only external artifacts it records the reversible
 canonical derivation used by the compatibility adapter, such as
 `derived_log_probability` or `derived_inverse_sigmoid`.
+
+Each `InferenceResultSet` reports an `execution` object describing the device
+selected by TensorFlow for the resident inference callable:
+
+```json
+{
+  "gpu_accelerated": true,
+  "accelerator": "gpu",
+  "device_type": "GPU",
+  "device_name": "/device:GPU:0",
+  "device_count": 2,
+  "source": "tensorflow_logical_devices"
+}
+```
+
+The same information is available from `GET /v1/models` under
+`models[].runtime.execution`, allowing Pelagia to inspect the expected
+execution target before submitting a prediction request.
 
 Large arrays remain NumPy arrays in memory. The JSON representation uses a
 typed NPY payload with shape, dtype, asset UUID, SHA-256, and optional base64

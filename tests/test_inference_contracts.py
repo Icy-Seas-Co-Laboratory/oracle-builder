@@ -43,10 +43,20 @@ def test_inference_item_and_array_assets_have_uuid_and_hash_identity():
 
 
 def test_result_set_json_lines_is_a_streamable_envelope():
-    result_set = InferenceResultSet(model=model_reference()).complete()
+    execution = {
+        "gpu_accelerated": False,
+        "accelerator": "cpu",
+        "device_type": "CPU",
+        "device_name": "/device:CPU:0",
+    }
+    result_set = InferenceResultSet(
+        model=model_reference(),
+        execution=execution,
+    ).complete()
     events = [json.loads(value) for value in result_set.to_json_lines()]
 
     assert events[0]["event"] == "result_set_start"
+    assert events[0]["execution"] == execution
     assert events[-1]["event"] == "result_set_complete"
     assert events[-1]["counts"]["requested"] == 0
 
@@ -123,6 +133,8 @@ def test_classification_bundle_uses_one_model_call_for_a_supplied_batch():
         item.request_id for item in items
     ]
     assert all(result.status == "ok" for result in result_set.results)
+    assert result_set.execution["accelerator"] in {"gpu", "cpu"}
+    assert isinstance(result_set.execution["gpu_accelerated"], bool)
     assert all(result.output["decision"]["class_index"] == 1 for result in result_set.results)
 
 

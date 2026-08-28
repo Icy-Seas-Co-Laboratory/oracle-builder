@@ -66,6 +66,26 @@ axis. `embed_in_model` is an explicit assertion that input values are raw images
 When enabled, `raw_input_shape` is required and the importer embeds supported
 resize, 1↔3 channel conversion, inversion, and rescaling operations.
 
+### Representation products
+
+Use `task = "generic"` for an encoder or other reusable representation model.
+Its output contract is explicit metadata, not an inferred cluster contract:
+
+```toml
+[outputs]
+primary = "representation"
+representation = "features"
+dimension = 256
+normalized = true
+```
+
+`representation` names the exported tensor or adapter output; `dimension` and
+`normalized` describe its values. A generic product is portable even when it
+needs an explicit Oracle Builder serving adapter. It must not declare
+`task = "clustering"`, `primary = "roi_cluster_evidence"`, or a
+`cluster_evidence` output. Those are derived-analysis semantics, not model
+product semantics.
+
 ## Model directory contract
 
 ```text
@@ -99,6 +119,7 @@ For known tasks, automatic promotion is attempted unless disabled with
 
 | Task | `final.keras` outputs |
 |---|---|
+| Embedding | `embedding` only. |
 | Classification | `logits`, `probabilities`, and `features` when an embedding is available. |
 | Segmentation | `logits` and `probabilities`. |
 | Generic/unpromoted | Original outputs; an explicit adapter is required. |
@@ -113,6 +134,25 @@ SavedModel import currently supports a single-input classification signature.
 It requires an explicit `promotion.activation` (`softmax` or `linear`) and
 wraps the selected output as named `logits` and `probabilities`. It does not
 invent an embedding when the source signature does not expose one.
+
+## Downstream clustering provenance
+
+Clustering a product representation creates a separate downstream result; it
+does not modify or redefine the sealed model product. The clustering result
+must retain, at minimum:
+
+- source model `artifact_id`, `run_id`, and sealed fingerprint;
+- representation name, dimension, dtype, and normalization contract;
+- input dataset/revision identifiers and semantic fingerprint;
+- fitting method, parameters, random seed, and implementation version; and
+- cluster structure/evidence identity and its own checksum or fingerprint.
+
+This provenance is required to interpret a run-local cluster ID. A deployment
+asset may expose a representation, but it does not package cluster assignments,
+centroids, nearest-neighbor evidence, or cluster labels as part of its model
+contract. A legacy clustering package may retain its historical evidence only
+through the dedicated one-way migration path; consumers must identify it as
+legacy compatibility material rather than a newly authored product contract.
 
 ## Dataset provenance
 

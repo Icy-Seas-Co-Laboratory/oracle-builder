@@ -37,6 +37,21 @@ class _ClassificationExport(tf.Module):
         return self.feature_model(inputs, training=False)
 
 
+class _EmbeddingExport(tf.Module):
+    def __init__(self, model: keras.Model):
+        super().__init__()
+        self.model = model
+
+    @tf.function
+    def embed(self, inputs):
+        values = self.model(inputs, training=False)
+        return {"embedding": values}
+
+    @tf.function
+    def serve(self, inputs):
+        return self.embed(inputs)
+
+
 class _SegmentationExport(tf.Module):
     def __init__(self, model: keras.Model):
         super().__init__()
@@ -71,6 +86,27 @@ def _export_classification_model(
         signatures={
             "serving_default": exported.serve.get_concrete_function(input_spec),
             "classify": exported.classify.get_concrete_function(input_spec),
+            "embed": exported.embed.get_concrete_function(input_spec),
+        },
+    )
+
+
+def _export_embedding_model(
+    model: keras.Model,
+    export_dir: Path,
+    config: dict[str, Any],
+) -> None:
+    exported = _EmbeddingExport(model)
+    input_spec = tf.TensorSpec(
+        [None, *config["data"]["input_shape"]],
+        tf.float32,
+        name="inputs",
+    )
+    tf.saved_model.save(
+        exported,
+        str(export_dir),
+        signatures={
+            "serving_default": exported.serve.get_concrete_function(input_spec),
             "embed": exported.embed.get_concrete_function(input_spec),
         },
     )
@@ -136,6 +172,8 @@ def save_model_artifacts(model: keras.Model, run_dir: str | Path, config: dict[s
             export_dir = model_path / "export_savedmodel"
             if config.get("run", {}).get("task") in {"classification", "clustering"}:
                 _export_classification_model(model, export_dir, config)
+            elif config.get("run", {}).get("task") == "embedding":
+                _export_embedding_model(model, export_dir, config)
             else:
                 _export_segmentation_model(model, export_dir, config)
             report["savedmodel_exported"] = True
@@ -212,6 +250,17 @@ def save_model_artifacts(model: keras.Model, run_dir: str | Path, config: dict[s
                 ).get("cluster_count"),
             }
             if config.get("run", {}).get("task") == "classification"
+            else {
+                "primary": "embedding",
+                "embedding": True,
+                "embedding_dimension": config.get("model", {}).get(
+                    "embedding_dim", 256
+                ),
+                "embedding_normalized": config.get("model", {}).get(
+                    "normalize_embeddings", True
+                ),
+            }
+            if config.get("run", {}).get("task") == "embedding"
             else {
                 "embedding": True,
                 "embedding_dimension": config.get("model", {}).get(

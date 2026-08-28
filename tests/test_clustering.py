@@ -146,6 +146,11 @@ learning_rate = 0.001
 projection_dim = 4
 projection_hidden_dim = 8
 
+[pretraining.embedding_health]
+# This smoke test intentionally trains only three tiny batches; it exercises
+# packaging rather than representation quality.
+enabled = false
+
 [clustering]
 n_clusters = 2
 top_k = 2

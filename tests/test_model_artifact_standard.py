@@ -100,6 +100,32 @@ def test_training_and_deployment_profiles_are_distinct(tmp_path, monkeypatch):
     assert validate_run_artifact(training)["valid"]
 
 
+def test_deployment_product_does_not_package_downstream_clustering_evidence(
+    tmp_path, monkeypatch
+):
+    training = _complete_training_record(tmp_path)
+    clustering = training / "model" / "clustering_evidence"
+    clustering.mkdir()
+    (clustering / "metadata.json").write_text("{}\n", encoding="utf-8")
+    deployment = tmp_path / "deployment"
+
+    def fake_environment(path):
+        layout = RunLayout(path)
+        layout.environment.write_text("{}\n", encoding="utf-8")
+        layout.requirements.write_text("oracle-builder==0.1.0\n", encoding="utf-8")
+        return {}
+
+    monkeypatch.setattr(
+        "oracle_builder.artifacts.deployment.write_environment", fake_environment
+    )
+
+    publish_deployment_asset(training, deployment, include_evidence=True)
+
+    contract = json.loads((deployment / "model" / "contract.json").read_text())
+    assert not (deployment / "model" / "clustering_evidence").exists()
+    assert "cluster_evidence" not in contract["outputs"]
+
+
 def test_jsonl_events_and_metrics_are_self_describing(tmp_path):
     events = tmp_path / "events.jsonl"
     metrics = tmp_path / "metrics.jsonl"

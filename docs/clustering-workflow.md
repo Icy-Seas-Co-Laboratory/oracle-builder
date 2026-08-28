@@ -1,73 +1,48 @@
-# Unlabeled ROI clustering workflow
+# Downstream ROI clustering
 
-Use `oracle-cluster` to train a self-supervised encoder, calculate a spherical
-k-means organization of the ROI embeddings, and package both into a sealed
-model artifact.
+Oracle Builder publishes representation models, not cluster products. Train a
+self-supervised embedding model with:
 
 ```bash
-oracle-cluster \
-  --config configs/example_clustering.toml \
+oracle-embed \
+  --config configs/example_embedding.toml \
   --input datasets/rois.sqlite \
-  --output runs/roi-clusters
+  --output runs/roi-embedding
 ```
 
-The input must be a frozen classification Dataset V1 database. Existing
-classification annotations are ignored; every classification item is used for
-self-supervised training and cluster fitting. BYOL is the default method and
-SimCLR is also supported. Self-supervised view augmentation is configured only
-under `[self_supervised.augmentation]`; it never inherits supervised training
-augmentation settings.
+The sealed training record contains the SSL diagnostics and the model assets.
+Publish a lean deployment asset with `oracle-run publish-deployment`; its
+contract exposes only the embedding and preprocessing needed by consumers.
+The model does not choose a clustering algorithm, number of clusters, labels,
+or novelty thresholds.
 
-The artifact contains:
+A downstream application can then generate embeddings and own the analysis:
 
-- the encoder and SavedModel `embed` signature;
-- normalized per-ROI embeddings and stable item UUIDs;
-- cluster assignments, centroids, sizes, similarity floors, and representative
-  (medoid) UUIDs;
-- a structure summary including the cluster count and optional silhouette
-score.
+1. Load the sealed embedding deployment asset.
+2. Generate embeddings for an explicitly identified dataset or stream.
+3. Fit and validate the chosen clustering method.
+4. Define cluster names, representatives, thresholds, and scientific meaning.
+5. Store assignments as a separate cluster record.
 
-For large datasets, `fit_batch_size` switches fitting to deterministic
-mini-batch spherical k-means once the ROI count exceeds that batch size,
-`silhouette_max_samples` bounds the quadratic diagnostic cost, and
-`reference_neighbors_per_cluster` retains only the most representative
-references per cluster. Cluster sizes, medoids, and novelty thresholds are
-still calculated from every fitted ROI. Use `reference_neighbors_per_cluster =
-"all"` only when a full nearest-neighbor reference set is essential.
+That cluster record should retain the source model artifact ID and fingerprint,
+embedding dimension/dtype/normalization, preprocessing contract, source dataset
+and revision fingerprint, fitting method and parameters, implementation version,
+and its own checksum. Cluster IDs are local to that record and are not model
+labels.
 
-Serve it like any other sealed model artifact:
+## Legacy clustering packages
+
+Existing sealed `task = "clustering"` runs remain readable by older inference
+consumers. Extract their dataset-conditioned evidence into a standalone
+downstream record without changing the source:
 
 ```bash
-oracle-serve --model roi-clusters=runs/roi-clusters
+oracle-run migrate-clustering \
+  runs/legacy-clusters \
+  records/legacy-clusters
 ```
 
-An inference result has `output.type = "clustering"` and includes an
-`output.evidence` packet with the selected cluster, top candidate clusters,
-representative UUIDs, nearest neighbors, similarity thresholds, and a novelty
-/ abstention decision. Cluster IDs are run-local (`cluster-0000`, etc.) and
-should not be treated as taxonomy labels.
-
-The artifact can also be discovered beneath a models root:
-
-```bash
-oracle-serve --models-root runs
-```
-
-## Attach clustering evidence to an existing classifier
-
-When a compatible classifier or prior clustering encoder already exists, avoid
-retraining it. Fit the cluster structure against its named embedding layer and
-explicitly reopen/reseal the artifact:
-
-```bash
-oracle-cluster --mode fit \
-  --config configs/example_clustering.toml \
-  --input datasets/rois.sqlite \
-  --encoder-run runs/classifier \
-  --reopen-reseal
-```
-
-This is intentionally in-place and refuses to overwrite an existing index.
-`--mode fit` is optional when `--encoder-run` is supplied.
-The resulting classifier continues to return its normal classification output;
-`oracle-serve` adds a separate `output.clustering_evidence` packet.
+The migrated record contains `cluster_manifest.json` and an `evidence/`
+directory. It is not a model product and must be interpreted together with the
+referenced legacy model artifact. New runs should use `oracle-embed` and leave
+clustering to downstream consumers.

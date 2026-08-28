@@ -70,6 +70,15 @@ def _model_contract(config: dict[str, Any]) -> dict[str, Any]:
         }
         if task == "classification"
         else {
+            "primary": "embedding",
+            "embedding": "identity_embedding",
+            "embedding_dimension": config.get("model", {}).get("embedding_dim", 256),
+            "embedding_normalized": config.get("model", {}).get(
+                "normalize_embeddings", True
+            ),
+        }
+        if task == "embedding"
+        else {
             "primary": "roi_cluster_evidence",
             "embedding": "identity_embedding",
             "embedding_dimension": config.get("model", {}).get("embedding_dim", 256),

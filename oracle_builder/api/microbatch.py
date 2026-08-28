@@ -105,7 +105,14 @@ class MicroBatchExecutor:
             execution_ms = (time.perf_counter() - started) * 1000.0
             offset = 0
             for request in pending:
-                result_set = InferenceResultSet(model=combined.model)
+                result_set = InferenceResultSet(
+                    model=combined.model,
+                    execution=(
+                        dict(combined.execution)
+                        if combined.execution
+                        else dict(getattr(self.bundle, "execution_diagnostics", {}))
+                    ),
+                )
                 result_set.parameters.update({
                     "microbatch_item_count": len(all_items),
                     "microbatch_request_count": len(pending),

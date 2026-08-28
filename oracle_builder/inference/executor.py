@@ -7,7 +7,43 @@ from typing import Any
 
 import numpy as np
 
-from oracle_builder.classification.features import build_feature_model
+from oracle_builder.classification.features import build_embedding_model, build_feature_model
+
+
+def execution_device_diagnostics() -> dict[str, Any]:
+    """Describe the TensorFlow device that the resident inference will use."""
+    try:
+        import tensorflow as tf
+
+        logical_gpus = tf.config.list_logical_devices("GPU")
+        if logical_gpus:
+            return {
+                "gpu_accelerated": True,
+                "accelerator": "gpu",
+                "device_type": "GPU",
+                "device_name": logical_gpus[0].name,
+                "device_count": len(logical_gpus),
+                "source": "tensorflow_logical_devices",
+            }
+        logical_cpus = tf.config.list_logical_devices("CPU")
+        return {
+            "gpu_accelerated": False,
+            "accelerator": "cpu",
+            "device_type": "CPU",
+            "device_name": logical_cpus[0].name if logical_cpus else "/device:CPU:0",
+            "device_count": 0,
+            "source": "tensorflow_logical_devices",
+        }
+    except Exception as exc:  # pragma: no cover - TensorFlow is a runtime dependency
+        return {
+            "gpu_accelerated": False,
+            "accelerator": "cpu",
+            "device_type": "CPU",
+            "device_name": "/device:CPU:0",
+            "device_count": 0,
+            "source": "tensorflow_unavailable",
+            "diagnostic_error": f"{type(exc).__name__}: {exc}",
+        }
 
 
 class ClassificationExecutor:
@@ -16,6 +52,7 @@ class ClassificationExecutor:
     def __init__(self, model: Any, input_shape: tuple[int, ...]):
         self.model = model
         self.input_shape = tuple(int(value) for value in input_shape)
+        self.execution_diagnostics = execution_device_diagnostics()
         self.runtime = "adapter"
         self._call = self._build()
 
@@ -81,6 +118,55 @@ class ClassificationExecutor:
         self.predict(np.zeros((batch_size, *self.input_shape), dtype="float32"))
         return {
             "runtime": self.runtime,
+            "execution": self.execution_diagnostics,
+            "batch_size": int(batch_size),
+            "duration_ms": (time.perf_counter() - started) * 1000.0,
+        }
+
+
+class EmbeddingExecutor:
+    """One stable embedding callable for representation-only products."""
+
+    def __init__(self, model: Any, input_shape: tuple[int, ...]):
+        self.model = model
+        self.input_shape = tuple(int(value) for value in input_shape)
+        self.execution_diagnostics = execution_device_diagnostics()
+        self.runtime = "adapter"
+        self._call = self._build()
+
+    def _build(self):
+        if hasattr(self.model, "predict_embedding"):
+            self.runtime = "savedmodel_signature"
+            return lambda values: self.model.predict_embedding(values, verbose=0)
+        try:
+            import tensorflow as tf
+
+            embedding_model = build_embedding_model(self.model)
+
+            @tf.function(
+                input_signature=[
+                    tf.TensorSpec([None, *self.input_shape], tf.float32, name="inputs")
+                ],
+                reduce_retracing=True,
+            )
+            def infer(inputs):
+                return embedding_model(inputs, training=False)
+
+            self.runtime = "compiled_keras"
+            return infer
+        except (AttributeError, ValueError):
+            self.runtime = "legacy_predict_adapter"
+            return lambda values: self.model.predict(values, verbose=0)
+
+    def predict(self, values: np.ndarray) -> np.ndarray:
+        return np.asarray(self._call(np.asarray(values, dtype="float32")))
+
+    def warm(self, batch_size: int) -> dict[str, Any]:
+        started = time.perf_counter()
+        self.predict(np.zeros((batch_size, *self.input_shape), dtype="float32"))
+        return {
+            "runtime": self.runtime,
+            "execution": self.execution_diagnostics,
             "batch_size": int(batch_size),
             "duration_ms": (time.perf_counter() - started) * 1000.0,
         }

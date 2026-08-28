@@ -30,7 +30,11 @@ from oracle_builder.inference.contracts import (
     new_uuid,
     utc_now,
 )
-from oracle_builder.inference.executor import ClassificationExecutor
+from oracle_builder.inference.executor import (
+    ClassificationExecutor,
+    EmbeddingExecutor,
+    execution_device_diagnostics,
+)
 from oracle_builder.saving.load_test import load_model_for_run
 
 
@@ -130,7 +134,21 @@ class InferenceBundle:
             if model_reference.task in {"classification", "clustering"}
             else None
         )
-        self.runtime_diagnostics: dict[str, Any] = {}
+        self._embedding_executor = (
+            EmbeddingExecutor(model, tuple(config["data"]["input_shape"]))
+            if model_reference.task == "embedding"
+            else None
+        )
+        self.execution_diagnostics = (
+            self._classification_executor.execution_diagnostics
+            if self._classification_executor is not None
+            else self._embedding_executor.execution_diagnostics
+            if self._embedding_executor is not None
+            else execution_device_diagnostics()
+        )
+        self.runtime_diagnostics: dict[str, Any] = {
+            "execution": self.execution_diagnostics,
+        }
 
     @classmethod
     def load(cls, run_dir: str | Path) -> "InferenceBundle":
@@ -180,6 +198,8 @@ class InferenceBundle:
             output = (
                 self._predict_classification(item)
                 if self.model_reference.task in {"classification", "clustering"}
+                else self._predict_embedding(item)
+                if self.model_reference.task == "embedding"
                 else self._predict_segmentation(item)
             )
             status = "ok"
@@ -224,8 +244,12 @@ class InferenceBundle:
         result_set = InferenceResultSet(
             model=self.model_reference,
             source_dataset=source_dataset,
+            execution=self.execution_diagnostics,
         )
         materialized_items = list(items)
+        if self.model_reference.task == "embedding":
+            self._predict_embedding_batch(materialized_items, result_set)
+            return result_set.complete()
         if self.model_reference.task not in {"classification", "clustering"}:
             for index, item in enumerate(materialized_items):
                 result_set.append(
@@ -332,17 +356,93 @@ class InferenceBundle:
         values = self._classification_executor.predict(prepared[None, ...])
         return self._classification_output_from_values(item, values, 0)
 
+    def _predict_embedding(self, item: InferenceItem) -> dict[str, Any]:
+        prepared = self._prepare_classification(item)
+        values = self._embedding_executor.predict(prepared[None, ...])[0]
+        return {
+            "type": "embedding",
+            "embedding": ArrayPayload(np.asarray(values, dtype="float32")),
+            "embedding_normalized": bool(
+                self.config.get("model", {}).get("normalize_embeddings", True)
+            ),
+        }
+
+    def _predict_embedding_batch(
+        self, items: list[InferenceItem], result_set: InferenceResultSet
+    ) -> None:
+        """Prepare and execute representation requests in one model call."""
+        results: list[InferenceResult | None] = [None] * len(items)
+        prepared: list[np.ndarray] = []
+        indices: list[int] = []
+        started: dict[int, tuple[float, str]] = {}
+        for index, item in enumerate(items):
+            started[index] = (time.perf_counter(), utc_now())
+            try:
+                prepared.append(self._prepare_classification(item))
+                indices.append(index)
+            except Exception as exc:
+                results[index] = self._error_result(
+                    item,
+                    exc,
+                    result_set_id=result_set.result_set_id,
+                    sequence_number=index,
+                    started=started[index],
+                )
+        if prepared:
+            try:
+                values = self._embedding_executor.predict(np.stack(prepared, axis=0))
+                for batch_index, item_index in enumerate(indices):
+                    item = items[item_index]
+                    output = {
+                        "type": "embedding",
+                        "embedding": ArrayPayload(
+                            np.asarray(values[batch_index], dtype="float32")
+                        ),
+                        "embedding_normalized": bool(
+                            self.config.get("model", {}).get(
+                                "normalize_embeddings", True
+                            )
+                        ),
+                    }
+                    results[item_index] = self._success_result(
+                        item,
+                        output,
+                        result_set_id=result_set.result_set_id,
+                        sequence_number=item_index,
+                        started=started[item_index],
+                    )
+            except Exception as exc:
+                for item_index in indices:
+                    results[item_index] = self._error_result(
+                        items[item_index],
+                        exc,
+                        result_set_id=result_set.result_set_id,
+                        sequence_number=item_index,
+                        started=started[item_index],
+                    )
+        for result in results:
+            if result is not None:
+                result_set.append(result)
+
     def warm_for_serving(self, batch_sizes: tuple[int, ...] = (1,)) -> dict[str, Any]:
         """Compile and exercise the resident callable without retaining input data."""
-        if self.model_reference.task not in {"classification", "clustering"} or self._classification_executor is None:
-            self.runtime_diagnostics = {"runtime": "segmentation", "warmup": []}
+        if self.model_reference.task == "embedding" and self._embedding_executor is not None:
+            executor = self._embedding_executor
+        elif self.model_reference.task in {"classification", "clustering"} and self._classification_executor is not None:
+            executor = self._classification_executor
+        else:
+            self.runtime_diagnostics = {
+                "runtime": "segmentation",
+                "execution": self.execution_diagnostics,
+                "warmup": [],
+            }
             return self.runtime_diagnostics
         warmup: list[dict[str, Any]] = []
         for requested_size in dict.fromkeys(max(1, int(value)) for value in batch_sizes):
             candidate = requested_size
             while True:
                 try:
-                    warmup.append(self._classification_executor.warm(candidate))
+                    warmup.append(executor.warm(candidate))
                     break
                 except Exception as exc:
                     try:
@@ -354,7 +454,8 @@ class InferenceBundle:
                         raise
                     candidate = max(1, candidate // 2)
         self.runtime_diagnostics = {
-            "runtime": self._classification_executor.runtime,
+            "runtime": executor.runtime,
+            "execution": self.execution_diagnostics,
             "warmup": warmup,
             "resolved_max_batch_size": warmup[-1]["batch_size"] if warmup else 1,
         }

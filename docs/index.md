@@ -6,7 +6,7 @@
 |---|---|
 | Install and run a first model | [Getting started](getting-started.md) |
 | Train an image classifier from labeled folders | [Classification workflow](classification-workflow.md) |
-| Organize unlabeled ROIs into embedding clusters | [Unlabeled ROI clustering workflow](clustering-workflow.md) |
+| Train an unlabeled ROI representation model | [Downstream ROI clustering](clustering-workflow.md) |
 | Curate ROIs and refine masks | [Mask-refinement workflow](mask-refinement-workflow.md) |
 | Ingest a pre-existing Keras model | [External model products](model-products.md) |
 | Configure training, evaluation, or recovery | [Training, evaluation, and recovery](training-and-evaluation.md) |
@@ -30,4 +30,5 @@
 The checked-in `configs/` files are runnable starting points. Classification
 family defaults are in `configs/classification_defaults/`; segmentation examples
 are `configs/example_segmentation_*.toml`; imported-model metadata begins with
-`configs/example_model_product.toml`.
+`configs/example_model_product.toml`; self-supervised embedding training begins
+with `configs/example_embedding.toml`.

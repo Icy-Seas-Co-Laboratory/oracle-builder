@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "oracle-builder"
-version = "0.1.6"
+version = "0.1.7"
 description = "A small file-based TensorFlow/Keras experimentation tool."
 requires-python = ">=3.10"
 dependencies = [
@@ -31,7 +31,7 @@ oracle-evaluate = "model_evaluate:main"
 oracle-mask-builder = "mask_builder:main"
 oracle-model = "oracle_builder.products.cli:main"
 oracle-serve = "oracle_builder.api.cli:main"
-oracle-cluster = "oracle_builder.clustering.cli:main"
+oracle-embed = "oracle_builder.embedding.cli:main"
 oracle-orchestrator = "oracle_builder.orchestration.cli:main"
 
 [tool.setuptools]

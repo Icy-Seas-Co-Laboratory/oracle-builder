@@ -62,6 +62,7 @@ class JSONLinesSink:
                 "schema_version": "1.0.0",
                 "result_set_id": result_set.result_set_id,
                 "model": result_set.model.to_dict(),
+                "execution": result_set.execution,
                 "started_at": result_set.started_at,
             }
         )
@@ -106,6 +107,7 @@ def run_connector(
     result_set = InferenceResultSet(
         model=bundle.model_reference,
         source_dataset=source_dataset,
+        execution=dict(getattr(bundle, "execution_diagnostics", {})),
     )
     destination = sink or InMemorySink()
     destination.start(result_set)

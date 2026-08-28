@@ -29,6 +29,7 @@ from oracle_builder.training.student_teacher import (
     make_pretraining_dataset,
     _pretraining_optimizer,
     run_student_teacher_pretraining,
+    serving_feature_representations,
     vicreg_regularization,
 )
 from oracle_builder.training.train import build_and_compile_model
@@ -190,6 +191,23 @@ def test_student_teacher_pretraining_updates_shared_classifier_encoder(
         ):
             assert metric in history.history
             assert np.isfinite(history.history[metric][-1])
+    else:
+        # SimCLR's contrastive projector may be healthy while the encoder that
+        # inference exports is not.  Keep both spaces visible in the training
+        # record so a projector-only success cannot conceal that failure.
+        for metric in (
+            "encoder_variance_loss",
+            "encoder_covariance_loss",
+            "encoder_representation_std",
+            "encoder_mean_direction_norm",
+            "encoder_related_cosine_similarity",
+            "encoder_unrelated_cosine_similarity",
+            "projector_representation_std",
+            "projector_related_cosine_similarity",
+            "projector_unrelated_cosine_similarity",
+        ):
+            assert metric in history.history
+            assert np.isfinite(history.history[metric][-1])
     for metric in (
         "related_cosine_similarity",
         "unrelated_cosine_similarity",
@@ -262,6 +280,37 @@ def test_vicreg_regularization_detects_collapsed_representations():
     assert np.isfinite(varied_covariance.numpy())
 
 
+def test_serving_feature_representations_are_unit_vectors_with_a_safe_zero_fallback():
+    representations = tf.constant([[3.0, 4.0], [0.0, 0.0]], dtype=tf.float32)
+
+    serving = serving_feature_representations(representations).numpy()
+
+    np.testing.assert_allclose(serving[0], [0.6, 0.8])
+    np.testing.assert_allclose(serving[1], [1.0, 0.0])
+    np.testing.assert_allclose(np.linalg.norm(serving, axis=1), 1.0)
+
+
+def test_encoder_vicreg_penalizes_a_collapsed_serving_direction():
+    collapsed_raw = tf.constant(
+        [[1.0, 0.0, 0.0]] * 4,
+        dtype=tf.float32,
+    )
+    diverse_raw = tf.constant(
+        [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [-1.0, 0.0, 0.0]],
+        dtype=tf.float32,
+    )
+
+    collapsed_variance, _, collapsed_std = vicreg_regularization(
+        serving_feature_representations(collapsed_raw), target_std=0.05
+    )
+    diverse_variance, _, diverse_std = vicreg_regularization(
+        serving_feature_representations(diverse_raw), target_std=0.05
+    )
+
+    assert float(collapsed_variance) > float(diverse_variance)
+    assert float(collapsed_std) < float(diverse_std)
+
+
 def test_ssl_optimizer_supports_adamw_without_changing_adam_default():
     adam = _pretraining_optimizer(pretraining_config()["pretraining"])
     adamw = _pretraining_optimizer(
@@ -291,6 +340,8 @@ def test_pretraining_wrappers_expose_a_buildable_call_path(pretrainer_type):
         ("epochs", 0, "epochs"),
         ("teacher_momentum", 1.0, "momentum"),
         ("projection_dim", 0, "projection_dim"),
+        ("encoder_variance_weight", -1.0, "encoder_variance_weight"),
+        ("encoder_target_std", 0.0, "encoder_target_std"),
         ("reconstruction_foreground_weight", 0.5, "foreground_weight"),
     ],
 )

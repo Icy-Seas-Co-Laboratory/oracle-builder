@@ -4,8 +4,10 @@
 
 [product]
 name = "example-external-classifier"
-# generic, classification, or segmentation. Classification and segmentation
-# enable conservative automatic promotion to Oracle Builder's inference layers.
+# generic, classification, or segmentation. Use generic for a reusable
+# embedding/representation model; clustering is never a model-product task.
+# Classification and segmentation enable conservative automatic promotion to
+# Oracle Builder's inference layers.
 task = "classification"
 version = "1.0.0"
 description = "Portable external Keras model imported into Oracle Builder."
@@ -41,6 +43,13 @@ enabled = true
 
 # Optional output details. The promoted model always exposes logits and
 # probabilities. Segmentation products can declare a reviewed mask threshold.
+# A generic representation product can instead use:
+# primary = "representation"
+# representation = "features"
+# dimension = 256
+# normalized = true
+# Clustering assignments/evidence belong to a downstream derived result, not
+# this model product.
 [outputs]
 primary = "class_probabilities"
 # threshold = 0.5

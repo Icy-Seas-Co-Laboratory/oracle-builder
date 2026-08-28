@@ -89,6 +89,20 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "vicreg_variance_weight": 25.0,
         "vicreg_covariance_weight": 1.0,
         "vicreg_target_std": 1.0,
+        # SimCLR protects the exported, unit-normalized encoder representation
+        # separately from its disposable contrastive projector.
+        "encoder_variance_weight": 25.0,
+        "encoder_covariance_weight": 1.0,
+        "encoder_target_std": 0.05,
+        "embedding_health": {
+            "enabled": True,
+            "sample_count": 4096,
+            "pair_count": 32768,
+            "minimum_effective_rank": 8.0,
+            "maximum_mean_pairwise_cosine": 0.95,
+            "maximum_p95_pairwise_cosine": 0.995,
+            "maximum_mean_direction_norm": 0.95,
+        },
     },
     "evidence": {
         "enabled": True,
@@ -234,17 +248,17 @@ def validate_config(config: dict[str, Any]) -> None:
         raise ValueError("preprocessing.invert must resolve to a boolean")
     task = config["run"].get("task")
     model = config["run"].get("model")
-    if task not in {"classification", "segmentation"}:
-        raise ValueError("run.task must be 'classification' or 'segmentation'")
+    if task not in {"classification", "embedding", "segmentation"}:
+        raise ValueError("run.task must be 'classification', 'embedding', or 'segmentation'")
     if not model:
         raise ValueError("run.model is required")
     if "input_shape" not in config["data"]:
         raise ValueError("data.input_shape is required")
-    if task == "classification" and "num_classes" not in config["data"]:
+    if task in {"classification", "embedding"} and "num_classes" not in config["data"]:
         raise ValueError(
             "Could not infer data.num_classes from the classification database"
         )
-    if task == "classification" and int(config.get("model", {}).get("embedding_dim", 256)) < 1:
+    if task in {"classification", "embedding"} and int(config.get("model", {}).get("embedding_dim", 256)) < 1:
         raise ValueError("model.embedding_dim must be a positive integer")
     if int(config.get("evidence", {}).get("knn_k", 5)) < 1:
         raise ValueError("evidence.knn_k must be at least 1")
@@ -337,7 +351,7 @@ def validate_config(config: dict[str, Any]) -> None:
             raise ValueError(
                 "self_supervised.method must be byol, student_teacher, simclr, or grayscale_reconstruction"
             )
-        if task != "classification" and method != "grayscale_reconstruction":
+        if task not in {"classification", "embedding"} and method != "grayscale_reconstruction":
             raise ValueError("segmentation pretraining requires method='grayscale_reconstruction'")
         if int(self_supervised.get("epochs", 10)) < 1:
             raise ValueError("self_supervised.epochs must be at least 1")
@@ -385,6 +399,53 @@ def validate_config(config: dict[str, Any]) -> None:
         target_std = float(self_supervised.get("vicreg_target_std", 1.0))
         if not np.isfinite(target_std) or target_std <= 0:
             raise ValueError("self_supervised.vicreg_target_std must be finite and positive")
+        for name in ("encoder_variance_weight", "encoder_covariance_weight"):
+            value = float(self_supervised.get(name, 0.0))
+            if not np.isfinite(value) or value < 0:
+                raise ValueError(f"self_supervised.{name} must be finite and non-negative")
+        encoder_target_std = float(self_supervised.get("encoder_target_std", 0.05))
+        if not np.isfinite(encoder_target_std) or not 0 < encoder_target_std <= 1:
+            raise ValueError(
+                "self_supervised.encoder_target_std must be finite and in (0, 1]"
+            )
+        health = self_supervised.get("embedding_health", {})
+        if not isinstance(health, dict):
+            raise ValueError("self_supervised.embedding_health must be a table")
+        health_defaults = {
+            "sample_count": 4096,
+            "pair_count": 32768,
+            "minimum_effective_rank": 8.0,
+            "maximum_mean_pairwise_cosine": 0.95,
+            "maximum_p95_pairwise_cosine": 0.995,
+            "maximum_mean_direction_norm": 0.95,
+        }
+        for name, minimum in (("sample_count", 2), ("pair_count", 1)):
+            value = health.get(name, health_defaults[name])
+            if isinstance(value, bool) or int(value) < minimum:
+                raise ValueError(
+                    f"self_supervised.embedding_health.{name} must be at least {minimum}"
+                )
+        for name in (
+            "minimum_effective_rank",
+            "maximum_mean_pairwise_cosine",
+            "maximum_p95_pairwise_cosine",
+            "maximum_mean_direction_norm",
+        ):
+            value = float(health.get(name, health_defaults[name]))
+            if not np.isfinite(value):
+                raise ValueError(f"self_supervised.embedding_health.{name} must be finite")
+        if float(health.get("minimum_effective_rank", health_defaults["minimum_effective_rank"])) <= 0:
+            raise ValueError("self_supervised.embedding_health.minimum_effective_rank must be positive")
+        for name in (
+            "maximum_mean_pairwise_cosine",
+            "maximum_p95_pairwise_cosine",
+            "maximum_mean_direction_norm",
+        ):
+            value = float(health.get(name, health_defaults[name]))
+            if not -1.0 <= value <= 1.0:
+                raise ValueError(
+                    f"self_supervised.embedding_health.{name} must be in [-1, 1]"
+                )
     if task == "segmentation" and "output_shape" not in config["data"]:
         raise ValueError("data.output_shape is required for segmentation")
     distance_mode = str(config["data"].get("candidate_distance", "none")).lower()
@@ -490,6 +551,12 @@ def resolve_config(config_path: str | Path, input_path: str | Path, run_dir: str
             )
         if "channel_mode" not in user_config.get("preprocessing", {}):
             resolved["preprocessing"]["channel_mode"] = "grayscale"
+    elif task == "embedding":
+        resolved["data"].setdefault("num_classes", 2)
+        if not resolved.get("training", {}).get("loss"):
+            resolved["training"]["loss"] = "sparse_categorical_crossentropy"
+        if "channel_mode" not in user_config.get("preprocessing", {}):
+            resolved["preprocessing"]["channel_mode"] = "grayscale"
     if resolved.get("run", {}).get("task") == "segmentation":
         from oracle_builder.datasets.legacy_roi import (
             ensure_mask_refinement_database,
@@ -516,7 +583,7 @@ def resolve_config(config_path: str | Path, input_path: str | Path, run_dir: str
             )
         expected_type = (
             "classification"
-            if resolved.get("run", {}).get("task") == "classification"
+            if resolved.get("run", {}).get("task") in {"classification", "embedding"}
             else "mask_refinement"
         )
         if dataset_info["dataset_type"] != expected_type:

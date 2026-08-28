@@ -1,6 +1,7 @@
 # High-throughput self-supervised ROI organization with spherical k-means.
 # The input must be a frozen classification Dataset V1 SQLite database. Existing
-# annotations are ignored: every ROI is used for encoder training and clustering.
+# LEGACY compatibility configuration. New runs should use
+# configs/example_embedding.toml and let downstream consumers define clusters.
 
 [run]
 task = "clustering"
@@ -81,6 +82,24 @@ collapse_embedding_spread_threshold = 0.005
 vicreg_variance_weight = 25.0
 vicreg_covariance_weight = 1.0
 vicreg_target_std = 1.0
+
+# SimCLR retains a disposable projector, but these terms protect the
+# unit-normalized encoder embedding exported to clustering and inference.
+encoder_variance_weight = 25.0
+encoder_covariance_weight = 1.0
+encoder_target_std = 0.05
+
+[self_supervised.embedding_health]
+# Product-space checks are computed from unaugmented serving embeddings before
+# the artifact is sealed. They prevent a successful projector loss from hiding
+# a narrow-cone encoder collapse.
+enabled = true
+sample_count = 4096
+pair_count = 32768
+minimum_effective_rank = 8.0
+maximum_mean_pairwise_cosine = 0.95
+maximum_p95_pairwise_cosine = 0.995
+maximum_mean_direction_norm = 0.95
 
 [self_supervised.augmentation]
 # Moderate, domain-agnostic ROI perturbations. Adjust only these values when

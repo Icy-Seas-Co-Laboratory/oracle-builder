@@ -7,7 +7,7 @@ import numpy as np
 import tensorflow as tf
 from tensorflow import keras
 
-from oracle_builder.classification.features import L2Normalization
+from oracle_builder.classification.features import L2Normalization, build_embedding_model
 from oracle_builder.products.ingest import (
     ConvertChannels,
     InvertIntensity,
@@ -72,6 +72,8 @@ def run_load_tests(run_dir: str | Path, config: dict[str, Any], initial_report: 
         report["weights_saved"] = True
         try:
             rebuilt = build_and_compile_model(config)
+            if config.get("run", {}).get("task") == "embedding":
+                rebuilt = build_embedding_model(rebuilt)
             rebuilt.load_weights(model_path / "weights.weights.h5")
             rebuilt.predict(sample, verbose=0)
             report["weights_reloaded_into_rebuilt_model"] = True
@@ -127,6 +129,8 @@ def load_model_for_run(
         errors.append(f"final.keras: {exc}")
     try:
         model = build_and_compile_model(config)
+        if config.get("run", {}).get("task") == "embedding":
+            model = build_embedding_model(model)
         model.load_weights(model_path / "weights.weights.h5")
         return model
     except Exception as exc:
@@ -164,8 +168,21 @@ class SavedModelPredictor:
         if self.embed is None:
             raise RuntimeError("SavedModel has no embed signature")
         input_name = next(iter(self.embed.structured_input_signature[1]))
-        output = self.embed(**{input_name: tf.constant(x)})
+        output = self.embed(**{input_name: tf.constant(np.asarray(x, dtype="float32"))})
         return output["features"].numpy()
+
+    def predict_embedding(self, x, verbose: int = 0):
+        del verbose
+        if self.embed is None:
+            raise RuntimeError("SavedModel has no embed signature")
+        input_name = next(iter(self.embed.structured_input_signature[1]))
+        output = self.embed(**{input_name: tf.constant(np.asarray(x, dtype="float32"))})
+        values = output.get("embedding")
+        if values is None:
+            values = output.get("features")
+        if values is None:
+            raise RuntimeError("SavedModel embed signature has no embedding output")
+        return values.numpy()
 
     def predict_outputs(self, x, verbose: int = 0):
         del verbose

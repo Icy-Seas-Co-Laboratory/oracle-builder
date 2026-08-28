@@ -2,6 +2,11 @@
 
 This guide covers choices shared by classification and mask-refinement runs.
 
+For a standalone self-supervised representation model, use
+`oracle-embed --config configs/example_embedding.toml ...`. It writes an
+embedding training record and does not fit cluster structure. The model's
+embedding can be consumed by any downstream clustering or analysis workflow.
+
 ## Training command
 
 ```bash
@@ -52,10 +57,15 @@ supported as a legacy alias.
 
 Self-supervised epoch logs report `related_cosine_similarity` for the two views
 of the same ROI and `unrelated_cosine_similarity` for views from other ROIs in
-the synchronized batch. Productive training should generally keep related
-similarity above unrelated similarity while `representation_std` remains
-healthy and `collapse_indicator` stays zero. BYOL's older `cosine_similarity`
-field remains as an alias for the related value.
+the synchronized batch. SimCLR also reports explicit `encoder_*` metrics for
+the normalized embedding exported to inference and `projector_*` metrics for
+its disposable contrastive head. Productive training should keep related
+similarity above unrelated similarity in both spaces, while the encoder keeps
+healthy spread and a low `encoder_mean_direction_norm`. SimCLR applies its
+encoder variance/covariance terms directly in this serving space; clustering
+runs additionally reject narrow-cone embeddings using effective rank and
+pairwise-cosine checks before sealing. BYOL's older `cosine_similarity` field
+remains as an alias for the related projector value.
 
 Batch-level live progress is enabled by default with
 `self_supervised.verbose = 1`. Use `0` for quiet operation or `2` for one

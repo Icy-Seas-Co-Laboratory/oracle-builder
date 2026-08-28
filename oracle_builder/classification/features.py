@@ -74,8 +74,9 @@ def build_feature_model(model: keras.Model) -> keras.Model:
 
 def build_embedding_model(model: keras.Model) -> keras.Model:
     """Return the shared classifier backbone through its fixed-size features."""
+    inputs = model.inputs[0] if getattr(model, "inputs", None) else model.input
     return keras.Model(
-        model.input,
+        inputs,
         model.get_layer(FEATURE_LAYER_NAME).output,
         name=f"{model.name}_encoder",
     )
@@ -90,8 +91,9 @@ def build_self_supervised_embedding_model(model: keras.Model) -> keras.Model:
     normalization, both to preserve magnitude information and to make variance
     regularization meaningful.
     """
+    inputs = model.inputs[0] if getattr(model, "inputs", None) else model.input
     return keras.Model(
-        model.input,
+        inputs,
         model.get_layer("embedding_projection").output,
         name=f"{model.name}_self_supervised_encoder",
     )

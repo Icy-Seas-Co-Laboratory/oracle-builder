@@ -38,6 +38,14 @@ def _reference() -> ModelReference:
 class FakeBundle:
     def __init__(self):
         self.model_reference = _reference()
+        self.execution_diagnostics = {
+            "gpu_accelerated": False,
+            "accelerator": "cpu",
+            "device_type": "CPU",
+            "device_name": "/device:CPU:0",
+            "device_count": 0,
+            "source": "test",
+        }
 
     def predict_batch(self, items):
         result_set = InferenceResultSet(model=self.model_reference)
@@ -149,9 +157,14 @@ def test_inference_api_lists_models_and_returns_npz(tmp_path: Path):
 
     assert catalog.status_code == 200
     assert catalog.json()["models"][0]["model"]["artifact_id"] == bundle.model_reference.artifact_id
+    catalog_execution = catalog.json()["models"][0]["runtime"]["execution"]
+    assert catalog_execution["accelerator"] in {"gpu", "cpu"}
+    assert isinstance(catalog_execution["gpu_accelerated"], bool)
     assert response.status_code == 200
     decoded = decode_inference_result(response.content)
     assert decoded["counts"]["succeeded"] == 1
+    assert decoded["execution"] == bundle.execution_diagnostics
+    assert decoded["parameters"]["execution"] == bundle.execution_diagnostics
     np.testing.assert_array_equal(decoded["results"][0]["output"]["mask"], np.eye(4, dtype="uint8"))
 
 
