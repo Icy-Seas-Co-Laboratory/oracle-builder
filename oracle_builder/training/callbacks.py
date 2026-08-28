@@ -6,6 +6,7 @@ from typing import Any
 from tensorflow import keras
 
 from oracle_builder.training.logging_callbacks import SQLiteMetricLogger
+from oracle_builder.training.status import RichTrainingStatusCallback
 
 
 def build_callbacks(
@@ -16,7 +17,16 @@ def build_callbacks(
     *,
     artifact_id: str | None = None,
 ):
-    callbacks: list[keras.callbacks.Callback] = [SQLiteMetricLogger(training_log, run_id)]
+    callbacks: list[keras.callbacks.Callback] = [
+        SQLiteMetricLogger(training_log, run_id),
+        RichTrainingStatusCallback(
+            phase="Supervised training",
+            epochs=int(config.get("training", {}).get("epochs", 10)),
+            display=str(config.get("training", {}).get("display", "rich")),
+            training_log=training_log,
+            run_id=run_id,
+        ),
+    ]
     callback_config = config.get("callbacks", {})
     output_config = config.get("output", {})
     monitor = callback_config.get("checkpoint_monitor", "val_loss")

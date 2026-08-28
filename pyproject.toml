@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "oracle-builder"
-version = "0.1.8"
+version = "0.1.9"
 description = "A small file-based TensorFlow/Keras experimentation tool."
 requires-python = ">=3.10"
 dependencies = [
@@ -20,6 +20,7 @@ dependencies = [
   "scipy",
   "PyYAML",
   "fastapi>=0.141.1",
+  "rich>=13",
 ]
 
 [project.scripts]

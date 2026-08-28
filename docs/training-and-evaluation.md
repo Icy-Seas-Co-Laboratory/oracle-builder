@@ -67,9 +67,16 @@ runs additionally reject narrow-cone embeddings using effective rank and
 pairwise-cosine checks before sealing. BYOL's older `cosine_similarity` field
 remains as an alias for the related projector value.
 
-Batch-level live progress is enabled by default with
-`self_supervised.verbose = 1`. Use `0` for quiet operation or `2` for one
-completed line per epoch.
+Training uses a shared Rich live status board by default for both supervised
+and self-supervised runs. It shows epoch and batch progress, elapsed/remaining
+time, learning rate, and the reported scalar metrics without emitting a line
+per batch. Captured or non-interactive consoles receive one compact completion
+line per epoch instead. Full metrics remain available in the run SQLite log,
+`events.jsonl`, `metrics.jsonl`, CSV, and JSON artifacts.
+
+Use `[training] display = "text"` for explicit epoch text, or `display = "off"`
+to suppress console status. The legacy `self_supervised.verbose` setting remains
+supported: `0` is quiet and `2` selects text output.
 
 ## Streaming and multiple GPUs
 

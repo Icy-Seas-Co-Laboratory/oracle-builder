@@ -52,6 +52,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "learning_rate": 0.001,
         "loss": None,
         "metrics": ["accuracy"],
+        # Rich is the default terminal UI; text is a concise one-line-per-epoch
+        # alternative for captured logs, and off suppresses console status.
+        "display": "rich",
         "class_weights": {
             "mode": "effective_number",
             "beta": 0.999,
@@ -254,6 +257,10 @@ def validate_config(config: dict[str, Any]) -> None:
         raise ValueError("run.model is required")
     if "input_shape" not in config["data"]:
         raise ValueError("data.input_shape is required")
+    if str(config.get("training", {}).get("display", "rich")).lower() not in {
+        "rich", "text", "off"
+    }:
+        raise ValueError("training.display must be 'rich', 'text', or 'off'")
     if task in {"classification", "embedding"} and "num_classes" not in config["data"]:
         raise ValueError(
             "Could not infer data.num_classes from the classification database"

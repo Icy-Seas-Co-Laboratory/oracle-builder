@@ -21,6 +21,7 @@ from oracle_builder.data.sqlite_dataset import resize_array_to_shape
 from oracle_builder.registry import get_model_builder
 from oracle_builder.training.augmentation import augment_batch
 from oracle_builder.training.logging_callbacks import log_event, write_history_jsonl
+from oracle_builder.training.status import RichTrainingStatusCallback
 
 
 DEFAULT_VIEW_AUGMENTATION = {
@@ -44,6 +45,16 @@ def _self_supervised_fit_verbose(settings: dict[str, Any]) -> int:
     if isinstance(value, bool) or value not in {0, 1, 2}:
         raise ValueError("self_supervised.verbose must be 0, 1, or 2")
     return int(value)
+
+
+def _self_supervised_display(config: dict[str, Any], settings: dict[str, Any]) -> str:
+    """Map the legacy SSL verbosity knob onto the shared display modes."""
+    verbose = _self_supervised_fit_verbose(settings)
+    if verbose == 0:
+        return "off"
+    if verbose == 2:
+        return "text"
+    return str(config.get("training", {}).get("display", "rich")).lower()
 
 
 def make_self_supervised_dataset(x: np.ndarray, config: dict[str, Any]):
@@ -298,12 +309,6 @@ def run_grayscale_reconstruction_self_supervised(
     foreground_weight = float(settings.get("reconstruction_foreground_weight", 4.0))
     epochs = int(settings.get("epochs", 10))
     learning_rate = float(settings.get("learning_rate", 0.001))
-    print(
-        "Self-supervised grayscale reconstruction: "
-        f"epochs={epochs}, learning_rate={learning_rate:g}, "
-        f"foreground_weight={foreground_weight:g}, reconstruction_head=linear",
-        flush=True,
-    )
     with strategy.scope():
         pre_model = get_model_builder(config["run"]["model"])(pre_config)
         pre_model.compile(
@@ -329,12 +334,12 @@ def run_grayscale_reconstruction_self_supervised(
         epochs=epochs,
         verbose=0,
         callbacks=[
-            SelfSupervisedStatusCallback(
-                method="grayscale_reconstruction",
+            RichTrainingStatusCallback(
+                phase="SSL · grayscale reconstruction",
                 epochs=epochs,
                 training_log=training_log,
                 run_id=run_id,
-                verbose=_self_supervised_fit_verbose(settings),
+                display=_self_supervised_display(config, settings),
             )
         ],
     )
@@ -1076,12 +1081,6 @@ def run_self_supervised_training(
                 "SimCLR requires at least two samples per synchronized replica; "
                 f"global batch size is {batch_size} across {replicas} replicas"
             )
-    print(
-        "Self-supervised training "
-        f"{method}: epochs={int(settings.get('epochs', 10))}, "
-        f"learning_rate={float(settings.get('learning_rate', 0.001)):g}",
-        flush=True,
-    )
     with strategy.scope():
         pretrainer = (
             SimCLRPretrainer(classifier, config)
@@ -1102,12 +1101,12 @@ def run_self_supervised_training(
         epochs=epochs,
         verbose=0,
         callbacks=[
-            SelfSupervisedStatusCallback(
-                method=method,
+            RichTrainingStatusCallback(
+                phase=f"SSL · {method.upper()}",
                 epochs=epochs,
                 training_log=training_log,
                 run_id=run_id,
-                verbose=_self_supervised_fit_verbose(settings),
+                display=_self_supervised_display(config, settings),
             )
         ],
     )

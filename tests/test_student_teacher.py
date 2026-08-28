@@ -181,13 +181,13 @@ def test_student_teacher_pretraining_updates_shared_classifier_encoder(
     history = run_student_teacher_pretraining(classifier, dataset, config, tmp_path)
 
     output = capsys.readouterr().out
-    assert f"[self-supervised {method} 1/1] started" in output
-    assert f"[self-supervised {method} 1/1] completed" in output
-    # Captured output must not contain one progress line per batch. Interactive
-    # terminals use carriage-return updates; non-TTY logs remain epoch-level.
-    assert output.count("[self-supervised") == 2
+    assert f"[SSL · {method.upper()}] epoch 1/1 completed" in output
+    assert "loss=" in output
+    # Captured output remains one concise completion record per epoch; Rich Live
+    # is intentionally reserved for interactive terminals.
+    assert output.count("\n") == 1
     assert "related_cosine_similarity=" in output
-    assert "unrelated_cosine_similarity=" in output
+    assert "+" in output and "more" in output
 
     after = classifier.get_layer("embedding_projection").get_weights()[0]
     assert "loss" in history.history

@@ -206,7 +206,9 @@ def train_model(
             initial_epoch=initial_epoch,
             epochs=total_epochs,
             callbacks=callbacks,
-            verbose=2 if config.get("debug") else 1,
+            # RichTrainingStatusCallback owns console rendering. Keeping Keras
+            # quiet prevents its batch progress output from competing with it.
+            verbose=0,
         )
     else:
         print("Supervised epochs already complete; continuing finalization.", flush=True)
