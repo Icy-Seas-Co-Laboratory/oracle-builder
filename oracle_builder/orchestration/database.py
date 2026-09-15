@@ -63,6 +63,21 @@ CREATE TABLE IF NOT EXISTS comparisons (
   selection_json TEXT NOT NULL, protocol_json TEXT NOT NULL,
   created_at TEXT NOT NULL, updated_at TEXT NOT NULL
 );
+-- Comparison groups are deliberately permissive: a group records a user's
+-- relationship claim, while the service reports protocol compatibility.
+CREATE TABLE IF NOT EXISTS comparison_groups (
+  comparison_group_id TEXT PRIMARY KEY, name TEXT NOT NULL,
+  description TEXT NOT NULL, relationship_label TEXT NOT NULL,
+  baseline_artifact_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS comparison_group_members (
+  comparison_group_id TEXT NOT NULL REFERENCES comparison_groups(comparison_group_id) ON DELETE CASCADE,
+  artifact_id TEXT NOT NULL REFERENCES artifacts(artifact_id), ordinal INTEGER NOT NULL,
+  relationship_label TEXT, note TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY (comparison_group_id, artifact_id),
+  UNIQUE(comparison_group_id, ordinal)
+);
+CREATE INDEX IF NOT EXISTS comparison_group_members_artifact_idx ON comparison_group_members(artifact_id);
 """
 
 

@@ -56,7 +56,7 @@ def test_dispatch_and_reconcile_keeps_orchestrator_job_identity(tmp_path, monkey
     model.write_bytes(b"placeholder")
     info = workspace / "external.toml"
     info.write_text("[product]\nname = 'External'\n")
-    orchestrator = Orchestrator(tmp_path / "orchestrator.sqlite", workspace_root=workspace)
+    orchestrator = Orchestrator(tmp_path / "orchestrator.sqlite", workspace_root=workspace, artifact_root=tmp_path / "artifacts")
     endpoint = orchestrator.register_compute_endpoint(name="local", base_url="http://oracle-serve:8100")
     experiment = orchestrator.create_model_import(name="external", model_path=model, info_path=info)
     specification = orchestrator.specifications(experiment["experiment_id"])[0]
@@ -162,7 +162,7 @@ def test_dispatch_preflight_explains_missing_gpu_capacity(tmp_path, monkeypatch)
     model.write_bytes(b"placeholder")
     info = workspace / "external.toml"
     info.write_text("[product]\nname = 'External'\n")
-    orchestrator = Orchestrator(tmp_path / "orchestrator.sqlite", workspace_root=workspace)
+    orchestrator = Orchestrator(tmp_path / "orchestrator.sqlite", workspace_root=workspace, artifact_root=tmp_path / "artifacts")
     endpoint = orchestrator.register_compute_endpoint(name="cpu", base_url="http://compute:8100")
     experiment = orchestrator.create_model_import(name="external", model_path=model, info_path=info, resources={"gpu_count": 1})
     specification = orchestrator.specifications(experiment["experiment_id"])[0]
@@ -315,6 +315,22 @@ def test_experiment_results_and_persisted_comparison_use_artifact_metrics(tmp_pa
     with pytest.raises(ValueError, match="different dataset revision"):
         orchestrator.create_comparison(name="invalid", artifact_ids=[artifact_ids[0], incompatible["artifact_id"]])
 
+    # Manual groups preserve the user's relationship even when protocols differ;
+    # compatibility is advice for interpreting the resulting metric matrix.
+    group = orchestrator.create_comparison_group(
+        name="baseline versus candidate",
+        relationship_label="ablation",
+        baseline_artifact_id=artifact_ids[0],
+        members=[
+            {"artifact_id": artifact_ids[0], "relationship_label": "baseline"},
+            {"artifact_id": incompatible["artifact_id"], "relationship_label": "candidate", "note": "new data"},
+        ],
+    )
+    assert not group["compatibility"]["compatible"]
+    assert group["members"][1]["note"] == "new data"
+    assert group["metrics"]["matrix"][1]["values"]["accuracy"]["delta"] == pytest.approx(0.15)
+    assert len(orchestrator.artifact_catalog()) == 3
+
     from fastapi.testclient import TestClient
     from oracle_builder.orchestration.api import create_app
     with TestClient(create_app(orchestrator)) as client:
@@ -328,3 +344,46 @@ def test_experiment_results_and_persisted_comparison_use_artifact_metrics(tmp_pa
         saved = client.post("/v1/comparisons", json={"name": "API comparison", "artifact_ids": artifact_ids})
         assert saved.status_code == 201
         assert len(client.get("/v1/comparisons").json()["comparisons"]) == 2
+
+
+def test_dataset_previews_and_artifact_inspector_are_bounded(tmp_path):
+    import sqlite3
+    from fastapi.testclient import TestClient
+    from oracle_builder.data.sqlite_dataset import create_synthetic_classification
+    from oracle_builder.orchestration.api import create_app
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "source.toml").write_text("[run]\ntask = 'classification'\n")
+    dataset_path = workspace / "samples.sqlite"
+    create_synthetic_classification(dataset_path, n=3, shape=(12, 12, 1))
+    with sqlite3.connect(dataset_path) as db:
+        db.execute("UPDATE dataset SET lifecycle='frozen'")
+        db.commit()
+    orchestrator = Orchestrator(
+        tmp_path / "orchestrator.sqlite", workspace_root=workspace,
+        artifact_root=tmp_path / "artifacts",
+    )
+    dataset = orchestrator.ingest_dataset(dataset_path)
+    detail = orchestrator.dataset_detail(dataset["dataset_id"])
+    assert detail["counts"]["items"] == 3
+    previews = orchestrator.dataset_previews(dataset["dataset_id"], limit=2)
+    assert previews["total"] == 3
+    assert len(previews["items"]) == 2
+    assert orchestrator.dataset_preview_image(dataset["dataset_id"], previews["items"][0]["item_id"]).startswith(b"\xff\xd8")
+
+    artifact = _create_sealed_product(
+        tmp_path / "artifacts" / "artifact", workspace / "source.toml", artifact_type="model_run",
+        metrics={"accuracy": 0.9}, dataset_fingerprint=dataset["fingerprint_sha256"],
+    )
+    orchestrator.scan(tmp_path / "artifacts" / "artifact")
+    # These inspector-only fixtures are intentionally added after the sealed
+    # artifact has been catalogued; production runs seal them before scanning.
+    (tmp_path / "artifacts" / "artifact" / "metrics" / "history.csv").write_text("epoch,loss,accuracy\n0,1.0,0.5\n1,0.5,0.9\n")
+    (tmp_path / "artifacts" / "artifact" / "model" / "model_summary.txt").write_text("Model: test\n")
+    assert orchestrator.artifact_history(artifact["artifact_id"])["columns"] == ["epoch", "loss", "accuracy"]
+    assert orchestrator.artifact_detail(artifact["artifact_id"])["architecture"]["available"]
+    with TestClient(create_app(orchestrator)) as client:
+        assert client.get(f"/v1/datasets/{dataset['dataset_id']}/detail").status_code == 200
+        assert client.get(f"/v1/datasets/{dataset['dataset_id']}/previews/{previews['items'][0]['item_id']}").headers["content-type"] == "image/jpeg"
+        assert client.get(f"/v1/artifacts/{artifact['artifact_id']}/history").json()["rows"][1]["accuracy"] == 0.9

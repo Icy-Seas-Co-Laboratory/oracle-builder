@@ -17,6 +17,9 @@
 	let uploadKind: 'datasets' | 'configs' | 'models' = 'datasets';
 	let uploadFile: File | null = null;
 	let uploading = false;
+	let registeringDataset = false;
+	let datasetMessage = '';
+	let datasetError = '';
 	let datasetPath = '';
 	let assetPath = '';
 	let recipeName = '';
@@ -29,12 +32,17 @@
 	const fail = (error: unknown, fallback: string) => onfailure(error instanceof Error ? error.message : fallback);
 
 	async function ingestDataset() {
+		if (!datasetPath.trim()) return;
+		registeringDataset = true; datasetMessage = ''; datasetError = '';
 		try {
 			const dataset = await api.ingestDataset(datasetPath);
 			datasetPath = '';
-			onuseDataset(String(dataset.dataset_id));
 			await onchanged(`Registered dataset ${display(dataset.name)}.`);
-		} catch (error) { fail(error, 'Dataset registration failed.'); }
+			datasetMessage = `Registered ${display(dataset.name)}. It is now available in Datasets and New run.`;
+		} catch (error) {
+			datasetError = error instanceof Error ? error.message : 'Dataset registration failed.';
+			fail(error, 'Dataset registration failed.');
+		} finally { registeringDataset = false; }
 	}
 
 	async function createRecipe() {
@@ -94,7 +102,7 @@
 <section class="panel upload-panel"><div><p class="eyebrow">UPLOAD</p><h2>Stage a new asset</h2><p>Uploads enter the Orchestrator-owned staging area before registration or validation.</p></div><div class="upload-controls"><label>Asset type<select bind:value={uploadKind}><option value="datasets">Frozen dataset (.sqlite)</option><option value="configs">Training config (.toml)</option><option value="models">Model file (.keras, .h5, .hdf5)</option></select></label><label class="file-input">Choose file<input type="file" accept={uploadKind === 'datasets' ? '.sqlite' : uploadKind === 'configs' ? '.toml' : '.keras,.h5,.hdf5'} on:change={chooseUpload} /><span>{uploadFile?.name ?? 'No file selected'}</span></label><button disabled={!uploadFile || uploading} on:click={uploadAsset}>{uploading ? 'Uploading…' : 'Upload asset'}</button></div></section>
 
 <div class="two-col">
-	<section class="panel"><div class="panel-head"><div><p class="eyebrow">DATASET</p><h2>Register a frozen dataset</h2><p>Registration indexes the SQLite contract without copying or rewriting it.</p></div></div><form on:submit|preventDefault={ingestDataset}><label>Frozen dataset path<div class="path-control"><input bind:value={datasetPath} required /><button class="secondary small" type="button" on:click={() => explorerTarget = 'dataset'}>Browse</button></div></label><button>Register dataset</button></form></section>
+	<section class="panel"><div class="panel-head"><div><p class="eyebrow">DATASET</p><h2>Register a frozen dataset</h2><p>Registration indexes the SQLite contract without copying or rewriting it.</p></div></div><form on:submit|preventDefault={ingestDataset}><label>Frozen dataset path<div class="path-control"><input bind:value={datasetPath} required disabled={registeringDataset} /><button class="secondary small" type="button" on:click={() => explorerTarget = 'dataset'} disabled={registeringDataset}>Browse</button></div></label><button disabled={!datasetPath.trim() || registeringDataset}>{registeringDataset ? 'Registering…' : 'Register dataset'}</button></form>{#if datasetMessage}<p class="inline-success" role="status">{datasetMessage}</p>{/if}{#if datasetError}<p class="inline-error" role="alert">{datasetError}</p>{/if}</section>
 	<section class="panel"><div class="panel-head"><div><p class="eyebrow">RECIPE</p><h2>Validate a training recipe</h2><p>Name and validate a reusable TOML training configuration.</p></div></div><form on:submit|preventDefault={createRecipe}><label>Recipe name<input bind:value={recipeName} required /></label><label>Configuration path<div class="path-control"><input bind:value={recipeConfigPath} required /><button class="secondary small" type="button" on:click={() => explorerTarget = 'config'}>Browse</button></div></label><button>Create recipe</button></form></section>
 </div>
 

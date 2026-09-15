@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import io
 import json
 import sqlite3
 import urllib.error
@@ -11,7 +12,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+from PIL import Image
+
 from oracle_data_contracts.datasets import dataset_fingerprint, read_dataset_info
+from oracle_builder.data.decoders import decode_blob
 from oracle_builder.config import DEFAULT_CONFIG, deep_merge, load_toml
 from oracle_builder.orchestration.database import connect
 
@@ -70,6 +75,83 @@ class Orchestrator:
 
     def _connection(self) -> sqlite3.Connection:
         return connect(self.database)
+
+    @staticmethod
+    def _architecture_config_path(architecture: str) -> Path:
+        """Return the maintained starting TOML for a supported architecture."""
+        root = Path(__file__).resolve().parents[2] / "configs"
+        paths = {
+            "simple_cnn": root / "classification_defaults" / "simple_cnn.toml",
+            "resnet_like": root / "classification_defaults" / "resnet_like.toml",
+            "densenet_like": root / "classification_defaults" / "densenet_like.toml",
+            "resnet": root / "classification_defaults" / "resnet.toml",
+            "resnet18": root / "classification_defaults" / "resnet.toml",
+            "resnet34": root / "classification_defaults" / "resnet.toml",
+            "resnet50": root / "classification_defaults" / "resnet.toml",
+            "resnet101": root / "classification_defaults" / "resnet.toml",
+            "resnet152": root / "classification_defaults" / "resnet.toml",
+            "densenet": root / "classification_defaults" / "densenet.toml",
+            "densenet121": root / "classification_defaults" / "densenet.toml",
+            "densenet169": root / "classification_defaults" / "densenet.toml",
+            "densenet201": root / "classification_defaults" / "densenet.toml",
+            "efficientnet": root / "classification_defaults" / "efficientnet.toml",
+            "efficientnet_b0": root / "classification_defaults" / "efficientnet.toml",
+            "efficientnet_b1": root / "classification_defaults" / "efficientnet.toml",
+            "efficientnet_b2": root / "classification_defaults" / "efficientnet.toml",
+            "efficientnet_b3": root / "classification_defaults" / "efficientnet.toml",
+            "efficientnet_b4": root / "classification_defaults" / "efficientnet.toml",
+            "efficientnet_b5": root / "classification_defaults" / "efficientnet.toml",
+            "efficientnet_b6": root / "classification_defaults" / "efficientnet.toml",
+            "efficientnet_b7": root / "classification_defaults" / "efficientnet.toml",
+            "unet": root / "example_segmentation_unet.toml",
+            "residual_unet": root / "example_segmentation_residual_unet.toml",
+            "unet_plus_plus": root / "example_segmentation_unet_plus_plus.toml",
+        }
+        try:
+            return paths[architecture]
+        except KeyError as exc:
+            raise ValueError(f"Unsupported architecture: {architecture}") from exc
+
+    def model_setup(self, architecture: str) -> dict[str, Any]:
+        """Expose the maintained TOML defaults as a safe UI setup schema."""
+        source = load_toml(self._architecture_config_path(architecture))
+        source.setdefault("run", {})["model"] = architecture
+        config = deep_merge(DEFAULT_CONFIG, source)
+        fields: list[dict[str, Any]] = []
+
+        def collect(value: dict[str, Any], prefix: str) -> None:
+            for key, item in value.items():
+                path = f"{prefix}.{key}"
+                if isinstance(item, (str, int, float, bool)):
+                    fields.append({"path": path, "value": item, "type": "boolean" if isinstance(item, bool) else "number" if isinstance(item, (int, float)) else "text"})
+                elif isinstance(item, list):
+                    fields.append({"path": path, "value": item, "type": "list"})
+
+        # These are the knobs users can safely understand before later advanced
+        # configuration support. They still come directly from each TOML.
+        for section in ("data", "model", "training"):
+            collect(config.get(section, {}), section)
+        return {"architecture": architecture, "task": config["run"].get("task"), "config": config, "fields": fields}
+
+    def model_preview(self, *, architecture: str, dataset_id: str, overrides: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Build a disposable model for an honest pre-run structural summary."""
+        dataset = self.dataset(dataset_id)
+        if dataset is None:
+            raise KeyError(dataset_id)
+        setup = self.model_setup(architecture)
+        config = deep_merge(setup["config"], overrides or {})
+        config.setdefault("run", {})["model"] = architecture
+        with sqlite3.connect(dataset["path"]) as db:
+            if config["run"].get("task") == "classification":
+                config.setdefault("data", {})["num_classes"] = int(db.execute("SELECT count(*) FROM classification_labels").fetchone()[0])
+        try:
+            from oracle_builder.registry import get_model_builder
+            model = get_model_builder(architecture)(config)
+            lines: list[str] = []
+            model.summary(print_fn=lines.append)
+            return {"architecture": architecture, "input_shape": list(model.input_shape), "output_shape": list(model.output_shape), "parameters": int(model.count_params()), "layers": len(model.layers), "summary": "\n".join(lines[:35]), "config": config}
+        except Exception as exc:  # A preview must never prevent configuring a run.
+            return {"architecture": architecture, "error": str(exc), "config": config}
 
     def register_compute_endpoint(self, *, name: str, base_url: str) -> dict[str, Any]:
         normalized = base_url.strip().rstrip("/")
@@ -230,7 +312,7 @@ class Orchestrator:
             db.execute("INSERT INTO recipes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (recipe_id, name.strip() or source.stem, description, str(source), digest, task, model, _json(summary), now, now))
         return self.recipe(recipe_id)  # type: ignore[return-value]
 
-    def create_training_experiment(self, *, name: str, dataset_id: str, recipe_ids: list[str], seeds: list[int], description: str = "", resources: dict[str, Any] | None = None) -> dict[str, Any]:
+    def create_training_experiment(self, *, name: str, dataset_id: str, recipe_ids: list[str], seeds: list[int], description: str = "", resources: dict[str, Any] | None = None, config_overrides: dict[str, Any] | None = None) -> dict[str, Any]:
         if not name.strip() or not recipe_ids or not seeds:
             raise ValueError("Training experiments require a name, at least one recipe, and at least one seed")
         dataset = self.dataset(dataset_id)
@@ -243,7 +325,14 @@ class Orchestrator:
             raise KeyError("One or more recipes were not found")
         selected = [recipe for recipe in recipes if recipe is not None]
         experiment_id, now = str(uuid.uuid4()), _now()
-        plan = {"kind": "training", "dataset_id": dataset_id, "recipe_ids": recipe_ids, "seeds": seeds, "resources": resources or {}}
+        if config_overrides is not None and not isinstance(config_overrides, dict):
+            raise ValueError("Configuration overrides must be an object")
+        overrides = config_overrides or {}
+        allowed_override_sections = {"run", "data", "model", "training", "augmentation", "callbacks", "output"}
+        unknown_sections = set(overrides) - allowed_override_sections
+        if unknown_sections or any(not isinstance(value, dict) for value in overrides.values()):
+            raise ValueError("Configuration overrides may contain only object-valued run, data, model, training, augmentation, callbacks, or output sections")
+        plan = {"kind": "training", "dataset_id": dataset_id, "recipe_ids": recipe_ids, "seeds": seeds, "resources": resources or {}, "config_overrides": overrides}
         config_dir = self.artifact_root / "experiments" / experiment_id / "configs"
         config_dir.mkdir(parents=True, exist_ok=True)
         with self._connection() as db:
@@ -253,7 +342,7 @@ class Orchestrator:
                 for seed in seeds:
                     ordinal += 1
                     specification_id = str(uuid.uuid4())
-                    source = load_toml(recipe["config_path"])
+                    source = deep_merge(load_toml(recipe["config_path"]), overrides)
                     source.setdefault("run", {})["seed"] = int(seed)
                     generated = config_dir / f"{ordinal:03d}-{recipe['recipe_id'][:8]}-seed-{seed}.toml"
                     import tomli_w
@@ -494,6 +583,155 @@ class Orchestrator:
         return path
 
     @staticmethod
+    def _json_file(path: Path) -> dict[str, Any] | list[Any] | None:
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            return loaded if isinstance(loaded, (dict, list)) else None
+        except (OSError, json.JSONDecodeError):
+            return None
+
+    def dataset_detail(self, dataset_id: str) -> dict[str, Any]:
+        """Summarize a registered dataset without returning item payloads."""
+        dataset = self.dataset(dataset_id)
+        if dataset is None:
+            raise KeyError(dataset_id)
+        path = Path(dataset["path"])
+        with sqlite3.connect(path) as db:
+            db.row_factory = sqlite3.Row
+            info = read_dataset_info(db)
+            total = int(db.execute("SELECT count(*) FROM dataset_items").fetchone()[0])
+            asset_count = int(db.execute("SELECT count(*) FROM assets").fetchone()[0])
+            if info["dataset_type"] == "classification":
+                labels = [dict(row) for row in db.execute("""SELECT l.label_id,l.class_index,l.name,count(ca.annotation_id) AS item_count
+                    FROM classification_labels l LEFT JOIN classification_annotations ca
+                    ON ca.label_id=l.label_id AND ca.is_current=1 AND ca.status='accepted'
+                    GROUP BY l.label_id ORDER BY l.class_index""")]
+            else:
+                labels = []
+            annotations_table = "classification_annotations" if info["dataset_type"] == "classification" else "mask_annotations"
+            annotated = int(db.execute(f"SELECT count(*) FROM {annotations_table} WHERE is_current=1 AND status='accepted'").fetchone()[0])
+        return {
+            "dataset": dataset,
+            "info": info,
+            "counts": {"items": total, "assets": asset_count, "current_annotations": annotated},
+            "labels": labels,
+            "preview": {"available": total > 0, "max_limit": 100, "max_size": 1024},
+        }
+
+    def dataset_previews(self, dataset_id: str, *, offset: int = 0, limit: int = 24) -> dict[str, Any]:
+        """List page-sized preview metadata; image bytes remain behind item URLs."""
+        dataset = self.dataset(dataset_id)
+        if dataset is None:
+            raise KeyError(dataset_id)
+        offset, limit = max(0, offset), min(max(1, limit), 100)
+        with sqlite3.connect(dataset["path"]) as db:
+            db.row_factory = sqlite3.Row
+            info = read_dataset_info(db)
+            total = int(db.execute("SELECT count(*) FROM dataset_items").fetchone()[0])
+            if info["dataset_type"] == "classification":
+                query = """SELECT di.item_id,di.source_key,di.metadata_json,a.shape_json,l.name AS label
+                    FROM dataset_items di JOIN classification_items ci ON ci.item_id=di.item_id
+                    JOIN assets a ON a.asset_id=ci.image_asset_id
+                    LEFT JOIN classification_annotations ca ON ca.item_id=di.item_id AND ca.is_current=1 AND ca.status='accepted'
+                    LEFT JOIN classification_labels l ON l.label_id=ca.label_id
+                    ORDER BY di.item_id LIMIT ? OFFSET ?"""
+            else:
+                query = """SELECT di.item_id,di.source_key,di.metadata_json,a.shape_json,NULL AS label
+                    FROM dataset_items di JOIN mask_refinement_items mi ON mi.item_id=di.item_id
+                    JOIN assets a ON a.asset_id=mi.image_asset_id ORDER BY di.item_id LIMIT ? OFFSET ?"""
+            items = []
+            for row in db.execute(query, (limit, offset)):
+                item = dict(row)
+                shape = json.loads(item.pop("shape_json") or "null")
+                item["shape"] = shape
+                item["metadata"] = json.loads(item.pop("metadata_json") or "{}")
+                item["image_url"] = f"/api/v1/datasets/{dataset_id}/previews/{item['item_id']}"
+                if info["dataset_type"] == "mask_refinement":
+                    item["mask_url"] = f"/api/v1/datasets/{dataset_id}/previews/{item['item_id']}?kind=mask"
+                    item["candidate_mask_url"] = f"/api/v1/datasets/{dataset_id}/previews/{item['item_id']}?kind=candidate_mask"
+                items.append(item)
+        return {"dataset_id": dataset_id, "offset": offset, "limit": limit, "total": total, "items": items}
+
+    def dataset_preview_image(self, dataset_id: str, item_id: str, *, kind: str = "image", max_size: int = 320) -> bytes:
+        """Decode one local dataset asset and emit a bounded JPEG preview."""
+        dataset = self.dataset(dataset_id)
+        if dataset is None:
+            raise KeyError(dataset_id)
+        if kind not in {"image", "mask", "candidate_mask"}:
+            raise ValueError("Preview kind must be image, mask, or candidate_mask")
+        max_size = min(max(32, max_size), 1024)
+        with sqlite3.connect(dataset["path"]) as db:
+            db.row_factory = sqlite3.Row
+            info = read_dataset_info(db)
+            if info["dataset_type"] == "classification" and kind != "image":
+                raise FileNotFoundError(item_id)
+            if info["dataset_type"] == "classification":
+                query = """SELECT a.payload,a.encoding,a.shape_json,a.external_uri FROM classification_items ci
+                    JOIN assets a ON a.asset_id=ci.image_asset_id WHERE ci.item_id=?"""
+            elif kind == "image":
+                query = """SELECT a.payload,a.encoding,a.shape_json,a.external_uri FROM mask_refinement_items mi
+                    JOIN assets a ON a.asset_id=mi.image_asset_id WHERE mi.item_id=?"""
+            elif kind == "candidate_mask":
+                query = """SELECT a.payload,a.encoding,a.shape_json,a.external_uri FROM mask_refinement_items mi
+                    JOIN assets a ON a.asset_id=mi.candidate_mask_asset_id WHERE mi.item_id=?"""
+            else:
+                query = """SELECT a.payload,a.encoding,a.shape_json,a.external_uri FROM mask_annotations ma
+                    JOIN assets a ON a.asset_id=ma.mask_asset_id WHERE ma.item_id=? AND ma.is_current=1 AND ma.status='accepted'"""
+            row = db.execute(query, (item_id,)).fetchone()
+        if row is None or row["payload"] is None:
+            # External asset URIs are intentionally not fetched by the API.
+            raise FileNotFoundError(item_id)
+        array = np.asarray(decode_blob(row["payload"], row["encoding"], row["shape_json"]))
+        if array.ndim == 3 and array.shape[-1] == 1:
+            array = array[..., 0]
+        if array.ndim not in {2, 3}:
+            raise ValueError("Dataset asset is not an image array")
+        array = np.nan_to_num(array, nan=0.0, posinf=1.0, neginf=0.0)
+        if array.dtype.kind == "f":
+            low, high = float(array.min(initial=0)), float(array.max(initial=1))
+            array = ((array - low) / (high - low) * 255 if high > low else array * 255).clip(0, 255).astype("uint8")
+        else:
+            array = np.clip(array, 0, 255).astype("uint8")
+        image = Image.fromarray(array)
+        if image.mode not in {"L", "RGB"}:
+            image = image.convert("RGB")
+        image.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
+        output = io.BytesIO()
+        image.save(output, format="JPEG", quality=85, optimize=True)
+        return output.getvalue()
+
+    def artifact_history(self, artifact_id: str, *, limit: int = 500) -> dict[str, Any]:
+        artifact = self.artifact(artifact_id)
+        if artifact is None:
+            raise KeyError(artifact_id)
+        limit = min(max(1, limit), 2000)
+        root = Path(artifact["path"])
+        rows = self._evidence_csv(root / "metrics" / "history.csv", limit=limit)
+        columns = list(rows[0]) if rows else []
+        return {"artifact_id": artifact_id, "rows": rows, "columns": columns, "limit": limit,
+                "truncated": len(rows) == limit and (root / "metrics" / "history.csv").is_file()}
+
+    def artifact_detail(self, artifact_id: str) -> dict[str, Any]:
+        """Read-only inspector payload for a sealed artifact; all large media stays separate."""
+        artifact = self.artifact(artifact_id)
+        if artifact is None:
+            raise KeyError(artifact_id)
+        root = Path(artifact["path"])
+        model_summary = None
+        try:
+            model_summary = (root / "model" / "model_summary.txt").read_text(encoding="utf-8")[:100_000]
+        except OSError:
+            pass
+        runtime = self._json_file(root / "provenance" / "runtime.json")
+        config = self._json_file(root / "config" / "resolved.json")
+        contract = self._json_file(root / "model" / "contract.json")
+        return {"artifact": self._artifact_result(artifact), "manifest": artifact["manifest"],
+                "runtime": runtime, "config": config, "model_contract": contract,
+                "architecture": {"summary": model_summary, "available": model_summary is not None},
+                "history_url": f"/api/v1/artifacts/{artifact_id}/history",
+                "evidence_url": f"/api/v1/artifacts/{artifact_id}/evidence"}
+
+    @staticmethod
     def _comparison_check(results: list[dict[str, Any]]) -> dict[str, Any]:
         reasons: list[str] = []
         if len(results) < 2:
@@ -554,6 +792,12 @@ class Orchestrator:
         }
 
     def create_comparison(self, *, name: str, artifact_ids: list[str], description: str = "") -> dict[str, Any]:
+        """Create a legacy comparison.
+
+        The historical endpoint remains strict so older API consumers retain
+        their reproducibility guardrail. New UI work should use comparison
+        groups, which intentionally allow a user to relate unlike runs.
+        """
         unique_ids = list(dict.fromkeys(artifact_ids))
         artifacts = [self.artifact(artifact_id) for artifact_id in unique_ids]
         if any(artifact is None for artifact in artifacts):
@@ -568,6 +812,90 @@ class Orchestrator:
         with self._connection() as db:
             db.execute("INSERT INTO comparisons VALUES (?, ?, ?, ?, ?, ?, ?)", (comparison_id, name.strip() or "Model comparison", description, _json(selection), _json(protocol), now, now))
         return self.comparison(comparison_id)  # type: ignore[return-value]
+
+    def _artifact_runtime(self, artifact_id: str) -> dict[str, float | None]:
+        """Return recorded queue and training duration when this artifact has a job."""
+        with self._connection() as db:
+            row = db.execute("""SELECT jobs.submitted_at, jobs.started_at, jobs.completed_at
+                FROM jobs JOIN run_specifications USING (specification_id)
+                WHERE run_specifications.artifact_id=?
+                ORDER BY jobs.submitted_at DESC LIMIT 1""", (artifact_id,)).fetchone()
+        if row is None:
+            return {"queue_seconds": None, "runtime_seconds": None}
+        return {
+            "queue_seconds": self._duration_seconds(row["submitted_at"], row["started_at"]),
+            "runtime_seconds": self._duration_seconds(row["started_at"], row["completed_at"]),
+        }
+
+    def artifact_catalog(self) -> list[dict[str, Any]]:
+        """A compact, display-ready global run/artifact catalog for selection UIs."""
+        return [{**self._artifact_result(artifact), "timing": self._artifact_runtime(artifact["artifact_id"])}
+                for artifact in self.artifacts()]
+
+    def _comparison_group_detail(self, group: dict[str, Any], members: list[dict[str, Any]]) -> dict[str, Any]:
+        results: list[dict[str, Any]] = []
+        for member in members:
+            artifact = self.artifact(member["artifact_id"])
+            # Members should always resolve due to the foreign key. Keeping a
+            # missing row visible makes imported/corrupt old databases diagnosable.
+            if artifact is None:
+                results.append({**member, "artifact": None, "timing": {"queue_seconds": None, "runtime_seconds": None}})
+                continue
+            results.append({**member, "artifact": self._artifact_result(artifact), "timing": self._artifact_runtime(member["artifact_id"])})
+
+        artifact_results = [row["artifact"] for row in results if row["artifact"]]
+        compatibility = self._comparison_check(artifact_results)
+        baseline_id = group.get("baseline_artifact_id") or (results[0]["artifact_id"] if results else None)
+        baseline = next((row for row in results if row["artifact_id"] == baseline_id), None)
+        baseline_metrics = (baseline or {}).get("artifact", {}).get("metrics", {})
+        all_metrics = sorted(set().union(*(set(row["artifact"]["metrics"]) for row in results if row["artifact"]))) if results else []
+        matrix: list[dict[str, Any]] = []
+        for row in results:
+            artifact = row.get("artifact")
+            metrics = artifact.get("metrics", {}) if artifact else {}
+            values = {}
+            for metric in all_metrics:
+                value = metrics.get(metric)
+                reference = baseline_metrics.get(metric)
+                values[metric] = {
+                    "value": value,
+                    "delta": (value - reference) if isinstance(value, (int, float)) and isinstance(reference, (int, float)) else None,
+                    "relative_delta": ((value - reference) / abs(reference)) if isinstance(value, (int, float)) and isinstance(reference, (int, float)) and reference != 0 else None,
+                }
+            matrix.append({"artifact_id": row["artifact_id"], "values": values,
+                           "runtime_seconds": row["timing"]["runtime_seconds"],
+                           "queue_seconds": row["timing"]["queue_seconds"]})
+        return {
+            **group, "members": results, "baseline_artifact_id": baseline_id,
+            "compatibility": compatibility,
+            "metrics": {"names": all_metrics, "baseline_artifact_id": baseline_id, "matrix": matrix},
+        }
+
+    def create_comparison_group(
+        self, *, name: str, members: list[dict[str, Any]], description: str = "",
+        relationship_label: str = "related", baseline_artifact_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Persist a manual relationship group without requiring protocol equality."""
+        if not members:
+            raise ValueError("Select at least one artifact")
+        artifact_ids = [str(member.get("artifact_id", "")) for member in members]
+        if not all(artifact_ids) or len(set(artifact_ids)) != len(artifact_ids):
+            raise ValueError("Each comparison group member must reference a unique artifact")
+        if any(self.artifact(artifact_id) is None for artifact_id in artifact_ids):
+            raise KeyError("One or more artifacts were not found")
+        if baseline_artifact_id is not None and baseline_artifact_id not in artifact_ids:
+            raise ValueError("The baseline artifact must be a member of the comparison group")
+        group_id, now = str(uuid.uuid4()), _now()
+        with self._connection() as db:
+            db.execute("INSERT INTO comparison_groups VALUES (?, ?, ?, ?, ?, ?, ?)", (
+                group_id, name.strip() or "Model comparison", description, relationship_label.strip() or "related",
+                baseline_artifact_id, now, now,
+            ))
+            for ordinal, member in enumerate(members):
+                db.execute("INSERT INTO comparison_group_members VALUES (?, ?, ?, ?, ?)", (
+                    group_id, artifact_ids[ordinal], ordinal, member.get("relationship_label"), str(member.get("note") or ""),
+                ))
+        return self.comparison_group(group_id)  # type: ignore[return-value]
 
     def _assign_output_path(self, action: str, parameters: dict[str, Any], specification_id: str) -> dict[str, Any]:
         """Assign paths owned by the orchestrator, never supplied by a UI client."""
@@ -619,6 +947,46 @@ class Orchestrator:
             db.execute("UPDATE jobs SET status='submitted', remote_status=?, worker_id=?, updated_at=? WHERE job_id=?", (response.get("status"), response.get("worker_id"), _now(), job_id))
             db.execute("UPDATE run_specifications SET status='dispatched', updated_at=? WHERE specification_id=?", (_now(), specification_id))
         return self.job(job_id)  # type: ignore[return-value]
+
+    def specification_detail(self, specification_id: str) -> dict[str, Any]:
+        specification = self.specification(specification_id)
+        if specification is None:
+            raise KeyError(specification_id)
+        config_path = specification.get("parameters", {}).get("config")
+        config = load_toml(config_path) if config_path else {}
+        return {"specification": specification, "config": config}
+
+    def update_planned_specification(self, specification_id: str, *, name: str | None = None, resources: dict[str, Any] | None = None, config_overrides: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Edit a saved run before it has been handed to compute."""
+        with self._connection() as db:
+            specification = self.specification(specification_id, connection=db)
+            if specification is None:
+                raise KeyError(specification_id)
+            if specification["status"] != "planned":
+                raise ValueError("Only runs that have not started can be edited. Create a new run to change a queued or completed execution.")
+            next_name = specification["name"] if name is None else name.strip()
+            if not next_name:
+                raise ValueError("Run name cannot be empty")
+            next_resources = dict(specification.get("resources") or {})
+            if resources:
+                if set(resources) - {"gpu_count"}:
+                    raise ValueError("Only the GPU request can be changed after a run is saved")
+                gpu_count = resources.get("gpu_count")
+                if isinstance(gpu_count, bool) or not isinstance(gpu_count, int) or gpu_count < 0:
+                    raise ValueError("GPU request must be a non-negative integer")
+                next_resources["gpu_count"] = gpu_count
+            overrides = config_overrides or {}
+            allowed_sections = {"run", "data", "model", "training", "augmentation", "callbacks", "output"}
+            if set(overrides) - allowed_sections or any(not isinstance(value, dict) for value in overrides.values()):
+                raise ValueError("Configuration changes must use known configuration sections")
+            if overrides:
+                config_path = specification.get("parameters", {}).get("config")
+                if not config_path:
+                    raise ValueError("This run has no editable training configuration")
+                import tomli_w
+                Path(config_path).write_text(tomli_w.dumps(deep_merge(load_toml(config_path), overrides)), encoding="utf-8")
+            db.execute("UPDATE run_specifications SET name=?, resources_json=?, updated_at=? WHERE specification_id=?", (next_name, _json(next_resources), _now(), specification_id))
+        return self.specification(specification_id)  # type: ignore[return-value]
 
     def reconcile_job(self, job_id: str) -> dict[str, Any]:
         local = self.job(job_id)
@@ -770,6 +1138,13 @@ class Orchestrator:
             rows = db.execute("SELECT * FROM job_events WHERE job_id=? ORDER BY sequence", (job_id,)).fetchall()
         return [{**dict(row), "data": json.loads(row["data_json"])} for row in rows]
     def comparisons(self) -> list[dict[str, Any]]: return self._many("SELECT * FROM comparisons ORDER BY created_at DESC")
+    def comparison_groups(self) -> list[dict[str, Any]]:
+        with self._connection() as db:
+            groups = [_row(item) for item in db.execute("SELECT * FROM comparison_groups ORDER BY created_at DESC").fetchall()]
+            counts = {row["comparison_group_id"]: row["member_count"] for row in db.execute(
+                "SELECT comparison_group_id, COUNT(*) AS member_count FROM comparison_group_members GROUP BY comparison_group_id"
+            ).fetchall()}
+        return [{**group, "member_count": counts.get(group["comparison_group_id"], 0)} for group in groups if group]
     def compute_endpoints(self, *, refresh: bool = False) -> list[dict[str, Any]]:
         endpoints = self._many("SELECT * FROM compute_endpoints WHERE enabled=1 ORDER BY name")
         return [self.refresh_compute_endpoint(item["endpoint_id"]) for item in endpoints] if refresh else endpoints
@@ -802,3 +1177,12 @@ class Orchestrator:
     def comparison(self, value: str) -> dict[str, Any] | None:
         with self._connection() as db:
             return _row(db.execute("SELECT * FROM comparisons WHERE comparison_id=?", (value,)).fetchone())
+    def comparison_group(self, value: str) -> dict[str, Any] | None:
+        with self._connection() as db:
+            group = _row(db.execute("SELECT * FROM comparison_groups WHERE comparison_group_id=?", (value,)).fetchone())
+            if group is None:
+                return None
+            members = [_row(row) for row in db.execute(
+                "SELECT * FROM comparison_group_members WHERE comparison_group_id=? ORDER BY ordinal", (value,)
+            ).fetchall()]
+        return self._comparison_group_detail(group, [member for member in members if member])

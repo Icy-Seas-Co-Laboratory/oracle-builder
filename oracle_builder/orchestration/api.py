@@ -5,7 +5,7 @@ from typing import Any
 import uuid
 
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, ConfigDict, Field
 
 from oracle_builder.orchestration.service import Orchestrator
@@ -36,6 +36,19 @@ class TrainingExperimentRequest(BaseModel):
     seeds: list[int]
     description: str = ""
     resources: dict[str, Any] = Field(default_factory=dict)
+    config_overrides: dict[str, Any] = Field(default_factory=dict)
+
+
+class PlannedRunUpdateRequest(BaseModel):
+    name: str | None = None
+    resources: dict[str, Any] = Field(default_factory=dict)
+    config_overrides: dict[str, Any] = Field(default_factory=dict)
+
+
+class ModelPreviewRequest(BaseModel):
+    architecture: str
+    dataset_id: str
+    overrides: dict[str, Any] = Field(default_factory=dict)
 
 
 class ModelImportRequest(BaseModel):
@@ -52,6 +65,20 @@ class ComparisonRequest(BaseModel):
     name: str
     artifact_ids: list[str]
     description: str = ""
+
+
+class ComparisonGroupMemberRequest(BaseModel):
+    artifact_id: str
+    relationship_label: str | None = None
+    note: str = ""
+
+
+class ComparisonGroupRequest(BaseModel):
+    name: str
+    members: list[ComparisonGroupMemberRequest]
+    description: str = ""
+    relationship_label: str = "related"
+    baseline_artifact_id: str | None = None
 
 
 def create_app(orchestrator: Orchestrator) -> FastAPI:
@@ -120,6 +147,17 @@ def create_app(orchestrator: Orchestrator) -> FastAPI:
     @app.get("/v1/datasets")
     def datasets() -> dict[str, Any]: return {"datasets": orchestrator.datasets()}
 
+    @app.get("/v1/model-setups/{architecture}")
+    def model_setup(architecture: str) -> dict[str, Any]:
+        try: return orchestrator.model_setup(architecture)
+        except ValueError as exc: raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/v1/model-previews")
+    def model_preview(body: ModelPreviewRequest) -> dict[str, Any]:
+        try: return orchestrator.model_preview(**body.model_dump())
+        except KeyError as exc: raise HTTPException(status_code=404, detail="Dataset was not found") from exc
+        except ValueError as exc: raise HTTPException(status_code=422, detail=str(exc)) from exc
+
     @app.post("/v1/datasets:ingest", status_code=201)
     def ingest_dataset(body: DatasetIngestRequest) -> dict[str, Any]:
         try: return orchestrator.ingest_dataset(body.path)
@@ -127,6 +165,26 @@ def create_app(orchestrator: Orchestrator) -> FastAPI:
 
     @app.get("/v1/datasets/{dataset_id}")
     def dataset(dataset_id: str) -> dict[str, Any]: return required(orchestrator.dataset(dataset_id), "Dataset")
+
+    @app.get("/v1/datasets/{dataset_id}/detail")
+    def dataset_detail(dataset_id: str) -> dict[str, Any]:
+        try: return orchestrator.dataset_detail(dataset_id)
+        except KeyError as exc: raise HTTPException(status_code=404, detail="Dataset was not found") from exc
+        except (OSError, ValueError) as exc: raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.get("/v1/datasets/{dataset_id}/previews")
+    def dataset_previews(dataset_id: str, offset: int = Query(default=0, ge=0), limit: int = Query(default=24, ge=1, le=100)) -> dict[str, Any]:
+        try: return orchestrator.dataset_previews(dataset_id, offset=offset, limit=limit)
+        except KeyError as exc: raise HTTPException(status_code=404, detail="Dataset was not found") from exc
+        except (OSError, ValueError) as exc: raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.get("/v1/datasets/{dataset_id}/previews/{item_id}")
+    def dataset_preview_image(dataset_id: str, item_id: str, kind: str = Query(default="image"), max_size: int = Query(default=320, ge=32, le=1024)) -> Response:
+        try:
+            return Response(orchestrator.dataset_preview_image(dataset_id, item_id, kind=kind, max_size=max_size), media_type="image/jpeg",
+                            headers={"Cache-Control": "private, max-age=3600"})
+        except (KeyError, FileNotFoundError) as exc: raise HTTPException(status_code=404, detail="Dataset preview was not found") from exc
+        except (OSError, ValueError) as exc: raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.post("/v1/catalog:scan")
     def scan(body: ScanRequest) -> dict[str, Any]:
@@ -136,8 +194,21 @@ def create_app(orchestrator: Orchestrator) -> FastAPI:
     @app.get("/v1/artifacts")
     def artifacts() -> dict[str, Any]: return {"artifacts": orchestrator.artifacts()}
 
+    @app.get("/v1/artifacts/catalog")
+    def artifact_catalog() -> dict[str, Any]: return {"artifacts": orchestrator.artifact_catalog()}
+
     @app.get("/v1/artifacts/{artifact_id}")
     def artifact(artifact_id: str) -> dict[str, Any]: return required(orchestrator.artifact(artifact_id), "Artifact")
+
+    @app.get("/v1/artifacts/{artifact_id}/detail")
+    def artifact_detail(artifact_id: str) -> dict[str, Any]:
+        try: return orchestrator.artifact_detail(artifact_id)
+        except KeyError as exc: raise HTTPException(status_code=404, detail="Artifact was not found") from exc
+
+    @app.get("/v1/artifacts/{artifact_id}/history")
+    def artifact_history(artifact_id: str, limit: int = Query(default=500, ge=1, le=2000)) -> dict[str, Any]:
+        try: return orchestrator.artifact_history(artifact_id, limit=limit)
+        except KeyError as exc: raise HTTPException(status_code=404, detail="Artifact was not found") from exc
 
     @app.get("/v1/artifacts/{artifact_id}/evidence")
     def artifact_evidence(artifact_id: str) -> dict[str, Any]:
@@ -196,6 +267,19 @@ def create_app(orchestrator: Orchestrator) -> FastAPI:
     @app.get("/v1/comparisons/{comparison_id}")
     def comparison(comparison_id: str) -> dict[str, Any]: return required(orchestrator.comparison(comparison_id), "Comparison")
 
+    @app.get("/v1/comparison-groups")
+    def comparison_groups() -> dict[str, Any]: return {"comparison_groups": orchestrator.comparison_groups()}
+
+    @app.post("/v1/comparison-groups", status_code=201)
+    def create_comparison_group(body: ComparisonGroupRequest) -> dict[str, Any]:
+        try: return orchestrator.create_comparison_group(**body.model_dump())
+        except KeyError as exc: raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc: raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.get("/v1/comparison-groups/{comparison_group_id}")
+    def comparison_group(comparison_group_id: str) -> dict[str, Any]:
+        return required(orchestrator.comparison_group(comparison_group_id), "Comparison group")
+
 
     @app.get("/v1/specifications")
     def specifications(experiment_id: str | None = Query(default=None)) -> dict[str, Any]:
@@ -205,6 +289,18 @@ def create_app(orchestrator: Orchestrator) -> FastAPI:
     def preflight(specification_id: str, endpoint_id: str = Query()) -> dict[str, Any]:
         try: return orchestrator.preflight(specification_id, endpoint_id)
         except KeyError as exc: raise HTTPException(status_code=404, detail="Run specification or compute endpoint was not found") from exc
+
+    @app.patch("/v1/specifications/{specification_id}")
+    def update_planned_specification(specification_id: str, body: PlannedRunUpdateRequest) -> dict[str, Any]:
+        try: return orchestrator.update_planned_specification(specification_id, name=body.name, resources=body.resources, config_overrides=body.config_overrides)
+        except KeyError as exc: raise HTTPException(status_code=404, detail="Run specification was not found") from exc
+        except ValueError as exc: raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.get("/v1/specifications/{specification_id}")
+    def specification_detail(specification_id: str) -> dict[str, Any]:
+        try: return orchestrator.specification_detail(specification_id)
+        except KeyError as exc: raise HTTPException(status_code=404, detail="Run specification was not found") from exc
+        except (OSError, ValueError) as exc: raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.post("/v1/specifications/{specification_id}:dispatch", status_code=202)
     def dispatch(specification_id: str, body: DispatchRequest) -> dict[str, Any]:

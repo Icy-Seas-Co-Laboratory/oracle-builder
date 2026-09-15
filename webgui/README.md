@@ -22,6 +22,13 @@ review and persisted model comparisons. Shared operational and empty states are 
 This keeps polling and shared catalog data centralized without introducing a
 global client-side store.
 
+For local development, run `scripts/start_oracle_stack.sh` from the repository
+root. The GUI defaults to `http://127.0.0.1:5111`; Oracle Serve and the
+Orchestrator retain their defaults at ports `8100` and `8110`. The script checks
+their health endpoints first and reuses either service when it is already
+healthy. Override any bind port with `ORACLE_WEBGUI_PORT`, `ORACLE_SERVE_PORT`,
+or `ORACLE_ORCHESTRATOR_PORT`.
+
 `ArtifactEvidence.svelte` adds read-only confusion matrices, class and sample
 detail, segmentation evidence, and a gallery for sealed figures, overlays, and
 activation or saliency products. The application shell follows the scientific
