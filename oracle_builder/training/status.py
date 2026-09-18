@@ -27,7 +27,14 @@ def _numeric_metrics(logs: dict[str, Any] | None) -> dict[str, float]:
 
 
 def _ordered_metrics(metrics: dict[str, float]) -> list[tuple[str, float]]:
-    preferred = ("loss", "val_loss", "accuracy", "val_accuracy")
+    preferred = (
+        "loss",
+        "val_loss",
+        "accuracy",
+        "val_accuracy",
+        "macro_f1",
+        "val_macro_f1",
+    )
     names = [name for name in preferred if name in metrics]
     names.extend(sorted(name for name in metrics if name not in names))
     return [(name, metrics[name]) for name in names]

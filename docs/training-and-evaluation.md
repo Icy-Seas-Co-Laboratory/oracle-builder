@@ -78,6 +78,13 @@ Use `[training] display = "text"` for explicit epoch text, or `display = "off"`
 to suppress console status. The legacy `self_supervised.verbose` setting remains
 supported: `0` is quiet and `2` selects text output.
 
+Classification defaults include `accuracy` and `macro_f1` in `[training].metrics`.
+`macro_f1` is calculated from one epoch-wide confusion matrix (not as an
+average of per-batch scores), so the status board and text log show both
+`macro_f1` and `val_macro_f1`. A class that is neither observed nor predicted
+in the measured split contributes zero, consistent with post-training
+evaluation. To opt out, remove `"macro_f1"` from the metric list.
+
 ## Streaming and multiple GPUs
 
 Classification SQLite loading is streaming by default: images are decoded and

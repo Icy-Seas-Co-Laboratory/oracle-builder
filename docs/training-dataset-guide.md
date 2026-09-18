@@ -191,9 +191,10 @@ when intentionally making a fixed, preprocessed representation. Use
 by default. For a source library with known dark-on-light acquisition, pass
 `--source-polarity dark_on_light` instead of relying on estimation.
 
-For classification runs, `resize_mode = "fit_pad_max_2x"` preserves aspect
-ratio and pads to the requested input shape, but limits enlargement of a small
-ROI to 2×. It still downscales an oversized ROI enough to fit. Use it when
+For classification runs, `resize_mode = "fit_pad_max_2x"` or
+`resize_mode = "fit_pad_max_3x"` preserves aspect ratio and pads to the
+requested input shape, but limits enlargement of a small ROI to 2× or 3×.
+Both still downscale an oversized ROI enough to fit. Use a capped mode when
 strong enlargement would turn low-resolution ROIs into blurred full-frame
 inputs; use ordinary `fit_pad` when all inputs should fill as much of the
 network input as possible.

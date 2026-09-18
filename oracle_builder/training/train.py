@@ -19,7 +19,7 @@ from oracle_builder.training.losses import (
     WeightedSparseCategoricalCrossentropy,
 )
 from oracle_builder.training.class_weights import WEIGHTED_CROSS_ENTROPY_NAMES
-from oracle_builder.training.metrics import BinaryDice
+from oracle_builder.training.metrics import BinaryDice, SparseCategoricalMacroF1
 from oracle_builder.training.distribution import (
     select_distribution_strategy,
     write_distribution_info,
@@ -74,6 +74,11 @@ def compile_model(model: keras.Model, config: dict[str, Any]) -> keras.Model:
     for metric in training.get("metrics", []):
         if str(metric).lower() == "dice":
             metrics.append(BinaryDice())
+            continue
+        if str(metric).lower() in {"macro_f1", "macro-f1"}:
+            if config["run"]["task"] not in {"classification", "embedding"}:
+                raise ValueError("macro_f1 is available only for classification tasks")
+            metrics.append(SparseCategoricalMacroF1(config["data"]["num_classes"]))
             continue
         if str(metric).lower() == "iou":
             continue

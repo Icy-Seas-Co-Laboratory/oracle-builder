@@ -107,7 +107,7 @@ def test_classification_model_trains_with_weighted_cross_entropy():
             "learning_rate": 0.001,
             "loss": "weighted_sparse_categorical_crossentropy",
             "class_weights": {"values": [0.5, 1.5]},
-            "metrics": ["accuracy"],
+            "metrics": ["accuracy", "macro_f1"],
         },
     }
     model = build_and_compile_model(config)

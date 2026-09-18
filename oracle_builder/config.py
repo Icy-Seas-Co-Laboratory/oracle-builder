@@ -294,13 +294,14 @@ def validate_config(config: dict[str, Any]) -> None:
     if preprocessing.get("resize_mode", "fit_pad") not in {
         "fit_pad",
         "fit_pad_max_2x",
+        "fit_pad_max_3x",
         "fill_crop",
         "stretch",
         "none",
         "fit",
     }:
         raise ValueError(
-            "preprocessing.resize_mode must be fit_pad, fit_pad_max_2x, fill_crop, stretch, none, or fit"
+            "preprocessing.resize_mode must be fit_pad, fit_pad_max_2x, fit_pad_max_3x, fill_crop, stretch, none, or fit"
         )
     if preprocessing.get("normalization", "dtype") not in {
         "dtype",

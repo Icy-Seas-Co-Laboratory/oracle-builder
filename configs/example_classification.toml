@@ -45,7 +45,7 @@ learning_rate = 0.001
 # Weighted cross entropy is the default; ordinary sparse cross entropy is the
 # simpler alternative when the dataset is already balanced.
 loss = "weighted_sparse_categorical_crossentropy"
-metrics = ["accuracy"]
+metrics = ["accuracy", "macro_f1"]
 
 [training.class_weights]
 # effective_number is gentler than inverse_frequency; explicit accepts a list.

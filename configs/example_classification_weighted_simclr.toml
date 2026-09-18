@@ -55,7 +55,7 @@ epochs = 50
 optimizer = "adam"
 learning_rate = 0.0003
 loss = "weighted_sparse_categorical_crossentropy"
-metrics = ["accuracy"]
+metrics = ["accuracy", "macro_f1"]
 
 [training.class_weights]
 # effective_number moderates rare-class weighting; inverse_frequency is stronger.

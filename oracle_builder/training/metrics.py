@@ -36,3 +36,53 @@ class BinaryDice(keras.metrics.Metric):
 
     def get_config(self):
         return {**super().get_config(), "threshold": self.threshold}
+
+
+@keras.utils.register_keras_serializable(package="oracle_builder")
+class SparseCategoricalMacroF1(keras.metrics.Metric):
+    """Macro F1 for exclusive classification, accumulated across an epoch.
+
+    The confusion matrix is retained across batches so this is not an average
+    of batch-level F1 values. Classes with no true or predicted samples receive
+    an F1 of zero, matching the evaluation report's ``zero_division=0`` policy.
+    """
+
+    def __init__(self, num_classes: int, name: str = "macro_f1", **kwargs):
+        super().__init__(name=name, **kwargs)
+        if int(num_classes) < 1:
+            raise ValueError("num_classes must be positive")
+        self.num_classes = int(num_classes)
+        self.confusion = self.add_weight(
+            name="confusion",
+            shape=(self.num_classes, self.num_classes),
+            initializer="zeros",
+        )
+
+    def update_state(self, y_true, y_pred, sample_weight=None):
+        targets = tf.cast(tf.reshape(y_true, [-1]), tf.int32)
+        predictions = tf.cast(tf.reshape(tf.argmax(y_pred, axis=-1), [-1]), tf.int32)
+        weights = None
+        if sample_weight is not None:
+            weights = tf.cast(tf.reshape(sample_weight, [-1]), self.dtype)
+        matrix = tf.math.confusion_matrix(
+            targets,
+            predictions,
+            num_classes=self.num_classes,
+            weights=weights,
+            dtype=self.dtype,
+        )
+        self.confusion.assign_add(matrix)
+
+    def result(self):
+        true_positives = tf.linalg.diag_part(self.confusion)
+        predicted_totals = tf.reduce_sum(self.confusion, axis=0)
+        actual_totals = tf.reduce_sum(self.confusion, axis=1)
+        denominator = actual_totals + predicted_totals
+        f1_by_class = tf.math.divide_no_nan(2.0 * true_positives, denominator)
+        return tf.reduce_mean(f1_by_class)
+
+    def reset_state(self):
+        self.confusion.assign(tf.zeros_like(self.confusion))
+
+    def get_config(self):
+        return {**super().get_config(), "num_classes": self.num_classes}

@@ -72,11 +72,12 @@ classification configuration:
 
 ```toml
 [preprocessing]
-resize_mode = "fit_pad_max_2x"
+resize_mode = "fit_pad_max_2x" # or "fit_pad_max_3x"
 ```
 
 It downsizes an oversized ROI to fit the configured input shape, but enlarges a
-smaller ROI by no more than 2× before centering it on the padded canvas.
+smaller ROI by no more than the selected 2× or 3× cap before centering it on
+the padded canvas.
 
 ## Create a curated or small test subset
 
