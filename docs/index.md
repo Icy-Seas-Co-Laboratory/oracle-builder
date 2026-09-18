@@ -5,6 +5,7 @@
 | Goal | Guide |
 |---|---|
 | Install and run a first model | [Getting started](getting-started.md) |
+| Build a training database from images or an image-folder library | [Building training-set databases](training-dataset-guide.md) |
 | Train an image classifier from labeled folders | [Classification workflow](classification-workflow.md) |
 | Train an unlabeled ROI representation model | [Downstream ROI clustering](clustering-workflow.md) |
 | Curate ROIs and refine masks | [Mask-refinement workflow](mask-refinement-workflow.md) |

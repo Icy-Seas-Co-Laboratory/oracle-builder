@@ -24,6 +24,7 @@ for your platform separately; do not install every GPU extra at once.
 Choose the guide that matches what you want to do:
 
 - [Getting started](docs/getting-started.md) — install, verify hardware, and run a small training job.
+- [Building training-set databases](docs/training-dataset-guide.md) — plan, import, validate, and freeze classification or mask-refinement datasets.
 - [Classification workflow](docs/classification-workflow.md) — import a folder library, train, evaluate, infer, and compare classifier families.
 - [Mask-refinement workflow](docs/mask-refinement-workflow.md) — build/edit an ROI mask dataset, train U-Net-family models, tile large ROIs, and visualize results.
 - [External model products](docs/model-products.md) — ingest and promote existing Keras models.

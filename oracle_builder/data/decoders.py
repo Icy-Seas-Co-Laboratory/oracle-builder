@@ -90,11 +90,15 @@ def prepare_classification_input(
         image = image.resize((target_w, target_h), interpolation)
     else:
         source_w, source_h = image.size
-        scale = (
-            min(target_w / source_w, target_h / source_h)
-            if mode in {"fit_pad", "fit"}
-            else max(target_w / source_w, target_h / source_h)
-        )
+        if mode in {"fit_pad", "fit", "fit_pad_max_2x"}:
+            scale = min(target_w / source_w, target_h / source_h)
+            # Preserve useful native detail in small ROIs.  Large ROIs still
+            # downscale to fit, while small ones receive no more than 2x
+            # enlargement and are centered on the padded canvas.
+            if mode == "fit_pad_max_2x":
+                scale = min(scale, 2.0)
+        else:
+            scale = max(target_w / source_w, target_h / source_h)
         resized = (
             max(1, int(round(source_w * scale))),
             max(1, int(round(source_h * scale))),
@@ -104,7 +108,7 @@ def prepare_classification_input(
             left = max(0, (image.width - target_w) // 2)
             top = max(0, (image.height - target_h) // 2)
             image = image.crop((left, top, left + target_w, top + target_h))
-        elif mode == "fit_pad":
+        elif mode in {"fit_pad", "fit_pad_max_2x"}:
             pad_value = float(settings.get("pad_value", 0.0))
             fill = int(round(min(max(pad_value, 0.0), 1.0) * 255))
             canvas = Image.new(image.mode, (target_w, target_h), color=_pil_fill(image.mode, fill))
@@ -116,7 +120,7 @@ def prepare_classification_input(
     if value.shape != target:
         raise ValueError(
             f"Preprocessing mode {mode!r} produced {value.shape}; expected {target}. "
-            "Use fit_pad, fill_crop, or stretch for batched training."
+            "Use fit_pad, fit_pad_max_2x, fill_crop, or stretch for batched training."
         )
     value = _normalize_classification_values(value, settings)
     if bool(settings.get("invert", False)):

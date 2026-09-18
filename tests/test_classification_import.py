@@ -225,6 +225,35 @@ def test_preprocessing_supports_resize_inversion_and_channel_conversion():
     assert value.max() == 1
 
 
+def test_fit_pad_max_2x_caps_small_roi_upscaling_and_still_downsizes_large_rois():
+    config = {
+        "preprocessing": {
+            "resize_mode": "fit_pad_max_2x",
+            "normalization": "dtype",
+            "rescale": True,
+            "pad_value": 0.0,
+            "interpolation": "nearest",
+            "channel_mode": "grayscale",
+        }
+    }
+
+    small = prepare_classification_input(
+        np.full((8, 8), 255, dtype="uint8"), [64, 64, 1], config
+    )
+    # A normal fit-pad operation would make this 64x64; the capped mode makes
+    # it 16x16 and pads the remaining canvas.
+    assert small.shape == (64, 64, 1)
+    assert np.count_nonzero(small) == 16 * 16
+
+    large = prepare_classification_input(
+        np.full((100, 200), 255, dtype="uint8"), [64, 64, 1], config
+    )
+    # The cap applies only to enlargement. A 100x200 ROI still scales down to
+    # 32x64 while preserving aspect ratio.
+    assert large.shape == (64, 64, 1)
+    assert np.count_nonzero(large) == 32 * 64
+
+
 def test_repeat_import_skips_existing_samples_and_preserves_labels(tmp_path):
     source = tmp_path / "library"
     write_image(source / "cod" / "one.jpg", (10, 20, 30))

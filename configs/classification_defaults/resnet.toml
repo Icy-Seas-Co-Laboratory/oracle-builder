@@ -32,8 +32,9 @@ deterministic = true
 sqlite_cache_kib = 65536
 
 [preprocessing]
-# fit_pad preserves the full image; fill_crop fills the frame; stretch may
-# distort geometry. Preprocessing is exported as part of the model contract.
+# fit_pad preserves the full image; fit_pad_max_2x caps enlargement at 2x;
+# fill_crop fills the frame; stretch may distort geometry. Preprocessing is
+# exported as part of the model contract.
 resize_mode = "fit_pad"
 normalization = "dtype"
 rescale = true

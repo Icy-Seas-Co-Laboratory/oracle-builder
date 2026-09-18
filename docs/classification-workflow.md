@@ -67,6 +67,17 @@ Original encoded image bytes are the default and recommended storage form.
 `--storage-mode materialized` is for a deliberately fixed, preprocessed image
 representation.
 
+To preserve native detail from small ROIs, use the capped fit-and-pad mode in a
+classification configuration:
+
+```toml
+[preprocessing]
+resize_mode = "fit_pad_max_2x"
+```
+
+It downsizes an oversized ROI to fit the configured input shape, but enlarges a
+smaller ROI by no more than 2× before centering it on the padded canvas.
+
 ## Create a curated or small test subset
 
 `oracle-dataset subset` never alters its source. It creates a new editable

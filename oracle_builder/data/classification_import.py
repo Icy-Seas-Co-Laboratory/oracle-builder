@@ -583,7 +583,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--input-shape", type=int, nargs=3)
     parser.add_argument(
         "--resize-mode",
-        choices=("fit_pad", "fill_crop", "stretch", "none", "fit"),
+        choices=("fit_pad", "fit_pad_max_2x", "fill_crop", "stretch", "none", "fit"),
         default="fit_pad",
     )
     parser.add_argument(
