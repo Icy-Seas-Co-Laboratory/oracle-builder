@@ -185,8 +185,10 @@ uv run oracle-dataset info datasets/cruise07-zooplankton.sqlite
 ```
 
 The importer preserves original encoded bytes by default, which is normally
-the right choice. Use `--storage-mode materialized --input-shape H W C` only
-when intentionally making a fixed, preprocessed representation. Use
+the right choice. Use `--storage-mode materialized --input-shape H W` only
+when intentionally making a fixed, preprocessed representation; optional
+`--gradient-magnitude` and `--local-contrast` flags add their resolved channels
+(the legacy `H W C` form is still accepted). Use
 `--require-rgb` when every input must be RGB; otherwise grayscale is accepted
 by default. For a source library with known dark-on-light acquisition, pass
 `--source-polarity dark_on_light` instead of relying on estimation.

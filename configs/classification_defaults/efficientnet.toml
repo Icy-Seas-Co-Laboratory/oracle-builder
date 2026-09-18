@@ -14,7 +14,7 @@ notes = "Documented efficientnet baseline"
 [data]
 # Classification defaults assume one-channel images. Increase height/width when
 # fine detail matters, recognizing that memory use grows roughly with image area.
-input_shape = [224, 224, 1]
+input_shape = [224, 224]
 batch_size = 8
 shuffle_buffer = 4096
 

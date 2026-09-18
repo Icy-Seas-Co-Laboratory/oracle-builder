@@ -473,6 +473,110 @@ def _ranking_metrics(
     return per_class, aggregate_metrics
 
 
+def classification_epoch_metric_records(
+    targets: np.ndarray,
+    probabilities: np.ndarray,
+    *,
+    class_names: dict[int, str] | None = None,
+) -> list[dict[str, Any]]:
+    """Return plot-ready classification metrics without writing evaluation files."""
+    targets = np.asarray(targets, dtype="int64").reshape(-1)
+    probabilities = np.asarray(probabilities, dtype="float64")
+    if probabilities.ndim != 2 or len(probabilities) != len(targets):
+        raise ValueError("Classification probabilities must be [samples, classes]")
+    predicted = np.argmax(probabilities, axis=1)
+    labels = sorted(set(targets.tolist()) | set(predicted.tolist()) | set((class_names or {}).keys()))
+    names = _display_names(labels, class_names)
+    report = classification_report(targets, predicted, labels=labels, output_dict=True, zero_division=0)
+    matrix = confusion_matrix(targets, predicted, labels=labels)
+    row_totals = matrix.sum(axis=1).astype("float64")
+    column_totals = matrix.sum(axis=0).astype("float64")
+    total = float(matrix.sum())
+    trace = float(np.trace(matrix))
+    expected = float(np.dot(row_totals, column_totals)) / total**2 if total else 0.0
+    observed = trace / total if total else 0.0
+    kappa = (observed - expected) / (1.0 - expected) if total and expected < 1.0 else 0.0
+    mcc_denominator = np.sqrt(
+        max(total**2 - float(np.dot(column_totals, column_totals)), 0.0)
+        * max(total**2 - float(np.dot(row_totals, row_totals)), 0.0)
+    )
+    mcc = (trace * total - float(np.dot(row_totals, column_totals))) / mcc_denominator if mcc_denominator else 0.0
+    accumulator = ClassificationMetricAccumulator(probabilities.shape[1])
+    accumulator.update(targets, probabilities)
+    ranking_by_class, ranking_summary = _ranking_metrics(targets, predicted, probabilities, labels)
+    summary: dict[str, float | int | None] = {
+        "accuracy": float(report.get("accuracy", 0.0)),
+        "micro_precision": float(report.get("accuracy", 0.0)),
+        "micro_recall": float(report.get("accuracy", 0.0)),
+        "micro_f1": float(report.get("accuracy", 0.0)),
+        "balanced_accuracy": float(report.get("macro avg", {}).get("recall", 0.0)),
+        "macro_precision": float(report.get("macro avg", {}).get("precision", 0.0)),
+        "macro_recall": float(report.get("macro avg", {}).get("recall", 0.0)),
+        "macro_f1": float(report.get("macro avg", {}).get("f1-score", 0.0)),
+        "weighted_precision": float(report.get("weighted avg", {}).get("precision", 0.0)),
+        "weighted_recall": float(report.get("weighted avg", {}).get("recall", 0.0)),
+        "weighted_f1": float(report.get("weighted avg", {}).get("f1-score", 0.0)),
+        "cohen_kappa": float(kappa),
+        "matthews_correlation_coefficient": float(mcc),
+        **accumulator.result(),
+        **ranking_summary,
+    }
+    records: list[dict[str, Any]] = []
+    for metric, value in summary.items():
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or metric == "sample_count":
+            continue
+        averaging = "macro" if metric.startswith("macro_") else "micro" if metric.startswith("micro_") else "weighted" if metric.startswith("weighted_") else "overall"
+        family = "ranking" if metric.endswith(("average_precision", "roc_auc")) else "calibration" if metric in {"log_loss", "multiclass_brier_score", "expected_calibration_error"} else "decision"
+        records.append({"metric": metric, "value": float(value), "metric_family": family, "averaging": averaging, "support": int(total)})
+    for label, name in zip(labels, names, strict=True):
+        values = report[str(label)]
+        ranking = ranking_by_class.get(label, {})
+        per_class = {
+            "precision": values["precision"],
+            "recall": values["recall"],
+            "f1_score": values["f1-score"],
+            "average_precision": ranking.get("average_precision"),
+            "roc_auc": ranking.get("roc_auc"),
+            "one_vs_rest_balanced_accuracy": ranking.get("balanced_accuracy"),
+            "one_vs_rest_matthews_correlation_coefficient": ranking.get("matthews_correlation_coefficient"),
+        }
+        for metric, value in per_class.items():
+            if value is not None:
+                records.append({"metric": metric, "value": float(value), "metric_family": "ranking" if metric in {"average_precision", "roc_auc"} else "decision", "averaging": "one_vs_rest", "label": name, "label_index": int(label), "support": int(values["support"])})
+    for true_position, predicted_position in zip(*np.nonzero(matrix), strict=True):
+        count = int(matrix[true_position, predicted_position])
+        records.append({
+            "metric": "confusion_count",
+            "value": float(count),
+            "metric_family": "diagnostic",
+            "averaging": "count",
+            "label": names[true_position],
+            "label_index": int(labels[true_position]),
+            "predicted_label": names[predicted_position],
+            "predicted_label_index": int(labels[predicted_position]),
+            "support": int(row_totals[true_position]),
+        })
+        records.append({
+            "metric": "confusion_fraction_of_true_class",
+            "value": float(count / row_totals[true_position]),
+            "metric_family": "diagnostic",
+            "averaging": "true_class",
+            "label": names[true_position],
+            "label_index": int(labels[true_position]),
+            "predicted_label": names[predicted_position],
+            "predicted_label_index": int(labels[predicted_position]),
+            "support": int(row_totals[true_position]),
+        })
+    for row in accumulator.calibration_rows():
+        if row["sample_count"] == 0:
+            continue
+        for metric in ("average_confidence", "accuracy", "absolute_gap"):
+            value = row[metric]
+            if value is not None:
+                records.append({"metric": f"calibration_{metric}", "value": float(value), "metric_family": "calibration", "averaging": "bin", "bin_index": int(row["bin_index"]), "support": int(row["sample_count"])})
+    return records
+
+
 def _nested_metadata_value(metadata: Any, key: str) -> Any:
     current = metadata if isinstance(metadata, dict) else {}
     for part in key.split("."):

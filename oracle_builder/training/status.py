@@ -48,6 +48,33 @@ def _rendered_metrics(metrics: dict[str, float], *, limit: int) -> str:
     return rendered
 
 
+def _sparkline(values: list[float], width: int = 16) -> str:
+    """Render a compact, scale-local history suitable for a terminal board."""
+    points = values[-max(1, int(width)):]
+    if not points:
+        return ""
+    if len(points) == 1:
+        return "▅"
+    low, high = min(points), max(points)
+    if high == low:
+        return "▅" * len(points)
+    glyphs = "▁▂▃▄▅▆▇█"
+    return "".join(
+        glyphs[min(len(glyphs) - 1, int((point - low) / (high - low) * len(glyphs)))]
+        for point in points
+    )
+
+
+def _trend(values: list[float]) -> str:
+    if len(values) < 2:
+        return ""
+    delta = values[-1] - values[-2]
+    tolerance = max(abs(values[-2]), 1.0) * 1e-6
+    if abs(delta) <= tolerance:
+        return "→"
+    return "↗" if delta > 0 else "↘"
+
+
 class RichTrainingStatusCallback(keras.callbacks.Callback):
     """A compact live board for Keras training, with log-safe text fallback.
 
@@ -88,6 +115,8 @@ class RichTrainingStatusCallback(keras.callbacks.Callback):
         self._started_at: float | None = None
         self._epoch_started_at: float | None = None
         self._metrics: dict[str, float] = {}
+        self._latest_validation: dict[str, float] = {}
+        self._history: dict[str, list[float]] = {}
 
     def _event(self, message: str, details: dict[str, Any]) -> None:
         if self.training_log is not None and self.run_id is not None:
@@ -103,8 +132,18 @@ class RichTrainingStatusCallback(keras.callbacks.Callback):
     def _board(self):
         total_epochs = self.epochs or self.params.get("epochs") or "?"
         metrics = Table.grid(expand=True, padding=(0, 2))
+        metrics.add_row("[bold]metric[/bold]", "[bold]current[/bold]", "[bold]history[/bold]")
         for name, value in _ordered_metrics(self._metrics)[:12]:
-            metrics.add_row(f"[bold]{name}[/bold]", f"{value:.5g}")
+            history = list(self._history.get(name, []))
+            if not history or history[-1] != value:
+                history.append(value)
+            sparkline = _sparkline(history)
+            direction = _trend(history)
+            metrics.add_row(
+                f"[bold]{name}[/bold]",
+                f"{value:.5g}",
+                f"{sparkline} {direction}".rstrip(),
+            )
         if len(self._metrics) > 12:
             metrics.add_row("metrics", f"+{len(self._metrics) - 12} more")
         learning_rate = self._learning_rate()
@@ -144,7 +183,9 @@ class RichTrainingStatusCallback(keras.callbacks.Callback):
         del logs
         self._epoch = int(epoch) + 1
         self._steps = self.params.get("steps")
-        self._metrics = {}
+        # Keras reports validation metrics only at an epoch boundary. Keep the
+        # latest values visible while the next epoch's training batches arrive.
+        self._metrics = dict(self._latest_validation)
         self._epoch_started_at = time.perf_counter()
         details = {"phase": self.phase, "epoch": self._epoch, "epochs": self.epochs}
         self._event("Training epoch started", details)
@@ -157,7 +198,10 @@ class RichTrainingStatusCallback(keras.callbacks.Callback):
             print(f"[{self.phase}] epoch {self._epoch}/{self.epochs or '?'} started", file=self.stream, flush=True)
 
     def on_train_batch_end(self, batch: int, logs=None):
-        self._metrics = _numeric_metrics(logs)
+        self._metrics = {
+            **self._latest_validation,
+            **_numeric_metrics(logs),
+        }
         if self._interactive and self._progress is not None and self._batch_task is not None:
             self._progress.update(self._batch_task, completed=int(batch) + 1)
             if self._live is not None:
@@ -165,6 +209,11 @@ class RichTrainingStatusCallback(keras.callbacks.Callback):
 
     def on_epoch_end(self, epoch: int, logs=None):
         self._metrics = _numeric_metrics(logs)
+        self._latest_validation = {
+            name: value for name, value in self._metrics.items() if name.startswith("val_")
+        }
+        for name, value in self._metrics.items():
+            self._history.setdefault(name, []).append(value)
         elapsed = time.perf_counter() - (self._epoch_started_at or time.perf_counter())
         details = {
             "phase": self.phase,

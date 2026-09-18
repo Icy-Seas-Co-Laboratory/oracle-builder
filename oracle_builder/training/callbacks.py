@@ -5,7 +5,10 @@ from typing import Any
 
 from tensorflow import keras
 
-from oracle_builder.training.logging_callbacks import SQLiteMetricLogger
+from oracle_builder.training.logging_callbacks import (
+    ClassificationEpochMetricsLogger,
+    SQLiteMetricLogger,
+)
 from oracle_builder.training.status import RichTrainingStatusCallback
 
 
@@ -16,6 +19,7 @@ def build_callbacks(
     run_id: str,
     *,
     artifact_id: str | None = None,
+    classification_metric_datasets: dict[str, Any] | None = None,
 ):
     callbacks: list[keras.callbacks.Callback] = [
         SQLiteMetricLogger(training_log, run_id),
@@ -27,6 +31,20 @@ def build_callbacks(
             run_id=run_id,
         ),
     ]
+    if classification_metric_datasets is not None:
+        labels = {
+            int(row["class_index"]): str(row.get("name") or row["class_index"])
+            for row in config.get("dataset", {}).get("labels", [])
+        }
+        callbacks.insert(
+            0,
+            ClassificationEpochMetricsLogger(
+                training_log,
+                run_id,
+                classification_metric_datasets,
+                labels,
+            ),
+        )
     callback_config = config.get("callbacks", {})
     output_config = config.get("output", {})
     monitor = callback_config.get("checkpoint_monitor", "val_loss")

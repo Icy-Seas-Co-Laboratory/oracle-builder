@@ -9,7 +9,7 @@ notes = "SimpleCNN with SimCLR self-supervised training and weighted cross entro
 
 [data]
 # Grayscale is assumed. Class count and splits are derived at run time.
-input_shape = [224, 224, 1]
+input_shape = [224, 224]
 batch_size = 8
 shuffle_buffer = 4096
 validation_split = 0.20

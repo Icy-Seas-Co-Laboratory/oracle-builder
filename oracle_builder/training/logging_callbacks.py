@@ -7,7 +7,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 from tensorflow import keras
+
+from oracle_builder.evaluation.classification import classification_epoch_metric_records
 
 
 EVENT_SCHEMA = "oracle_training_event"
@@ -226,6 +229,56 @@ class SQLiteMetricLogger(keras.callbacks.Callback):
             )
         connection.commit()
         connection.close()
+
+
+class ClassificationEpochMetricsLogger(keras.callbacks.Callback):
+    """Append rich, non-test classification metrics after every epoch."""
+
+    def __init__(
+        self,
+        sqlite_path: str | Path,
+        run_id: str,
+        datasets: dict[str, Any],
+        class_names: dict[int, str],
+    ):
+        super().__init__()
+        self.sqlite_path = sqlite_path
+        self.run_id = run_id
+        self.datasets = datasets
+        self.class_names = class_names
+
+    def on_epoch_end(self, epoch: int, logs=None):
+        del logs
+        for split, dataset in self.datasets.items():
+            if split not in {"train", "validation"}:
+                continue
+            targets: list[int] = []
+            probabilities: list[np.ndarray] = []
+            for batch in dataset:
+                images, labels = batch[:2]
+                probabilities.append(np.asarray(self.model(images, training=False)))
+                targets.extend(int(value) for value in labels.numpy().reshape(-1))
+            if not targets:
+                continue
+            for metric in classification_epoch_metric_records(
+                targets,
+                np.concatenate(probabilities, axis=0),
+                class_names=self.class_names,
+            ):
+                _append_jsonl(
+                    _metrics_path(self.sqlite_path),
+                    {
+                        "schema": METRIC_SCHEMA,
+                        "schema_version": "1.1.0",
+                        "metric_id": str(uuid.uuid4()),
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "run_id": self.run_id,
+                        "phase": "epoch_evaluation",
+                        "epoch": int(epoch),
+                        "split": split,
+                        **metric,
+                    },
+                )
 
 
 def history_from_training_log(path: str | Path, run_id: str) -> dict[str, list[float]]:

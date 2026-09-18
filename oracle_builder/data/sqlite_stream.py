@@ -10,7 +10,10 @@ from typing import Any, Iterator
 import numpy as np
 import tensorflow as tf
 
-from oracle_builder.data.decoders import decode_blob, prepare_classification_input
+from oracle_builder.data.decoders import (
+    decode_blob,
+    prepare_dataset_classification_input,
+)
 from oracle_builder.data.splits import assign_run_splits
 from oracle_builder.training.augmentation import apply_training_augmentation
 
@@ -160,8 +163,9 @@ class SQLiteClassificationSource:
     def read_image(self, item_id: str) -> np.ndarray:
         row = self._connection().execute(
             """
-            SELECT a.payload, a.encoding, a.shape_json
+            SELECT a.payload, a.encoding, a.shape_json, di.metadata_json
             FROM classification_items ci
+            JOIN dataset_items di ON di.item_id = ci.item_id
             JOIN assets a ON a.asset_id = ci.image_asset_id
             WHERE ci.item_id = ?
             """,
@@ -170,7 +174,10 @@ class SQLiteClassificationSource:
         if row is None:
             raise KeyError(f"SQLite dataset item {item_id!r} no longer exists")
         decoded = decode_blob(row[0], row[1], row[2])
-        return prepare_classification_input(decoded, self.input_shape, self.config)
+        metadata = json.loads(row[3]) if row[3] else {}
+        return prepare_dataset_classification_input(
+            decoded, self.input_shape, self.config, metadata
+        )
 
     def _tf_read_image(self, item_id):
         image = tf.py_function(

@@ -68,7 +68,7 @@ def test_family_defaults_share_the_same_augmentation_policy():
 def test_resnet_default_preserves_roi_detail_and_uses_raw_classifier_embeddings():
     config = load_toml(CONFIG_DIR / "resnet.toml")
 
-    assert config["data"]["input_shape"] == [128, 128, 1]
+    assert config["data"]["input_shape"] == [128, 128]
     assert config["model"]["variant"] == "resnet18"
     assert config["model"]["stem_kernel_size"] == 3
     assert config["model"]["stem_stride"] == 1
@@ -79,7 +79,7 @@ def test_resnet_default_preserves_roi_detail_and_uses_raw_classifier_embeddings(
 def test_resnet_like_default_uses_roi_input_and_raw_classifier_embeddings():
     config = load_toml(CONFIG_DIR / "resnet_like.toml")
 
-    assert config["data"]["input_shape"] == [128, 128, 1]
+    assert config["data"]["input_shape"] == [128, 128]
     assert config["model"]["normalize_embeddings"] is False
 
 
@@ -93,7 +93,7 @@ def test_all_classification_examples_share_high_level_defaults(path):
 
     assert user_config["run"]["task"] == "classification"
     assert "num_classes" not in user_config["data"]
-    assert user_config["data"]["input_shape"][-1] == 1
+    assert len(user_config["data"]["input_shape"]) == 2
     assert user_config["preprocessing"]["channel_mode"] == "grayscale"
     assert user_config["training"]["loss"] == (
         "weighted_sparse_categorical_crossentropy"

@@ -16,7 +16,7 @@ from oracle_builder.data.decoders import (
     decode_blob,
     encode_npy,
     normalize_input,
-    prepare_classification_input,
+    prepare_dataset_classification_input,
 )
 from oracle_builder.data.splits import assign_run_splits
 from oracle_builder.data.signed_distance import signed_distance_field
@@ -157,7 +157,12 @@ def load_arrays(sqlite_path: str | Path, config: dict[str, Any], split: str | No
         if task == "segmentation":
             x = prepare_segmentation_input(x, input_shape, config)
         xs.append(
-            prepare_classification_input(x, input_shape, config)
+            prepare_dataset_classification_input(
+                x,
+                input_shape,
+                config,
+                json.loads(row["metadata_json"]) if row.get("metadata_json") else {},
+            )
             if task == "classification"
             else normalize_input(x, input_shape)
         )
@@ -241,7 +246,12 @@ def load_prediction_arrays(
         if task == "segmentation":
             x = prepare_segmentation_input(x, input_shape, config)
         xs.append(
-            prepare_classification_input(x, input_shape, config)
+            prepare_dataset_classification_input(
+                x,
+                input_shape,
+                config,
+                json.loads(row["metadata_json"]) if row.get("metadata_json") else {},
+            )
             if task == "classification"
             else normalize_input(x, input_shape)
         )
@@ -488,6 +498,43 @@ def make_tf_datasets(sqlite_path: str | Path, config: dict[str, Any]):
     if "train" not in datasets:
         raise ValueError("Dataset must contain or create a train split")
     return datasets, records_by_split
+
+
+def make_classification_metric_datasets(
+    sqlite_path: str | Path, config: dict[str, Any]
+):
+    """Build unshuffled, unaugmented train/validation datasets for epoch metrics."""
+    if config.get("data", {}).get("streaming", {}).get("enabled", True):
+        from oracle_builder.data.sqlite_stream import (
+            SQLiteClassificationSource,
+            build_classification_index,
+        )
+
+        source = SQLiteClassificationSource(sqlite_path, config)
+        datasets = {}
+        for split in ("train", "validation"):
+            index = build_classification_index(
+                sqlite_path, config, split, labeled_only=True
+            )
+            if index.refs:
+                datasets[split] = source.training_dataset(
+                    index, shuffle=False, augment=False
+                )
+        return datasets
+    import tensorflow as tf
+
+    datasets = {}
+    for split in ("train", "validation"):
+        try:
+            inputs, targets, _ = load_arrays(sqlite_path, config, split=split)
+        except ValueError as exc:
+            if not str(exc).startswith("No samples found for split="):
+                raise
+            continue
+        datasets[split] = tf.data.Dataset.from_tensor_slices((inputs, targets)).batch(
+            int(config["data"].get("batch_size", 16))
+        )
+    return datasets
 
 
 def resize_segmentation_input(array: Any, input_shape: list[int] | tuple[int, ...]) -> np.ndarray:

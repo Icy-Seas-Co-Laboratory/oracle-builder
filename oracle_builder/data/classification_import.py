@@ -190,10 +190,38 @@ def _encoded_input(candidate: Candidate, options: argparse.Namespace):
             "pad_value": options.pad_value,
             "interpolation": options.interpolation,
             "channel_mode": options.channel_mode,
+            "derived_channels": {
+                "gradient_magnitude": options.gradient_magnitude,
+                "local_contrast": options.local_contrast,
+                "local_contrast_sigma": options.local_contrast_sigma,
+            },
         }
     }
-    materialized = prepare_classification_input(array, options.input_shape, config)
+    materialized = prepare_classification_input(
+        array, _resolved_materialized_input_shape(options), config
+    )
     return encode_npy(materialized), "npy", json.dumps(list(materialized.shape))
+
+
+def _resolved_materialized_input_shape(options: argparse.Namespace) -> list[int]:
+    """Make the importer accept the same H, W input declaration as training.
+
+    Materialized arrays must retain an explicit channel dimension, but callers
+    only need to specify it when preserving a legacy RGB/RGBA input contract.
+    """
+    shape = [int(value) for value in options.input_shape]
+    derived_count = int(options.gradient_magnitude) + int(options.local_contrast)
+    expected_channels = 1 + derived_count
+    if len(shape) == 2:
+        return [*shape, expected_channels]
+    if len(shape) != 3:
+        raise ValueError("--input-shape must be H W or H W C")
+    if derived_count and shape[-1] != expected_channels:
+        raise ValueError(
+            "Derived channels require --input-shape H W or "
+            f"H W {expected_channels}"
+        )
+    return shape
 
 
 def import_folders(options: argparse.Namespace) -> dict[str, Any]:
@@ -580,7 +608,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--duplicate-policy", choices=("error", "skip", "allow"), default="skip")
     parser.add_argument("--existing-policy", choices=("error", "skip", "update"), default="skip")
     parser.add_argument("--storage-mode", choices=("original", "materialized"), default="original")
-    parser.add_argument("--input-shape", type=int, nargs=3)
+    parser.add_argument(
+        "--input-shape",
+        type=int,
+        nargs="+",
+        metavar="DIM",
+        help="Target H W (channels are resolved automatically) or legacy H W C.",
+    )
     parser.add_argument(
         "--resize-mode",
         choices=("fit_pad", "fit_pad_max_2x", "fit_pad_max_3x", "fill_crop", "stretch", "none", "fit"),
@@ -604,6 +638,17 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("auto", "grayscale", "rgb", "rgba"),
         default="auto",
     )
+    parser.add_argument(
+        "--gradient-magnitude",
+        action="store_true",
+        help="Append a normalized grayscale gradient-magnitude channel.",
+    )
+    parser.add_argument(
+        "--local-contrast",
+        action="store_true",
+        help="Append a normalized local-contrast/high-pass channel.",
+    )
+    parser.add_argument("--local-contrast-sigma", type=float, default=3.0)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--report")
     return parser
@@ -613,8 +658,19 @@ def main() -> int:
     options = build_parser().parse_args()
     if options.polarity_sample_count < 1:
         raise SystemExit("--polarity-sample-count must be positive")
-    if options.storage_mode == "materialized" and not options.input_shape:
-        raise SystemExit("--storage-mode materialized requires --input-shape H W C")
+    if options.storage_mode == "materialized":
+        if not options.input_shape:
+            raise SystemExit("--storage-mode materialized requires --input-shape H W")
+        if len(options.input_shape) not in {2, 3} or any(
+            value < 1 for value in options.input_shape
+        ):
+            raise SystemExit("--input-shape must contain H W or H W C positive integers")
+        if options.local_contrast_sigma <= 0:
+            raise SystemExit("--local-contrast-sigma must be positive")
+        try:
+            _resolved_materialized_input_shape(options)
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
     summary = import_folders(options)
     print(json.dumps(summary, indent=2, sort_keys=True))
     return 0

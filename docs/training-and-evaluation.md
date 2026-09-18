@@ -69,9 +69,11 @@ remains as an alias for the related projector value.
 
 Training uses a shared Rich live status board by default for both supervised
 and self-supervised runs. It shows epoch and batch progress, elapsed/remaining
-time, learning rate, and the reported scalar metrics without emitting a line
-per batch. Captured or non-interactive consoles receive one compact completion
-line per epoch instead. Full metrics remain available in the run SQLite log,
+time, learning rate, the latest train and validation metrics, and compact
+history sparklines with directional indicators. Validation values remain visible
+through the next training epoch until they are refreshed. Captured or
+non-interactive consoles receive one compact completion line per epoch instead.
+Full metrics remain available in the run SQLite log,
 `events.jsonl`, `metrics.jsonl`, CSV, and JSON artifacts.
 
 Use `[training] display = "text"` for explicit epoch text, or `display = "off"`
@@ -84,6 +86,16 @@ average of per-batch scores), so the status board and text log show both
 `macro_f1` and `val_macro_f1`. A class that is neither observed nor predicted
 in the measured split contributes zero, consistent with post-training
 evaluation. To opt out, remove `"macro_f1"` from the metric list.
+
+After every supervised classification epoch, Oracle Builder also runs the
+broader classification metric calculation against the unaugmented training and
+validation splits. It appends plot-ready records to `metrics/metrics.jsonl`:
+overall and macro/micro/weighted decision metrics, ranking metrics, calibration
+metrics, per-class one-vs-rest metrics, and nonzero confusion-matrix counts
+(including each count normalized by its true class). Each record identifies its
+epoch, split, metric family, averaging method, and, where applicable, class
+label and support. The test split is deliberately excluded from this loop and
+is evaluated only once during finalization.
 
 ## Streaming and multiple GPUs
 

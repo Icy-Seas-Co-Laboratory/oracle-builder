@@ -128,6 +128,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "channel_mode": "grayscale",
         "percentile_low": 1.0,
         "percentile_high": 99.0,
+        "derived_channels": {
+            "gradient_magnitude": False,
+            "local_contrast": False,
+            "local_contrast_sigma": 3.0,
+        },
     },
     "distribution": {
         "strategy": "auto",
@@ -257,6 +262,13 @@ def validate_config(config: dict[str, Any]) -> None:
         raise ValueError("run.model is required")
     if "input_shape" not in config["data"]:
         raise ValueError("data.input_shape is required")
+    if task in {"classification", "embedding"}:
+        input_shape = config["data"]["input_shape"]
+        if len(input_shape) not in {2, 3} or any(int(value) < 1 for value in input_shape):
+            raise ValueError(
+                "Classification data.input_shape must be [height, width] or "
+                "[height, width, channels]"
+            )
     if str(config.get("training", {}).get("display", "rich")).lower() not in {
         "rich", "text", "off"
     }:
@@ -321,6 +333,23 @@ def validate_config(config: dict[str, Any]) -> None:
         raise ValueError("Unsupported preprocessing.interpolation")
     if preprocessing.get("channel_mode", "auto") not in {"auto", "grayscale", "rgb", "rgba"}:
         raise ValueError("preprocessing.channel_mode must be auto, grayscale, rgb, or rgba")
+    derived = preprocessing.get("derived_channels", {})
+    if not isinstance(derived, dict):
+        raise ValueError("preprocessing.derived_channels must be a table/object")
+    if float(derived.get("local_contrast_sigma", 3.0)) <= 0:
+        raise ValueError("preprocessing.derived_channels.local_contrast_sigma must be positive")
+    if task in {"classification", "embedding"}:
+        derived_count = int(bool(derived.get("gradient_magnitude", False))) + int(
+            bool(derived.get("local_contrast", False))
+        )
+        if (
+            derived_count
+            and len(config["data"]["input_shape"]) == 3
+            and int(config["data"]["input_shape"][-1]) != 1 + derived_count
+        ):
+            raise ValueError(
+                "Derived classification channels must match the resolved input channel count"
+            )
     streaming = config.get("data", {}).get("streaming", {})
     if int(streaming.get("reader_workers", 4)) < 1:
         raise ValueError("data.streaming.reader_workers must be at least 1")
@@ -576,6 +605,8 @@ def resolve_config(config_path: str | Path, input_path: str | Path, run_dir: str
             resolved["training"]["loss"] = "sparse_categorical_crossentropy"
         if "channel_mode" not in user_config.get("preprocessing", {}):
             resolved["preprocessing"]["channel_mode"] = "grayscale"
+    if task in {"classification", "embedding"}:
+        _resolve_classification_channels(resolved)
     if resolved.get("run", {}).get("task") == "segmentation":
         from oracle_builder.datasets.legacy_roi import (
             ensure_mask_refinement_database,
@@ -694,6 +725,39 @@ def resolve_config(config_path: str | Path, input_path: str | Path, run_dir: str
         "run_dir": str(Path(run_dir).resolve()),
     }
     return resolved
+
+
+def _resolve_classification_channels(config: dict[str, Any]) -> None:
+    """Resolve user-facing [height, width] into the model's three-axis shape."""
+    input_shape = [int(value) for value in config["data"]["input_shape"]]
+    if len(input_shape) not in {2, 3} or any(value < 1 for value in input_shape):
+        raise ValueError(
+            "Classification data.input_shape must be [height, width] or the legacy "
+            "[height, width, channels] form"
+        )
+    derived = config.get("preprocessing", {}).get("derived_channels", {})
+    if not isinstance(derived, dict):
+        raise ValueError("preprocessing.derived_channels must be a table/object")
+    names = ["grayscale"]
+    if bool(derived.get("gradient_magnitude", False)):
+        names.append("gradient_magnitude")
+    if bool(derived.get("local_contrast", False)):
+        names.append("local_contrast")
+    expected_channels = len(names)
+    if len(input_shape) == 3 and len(names) > 1 and input_shape[-1] != expected_channels:
+        raise ValueError(
+            "Legacy data.input_shape channel count conflicts with enabled derived channels; "
+            "use [height, width] instead"
+        )
+    if len(input_shape) == 3 and len(names) == 1 and input_shape[-1] != 1:
+        # Preserve existing explicit RGB/RGBA classification contracts when no
+        # grayscale-derived feature is requested.
+        config["preprocessing"]["resolved_channels"] = [
+            f"source_channel_{index}" for index in range(input_shape[-1])
+        ]
+        return
+    config["data"]["input_shape"] = [input_shape[0], input_shape[1], expected_channels]
+    config["preprocessing"]["resolved_channels"] = names
 
 
 def infer_classification_num_classes(input_path: str | Path) -> int:

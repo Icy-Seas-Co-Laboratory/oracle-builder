@@ -9,7 +9,7 @@ notes = "ROI-friendly ResNet-18 classification example"
 
 [data]
 # Grayscale is assumed. Class count comes from the SQLite dataset.
-input_shape = [128, 128, 1]
+input_shape = [128, 128]
 batch_size = 16
 shuffle_buffer = 512
 validation_split = 0.20

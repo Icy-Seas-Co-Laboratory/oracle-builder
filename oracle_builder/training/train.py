@@ -107,6 +107,7 @@ def train_model(
     run_id: str,
     pretraining_dataset=None,
     resume_state: dict[str, Any] | None = None,
+    classification_metric_datasets: dict[str, Any] | None = None,
 ):
     set_seed(int(config["run"].get("seed", 123)))
     strategy, distribution_info = select_distribution_strategy(config)
@@ -197,6 +198,7 @@ def train_model(
         training_log,
         run_id,
         artifact_id=config.get("artifact", {}).get("artifact_id"),
+        classification_metric_datasets=classification_metric_datasets,
     )
     validation_data = datasets.get("validation")
     initial_epoch = int(resume_state.get("completed_epoch", 0)) if resume_state else 0
@@ -220,7 +222,6 @@ def train_model(
     from oracle_builder.artifacts.layout import RunLayout
     from oracle_builder.training.logging_callbacks import (
         history_from_training_log,
-        write_history_jsonl,
     )
 
     history_data = history_from_training_log(training_log, run_id)
@@ -233,12 +234,6 @@ def train_model(
     metrics_df.to_csv(layout.metrics_csv, index=False)
     layout.metrics_json.write_text(
         json.dumps(history_data, indent=2, default=float) + "\n"
-    )
-    write_history_jsonl(
-        history_data,
-        layout.metrics_jsonl,
-        run_id=run_id,
-        phase="training",
     )
     history = keras.callbacks.History()
     history.history = history_data

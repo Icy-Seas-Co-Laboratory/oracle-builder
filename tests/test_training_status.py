@@ -1,7 +1,7 @@
 import io
 
 from oracle_builder.training.callbacks import build_callbacks
-from oracle_builder.training.status import RichTrainingStatusCallback
+from oracle_builder.training.status import RichTrainingStatusCallback, _sparkline, _trend
 
 
 def test_text_status_emits_one_compact_line_per_epoch_without_batch_noise():
@@ -41,3 +41,24 @@ def test_supervised_callback_factory_uses_rich_status_by_default(tmp_path):
     assert status.phase == "Supervised training"
     assert status.epochs == 3
     assert status.display == "rich"
+
+
+def test_status_retains_validation_metrics_and_metric_history_between_epochs():
+    callback = RichTrainingStatusCallback(phase="Classification", epochs=3, display="off")
+    callback.set_params({"steps": 2})
+    callback.on_train_begin()
+    callback.on_epoch_begin(0)
+    callback.on_epoch_end(0, {"loss": 1.0, "val_loss": 1.2, "accuracy": 0.7, "val_accuracy": 0.6})
+    callback.on_epoch_begin(1)
+    callback.on_train_batch_end(0, {"loss": 0.8, "accuracy": 0.8})
+
+    assert callback._metrics["val_loss"] == 1.2
+    assert callback._metrics["val_accuracy"] == 0.6
+    assert callback._history["loss"] == [1.0]
+
+
+def test_sparkline_and_direction_make_static_and_changing_metrics_visible():
+    assert _sparkline([0.5, 0.5, 0.5]) == "▅▅▅"
+    assert _trend([0.5, 0.5]) == "→"
+    assert _trend([0.5, 0.6]) == "↗"
+    assert _trend([0.6, 0.5]) == "↘"

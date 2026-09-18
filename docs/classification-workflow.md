@@ -65,7 +65,9 @@ otherwise it creates its own deterministic assignments. Set
 
 Original encoded image bytes are the default and recommended storage form.
 `--storage-mode materialized` is for a deliberately fixed, preprocessed image
-representation.
+representation. It accepts `--input-shape H W` and resolves its output channel
+count from `--gradient-magnitude` and `--local-contrast` (the legacy `H W C`
+form remains available).
 
 To preserve native detail from small ROIs, use the capped fit-and-pad mode in a
 classification configuration:
@@ -78,6 +80,30 @@ resize_mode = "fit_pad_max_2x" # or "fit_pad_max_3x"
 It downsizes an oversized ROI to fit the configured input shape, but enlarges a
 smaller ROI by no more than the selected 2× or 3× cap before centering it on
 the padded canvas.
+
+## Optional morphology and texture channels
+
+Classification and embedding configurations may specify only image height and
+width. The resolved model channel count is derived from enabled preprocessing
+features and is saved with the run/model artifact:
+
+```toml
+[data]
+input_shape = [128, 128] # height, width
+
+[preprocessing]
+channel_mode = "grayscale"
+
+[preprocessing.derived_channels]
+gradient_magnitude = true # Sobel-gradient morphology channel
+local_contrast = true     # Gaussian high-pass texture channel
+local_contrast_sigma = 3.0
+```
+
+The resulting model input is `[128, 128, 3]`: grayscale, gradient magnitude,
+then local contrast. Each feature is reconstructed from the raw grayscale ROI
+during training, evaluation, and future inference; do not supply the derived
+channels yourself. Disable either flag to remove its channel.
 
 ## Create a curated or small test subset
 

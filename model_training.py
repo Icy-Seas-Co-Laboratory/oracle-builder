@@ -385,6 +385,15 @@ def main() -> int:
         "Loaded self-supervised training inputs",
                 {"samples": self_supervised_count, "split": "train"},
             )
+        classification_metric_datasets = None
+        if config["run"]["task"] == "classification":
+            from oracle_builder.data.sqlite_dataset import (
+                make_classification_metric_datasets,
+            )
+
+            classification_metric_datasets = make_classification_metric_datasets(
+                args.input, config
+            )
         model, history = train_model(
             config,
             datasets,
@@ -393,6 +402,7 @@ def main() -> int:
             run_id,
             pretraining_dataset=self_supervised_dataset,
             resume_state=resume_state,
+            classification_metric_datasets=classification_metric_datasets,
         )
         from oracle_builder.inference.batching import (
             resolve_inference_batch_size,

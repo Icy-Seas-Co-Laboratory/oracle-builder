@@ -11,6 +11,7 @@ from oracle_builder.data.classification_import import build_parser, import_folde
 from oracle_builder.data.decoders import decode_blob, prepare_classification_input
 from oracle_builder.data.polarity import infer_source_polarity
 from oracle_builder.data.sqlite_dataset import load_arrays
+from oracle_builder.data.sqlite_stream import SQLiteClassificationSource
 
 
 def write_image(path: Path, color: tuple[int, int, int], size=(24, 12)):
@@ -170,6 +171,68 @@ def test_materialized_import_applies_requested_preprocessing(tmp_path):
     assert np.allclose(array[:3], 1.0)
 
 
+def test_materialized_import_resolves_derived_channels_from_height_and_width(tmp_path):
+    source = tmp_path / "library"
+    image = np.zeros((12, 20), dtype="uint8")
+    image[:, 10:] = 255
+    path = source / "one" / "edge.png"
+    path.parent.mkdir(parents=True)
+    Image.fromarray(image).save(path)
+    output = tmp_path / "materialized.sqlite"
+
+    import_folders(
+        options_for(
+            source,
+            output,
+            "--storage-mode",
+            "materialized",
+            "--input-shape",
+            "12",
+            "12",
+            "--gradient-magnitude",
+            "--local-contrast",
+        )
+    )
+
+    with sqlite3.connect(output) as connection:
+        blob, encoding, dimensions = connection.execute(
+            """
+            SELECT a.payload, a.encoding, a.shape_json
+            FROM classification_items ci
+            JOIN assets a ON a.asset_id = ci.image_asset_id
+            """
+        ).fetchone()
+    array = decode_blob(blob, encoding, dimensions)
+    assert array.shape == (12, 12, 3)
+    assert array.dtype == np.float32
+    assert array[..., 1].max() > 0.0
+
+    config = {
+        "run": {"task": "classification", "seed": 123},
+        "data": {"input_shape": [12, 12, 3]},
+        "preprocessing": {
+            "resize_mode": "fit_pad",
+            "normalization": "dtype",
+            "rescale": True,
+            "invert": False,
+            "pad_value": 0.0,
+            "interpolation": "bilinear",
+            "channel_mode": "grayscale",
+            "derived_channels": {
+                "gradient_magnitude": True,
+                "local_contrast": True,
+                "local_contrast_sigma": 3.0,
+            },
+        },
+    }
+    eager, _, _ = load_arrays(output, config)
+    with sqlite3.connect(output) as connection:
+        item_id = connection.execute("SELECT item_id FROM dataset_items").fetchone()[0]
+    streamed = SQLiteClassificationSource(output, config).read_image(item_id)
+    np.testing.assert_allclose(eager[0], array)
+    np.testing.assert_allclose(streamed, array)
+
+
 def test_existing_source_partitions_are_provenance_not_dataset_splits(tmp_path):
     source = tmp_path / "library"
     write_image(source / "train" / "cod" / "one.jpg", (1, 2, 3))
@@ -223,6 +286,77 @@ def test_preprocessing_supports_resize_inversion_and_channel_conversion():
     assert value.dtype == np.float32
     assert value.min() == 0
     assert value.max() == 1
+
+
+def test_preprocessing_adds_gradient_and_local_contrast_channels_from_grayscale_roi():
+    array = np.zeros((12, 12), dtype="uint8")
+    array[3:9, 3:9] = 255
+    config = {
+        "preprocessing": {
+            "resize_mode": "fit_pad",
+            "normalization": "dtype",
+            "rescale": True,
+            "invert": False,
+            "pad_value": 0.0,
+            "interpolation": "nearest",
+            "channel_mode": "grayscale",
+            "derived_channels": {
+                "gradient_magnitude": True,
+                "local_contrast": True,
+                "local_contrast_sigma": 1.5,
+            },
+        }
+    }
+
+    value = prepare_classification_input(array, [16, 16, 3], config)
+
+    assert value.shape == (16, 16, 3)
+    assert value.dtype == np.float32
+    assert value[..., 0].max() == 1.0
+    assert value[..., 1].max() == 1.0
+    assert not np.array_equal(value[..., 0], value[..., 1])
+    assert np.all((0.0 <= value[..., 2]) & (value[..., 2] <= 1.0))
+
+
+def test_local_contrast_uses_the_configured_sigma():
+    array = np.zeros((32, 32), dtype="uint8")
+    array[8:24, 8:24] = 255
+    base = {
+        "resize_mode": "none",
+        "normalization": "dtype",
+        "rescale": True,
+        "invert": False,
+        "channel_mode": "grayscale",
+        "interpolation": "nearest",
+    }
+    small_sigma = prepare_classification_input(
+        array,
+        [32, 32, 2],
+        {
+            "preprocessing": {
+                **base,
+                "derived_channels": {
+                    "local_contrast": True,
+                    "local_contrast_sigma": 1.0,
+                },
+            }
+        },
+    )
+    large_sigma = prepare_classification_input(
+        array,
+        [32, 32, 2],
+        {
+            "preprocessing": {
+                **base,
+                "derived_channels": {
+                    "local_contrast": True,
+                    "local_contrast_sigma": 8.0,
+                },
+            }
+        },
+    )
+
+    assert not np.allclose(small_sigma[..., 1], large_sigma[..., 1])
 
 
 def test_capped_fit_pad_modes_limit_small_roi_upscaling_and_downsize_large_rois():

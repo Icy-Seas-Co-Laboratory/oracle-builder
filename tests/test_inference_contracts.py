@@ -138,6 +138,48 @@ def test_classification_bundle_uses_one_model_call_for_a_supplied_batch():
     assert all(result.output["decision"]["class_index"] == 1 for result in result_set.results)
 
 
+def test_classification_bundle_reconstructs_configured_derived_channels():
+    class ShapeRecordingModel:
+        def __init__(self):
+            self.values = None
+
+        def predict_outputs(self, values, verbose=0):
+            self.values = values
+            return {
+                "logits": np.array([[0.0, 1.0]], dtype="float32"),
+                "probabilities": np.array([[0.25, 0.75]], dtype="float32"),
+                "features": np.array([[0.0, 1.0]], dtype="float32"),
+            }
+
+    config = {
+        "run": {"task": "classification", "model": "test"},
+        "data": {"input_shape": [4, 4, 3]},
+        "model": {"normalize_embeddings": True},
+        "preprocessing": {
+            "resize_mode": "stretch",
+            "normalization": "dtype",
+            "rescale": True,
+            "channel_mode": "grayscale",
+            "interpolation": "bilinear",
+            "derived_channels": {
+                "gradient_magnitude": True,
+                "local_contrast": True,
+                "local_contrast_sigma": 1.0,
+            },
+        },
+    }
+    model = ShapeRecordingModel()
+    bundle = InferenceBundle(model, config, model_reference())
+    source = np.zeros((4, 4), dtype="uint8")
+    source[:, 2:] = 255
+
+    result = bundle.predict(InferenceItem.from_array(source))
+
+    assert result.status == "ok"
+    assert model.values.shape == (1, 4, 4, 3)
+    assert model.values[0, ..., 1].max() > 0.0
+
+
 def test_classification_bundle_returns_logits_probabilities_and_embedding():
     tf = pytest.importorskip("tensorflow")
     from oracle_builder.registry import get_model_builder

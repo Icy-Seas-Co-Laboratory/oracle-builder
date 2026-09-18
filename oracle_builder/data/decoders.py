@@ -5,7 +5,7 @@ import json
 from typing import Any
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageFilter
 
 
 def decode_blob(blob: bytes | str | int | float | None, encoding: str | None, dimensions: str | None = None) -> Any:
@@ -67,7 +67,16 @@ def prepare_classification_input(
     if len(target) != 3:
         raise ValueError("Classification data.input_shape must be [height, width, channels]")
     settings = config.get("preprocessing", {})
+    derived_channels = _derived_channel_names(settings)
     channel_mode = settings.get("channel_mode", "auto")
+    if derived_channels:
+        expected_channels = 1 + len(derived_channels)
+        if target[-1] != expected_channels:
+            raise ValueError(
+                "Derived classification channels require data.input_shape with "
+                f"{expected_channels} channels; received {target[-1]}"
+            )
+        channel_mode = "grayscale"
     if channel_mode == "auto":
         channel_mode = {1: "grayscale", 3: "rgb", 4: "rgba"}.get(target[-1])
         if channel_mode is None:
@@ -121,15 +130,99 @@ def prepare_classification_input(
     value = np.asarray(image)
     if value.ndim == 2:
         value = value[..., None]
-    if value.shape != target:
+    if value.shape[:2] != target[:2]:
         raise ValueError(
-            f"Preprocessing mode {mode!r} produced {value.shape}; expected {target}. "
+            f"Preprocessing mode {mode!r} produced {value.shape}; expected spatial shape {target[:2]}. "
             "Use fit_pad, fit_pad_max_2x, fit_pad_max_3x, fill_crop, or stretch for batched training."
         )
     value = _normalize_classification_values(value, settings)
     if bool(settings.get("invert", False)):
         value = 1.0 - value
+    if derived_channels:
+        base = value[..., 0]
+        values = [base]
+        for name in derived_channels:
+            if name == "gradient_magnitude":
+                values.append(_gradient_magnitude(base))
+            elif name == "local_contrast":
+                values.append(
+                    _local_contrast(
+                        base,
+                        sigma=float(
+                            settings.get("derived_channels", {}).get(
+                                "local_contrast_sigma", 3.0
+                            )
+                        ),
+                    )
+                )
+        value = np.stack(values, axis=-1)
+    if value.shape != target:
+        raise ValueError(
+            f"Preprocessing produced {value.shape}; expected {target}."
+        )
     return value.astype("float32")
+
+
+def prepare_dataset_classification_input(
+    array: Any,
+    input_shape: list[int] | tuple[int, ...],
+    config: dict[str, Any],
+    metadata: dict[str, Any] | None = None,
+) -> np.ndarray:
+    """Prepare a database image without reprocessing a materialized tensor.
+
+    Folder imports in ``materialized`` mode persist the complete, final model
+    tensor. Reapplying the normal preprocessing pipeline would blend its
+    channels back into grayscale and regenerate different derived features.
+    """
+    target = tuple(int(value) for value in input_shape)
+    if (metadata or {}).get("storage_mode") == "materialized":
+        value = np.asarray(array, dtype="float32")
+        if value.shape != target:
+            raise ValueError(
+                "Materialized classification input shape "
+                f"{value.shape} does not match the configured model input {target}"
+            )
+        return value
+    return prepare_classification_input(array, input_shape, config)
+
+
+def _derived_channel_names(settings: dict[str, Any]) -> list[str]:
+    """Return the stable input-channel order requested by preprocessing."""
+    channels = settings.get("derived_channels", {})
+    if not isinstance(channels, dict):
+        raise ValueError("preprocessing.derived_channels must be a table/object")
+    result = []
+    if bool(channels.get("gradient_magnitude", False)):
+        result.append("gradient_magnitude")
+    if bool(channels.get("local_contrast", False)):
+        result.append("local_contrast")
+    return result
+
+
+def _gradient_magnitude(value: np.ndarray) -> np.ndarray:
+    dy, dx = np.gradient(np.asarray(value, dtype="float32"))
+    magnitude = np.hypot(dx, dy)
+    return _normalize_positive_feature(magnitude)
+
+
+def _local_contrast(value: np.ndarray, *, sigma: float) -> np.ndarray:
+    if sigma <= 0:
+        raise ValueError("preprocessing.derived_channels.local_contrast_sigma must be positive")
+    image = Image.fromarray(np.rint(np.clip(value, 0.0, 1.0) * 255).astype("uint8"))
+    blurred = np.asarray(image.filter(ImageFilter.GaussianBlur(radius=sigma)), dtype="float32") / 255.0
+    contrast = np.asarray(value, dtype="float32") - blurred
+    scale = float(np.percentile(np.abs(contrast), 99.0)) if contrast.size else 0.0
+    if scale <= 1e-12:
+        return np.full_like(contrast, 0.5, dtype="float32")
+    return np.clip(0.5 + 0.5 * contrast / scale, 0.0, 1.0).astype("float32")
+
+
+def _normalize_positive_feature(value: np.ndarray) -> np.ndarray:
+    scale = float(np.percentile(value, 99.0)) if value.size else 0.0
+    if scale <= 1e-12:
+        return np.zeros_like(value, dtype="float32")
+    return np.clip(value / scale, 0.0, 1.0).astype("float32")
 
 
 def _array_to_pil(value: np.ndarray, channel_mode: str) -> Image.Image:

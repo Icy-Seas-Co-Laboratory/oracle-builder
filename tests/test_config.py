@@ -45,6 +45,40 @@ loss = "sparse_categorical_crossentropy"
     assert config["paths"]["run_dir"] == str(run_dir.resolve())
 
 
+def test_resolve_config_derives_classification_channels_from_two_dimensional_shape(tmp_path: Path):
+    config_path = tmp_path / "config.toml"
+    input_path = tmp_path / "data.sqlite"
+    create_synthetic_classification(input_path, n=4, shape=(16, 16, 1), classes=2)
+    freeze(input_path)
+    config_path.write_text(
+        """
+[run]
+task = "classification"
+model = "simple_cnn"
+
+[data]
+input_shape = [16, 16]
+
+[preprocessing.derived_channels]
+gradient_magnitude = true
+local_contrast = true
+local_contrast_sigma = 2.0
+
+[training]
+loss = "sparse_categorical_crossentropy"
+"""
+    )
+
+    config = resolve_config(config_path, input_path, tmp_path / "run")
+
+    assert config["data"]["input_shape"] == [16, 16, 3]
+    assert config["preprocessing"]["resolved_channels"] == [
+        "grayscale",
+        "gradient_magnitude",
+        "local_contrast",
+    ]
+
+
 def test_resolve_config_infers_class_count_from_sqlite(tmp_path: Path):
     config_path = tmp_path / "config.toml"
     input_path = tmp_path / "data.sqlite"
