@@ -7,7 +7,10 @@ import tensorflow as tf
 from tensorflow import keras
 
 from oracle_builder.evaluation.classification import classification_epoch_metric_records
-from oracle_builder.training.logging_callbacks import ClassificationEpochMetricsLogger
+from oracle_builder.training.logging_callbacks import (
+    ClassificationEpochMetricsLogger,
+    JSONLMetricLogger,
+)
 from oracle_builder.training.metrics import BinaryDice, SparseCategoricalMacroF1
 
 
@@ -91,3 +94,19 @@ def test_epoch_classification_logger_writes_train_and_validation_but_not_test(tm
     assert {row["split"] for row in rows} == {"train", "validation"}
     assert all(row["phase"] == "epoch_evaluation" for row in rows)
     assert any(row["metric"] == "macro_f1" for row in rows)
+
+
+def test_jsonl_metric_logger_persists_self_supervised_metrics_each_epoch(tmp_path):
+    path = tmp_path / "self_supervised" / "metrics.jsonl"
+    callback = JSONLMetricLogger(path, "run-ssl", phase="self_supervised")
+
+    callback.on_epoch_end(2, {"loss": 0.4, "representation_std": 0.2, "val_loss": 0.5})
+
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    assert {row["metric"] for row in rows} == {
+        "loss",
+        "representation_std",
+    }
+    assert {row["split"] for row in rows} == {"train", "validation"}
+    assert all(row["epoch"] == 2 for row in rows)
+    assert all(row["phase"] == "self_supervised" for row in rows)

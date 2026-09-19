@@ -359,6 +359,27 @@ def test_local_contrast_uses_the_configured_sigma():
     assert not np.allclose(small_sigma[..., 1], large_sigma[..., 1])
 
 
+def test_local_contrast_magnitude_is_zero_for_a_uniform_roi():
+    value = prepare_classification_input(
+        np.full((16, 16), 127, dtype="uint8"),
+        [16, 16, 2],
+        {
+            "preprocessing": {
+                "resize_mode": "none",
+                "normalization": "dtype",
+                "rescale": True,
+                "channel_mode": "grayscale",
+                "derived_channels": {
+                    "local_contrast": True,
+                    "local_contrast_sigma": 3.0,
+                },
+            }
+        },
+    )
+
+    assert np.allclose(value[..., 1], 0.0)
+
+
 def test_capped_fit_pad_modes_limit_small_roi_upscaling_and_downsize_large_rois():
     config = {
         "preprocessing": {

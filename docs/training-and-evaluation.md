@@ -73,8 +73,11 @@ time, learning rate, the latest train and validation metrics, and compact
 history sparklines with directional indicators. Validation values remain visible
 through the next training epoch until they are refreshed. Captured or
 non-interactive consoles receive one compact completion line per epoch instead.
-Full metrics remain available in the run SQLite log,
-`events.jsonl`, `metrics.jsonl`, CSV, and JSON artifacts.
+The Rich board lists every reported scalar metric and alternates metric-row
+backgrounds for readability. Full metrics remain available in the run SQLite
+log, `events.jsonl`, `metrics.jsonl`, CSV, and JSON artifacts. Self-supervised
+metrics are appended during each epoch to `metrics/pretraining/metrics.jsonl`,
+so the partial history remains available if the phase is interrupted.
 
 Use `[training] display = "text"` for explicit epoch text, or `display = "off"`
 to suppress console status. The legacy `self_supervised.verbose` setting remains

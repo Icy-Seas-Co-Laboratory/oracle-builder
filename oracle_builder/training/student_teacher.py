@@ -20,7 +20,7 @@ from oracle_builder.data.decoders import decode_blob
 from oracle_builder.data.sqlite_dataset import resize_array_to_shape
 from oracle_builder.registry import get_model_builder
 from oracle_builder.training.augmentation import augment_batch
-from oracle_builder.training.logging_callbacks import log_event, write_history_jsonl
+from oracle_builder.training.logging_callbacks import JSONLMetricLogger, log_event
 from oracle_builder.training.status import RichTrainingStatusCallback
 
 
@@ -329,18 +329,28 @@ def run_grayscale_reconstruction_self_supervised(
                 ),
             ],
         )
+    from oracle_builder.artifacts.layout import RunLayout
+
+    layout = RunLayout(run_dir)
+    layout.self_supervised_metrics.mkdir(parents=True, exist_ok=True)
+    layout.self_supervised_model.mkdir(parents=True, exist_ok=True)
     history = pre_model.fit(
         dataset,
         epochs=epochs,
         verbose=0,
         callbacks=[
+            JSONLMetricLogger(
+                layout.self_supervised_metrics_jsonl,
+                run_id,
+                phase="self_supervised",
+            ),
             RichTrainingStatusCallback(
                 phase="SSL · grayscale reconstruction",
                 epochs=epochs,
                 training_log=training_log,
                 run_id=run_id,
                 display=_self_supervised_display(config, settings),
-            )
+            ),
         ],
     )
     source_convs = [layer for layer in pre_model.layers if isinstance(layer, layers.Conv2D)]
@@ -357,16 +367,8 @@ def run_grayscale_reconstruction_self_supervised(
             kernel = np.zeros_like(target_weights[0])
             kernel[..., 0, :] = source_weights[0][..., 0, :]
             target.set_weights([kernel, source_weights[1]])
-    from oracle_builder.artifacts.layout import RunLayout
-    layout = RunLayout(run_dir); layout.self_supervised_metrics.mkdir(parents=True, exist_ok=True); layout.self_supervised_model.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(history.history).to_csv(layout.self_supervised_metrics / "metrics.csv", index_label="epoch")
     (layout.self_supervised_metrics / "metrics.json").write_text(json.dumps(history.history, indent=2, default=float) + "\n")
-    write_history_jsonl(
-        history.history,
-        layout.self_supervised_metrics_jsonl,
-        run_id=run_id,
-        phase="self_supervised",
-    )
     pre_model.save_weights(layout.self_supervised_model / "grayscale_reconstruction.weights.h5")
     return history
 
@@ -1096,23 +1098,30 @@ def run_self_supervised_training(
             training=False,
         )
     epochs = int(settings.get("epochs", 10))
+    from oracle_builder.artifacts.layout import RunLayout
+
+    layout = RunLayout(run_dir)
+    layout.self_supervised_metrics.mkdir(parents=True, exist_ok=True)
+    layout.self_supervised_model.mkdir(parents=True, exist_ok=True)
     history = pretrainer.fit(
         dataset,
         epochs=epochs,
         verbose=0,
         callbacks=[
+            JSONLMetricLogger(
+                layout.self_supervised_metrics_jsonl,
+                run_id,
+                phase="self_supervised",
+            ),
             RichTrainingStatusCallback(
                 phase=f"SSL · {method.upper()}",
                 epochs=epochs,
                 training_log=training_log,
                 run_id=run_id,
                 display=_self_supervised_display(config, settings),
-            )
+            ),
         ],
     )
-    from oracle_builder.artifacts.layout import RunLayout
-
-    layout = RunLayout(run_dir)
     metrics_dir = layout.self_supervised_metrics
     model_dir = layout.self_supervised_model
     metrics_dir.mkdir(parents=True, exist_ok=True)
@@ -1122,12 +1131,6 @@ def run_self_supervised_training(
     )
     (metrics_dir / "metrics.json").write_text(
         json.dumps(history.history, indent=2, default=float) + "\n"
-    )
-    write_history_jsonl(
-        history.history,
-        layout.self_supervised_metrics_jsonl,
-        run_id=run_id,
-        phase="self_supervised",
     )
     classifier.save_weights(model_dir / "student_pretrained.weights.h5")
     return history

@@ -96,14 +96,30 @@ channel_mode = "grayscale"
 
 [preprocessing.derived_channels]
 gradient_magnitude = true # Sobel-gradient morphology channel
-local_contrast = true     # Gaussian high-pass texture channel
+local_contrast = true     # Gaussian high-pass magnitude texture channel
 local_contrast_sigma = 3.0
 ```
 
 The resulting model input is `[128, 128, 3]`: grayscale, gradient magnitude,
 then local contrast. Each feature is reconstructed from the raw grayscale ROI
 during training, evaluation, and future inference; do not supply the derived
-channels yourself. Disable either flag to remove its channel.
+channels yourself. The local-contrast channel is a normalized magnitude: zero
+means no local texture (including padding), while larger values indicate
+stronger local intensity change. Disable either flag to remove its channel.
+
+To inspect the channels at each ROI's original pixel dimensions, write a
+random three-column contact sheet:
+
+```bash
+uv run python scripts/visualize_derived_channels.py \
+  --database datasets/training.sqlite \
+  --output derived-channels.png \
+  --count 5
+```
+
+Each row is one random ROI; columns are grayscale, gradient magnitude, and
+local contrast. Use `--seed` for repeatable selection, `--invert` to preview
+inverted input, and `--local-contrast-sigma` to match a non-default setting.
 
 ## Create a curated or small test subset
 

@@ -231,6 +231,40 @@ class SQLiteMetricLogger(keras.callbacks.Callback):
         connection.close()
 
 
+class JSONLMetricLogger(keras.callbacks.Callback):
+    """Persist scalar epoch metrics as they are produced by a Keras phase."""
+
+    def __init__(self, path: str | Path, run_id: str | None, *, phase: str):
+        super().__init__()
+        self.path = Path(path)
+        self.run_id = run_id
+        self.phase = str(phase)
+
+    def on_epoch_end(self, epoch: int, logs=None):
+        for key, value in (logs or {}).items():
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                continue
+            split = "validation" if str(key).startswith("val_") else "train"
+            metric = str(key)[4:] if split == "validation" else str(key)
+            _append_jsonl(
+                self.path,
+                {
+                    "schema": METRIC_SCHEMA,
+                    "schema_version": "1.0.0",
+                    "metric_id": str(uuid.uuid4()),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "run_id": self.run_id,
+                    "phase": self.phase,
+                    "epoch": int(epoch),
+                    "metric": metric,
+                    "split": split,
+                    "value": numeric,
+                },
+            )
+
+
 class ClassificationEpochMetricsLogger(keras.callbacks.Callback):
     """Append rich, non-test classification metrics after every epoch."""
 

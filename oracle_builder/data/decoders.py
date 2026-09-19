@@ -212,10 +212,9 @@ def _local_contrast(value: np.ndarray, *, sigma: float) -> np.ndarray:
     image = Image.fromarray(np.rint(np.clip(value, 0.0, 1.0) * 255).astype("uint8"))
     blurred = np.asarray(image.filter(ImageFilter.GaussianBlur(radius=sigma)), dtype="float32") / 255.0
     contrast = np.asarray(value, dtype="float32") - blurred
-    scale = float(np.percentile(np.abs(contrast), 99.0)) if contrast.size else 0.0
-    if scale <= 1e-12:
-        return np.full_like(contrast, 0.5, dtype="float32")
-    return np.clip(0.5 + 0.5 * contrast / scale, 0.0, 1.0).astype("float32")
+    # Use magnitude rather than a signed, midpoint-encoded high-pass signal:
+    # zero now means no local texture, including a padded background.
+    return _normalize_positive_feature(np.abs(contrast))
 
 
 def _normalize_positive_feature(value: np.ndarray) -> np.ndarray:

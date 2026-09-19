@@ -62,3 +62,14 @@ def test_sparkline_and_direction_make_static_and_changing_metrics_visible():
     assert _trend([0.5, 0.5]) == "→"
     assert _trend([0.5, 0.6]) == "↗"
     assert _trend([0.6, 0.5]) == "↘"
+
+
+def test_rich_board_shows_every_metric_with_alternating_metric_rows():
+    callback = RichTrainingStatusCallback(phase="SSL", epochs=1, display="off")
+    callback._metrics = {f"metric_{index}": float(index) for index in range(20)}
+
+    board = callback._board()
+    metrics = board.renderable.renderables[1]
+
+    assert len(metrics.rows) == 21  # Header plus every supplied metric.
+    assert metrics.row_styles == ["", "on grey15"]

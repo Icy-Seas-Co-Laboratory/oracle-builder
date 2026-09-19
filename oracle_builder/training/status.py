@@ -132,8 +132,9 @@ class RichTrainingStatusCallback(keras.callbacks.Callback):
     def _board(self):
         total_epochs = self.epochs or self.params.get("epochs") or "?"
         metrics = Table.grid(expand=True, padding=(0, 2))
+        metrics.row_styles = ["", "on grey15"]
         metrics.add_row("[bold]metric[/bold]", "[bold]current[/bold]", "[bold]history[/bold]")
-        for name, value in _ordered_metrics(self._metrics)[:12]:
+        for name, value in _ordered_metrics(self._metrics):
             history = list(self._history.get(name, []))
             if not history or history[-1] != value:
                 history.append(value)
@@ -144,8 +145,6 @@ class RichTrainingStatusCallback(keras.callbacks.Callback):
                 f"{value:.5g}",
                 f"{sparkline} {direction}".rstrip(),
             )
-        if len(self._metrics) > 12:
-            metrics.add_row("metrics", f"+{len(self._metrics) - 12} more")
         learning_rate = self._learning_rate()
         if learning_rate is not None:
             metrics.add_row("[bold]learning rate[/bold]", f"{learning_rate:.3g}")
