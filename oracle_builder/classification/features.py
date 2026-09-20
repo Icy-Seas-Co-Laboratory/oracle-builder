@@ -28,6 +28,21 @@ class L2Normalization(layers.Layer):
         return tf.where(norm > 0, normalized, fallback)
 
 
+def classifier_inputs(input_shape: tuple[int, ...], config: dict[str, Any]):
+    """Create the stable named inputs used by native image classifiers."""
+    image = keras.Input(shape=input_shape, name="image")
+    count = len(config.get("model", {}).get("auxiliary_features_fitted", config.get("model", {}).get("auxiliary_features", [])))
+    metadata = keras.Input(shape=(count,), name="metadata") if count else None
+    return image, metadata
+
+
+def join_auxiliary_features(x, metadata):
+    """Join standardized scalar features after global image pooling."""
+    if metadata is None:
+        return x
+    return layers.Concatenate(name="image_metadata_features")([x, metadata])
+
+
 def classification_head(
     x,
     num_classes: int,
@@ -75,7 +90,7 @@ def build_feature_model(model: keras.Model) -> keras.Model:
 
 def build_embedding_model(model: keras.Model) -> keras.Model:
     """Return the shared classifier backbone through its fixed-size features."""
-    inputs = model.inputs[0] if getattr(model, "inputs", None) else model.input
+    inputs = model.inputs if getattr(model, "inputs", None) and len(model.inputs) > 1 else model.inputs[0] if getattr(model, "inputs", None) else model.input
     return keras.Model(
         inputs,
         model.get_layer(FEATURE_LAYER_NAME).output,
@@ -92,7 +107,7 @@ def build_self_supervised_embedding_model(model: keras.Model) -> keras.Model:
     normalization, both to preserve magnitude information and to make variance
     regularization meaningful.
     """
-    inputs = model.inputs[0] if getattr(model, "inputs", None) else model.input
+    inputs = model.inputs if getattr(model, "inputs", None) and len(model.inputs) > 1 else model.inputs[0] if getattr(model, "inputs", None) else model.input
     return keras.Model(
         inputs,
         model.get_layer("embedding_projection").output,

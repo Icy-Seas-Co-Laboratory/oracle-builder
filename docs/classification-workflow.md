@@ -121,6 +121,46 @@ Each row is one random ROI; columns are grayscale, gradient magnitude, and
 local contrast. Use `--seed` for repeatable selection, `--invert` to preview
 inverted input, and `--local-contrast-sigma` to match a non-default setting.
 
+## Optional scalar ROI metadata
+
+Native classifiers can combine standardized scalar metadata with the pooled CNN
+representation immediately before their embedding and classification layers.
+The value is computed from the original ROI, before resize/padding. For example,
+to add natural-log bounding-box area:
+
+```toml
+[[model.auxiliary_features]]
+name = "log_roi_area"
+source = "roi.bounding_box_area_px"
+transform = "log"
+standardize = true
+missing = "error"
+```
+
+Other values can be read from the per-item metadata JSON with a dotted path:
+`source = "metadata.environment.depth_m"`. Means and scales are fitted from
+the training split only and persisted in the run artifact. At serving time pass
+the same fields in `InferenceItem.metadata`; a missing required value rejects
+only that item. `roi.bounding_box_area_px` means original image width × height;
+an irregular polygon/mask area must be stored explicitly in item metadata.
+
+## Resolution strata
+
+The configured stratum chooser is available for convolutional native classifier
+families. It assigns an ROI to the smallest square dimension that contains its
+original maximum dimension, falling back to the largest dimension for larger
+ROIs. Thus a `20×34` ROI maps to `64` here:
+
+```toml
+[classification.stratification]
+enabled = true
+dimensions = [32, 64, 128]
+basis = "max_original_dimension"
+```
+
+Use `fit_pad` preprocessing so small ROIs are enlarged in their selected
+stratum and images larger than the last stratum are downscaled.
+
 ## Create a curated or small test subset
 
 `oracle-dataset subset` never alters its source. It creates a new editable

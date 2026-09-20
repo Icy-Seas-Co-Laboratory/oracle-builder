@@ -37,3 +37,10 @@ To enable self-supervised training, set `self_supervised.enabled = true`. Choose
 `byol` for the student-teacher approach without negative examples, or `simclr`
 for NT-Xent contrastive training. Both transfer the learned encoder into the
 selected classification family before supervised training.
+
+Each family config also includes disabled-by-default auxiliary metadata and
+resolution-stratification sections. `data.batch_size` is the baseline for the
+smallest configured resolution; `constant_input_tensor` derives larger-stratum
+batches by inverse image area. `distribution.strategy = "auto"` reserves one
+unused GPU for the run; use `strategy = "mirrored"` explicitly for synchronous
+multi-GPU training.

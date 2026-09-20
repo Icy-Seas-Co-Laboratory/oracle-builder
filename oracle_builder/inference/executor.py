@@ -52,6 +52,9 @@ class ClassificationExecutor:
     def __init__(self, model: Any, input_shape: tuple[int, ...]):
         self.model = model
         self.input_shape = tuple(int(value) for value in input_shape)
+        self.metadata_count = len(getattr(model, "inputs", [])) > 1
+        if self.metadata_count:
+            self.metadata_count = int(model.inputs[1].shape[-1])
         self.execution_diagnostics = execution_device_diagnostics()
         self.runtime = "adapter"
         self._call = self._build()
@@ -71,12 +74,12 @@ class ClassificationExecutor:
 
             feature_model = build_feature_model(self.model)
 
-            @tf.function(
-                input_signature=[
-                    tf.TensorSpec([None, *self.input_shape], tf.float32, name="inputs")
-                ],
-                reduce_retracing=True,
+            signature = (
+                {"image": tf.TensorSpec([None, *self.input_shape], tf.float32, name="image"),
+                 "metadata": tf.TensorSpec([None, self.metadata_count], tf.float32, name="metadata")}
+                if self.metadata_count else tf.TensorSpec([None, *self.input_shape], tf.float32, name="inputs")
             )
+            @tf.function(input_signature=[signature], reduce_retracing=True)
             def infer(inputs):
                 return feature_model(inputs, training=False)
 
@@ -86,8 +89,9 @@ class ClassificationExecutor:
             self.runtime = "legacy_predict_adapter"
             return lambda values: self.model.predict(values, verbose=0)
 
-    def predict(self, values: np.ndarray) -> dict[str, np.ndarray | None | str]:
-        batch = np.asarray(values, dtype="float32")
+    def predict(self, values: Any) -> dict[str, np.ndarray | None | str]:
+        batch = ({key: np.asarray(value, dtype="float32") for key, value in values.items()}
+                 if isinstance(values, dict) else np.asarray(values, dtype="float32"))
         outputs = self._call(batch)
         if isinstance(outputs, dict) and {"logits", "probabilities"}.issubset(outputs):
             return {
@@ -115,7 +119,10 @@ class ClassificationExecutor:
 
     def warm(self, batch_size: int) -> dict[str, Any]:
         started = time.perf_counter()
-        self.predict(np.zeros((batch_size, *self.input_shape), dtype="float32"))
+        values: Any = np.zeros((batch_size, *self.input_shape), dtype="float32")
+        if self.metadata_count:
+            values = {"image": values, "metadata": np.zeros((batch_size, self.metadata_count), dtype="float32")}
+        self.predict(values)
         return {
             "runtime": self.runtime,
             "execution": self.execution_diagnostics,

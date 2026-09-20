@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import fcntl
+import os
+from subprocess import DEVNULL, run
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -17,6 +20,7 @@ class DistributionInfo:
     global_batch_size: int
     per_replica_batch_size: int
     cross_device_ops: str
+    gpu_lease_path: str | None = None
 
 
 def _device_name(value: str) -> str:
@@ -37,6 +41,67 @@ def _cross_device_ops(name: str):
     raise ValueError(
         "distribution.cross_device_ops must be auto, nccl, or hierarchical_copy"
     )
+
+
+_GPU_LEASES: dict[str, Any] = {}
+
+
+def _busy_gpu_indices() -> set[int]:
+    """Best-effort NVIDIA occupancy query; leases handle the race we control."""
+    try:
+        result = run(
+            ["nvidia-smi", "--query-compute-apps=gpu_uuid", "--format=csv,noheader"],
+            capture_output=True, text=True, check=False, timeout=2, stdin=DEVNULL,
+        )
+        if result.returncode:
+            return set()
+        uuid_result = run(
+            ["nvidia-smi", "--query-gpu=index,uuid", "--format=csv,noheader"],
+            capture_output=True, text=True, check=False, timeout=2, stdin=DEVNULL,
+        )
+        mapping = {
+            parts[1].strip(): int(parts[0].strip())
+            for line in uuid_result.stdout.splitlines()
+            if len(parts := line.split(",", 1)) == 2
+        }
+        return {mapping[value.strip()] for value in result.stdout.splitlines() if value.strip() in mapping}
+    except (FileNotFoundError, OSError):
+        return set()
+
+
+def _reserve_gpu(index: int, settings: dict[str, Any]) -> str | None:
+    directory = Path(settings.get("gpu_lease_directory", "/tmp/oracle-builder-gpu-leases"))
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"gpu-{index}.lock"
+    handle = path.open("a+")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        return None
+    handle.seek(0)
+    handle.truncate()
+    handle.write(json.dumps({"pid": os.getpid()}) + "\n")
+    handle.flush()
+    _GPU_LEASES[str(path)] = handle
+    return str(path)
+
+
+def _select_auto_gpu(available: list[str], settings: dict[str, Any]) -> tuple[str | None, str | None]:
+    busy = _busy_gpu_indices()
+    for device in available:
+        index = int(device.rsplit(":", 1)[1])
+        if bool(settings.get("require_unused_gpu", True)) and index in busy:
+            continue
+        lease = _reserve_gpu(index, settings)
+        if lease is not None:
+            return device, lease
+    if bool(settings.get("allow_busy_fallback", False)):
+        for device in available:
+            lease = _reserve_gpu(int(device.rsplit(":", 1)[1]), settings)
+            if lease is not None:
+                return device, lease
+    return None, None
 
 
 def select_distribution_strategy(
@@ -72,9 +137,15 @@ def select_distribution_strategy(
             f"available GPUs: {available_gpu_names}"
         )
 
-    should_mirror = requested == "mirrored" or (
-        requested == "auto" and len(selected_devices) > 1
-    )
+    lease_path = None
+    if requested == "auto" and not requested_devices and available_gpu_names:
+        selected, lease_path = _select_auto_gpu(available_gpu_names, settings)
+        if selected is None:
+            raise RuntimeError("No unused GPU is available for this Oracle Builder run")
+        selected_devices = [selected]
+    elif requested == "single" and selected_devices:
+        selected_devices = selected_devices[:1]
+    should_mirror = requested == "mirrored"
     cross_name = str(settings.get("cross_device_ops", "auto")).lower()
     if should_mirror and len(selected_devices) < 2:
         if requested == "mirrored" and not bool(
@@ -96,7 +167,7 @@ def select_distribution_strategy(
         strategy = tf.distribute.OneDeviceStrategy("/CPU:0")
         resolved = "cpu"
     else:
-        strategy = tf.distribute.get_strategy()
+        strategy = tf.distribute.OneDeviceStrategy(selected_devices[0]) if selected_devices else tf.distribute.get_strategy()
         resolved = "single"
 
     replicas = int(strategy.num_replicas_in_sync)
@@ -125,6 +196,7 @@ def select_distribution_strategy(
         global_batch_size=global_batch,
         per_replica_batch_size=global_batch // replicas,
         cross_device_ops=cross_name,
+        gpu_lease_path=lease_path,
     )
     return strategy, info
 

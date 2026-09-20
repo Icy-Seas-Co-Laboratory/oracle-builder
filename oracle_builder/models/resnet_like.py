@@ -5,7 +5,7 @@ from typing import Any
 from tensorflow import keras
 from tensorflow.keras import layers
 
-from oracle_builder.classification.features import classification_head
+from oracle_builder.classification.features import classification_head, classifier_inputs, join_auxiliary_features
 
 
 def _residual_block(x, filters: int, stride: int = 1):
@@ -23,11 +23,12 @@ def build_model(config: dict[str, Any]):
     num_classes = int(config["data"]["num_classes"])
     base = int(config.get("model", {}).get("base_filters", 32))
 
-    inputs = keras.Input(shape=input_shape)
+    inputs, metadata = classifier_inputs(input_shape, config)
     x = layers.Conv2D(base, 3, padding="same", activation="relu")(inputs)
     x = _residual_block(x, base)
     x = _residual_block(x, base * 2, stride=2)
     x = _residual_block(x, base * 4, stride=2)
     x = layers.GlobalAveragePooling2D(name="global_pool")(x)
+    x = join_auxiliary_features(x, metadata)
     outputs = classification_head(x, num_classes, config, dropout_default=0.2)
-    return keras.Model(inputs, outputs, name="resnet_like")
+    return keras.Model([inputs, metadata] if metadata is not None else inputs, outputs, name="resnet_like")

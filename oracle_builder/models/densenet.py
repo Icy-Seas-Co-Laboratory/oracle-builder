@@ -5,7 +5,7 @@ from typing import Any
 from tensorflow import keras
 from tensorflow.keras import layers
 
-from oracle_builder.classification.features import classification_head
+from oracle_builder.classification.features import classification_head, classifier_inputs, join_auxiliary_features
 
 
 DENSENET_VARIANTS = {
@@ -71,7 +71,7 @@ def build_model(config: dict[str, Any]):
     if not 0 < compression <= 1:
         raise ValueError("model.compression must be in (0, 1]")
 
-    inputs = keras.Input(shape=input_shape)
+    inputs, metadata = classifier_inputs(input_shape, config)
     x = layers.Conv2D(
         initial_filters,
         stem_kernel,
@@ -98,5 +98,6 @@ def build_model(config: dict[str, Any]):
     x = layers.BatchNormalization(name="final_bn")(x)
     x = layers.Activation("relu", name="final_relu")(x)
     x = layers.GlobalAveragePooling2D(name="global_pool")(x)
+    x = join_auxiliary_features(x, metadata)
     outputs = classification_head(x, num_classes, config)
-    return keras.Model(inputs, outputs, name=variant)
+    return keras.Model([inputs, metadata] if metadata is not None else inputs, outputs, name=variant)

@@ -43,14 +43,14 @@ def test_cpu_strategy_can_be_requested_explicitly():
     assert any("CPU" in device.upper() for device in info.devices)
 
 
-def test_auto_uses_mirrored_strategy_for_multiple_gpus(monkeypatch):
+def test_auto_uses_one_unused_gpu_for_multiple_gpus(monkeypatch, tmp_path):
     fake_devices = [
         SimpleNamespace(name="/device:GPU:0"),
         SimpleNamespace(name="/device:GPU:1"),
     ]
     fake_strategy = SimpleNamespace(
-        num_replicas_in_sync=2,
-        extended=SimpleNamespace(worker_devices=("/device:GPU:0", "/device:GPU:1")),
+        num_replicas_in_sync=1,
+        extended=SimpleNamespace(worker_devices=("/device:GPU:0",)),
     )
     monkeypatch.setattr(
         "oracle_builder.training.distribution.tf.config.list_physical_devices",
@@ -60,24 +60,29 @@ def test_auto_uses_mirrored_strategy_for_multiple_gpus(monkeypatch):
         "oracle_builder.training.distribution.tf.config.list_logical_devices",
         lambda kind: fake_devices if kind == "GPU" else [],
     )
-    mirrored_calls = []
+    one_device_calls = []
     monkeypatch.setattr(
-        "oracle_builder.training.distribution.tf.distribute.MirroredStrategy",
-        lambda **kwargs: mirrored_calls.append(kwargs) or fake_strategy,
+        "oracle_builder.training.distribution.tf.distribute.OneDeviceStrategy",
+        lambda device: one_device_calls.append(device) or fake_strategy,
     )
+    monkeypatch.setattr("oracle_builder.training.distribution._busy_gpu_indices", lambda: set())
+    config = base_config()
+    config["distribution"]["gpu_lease_directory"] = str(tmp_path)
 
-    strategy, info = select_distribution_strategy(base_config())
+    strategy, info = select_distribution_strategy(config)
 
     assert strategy is fake_strategy
-    assert info.resolved_strategy == "mirrored"
-    assert info.replicas == 2
-    assert info.per_replica_batch_size == 4
-    assert mirrored_calls[0]["devices"] == ["/GPU:0", "/GPU:1"]
+    assert info.resolved_strategy == "single"
+    assert info.replicas == 1
+    assert info.per_replica_batch_size == 8
+    assert one_device_calls == ["/GPU:0"]
+    assert info.gpu_lease_path is not None
 
 
 def test_global_batch_must_be_divisible_by_replica_count(monkeypatch):
     config = base_config()
     config["data"]["batch_size"] = 7
+    config["distribution"]["strategy"] = "mirrored"
     fake_devices = [
         SimpleNamespace(name="/device:GPU:0"),
         SimpleNamespace(name="/device:GPU:1"),

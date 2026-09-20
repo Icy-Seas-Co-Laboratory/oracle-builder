@@ -140,6 +140,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "cross_device_ops": "auto",
         "fallback_to_single": True,
         "memory_growth": True,
+        "gpu_selection": "unused_first",
+        "require_unused_gpu": True,
+        "allow_busy_fallback": False,
+        "gpu_lease_directory": "/tmp/oracle-builder-gpu-leases",
     },
     "callbacks": {
         "early_stopping": False,
@@ -279,6 +283,18 @@ def validate_config(config: dict[str, Any]) -> None:
         )
     if task in {"classification", "embedding"} and int(config.get("model", {}).get("embedding_dim", 256)) < 1:
         raise ValueError("model.embedding_dim must be a positive integer")
+    if task == "classification":
+        from oracle_builder.classification.metadata import validate_feature_specs
+        from oracle_builder.classification.stratification import architecture_supported, enabled as stratification_enabled, validate as validate_stratification
+
+        validate_feature_specs(config)
+        validate_stratification(config)
+        if stratification_enabled(config) and not architecture_supported(config):
+            raise ValueError("The selected classifier architecture does not support resolution stratification")
+        if config.get("model", {}).get("auxiliary_features") and self_supervised_settings(config).get("enabled", False):
+            raise ValueError(
+                "Auxiliary classifier features are not yet compatible with self-supervised pretraining"
+            )
     if int(config.get("evidence", {}).get("knn_k", 5)) < 1:
         raise ValueError("evidence.knn_k must be at least 1")
     inference = config.get("inference", {})
@@ -377,6 +393,12 @@ def validate_config(config: dict[str, Any]) -> None:
         raise ValueError(
             "distribution.cross_device_ops must be auto, nccl, or hierarchical_copy"
         )
+    if distribution.get("gpu_selection", "unused_first") not in {"unused_first"}:
+        raise ValueError("distribution.gpu_selection must be 'unused_first'")
+    if not isinstance(distribution.get("require_unused_gpu", True), bool):
+        raise ValueError("distribution.require_unused_gpu must be boolean")
+    if not isinstance(distribution.get("allow_busy_fallback", False), bool):
+        raise ValueError("distribution.allow_busy_fallback must be boolean")
     self_supervised = self_supervised_settings(config)
     if self_supervised.get("enabled", False):
         method = str(self_supervised.get("method", "byol")).lower()
@@ -618,6 +640,14 @@ def resolve_config(config_path: str | Path, input_path: str | Path, run_dir: str
         and "num_classes" not in resolved.get("data", {})
     ):
         resolved["data"]["num_classes"] = infer_classification_num_classes(input_path)
+    if task == "classification":
+        # Stats are part of the serving contract and must never be fitted from
+        # validation/test samples.  Do this after class/split settings resolve.
+        from oracle_builder.classification.metadata import fit_feature_specs
+
+        fitted = fit_feature_specs(input_path, resolved)
+        if fitted:
+            resolved.setdefault("model", {})["auxiliary_features_fitted"] = fitted
     from oracle_builder.datasets.schema import (
         dataset_fingerprint,
         read_dataset_info,

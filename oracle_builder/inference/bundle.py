@@ -13,6 +13,7 @@ from oracle_builder.classification.evidence import IdentityEvidenceIndex
 from oracle_builder.data.decoders import (
     prepare_classification_input,
 )
+from oracle_builder.classification.metadata import enabled as auxiliary_features_enabled, vector as auxiliary_feature_vector
 from oracle_builder.data.sqlite_dataset import prepare_segmentation_input
 from oracle_builder.data.tiling import extract_tile, plan_tiles, reassemble_tiles
 from oracle_builder.evaluation.segmentation_targets import (
@@ -280,7 +281,7 @@ class InferenceBundle:
                 )
         if prepared:
             try:
-                values = self._classification_executor.predict(np.stack(prepared, axis=0))
+                values = self._classification_executor.predict(self._stack_classification_inputs(prepared))
                 cluster_packets = None
                 if self.cluster_index is not None and values["features"] is not None:
                     embeddings = np.asarray(values["features"], dtype="float32")
@@ -353,7 +354,9 @@ class InferenceBundle:
 
     def _predict_classification(self, item: InferenceItem) -> dict[str, Any]:
         prepared = self._prepare_classification(item)
-        values = self._classification_executor.predict(prepared[None, ...])
+        values = self._classification_executor.predict(
+            self._stack_classification_inputs([prepared])
+        )
         return self._classification_output_from_values(item, values, 0)
 
     def _predict_embedding(self, item: InferenceItem) -> dict[str, Any]:
@@ -477,7 +480,21 @@ class InferenceBundle:
             prepared = prepare_classification_input(
                 raw, self.config["data"]["input_shape"], self.config
             )
-        return np.asarray(prepared)
+        image = np.asarray(prepared)
+        if auxiliary_features_enabled(self.config):
+            return {
+                "image": image,
+                "metadata": auxiliary_feature_vector(self.config, item.metadata, np.asarray(raw).shape),
+            }
+        return image
+
+    @staticmethod
+    def _stack_classification_inputs(prepared: list[Any]) -> Any:
+        if not prepared:
+            raise ValueError("Cannot stack an empty classification batch")
+        if isinstance(prepared[0], dict):
+            return {key: np.stack([value[key] for value in prepared], axis=0) for key in prepared[0]}
+        return np.stack(prepared, axis=0)
 
     def _classification_output_from_values(
         self,

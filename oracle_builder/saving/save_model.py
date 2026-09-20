@@ -75,10 +75,14 @@ def _export_classification_model(
     config: dict[str, Any],
 ) -> None:
     exported = _ClassificationExport(model)
-    input_spec = tf.TensorSpec(
-        [None, *config["data"]["input_shape"]],
-        tf.float32,
-        name="inputs",
+    metadata_specs = config.get("model", {}).get("auxiliary_features_fitted", [])
+    input_spec: Any = (
+        {
+            "image": tf.TensorSpec([None, *config["data"]["input_shape"]], tf.float32, name="image"),
+            "metadata": tf.TensorSpec([None, len(metadata_specs)], tf.float32, name="metadata"),
+        }
+        if metadata_specs
+        else tf.TensorSpec([None, *config["data"]["input_shape"]], tf.float32, name="inputs")
     )
     tf.saved_model.save(
         exported,
@@ -221,6 +225,7 @@ def save_model_artifacts(model: keras.Model, run_dir: str | Path, config: dict[s
         "input": {
             "shape": [None, *config["data"]["input_shape"]],
             "dtype": "float32",
+            "auxiliary_features": config.get("model", {}).get("auxiliary_features_fitted", []),
             "preprocessing": config.get("preprocessing", {}),
             "segmentation_input": {
                 "candidate_sdf": config.get("data", {}).get(

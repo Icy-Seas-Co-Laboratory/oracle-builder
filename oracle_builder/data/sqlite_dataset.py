@@ -18,6 +18,7 @@ from oracle_builder.data.decoders import (
     normalize_input,
     prepare_dataset_classification_input,
 )
+from oracle_builder.classification.metadata import enabled as auxiliary_features_enabled, vector as auxiliary_feature_vector
 from oracle_builder.data.splits import assign_run_splits
 from oracle_builder.data.signed_distance import signed_distance_field
 from oracle_builder.data.tiling import coverage_map, extract_tile, plan_tiles
@@ -141,6 +142,7 @@ def load_arrays(sqlite_path: str | Path, config: dict[str, Any], split: str | No
     input_shape = config["data"]["input_shape"]
     output_shape = config["data"].get("output_shape")
     xs: list[np.ndarray] = []
+    auxiliary: list[np.ndarray] = []
     ys: list[Any] = []
     records: list[dict[str, Any]] = []
     for row in rows:
@@ -156,7 +158,7 @@ def load_arrays(sqlite_path: str | Path, config: dict[str, Any], split: str | No
             continue
         if task == "segmentation":
             x = prepare_segmentation_input(x, input_shape, config)
-        xs.append(
+        prepared = (
             prepare_dataset_classification_input(
                 x,
                 input_shape,
@@ -166,6 +168,15 @@ def load_arrays(sqlite_path: str | Path, config: dict[str, Any], split: str | No
             if task == "classification"
             else normalize_input(x, input_shape)
         )
+        xs.append(prepared)
+        if task == "classification" and auxiliary_features_enabled(config):
+            auxiliary.append(
+                auxiliary_feature_vector(
+                    config,
+                    json.loads(row["metadata_json"]) if row.get("metadata_json") else {},
+                    np.asarray(x).shape,
+                )
+            )
         if task == "classification":
             ys.append(int(y if y is not None else row.get("label_text")))
         else:
@@ -188,11 +199,15 @@ def load_arrays(sqlite_path: str | Path, config: dict[str, Any], split: str | No
                 "label_text": row.get("label_text"),
                 "sample_weight": row.get("sample_weight"),
                 "metadata": json.loads(row["metadata_json"]) if row.get("metadata_json") else {},
+                "original_shape": list(np.asarray(x).shape),
                 "candidate_mask": candidate,
                 "validated_mask": validated_target if task == "segmentation" else None,
             }
         )
-    return np.stack(xs), np.asarray(ys), records
+    inputs: Any = np.stack(xs)
+    if task == "classification" and auxiliary_features_enabled(config):
+        inputs = {"image": inputs, "metadata": np.stack(auxiliary)}
+    return inputs, np.asarray(ys), records
 
 
 def load_prediction_arrays(
@@ -224,6 +239,7 @@ def load_prediction_arrays(
     input_shape = config["data"]["input_shape"]
     output_shape = config["data"].get("output_shape")
     xs: list[np.ndarray] = []
+    auxiliary: list[np.ndarray] = []
     targets: list[Any | None] = []
     records: list[dict[str, Any]] = []
     for row in assigned:
@@ -245,7 +261,7 @@ def load_prediction_arrays(
             raise ValueError(f"Sample {row['uuid']} has no candidate mask required for candidate_delta prediction")
         if task == "segmentation":
             x = prepare_segmentation_input(x, input_shape, config)
-        xs.append(
+        prepared = (
             prepare_dataset_classification_input(
                 x,
                 input_shape,
@@ -255,6 +271,15 @@ def load_prediction_arrays(
             if task == "classification"
             else normalize_input(x, input_shape)
         )
+        xs.append(prepared)
+        if task == "classification" and auxiliary_features_enabled(config):
+            auxiliary.append(
+                auxiliary_feature_vector(
+                    config,
+                    json.loads(row["metadata_json"]) if row.get("metadata_json") else {},
+                    np.asarray(x).shape,
+                )
+            )
         if row.get("output_blob") is None:
             target = None
         else:
@@ -277,11 +302,15 @@ def load_prediction_arrays(
                 "label_text": row.get("label_text"),
                 "sample_weight": row.get("sample_weight"),
                 "metadata": json.loads(row["metadata_json"]) if row.get("metadata_json") else {},
+                "original_shape": list(np.asarray(x).shape),
                 "candidate_mask": candidate,
                 "validated_mask": validated_target if task == "segmentation" and row.get("output_blob") is not None else None,
             }
         )
-    return np.stack(xs), targets, records
+    inputs: Any = np.stack(xs)
+    if task == "classification" and auxiliary_features_enabled(config):
+        inputs = {"image": inputs, "metadata": np.stack(auxiliary)}
+    return inputs, targets, records
 
 
 def _candidate_mask_for_output(array: Any, output_shape: list[int] | tuple[int, ...] | None) -> np.ndarray | None:

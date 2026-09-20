@@ -5,7 +5,7 @@ from typing import Any
 from tensorflow import keras
 from tensorflow.keras import layers
 
-from oracle_builder.classification.features import classification_head
+from oracle_builder.classification.features import classification_head, classifier_inputs, join_auxiliary_features
 
 
 RESNET_VARIANTS = {
@@ -97,7 +97,7 @@ def build_model(config: dict[str, Any]):
         raise ValueError("ResNet filter, stem kernel, and stem stride parameters must be positive")
     block = _basic_block if block_type == "basic" else _bottleneck_block
 
-    inputs = keras.Input(shape=input_shape)
+    inputs, metadata = classifier_inputs(input_shape, config)
     x = _conv_bn(inputs, base_filters, stem_kernel, stride=stem_stride, name="stem_conv")
     if stem_pool:
         x = layers.MaxPooling2D(3, strides=2, padding="same", name="stem_pool")(x)
@@ -107,5 +107,6 @@ def build_model(config: dict[str, Any]):
             stride = 2 if stage > 0 and index == 0 else 1
             x = block(x, filters, stride, name=f"stage{stage + 1}_block{index + 1}")
     x = layers.GlobalAveragePooling2D(name="global_pool")(x)
+    x = join_auxiliary_features(x, metadata)
     outputs = classification_head(x, num_classes, config, normalize_default=False)
-    return keras.Model(inputs, outputs, name=variant)
+    return keras.Model([inputs, metadata] if metadata is not None else inputs, outputs, name=variant)

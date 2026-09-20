@@ -45,13 +45,15 @@ percentile_low = 1.0
 percentile_high = 99.0
 
 [distribution]
-# auto uses MirroredStrategy when multiple GPUs are visible, otherwise one
-# device. Global data.batch_size must divide sensibly across all replicas.
+# auto reserves one unused GPU; use mirrored explicitly for multi-GPU training.
 strategy = "auto"
 devices = []
 cross_device_ops = "auto"
 fallback_to_single = true
 memory_growth = true
+gpu_selection = "unused_first"
+require_unused_gpu = true
+allow_busy_fallback = false
 
 [model]
 # Controls both the initial width and the growth rate of this compact network.
@@ -65,6 +67,23 @@ embedding_dim = 256
 normalize_embeddings = true
 # Dropout applied before the final classifier.
 dropout = 0.20
+
+# [[model.auxiliary_features]]
+# name = "log_roi_area"
+# source = "roi.bounding_box_area_px"
+# transform = "log"
+# standardize = true
+# missing = "error"
+
+[classification.stratification]
+enabled = false
+dimensions = [32, 64, 128]
+basis = "max_original_dimension"
+batch_size_policy = "constant_input_tensor"
+[classification.stratification.training_routing]
+enabled = true
+adjacent_lower_probability = 0.10
+seed = 123
 
 [self_supervised]
 # Self-supervised pretraining initializes this same architecture before labels

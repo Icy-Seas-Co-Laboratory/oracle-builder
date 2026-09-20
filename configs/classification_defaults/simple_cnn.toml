@@ -45,13 +45,17 @@ percentile_low = 1.0
 percentile_high = 99.0
 
 [distribution]
-# auto uses MirroredStrategy when multiple GPUs are visible, otherwise one
-# device. Global data.batch_size must divide sensibly across all replicas.
+# auto reserves one unused GPU for this run; request mirrored explicitly for
+# synchronous multi-GPU training. data.batch_size applies to the smallest
+# resolution stratum when stratification is enabled.
 strategy = "auto"
 devices = []
 cross_device_ops = "auto"
 fallback_to_single = true
 memory_growth = true
+gpu_selection = "unused_first"
+require_unused_gpu = true
+allow_busy_fallback = false
 
 [model]
 # Width of the three convolution stages is base_filters, 2x, and 4x.
@@ -64,6 +68,30 @@ embedding_dim = 256
 normalize_embeddings = true
 # Dropout applied before the final classifier.
 dropout = 0.20
+
+# Optional standardized scalar inputs are concatenated after global pooling.
+# Example: log ROI bounding-box area, computed before resize/padding.
+# [[model.auxiliary_features]]
+# name = "log_roi_area"
+# source = "roi.bounding_box_area_px"
+# transform = "log"
+# standardize = true
+# missing = "error"
+
+[classification.stratification]
+# Train one compatible convolutional classifier per resolution when enabled.
+# data.batch_size is the smallest-stratum batch; larger batches scale down to
+# preserve total input tensor size. Serving/evaluation always route canonically.
+enabled = false
+dimensions = [32, 64, 128]
+basis = "max_original_dimension"
+batch_size_policy = "constant_input_tensor"
+
+[classification.stratification.training_routing]
+# Training only: occasionally use the next smaller stratum for robustness.
+enabled = true
+adjacent_lower_probability = 0.10
+seed = 123
 
 [self_supervised]
 # Self-supervised pretraining initializes this same architecture before labels

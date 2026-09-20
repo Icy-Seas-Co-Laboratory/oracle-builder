@@ -14,6 +14,7 @@ from oracle_builder.data.decoders import (
     decode_blob,
     prepare_dataset_classification_input,
 )
+from oracle_builder.classification.metadata import enabled as auxiliary_features_enabled, vector as auxiliary_feature_vector
 from oracle_builder.data.splits import assign_run_splits
 from oracle_builder.training.augmentation import apply_training_augmentation
 
@@ -35,6 +36,7 @@ class SQLiteSampleRef:
             "label_text": None,
             "sample_weight": None,
             "metadata": json.loads(self.metadata_json) if self.metadata_json else {},
+            "original_shape": json.loads(self.input_dimensions) if self.input_dimensions else None,
             "candidate_mask": None,
             "validated_mask": None,
         }
@@ -179,6 +181,26 @@ class SQLiteClassificationSource:
             decoded, self.input_shape, self.config, metadata
         )
 
+    def read_input(self, item_id: str):
+        row = self._connection().execute(
+            """
+            SELECT a.payload, a.encoding, a.shape_json, di.metadata_json
+            FROM classification_items ci
+            JOIN dataset_items di ON di.item_id = ci.item_id
+            JOIN assets a ON a.asset_id = ci.image_asset_id
+            WHERE ci.item_id = ?
+            """,
+            (str(item_id),),
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"SQLite dataset item {item_id!r} no longer exists")
+        decoded = decode_blob(row[0], row[1], row[2])
+        metadata = json.loads(row[3]) if row[3] else {}
+        image = prepare_dataset_classification_input(decoded, self.input_shape, self.config, metadata)
+        if auxiliary_features_enabled(self.config):
+            return image, auxiliary_feature_vector(self.config, metadata, np.asarray(decoded).shape)
+        return image
+
     def _tf_read_image(self, item_id):
         image = tf.py_function(
             lambda value: self.read_image(value.numpy().decode("utf-8")),
@@ -187,6 +209,19 @@ class SQLiteClassificationSource:
         )
         image.set_shape(self.input_shape)
         return image
+
+    def _tf_read_input(self, item_id):
+        if not auxiliary_features_enabled(self.config):
+            return self._tf_read_image(item_id)
+        image, metadata = tf.py_function(
+            lambda value: self.read_input(value.numpy().decode("utf-8")),
+            [item_id],
+            Tout=[tf.float32, tf.float32],
+        )
+        image.set_shape(self.input_shape)
+        image_metadata_count = len(self.config.get("model", {}).get("auxiliary_features_fitted", self.config.get("model", {}).get("auxiliary_features", [])))
+        metadata.set_shape((image_metadata_count,))
+        return {"image": image, "metadata": metadata}
 
     def training_dataset(
         self,
@@ -218,7 +253,7 @@ class SQLiteClassificationSource:
             if repeats > 1:
                 dataset = dataset.repeat(repeats)
         dataset = dataset.map(
-            lambda item_id, label: (self._tf_read_image(item_id), label),
+            lambda item_id, label: (self._tf_read_input(item_id), label),
             num_parallel_calls=workers,
             deterministic=deterministic,
         )
@@ -248,7 +283,7 @@ class SQLiteClassificationSource:
                 reshuffle_each_iteration=True,
             )
         dataset = dataset.map(
-            lambda item_id, position: (self._tf_read_image(item_id), position),
+            lambda item_id, position: (self._tf_read_input(item_id), position),
             num_parallel_calls=max(1, int(streaming.get("reader_workers", 4))),
             deterministic=bool(streaming.get("deterministic", True)),
         )

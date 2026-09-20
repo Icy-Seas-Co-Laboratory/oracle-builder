@@ -6,7 +6,7 @@ from typing import Any
 from tensorflow import keras
 from tensorflow.keras import layers
 
-from oracle_builder.classification.features import classification_head
+from oracle_builder.classification.features import classification_head, classifier_inputs, join_auxiliary_features
 
 
 EFFICIENTNET_VARIANTS = {
@@ -106,7 +106,7 @@ def build_model(config: dict[str, Any]):
     if not 0 <= se_ratio <= 1:
         raise ValueError("model.se_ratio must be in [0, 1]")
 
-    inputs = keras.Input(shape=tuple(config["data"]["input_shape"]))
+    inputs, metadata = classifier_inputs(tuple(config["data"]["input_shape"]), config)
     x = layers.Conv2D(
         stem_filters,
         stem_kernel,
@@ -133,10 +133,11 @@ def build_model(config: dict[str, Any]):
     x = layers.BatchNormalization(name="top_bn")(x)
     x = layers.Activation("swish", name="top_activation")(x)
     x = layers.GlobalAveragePooling2D(name="global_pool")(x)
+    x = join_auxiliary_features(x, metadata)
     outputs = classification_head(
         x,
         int(config["data"]["num_classes"]),
         config,
         dropout_default=default_dropout,
     )
-    return keras.Model(inputs, outputs, name=variant)
+    return keras.Model([inputs, metadata] if metadata is not None else inputs, outputs, name=variant)
