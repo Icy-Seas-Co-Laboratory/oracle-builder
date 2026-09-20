@@ -410,11 +410,10 @@ def train_stratified_models(
     run_path = Path(run_dir)
     indices = build_indices(sqlite_path, config)
     split_summaries = _split_summaries(indices, config)
-    # Epoch-major scheduling means every ROI is routed exactly once for parent
-    # epoch N before any child begins parent epoch N+1. Children are reloaded
-    # from their full recovery snapshot between turns, keeping GPU residency to
-    # one model while preserving optimizer state.
-    for scheduled_epoch, dimension in epoch_stratum_schedule(config, total_epochs):
+    total_epochs = int(config["training"].get("epochs", 10))
+    save_every = max(1, int(config.get("recovery", {}).get("save_every_epochs", 1)))
+    recovery_enabled = bool(config.get("recovery", {}).get("enabled", True))
+    for dimension in dimensions(config):
         if not routed_index(indices["train"], config, dimension).refs:
             raise ValueError(
                 f"Resolution stratum {dimension} has no canonical training samples"
@@ -443,11 +442,9 @@ def train_stratified_models(
 
     state = resume_state or _initial_recovery(config, run_id)
     children: dict[int, StratifiedChildResult] = {}
-    total_epochs = int(config["training"].get("epochs", 10))
-    save_every = max(1, int(config.get("recovery", {}).get("save_every_epochs", 1)))
-    recovery_enabled = bool(config.get("recovery", {}).get("enabled", True))
 
-    for dimension in dimensions(config):
+    # Every child completes parent epoch N before any child starts N + 1.
+    for scheduled_epoch, dimension in epoch_stratum_schedule(config, total_epochs):
         child = child_config(config, dimension)
         child_dir = run_path / "model" / "strata" / str(dimension)
         child_dir.mkdir(parents=True, exist_ok=True)
