@@ -141,8 +141,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "fallback_to_single": True,
         "memory_growth": True,
         "gpu_selection": "unused_first",
-        "require_unused_gpu": True,
+        "require_unused_gpu": False,
         "allow_busy_fallback": False,
+        "gpu_light_share_memory_mb": 1024,
+        "gpu_light_share_utilization_percent": 15,
         "gpu_lease_directory": "/tmp/oracle-builder-gpu-leases",
     },
     "callbacks": {
@@ -399,6 +401,11 @@ def validate_config(config: dict[str, Any]) -> None:
         raise ValueError("distribution.require_unused_gpu must be boolean")
     if not isinstance(distribution.get("allow_busy_fallback", False), bool):
         raise ValueError("distribution.allow_busy_fallback must be boolean")
+    if int(distribution.get("gpu_light_share_memory_mb", 1024)) < 0:
+        raise ValueError("distribution.gpu_light_share_memory_mb must be non-negative")
+    utilization_limit = int(distribution.get("gpu_light_share_utilization_percent", 15))
+    if not 0 <= utilization_limit <= 100:
+        raise ValueError("distribution.gpu_light_share_utilization_percent must be in [0, 100]")
     self_supervised = self_supervised_settings(config)
     if self_supervised.get("enabled", False):
         method = str(self_supervised.get("method", "byol")).lower()

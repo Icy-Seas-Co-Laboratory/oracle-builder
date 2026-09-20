@@ -65,7 +65,7 @@ def test_auto_uses_one_unused_gpu_for_multiple_gpus(monkeypatch, tmp_path):
         "oracle_builder.training.distribution.tf.distribute.OneDeviceStrategy",
         lambda device: one_device_calls.append(device) or fake_strategy,
     )
-    monkeypatch.setattr("oracle_builder.training.distribution._busy_gpu_indices", lambda: set())
+    monkeypatch.setattr("oracle_builder.training.distribution._gpu_loads", lambda: {0: (100, 1), 1: (0, 0)})
     config = base_config()
     config["distribution"]["gpu_lease_directory"] = str(tmp_path)
 
@@ -75,7 +75,7 @@ def test_auto_uses_one_unused_gpu_for_multiple_gpus(monkeypatch, tmp_path):
     assert info.resolved_strategy == "single"
     assert info.replicas == 1
     assert info.per_replica_batch_size == 8
-    assert one_device_calls == ["/GPU:0"]
+    assert one_device_calls == ["/GPU:1"]
     assert info.gpu_lease_path is not None
 
 

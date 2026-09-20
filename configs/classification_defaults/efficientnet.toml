@@ -52,8 +52,10 @@ cross_device_ops = "auto"
 fallback_to_single = true
 memory_growth = true
 gpu_selection = "unused_first"
-require_unused_gpu = true
+require_unused_gpu = false # Permit light desktop/interactive GPU sharing.
 allow_busy_fallback = false
+gpu_light_share_memory_mb = 1024
+gpu_light_share_utilization_percent = 15
 
 [model]
 # Valid variants: efficientnet_b0 through efficientnet_b7.

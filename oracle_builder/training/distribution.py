@@ -46,27 +46,23 @@ def _cross_device_ops(name: str):
 _GPU_LEASES: dict[str, Any] = {}
 
 
-def _busy_gpu_indices() -> set[int]:
-    """Best-effort NVIDIA occupancy query; leases handle the race we control."""
+def _gpu_loads() -> dict[int, tuple[int, int]]:
+    """Return ``{index: (MiB used, utilization %)}`` when NVIDIA tools exist."""
     try:
         result = run(
-            ["nvidia-smi", "--query-compute-apps=gpu_uuid", "--format=csv,noheader"],
+            ["nvidia-smi", "--query-gpu=index,memory.used,utilization.gpu", "--format=csv,noheader,nounits"],
             capture_output=True, text=True, check=False, timeout=2, stdin=DEVNULL,
         )
         if result.returncode:
-            return set()
-        uuid_result = run(
-            ["nvidia-smi", "--query-gpu=index,uuid", "--format=csv,noheader"],
-            capture_output=True, text=True, check=False, timeout=2, stdin=DEVNULL,
-        )
-        mapping = {
-            parts[1].strip(): int(parts[0].strip())
-            for line in uuid_result.stdout.splitlines()
-            if len(parts := line.split(",", 1)) == 2
-        }
-        return {mapping[value.strip()] for value in result.stdout.splitlines() if value.strip() in mapping}
+            return {}
+        loads = {}
+        for line in result.stdout.splitlines():
+            parts = [part.strip() for part in line.split(",")]
+            if len(parts) == 3:
+                loads[int(parts[0])] = (int(float(parts[1])), int(float(parts[2])))
+        return loads
     except (FileNotFoundError, OSError):
-        return set()
+        return {}
 
 
 def _reserve_gpu(index: int, settings: dict[str, Any]) -> str | None:
@@ -88,16 +84,28 @@ def _reserve_gpu(index: int, settings: dict[str, Any]) -> str | None:
 
 
 def _select_auto_gpu(available: list[str], settings: dict[str, Any]) -> tuple[str | None, str | None]:
-    busy = _busy_gpu_indices()
-    for device in available:
+    loads = _gpu_loads()
+    max_memory = int(settings.get("gpu_light_share_memory_mb", 1024))
+    max_utilization = int(settings.get("gpu_light_share_utilization_percent", 15))
+    if bool(settings.get("require_unused_gpu", False)):
+        max_memory = 0
+        max_utilization = 0
+    candidates = sorted(
+        available,
+        key=lambda device: loads.get(int(device.rsplit(":", 1)[1]), (0, 0)),
+    )
+    for device in candidates:
         index = int(device.rsplit(":", 1)[1])
-        if bool(settings.get("require_unused_gpu", True)) and index in busy:
+        memory_used, utilization = loads.get(index, (0, 0))
+        if (memory_used > max_memory or utilization > max_utilization) and not bool(
+            settings.get("allow_busy_fallback", False)
+        ):
             continue
         lease = _reserve_gpu(index, settings)
         if lease is not None:
             return device, lease
     if bool(settings.get("allow_busy_fallback", False)):
-        for device in available:
+        for device in candidates:
             lease = _reserve_gpu(int(device.rsplit(":", 1)[1]), settings)
             if lease is not None:
                 return device, lease
