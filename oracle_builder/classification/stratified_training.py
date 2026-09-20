@@ -399,6 +399,7 @@ def train_stratified_models(
         build_and_compile_model,
         write_model_summary,
     )
+    from oracle_builder.training.status import RichTrainingStatusCallback
     run_path = Path(run_dir)
     indices = build_indices(sqlite_path, config)
     split_summaries = _split_summaries(indices, config)
@@ -507,11 +508,23 @@ def train_stratified_models(
                 train_data = source.training_dataset(
                     selected, shuffle=True, augment=True
                 )
+                rich_status = RichTrainingStatusCallback(
+                    phase=(
+                        f"Stratified {dimension}×{dimension} "
+                        f"· {len(selected):,} routed samples "
+                        f"· parent epoch {epoch + 1}/{total_epochs}"
+                    ),
+                    epochs=total_epochs,
+                    display=str(config.get("training", {}).get("display", "rich")),
+                    training_log=training_log,
+                    run_id=run_id,
+                )
                 epoch_history = model.fit(
                     train_data,
                     validation_data=validation_data,
                     initial_epoch=epoch,
                     epochs=epoch + 1,
+                    callbacks=[rich_status],
                     verbose=0,
                 )
                 _append_history(history, epoch_history.history)
