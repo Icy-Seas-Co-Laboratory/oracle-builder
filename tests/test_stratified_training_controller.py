@@ -9,6 +9,7 @@ from oracle_builder.classification.stratified_training import (
     RECOVERY_SCHEMA,
     _sha256,
     child_config,
+    epoch_stratum_schedule,
     recovery_config_hash,
     routed_index,
     train_stratified_models,
@@ -66,6 +67,12 @@ def test_child_configs_are_isolated_and_use_area_scaled_batches():
     assert child["data"]["batch_size"] == 4
     assert child["classification"]["stratification"]["_active_dimension"] == 64
     assert config["data"]["input_shape"] == [32, 32, 1]
+
+
+def test_schedule_completes_every_stratum_before_advancing_parent_epoch():
+    assert list(epoch_stratum_schedule(_config(), 2)) == [
+        (0, 32), (0, 64), (1, 32), (1, 64),
+    ]
 
 
 def test_epoch_routing_assigns_every_reference_exactly_once(tmp_path):

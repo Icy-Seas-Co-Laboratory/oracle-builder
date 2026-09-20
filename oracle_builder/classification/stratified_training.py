@@ -227,6 +227,13 @@ def _canonical_counts(
     }
 
 
+def epoch_stratum_schedule(config: dict[str, Any], total_epochs: int):
+    """Yield parent-epoch-major child turns in deterministic resolution order."""
+    for epoch in range(int(total_epochs)):
+        for dimension in dimensions(config):
+            yield epoch, dimension
+
+
 def _history_path(child_dir: Path) -> Path:
     return child_dir / "training_history.json"
 
@@ -403,7 +410,11 @@ def train_stratified_models(
     run_path = Path(run_dir)
     indices = build_indices(sqlite_path, config)
     split_summaries = _split_summaries(indices, config)
-    for dimension in dimensions(config):
+    # Epoch-major scheduling means every ROI is routed exactly once for parent
+    # epoch N before any child begins parent epoch N+1. Children are reloaded
+    # from their full recovery snapshot between turns, keeping GPU residency to
+    # one model while preserving optimizer state.
+    for scheduled_epoch, dimension in epoch_stratum_schedule(config, total_epochs):
         if not routed_index(indices["train"], config, dimension).refs:
             raise ValueError(
                 f"Resolution stratum {dimension} has no canonical training samples"
@@ -474,7 +485,10 @@ def train_stratified_models(
         stopped_early = bool(control.get("stopped_early", False))
         completed_epochs = initial_epoch
 
-        for epoch in range(initial_epoch, total_epochs):
+        for epoch in range(
+            max(initial_epoch, scheduled_epoch),
+            min(total_epochs, scheduled_epoch + 1),
+        ):
             if stopped_early:
                 break
             selected = routed_index(
@@ -605,6 +619,8 @@ def train_stratified_models(
                     "stopped_early": stopped_early,
                 },
             )
+            # Epoch-major scheduling needs a reloadable optimizer snapshot for
+            # every child turn, even if optional long-term recovery is off.
             if recovery_enabled and (completed % save_every == 0 or stopped_early):
                 _save_recovery_model(
                     model,
@@ -615,22 +631,21 @@ def train_stratified_models(
                     history,
                     control,
                 )
-        if (child_dir / "best.weights.h5").exists() and bool(
+        if (completed_epochs >= total_epochs or stopped_early) and (child_dir / "best.weights.h5").exists() and bool(
             config.get("callbacks", {}).get("early_stopping", False)
         ):
             model.load_weights(child_dir / "best.weights.h5")
         final_path = child_dir / "final.keras"
         model.save(final_path)
-        if recovery_enabled:
-            _save_recovery_model(
-                model,
-                run_path,
-                dimension,
-                completed_epochs,
-                state,
-                history,
-                control,
-            )
+        _save_recovery_model(
+            model,
+            run_path,
+            dimension,
+            completed_epochs,
+            state,
+            history,
+            control,
+        )
         result = StratifiedChildResult(
             dimension=dimension,
             batch_size=int(child["data"]["batch_size"]),
