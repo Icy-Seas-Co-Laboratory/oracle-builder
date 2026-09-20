@@ -25,6 +25,12 @@ def augment_batch(x, y, config: dict[str, Any], sample_weight=None):
         if sample_weight is None:
             return x, y
         return x, y, sample_weight
+    # Classifiers with auxiliary scalar features arrive as a named Keras input
+    # dictionary. Geometric/photometric augmentation applies only to pixels;
+    # ROI metadata describes the original item and must remain unchanged.
+    auxiliary_inputs = x if isinstance(x, dict) else None
+    if auxiliary_inputs is not None:
+        x = auxiliary_inputs["image"]
     task = config["run"]["task"]
     x = tf.cast(x, tf.float32)
     y_dtype = y.dtype
@@ -80,9 +86,14 @@ def augment_batch(x, y, config: dict[str, Any], sample_weight=None):
                 )
 
     x = apply_photometric_augmentation(x, config, augmentation)
+    result_x = (
+        {**auxiliary_inputs, "image": x}
+        if auxiliary_inputs is not None
+        else x
+    )
     if sample_weight is not None:
-        return x, tf.cast(y, y_dtype), tf.cast(sample_weight, tf.float32)
-    return x, tf.cast(y, y_dtype)
+        return result_x, tf.cast(y, y_dtype), tf.cast(sample_weight, tf.float32)
+    return result_x, tf.cast(y, y_dtype)
 
 
 def build_random_affine_transforms(x, augmentation: dict[str, Any]):

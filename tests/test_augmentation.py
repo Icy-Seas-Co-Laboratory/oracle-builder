@@ -77,6 +77,25 @@ def test_classification_augmentation_keeps_label_dtype_and_shape():
     assert np.allclose(augmented_x.numpy(), 0.8)
 
 
+def test_classification_augmentation_preserves_auxiliary_metadata_input():
+    config = {
+        "run": {"task": "classification"},
+        "data": {"input_shape": [4, 4, 1]},
+        "augmentation": {"enabled": True, "invert": True},
+    }
+    image = tf.ones((2, 4, 4, 1), dtype=tf.float32) * 0.2
+    metadata = tf.constant([[1.5], [2.5]], dtype=tf.float32)
+    inputs, labels = augment_batch(
+        {"image": image, "metadata": metadata},
+        tf.constant([0, 1], dtype=tf.int64),
+        config,
+    )
+
+    assert np.allclose(inputs["image"].numpy(), 0.8)
+    assert np.array_equal(inputs["metadata"].numpy(), metadata.numpy())
+    assert np.array_equal(labels.numpy(), [0, 1])
+
+
 def test_segmentation_augmentation_transforms_spatial_weights_with_masks():
     config = {
         "run": {"task": "segmentation"},
