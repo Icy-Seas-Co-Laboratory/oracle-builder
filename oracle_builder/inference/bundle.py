@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import time
 from collections.abc import AsyncIterable, AsyncIterator, Iterable, Iterator
 from pathlib import Path
@@ -14,6 +15,7 @@ from oracle_builder.data.decoders import (
     prepare_classification_input,
 )
 from oracle_builder.classification.metadata import enabled as auxiliary_features_enabled, vector as auxiliary_feature_vector
+from oracle_builder.classification.stratification import stratum_for_array
 from oracle_builder.data.sqlite_dataset import prepare_segmentation_input
 from oracle_builder.data.tiling import extract_tile, plan_tiles, reassemble_tiles
 from oracle_builder.evaluation.segmentation_targets import (
@@ -36,7 +38,8 @@ from oracle_builder.inference.executor import (
     EmbeddingExecutor,
     execution_device_diagnostics,
 )
-from oracle_builder.saving.load_test import load_model_for_run
+from oracle_builder.saving.load_test import load_model_for_run, load_model_from_dir
+from oracle_builder.saving.save_model import read_stratification_manifest
 
 
 def _labels(config: dict[str, Any]) -> dict[int, dict[str, Any]]:
@@ -44,6 +47,28 @@ def _labels(config: dict[str, Any]) -> dict[int, dict[str, Any]]:
         int(row["class_index"]): dict(row)
         for row in config.get("dataset", {}).get("labels", [])
     }
+
+
+def _stratified_child_config(
+    parent: dict[str, Any], entry: dict[str, Any], dimension: int
+) -> dict[str, Any]:
+    """Resolve the child config stored by a stratified training controller."""
+    config = copy.deepcopy(parent)
+    supplied = entry.get("config")
+    if isinstance(supplied, dict):
+        # Controller may store a compact child override rather than a full
+        # duplicated run config.  Deep-update the sections it supplies.
+        for key, value in supplied.items():
+            if isinstance(value, dict) and isinstance(config.get(key), dict):
+                config[key].update(copy.deepcopy(value))
+            else:
+                config[key] = copy.deepcopy(value)
+    shape = list(config["data"]["input_shape"])
+    shape[:2] = [dimension, dimension]
+    config["data"]["input_shape"] = shape
+    stratification = config.setdefault("classification", {}).setdefault("stratification", {})
+    stratification["_active_dimension"] = dimension
+    return config
 
 
 def _segmentation_outputs(model, batch: np.ndarray, activation: str) -> dict[str, Any]:
@@ -124,15 +149,18 @@ class InferenceBundle:
         *,
         evidence_index: IdentityEvidenceIndex | None = None,
         cluster_index: ClusterEvidenceIndex | None = None,
+        strata: dict[int, "InferenceBundle"] | None = None,
     ):
         self.model = model
         self.config = config
         self.model_reference = model_reference
         self.evidence_index = evidence_index
         self.cluster_index = cluster_index
+        self.strata = dict(strata or {})
         self._classification_executor = (
             ClassificationExecutor(model, tuple(config["data"]["input_shape"]))
             if model_reference.task in {"classification", "clustering"}
+            and model is not None
             else None
         )
         self._embedding_executor = (
@@ -156,6 +184,41 @@ class InferenceBundle:
         run_dir = Path(run_dir).expanduser().resolve()
         config = read_run_config(run_dir)
         manifest = read_run_manifest(run_dir)
+        reference = ModelReference(
+            artifact_id=manifest["artifact_id"],
+            artifact_fingerprint=manifest.get("fingerprint_sha256"),
+            run_id=manifest["run_id"],
+            task=config["run"]["task"],
+            architecture=config["run"]["model"],
+        )
+        stratification_path = run_dir / "model" / "stratification_manifest.json"
+        if stratification_path.exists():
+            if reference.task != "classification":
+                raise ValueError("Only classification bundles can contain stratified models")
+            payload = read_stratification_manifest(run_dir)
+            assert payload is not None
+            children = payload.get("children", [])
+            if not isinstance(children, list) or not children:
+                raise ValueError("Stratification manifest has no child models")
+            child_bundles: dict[int, InferenceBundle] = {}
+            for entry in children:
+                dimension = int(entry["dimension"])
+                relative_child_path = Path(str(entry.get("path", f"strata/{dimension}")))
+                if relative_child_path.is_absolute() or ".." in relative_child_path.parts:
+                    raise ValueError(f"Unsafe stratification child path {relative_child_path}")
+                child_path = run_dir / "model" / relative_child_path
+                if dimension in child_bundles or not child_path.is_dir():
+                    raise ValueError(f"Invalid stratification child {dimension}: {child_path}")
+                child_config = _stratified_child_config(config, entry, dimension)
+                child_model = load_model_from_dir(child_path, child_config, prefer_savedmodel=True)
+                evidence_path = child_path / "classification_evidence"
+                if not evidence_path.exists():
+                    evidence_path = child_path / "classification_evidence.npz"
+                child_bundles[dimension] = cls(
+                    child_model, child_config, reference,
+                    evidence_index=IdentityEvidenceIndex.load(evidence_path) if evidence_path.exists() else None,
+                )
+            return cls(None, config, reference, strata=child_bundles)
         model = load_model_for_run(run_dir, config, prefer_savedmodel=True)
         evidence_path = run_dir / "model" / "classification_evidence"
         if not evidence_path.exists():
@@ -174,13 +237,7 @@ class InferenceBundle:
         return cls(
             model,
             config,
-            ModelReference(
-                artifact_id=manifest["artifact_id"],
-                artifact_fingerprint=manifest.get("fingerprint_sha256"),
-                run_id=manifest["run_id"],
-                task=config["run"]["task"],
-                architecture=config["run"]["model"],
-            ),
+            reference,
             evidence_index=evidence,
             cluster_index=cluster_index,
         )
@@ -192,6 +249,8 @@ class InferenceBundle:
         result_set_id: str | None = None,
         sequence_number: int | None = None,
     ) -> InferenceResult:
+        if self.strata:
+            return self._predict_stratified(item, result_set_id=result_set_id, sequence_number=sequence_number)
         resolved_result_set_id = result_set_id or new_uuid()
         started = time.perf_counter()
         received_at = utc_now()
@@ -242,6 +301,8 @@ class InferenceBundle:
         each ROI can expand into a variable number of tiles; its batching is a
         separate tile scheduler concern.
         """
+        if self.strata:
+            return self._predict_stratified_batch(list(items), source_dataset=source_dataset)
         result_set = InferenceResultSet(
             model=self.model_reference,
             source_dataset=source_dataset,
@@ -352,6 +413,85 @@ class InferenceBundle:
             )
             index += 1
 
+    def _stratum_for_item(self, item: InferenceItem) -> int:
+        dimension = stratum_for_array(item.inputs["image"].values, self.config)
+        if dimension not in self.strata:
+            raise ValueError(
+                f"No loaded child model for canonical resolution stratum {dimension}"
+            )
+        return dimension
+
+    @staticmethod
+    def _annotate_stratum(result: InferenceResult, dimension: int) -> InferenceResult:
+        if result.output is not None:
+            result.output["stratum_dimension"] = dimension
+            result.output["routing_mode"] = "canonical"
+        return result
+
+    def _predict_stratified(
+        self,
+        item: InferenceItem,
+        *,
+        result_set_id: str | None,
+        sequence_number: int | None,
+    ) -> InferenceResult:
+        started = time.perf_counter()
+        received_at = utc_now()
+        resolved_result_set_id = result_set_id or new_uuid()
+        try:
+            dimension = self._stratum_for_item(item)
+            child = self.strata[dimension]
+            result = child.predict(
+                item, result_set_id=resolved_result_set_id, sequence_number=sequence_number
+            )
+            result.model = self.model_reference
+            return self._annotate_stratum(result, dimension)
+        except (TypeError, ValueError, KeyError) as exc:
+            return InferenceResult(
+                request_id=item.request_id, item_id=item.item_id, source=item.source,
+                model=self.model_reference, output=None, input_sha256=item.input_sha256,
+                result_set_id=resolved_result_set_id, sequence_number=sequence_number,
+                status="rejected", received_at=received_at, completed_at=utc_now(),
+                duration_ms=(time.perf_counter() - started) * 1000.0,
+                error={"type": type(exc).__name__, "message": str(exc)},
+            )
+
+    def _predict_stratified_batch(
+        self,
+        items: list[InferenceItem],
+        *,
+        source_dataset: dict[str, Any] | None,
+    ) -> InferenceResultSet:
+        result_set = InferenceResultSet(
+            model=self.model_reference, source_dataset=source_dataset,
+            execution={"stratified": True, "strata": sorted(self.strata)},
+        )
+        results: list[InferenceResult | None] = [None] * len(items)
+        grouped: dict[int, list[tuple[int, InferenceItem]]] = {}
+        for index, item in enumerate(items):
+            try:
+                grouped.setdefault(self._stratum_for_item(item), []).append((index, item))
+            except (TypeError, ValueError, KeyError) as exc:
+                now = utc_now()
+                results[index] = InferenceResult(
+                    request_id=item.request_id, item_id=item.item_id, source=item.source,
+                    model=self.model_reference, output=None, input_sha256=item.input_sha256,
+                    result_set_id=result_set.result_set_id, sequence_number=index,
+                    status="rejected", received_at=now, completed_at=now,
+                    duration_ms=0.0, error={"type": type(exc).__name__, "message": str(exc)},
+                )
+        for dimension, rows in grouped.items():
+            child_results = self.strata[dimension].predict_batch([item for _, item in rows])
+            for (index, _), result in zip(rows, child_results.results, strict=True):
+                result.result_set_id = result_set.result_set_id
+                result.sequence_number = index
+                result.model = self.model_reference
+                results[index] = self._annotate_stratum(result, dimension)
+        for result in results:
+            assert result is not None
+            result_set.append(result)
+        return result_set.complete()
+
     def _predict_classification(self, item: InferenceItem) -> dict[str, Any]:
         prepared = self._prepare_classification(item)
         values = self._classification_executor.predict(
@@ -429,6 +569,17 @@ class InferenceBundle:
 
     def warm_for_serving(self, batch_sizes: tuple[int, ...] = (1,)) -> dict[str, Any]:
         """Compile and exercise the resident callable without retaining input data."""
+        if self.strata:
+            reports = {
+                str(dimension): child.warm_for_serving(batch_sizes)
+                for dimension, child in sorted(self.strata.items())
+            }
+            self.runtime_diagnostics = {
+                "runtime": "stratified_classification",
+                "strata": reports,
+                "execution": self.execution_diagnostics,
+            }
+            return self.runtime_diagnostics
         if self.model_reference.task == "embedding" and self._embedding_executor is not None:
             executor = self._embedding_executor
         elif self.model_reference.task in {"classification", "clustering"} and self._classification_executor is not None:

@@ -96,7 +96,23 @@ def build_and_compile_model(config: dict[str, Any]) -> keras.Model:
 def write_model_summary(model: keras.Model, path: str | Path) -> None:
     lines: list[str] = []
     model.summary(print_fn=lines.append)
-    Path(path).write_text("\n".join(lines) + "\n")
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("\n".join(lines) + "\n")
+
+
+def model_summary_path(run_dir: str | Path, config: dict[str, Any]) -> Path:
+    """Return the canonical architecture-summary location for this model.
+
+    Stratified orchestration sets the private active dimension on each child
+    config. It is intentionally runtime-only: the parent configuration retains
+    the complete stratum list while each child writes next to its own artifacts.
+    """
+    stratification = config.get("classification", {}).get("stratification", {})
+    dimension = stratification.get("_active_dimension") if isinstance(stratification, dict) else None
+    if dimension is not None:
+        return Path(run_dir) / "model" / "strata" / str(int(dimension)) / "model_summary.txt"
+    return Path(run_dir) / "model" / "model_summary.txt"
 
 
 def train_model(
@@ -118,7 +134,7 @@ def train_model(
             recovery_path = Path(run_dir) / resume_state["model_path"]
             model = keras.models.load_model(recovery_path)
     write_distribution_info(distribution_info, run_dir)
-    write_model_summary(model, Path(run_dir) / "model" / "model_summary.txt")
+    write_model_summary(model, model_summary_path(run_dir, config))
     from oracle_builder.training.logging_callbacks import log_event
 
     log_event(

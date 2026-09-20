@@ -34,6 +34,7 @@ class SQLiteSampleRef:
             "uuid": self.uuid,
             "split": self.split,
             "label_text": None,
+            "class_index": self.target,
             "sample_weight": None,
             "metadata": json.loads(self.metadata_json) if self.metadata_json else {},
             "original_shape": json.loads(self.input_dimensions) if self.input_dimensions else None,

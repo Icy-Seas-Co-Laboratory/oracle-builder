@@ -17,8 +17,15 @@ from oracle_builder.training.losses import WeightedSparseCategoricalCrossentropy
 from oracle_builder.training.train import build_and_compile_model
 
 
-def _synthetic_input(config: dict[str, Any]) -> np.ndarray:
-    return np.zeros((1, *config["data"]["input_shape"]), dtype="float32")
+def _synthetic_input(config: dict[str, Any]) -> np.ndarray | dict[str, np.ndarray]:
+    image = np.zeros((1, *config["data"]["input_shape"]), dtype="float32")
+    specs = config.get("model", {}).get("auxiliary_features_fitted", [])
+    if specs:
+        return {
+            "image": image,
+            "metadata": np.zeros((1, len(specs)), dtype="float32"),
+        }
+    return image
 
 
 def _load_keras_model(path: str | Path):
@@ -88,8 +95,12 @@ def run_load_tests(run_dir: str | Path, config: dict[str, Any], initial_report: 
             loaded_export = tf.saved_model.load(str(export_dir))
             infer = loaded_export.signatures.get("serving_default")
             if infer:
-                input_name = next(iter(infer.structured_input_signature[1]))
-                infer(**{input_name: tf.constant(sample)})
+                expected = infer.structured_input_signature[1]
+                if isinstance(sample, dict):
+                    infer(**{name: tf.constant(sample[name]) for name in expected})
+                else:
+                    input_name = next(iter(expected))
+                    infer(**{input_name: tf.constant(sample)})
             report["savedmodel_reload_checked"] = True
             prediction_ok = True
         except Exception as exc:
@@ -116,7 +127,22 @@ def load_model_for_run(
                 "Run artifact integrity validation failed: "
                 + "; ".join(validation["errors"])
             )
-    model_path = Path(run_dir) / "model"
+    return load_model_from_dir(Path(run_dir) / "model", config, prefer_savedmodel=prefer_savedmodel)
+
+
+def load_model_from_dir(
+    model_path: str | Path,
+    config: dict[str, Any],
+    *,
+    prefer_savedmodel: bool = False,
+):
+    """Load a model from a normal artifact directory.
+
+    Unlike :func:`load_model_for_run`, this is intentionally not coupled to a
+    run-root integrity check.  Stratified children live under their parent
+    artifact and are validated by the parent bundle manifest.
+    """
+    model_path = Path(model_path)
     errors = []
     if prefer_savedmodel:
         try:
@@ -152,12 +178,13 @@ class SavedModelPredictor:
         self.infer = self.loaded.signatures.get("serving_default")
         if self.infer is None:
             raise RuntimeError("SavedModel has no serving_default signature")
-        self.input_name = next(iter(self.infer.structured_input_signature[1]))
+        self.input_names = tuple(self.infer.structured_input_signature[1])
+        self.input_name = self.input_names[0]
         self.embed = self.loaded.signatures.get("embed")
 
     def predict(self, x, verbose: int = 0):
         del verbose
-        output = self.infer(**{self.input_name: tf.constant(x)})
+        output = self.infer(**self._inputs(self.infer, x))
         probabilities = output.get("probabilities")
         if probabilities is None:
             probabilities = next(iter(output.values()))
@@ -167,16 +194,14 @@ class SavedModelPredictor:
         del verbose
         if self.embed is None:
             raise RuntimeError("SavedModel has no embed signature")
-        input_name = next(iter(self.embed.structured_input_signature[1]))
-        output = self.embed(**{input_name: tf.constant(np.asarray(x, dtype="float32"))})
+        output = self.embed(**self._inputs(self.embed, x))
         return output["features"].numpy()
 
     def predict_embedding(self, x, verbose: int = 0):
         del verbose
         if self.embed is None:
             raise RuntimeError("SavedModel has no embed signature")
-        input_name = next(iter(self.embed.structured_input_signature[1]))
-        output = self.embed(**{input_name: tf.constant(np.asarray(x, dtype="float32"))})
+        output = self.embed(**self._inputs(self.embed, x))
         values = output.get("embedding")
         if values is None:
             values = output.get("features")
@@ -186,7 +211,7 @@ class SavedModelPredictor:
 
     def predict_outputs(self, x, verbose: int = 0):
         del verbose
-        output = self.infer(**{self.input_name: tf.constant(x)})
+        output = self.infer(**self._inputs(self.infer, x))
         probabilities = output.get("probabilities")
         if probabilities is None:
             probabilities = next(iter(output.values()))
@@ -209,3 +234,20 @@ class SavedModelPredictor:
             "features": features,
             "logits_source": logits_source,
         }
+
+    @staticmethod
+    def _inputs(signature, value):
+        """Convert array or named image/metadata inputs for SavedModel calls."""
+        expected = signature.structured_input_signature[1]
+        if isinstance(value, dict):
+            missing = set(expected) - set(value)
+            extra = set(value) - set(expected)
+            if missing or extra:
+                raise ValueError(
+                    "SavedModel inputs do not match signature; "
+                    f"missing={sorted(missing)}, extra={sorted(extra)}"
+                )
+            return {name: tf.constant(np.asarray(value[name], dtype="float32")) for name in expected}
+        if len(expected) != 1:
+            raise ValueError("This SavedModel requires named multi-input data")
+        return {next(iter(expected)): tf.constant(np.asarray(value, dtype="float32"))}

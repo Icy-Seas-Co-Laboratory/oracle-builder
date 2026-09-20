@@ -152,8 +152,22 @@ def _path_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def save_model_artifacts(model: keras.Model, run_dir: str | Path, config: dict[str, Any]) -> dict[str, Any]:
-    model_path = Path(run_dir) / "model"
+def save_model_artifacts(
+    model: keras.Model,
+    run_dir: str | Path,
+    config: dict[str, Any],
+    *,
+    model_dir: str | Path | None = None,
+) -> dict[str, Any]:
+    """Save one model's artifacts.
+
+    ``model_dir`` is primarily for resolution-stratified classification runs.
+    It is relative to ``run_dir`` unless absolute, and lets every child retain
+    the normal, self-contained artifact layout under ``model/strata/<size>``.
+    """
+    model_path = Path(model_dir) if model_dir is not None else Path(run_dir) / "model"
+    if not model_path.is_absolute():
+        model_path = Path(run_dir) / model_path
     model_path.mkdir(parents=True, exist_ok=True)
     report: dict[str, Any] = {
         "final_keras_saved": False,
@@ -326,8 +340,11 @@ def save_model_artifacts(model: keras.Model, run_dir: str | Path, config: dict[s
     (model_path / "model_manifest.json").write_text(
         json.dumps(model_manifest, indent=2, sort_keys=True, default=str) + "\n"
     )
+    # The parent contract describes a bundle.  Child contracts are retained
+    # beside their artifacts for auditability but must not overwrite it.
+    contract_target = model_path if model_dir is not None else Path(run_dir)
     write_model_contract(
-        run_dir,
+        contract_target,
         {
             "task": model_manifest["task"],
             "architecture": model_manifest["architecture"],
@@ -339,6 +356,63 @@ def save_model_artifacts(model: keras.Model, run_dir: str | Path, config: dict[s
         },
     )
     return report
+
+
+def write_stratification_manifest(
+    run_dir: str | Path,
+    manifest: dict[str, Any],
+) -> Path:
+    """Persist the portable parent manifest for a resolution model bundle.
+
+    Child paths must be relative to ``model`` and each child must carry a
+    dimension.  Keeping this deliberately small makes it forward-compatible
+    with training/recovery details owned by the parent run manifest.
+    """
+    root = Path(run_dir) / "model"
+    root.mkdir(parents=True, exist_ok=True)
+    value = dict(manifest)
+    value.setdefault("schema_name", "oracle_builder_stratified_classification_bundle")
+    value.setdefault("schema_version", "1.0.0")
+    children = value.get("children", value.get("strata", []))
+    if isinstance(children, dict):
+        children = [dict(entry, dimension=int(dimension)) for dimension, entry in children.items()]
+    if not isinstance(children, list) or not children:
+        raise ValueError("Stratification manifest requires a non-empty children list")
+    normalized: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    for child in children:
+        if not isinstance(child, dict):
+            raise ValueError("Each stratification child must be an object")
+        dimension = int(child["dimension"])
+        path = str(child.get("path", f"strata/{dimension}")).strip("/")
+        if (
+            dimension < 2
+            or dimension in seen
+            or not path
+            or ".." in Path(path).parts
+            or Path(path).is_absolute()
+        ):
+            raise ValueError("Stratification child dimensions and paths must be unique and valid")
+        seen.add(dimension)
+        normalized.append({**child, "dimension": dimension, "path": path})
+    value["children"] = sorted(normalized, key=lambda child: child["dimension"])
+    value.pop("strata", None)
+    path = root / "stratification_manifest.json"
+    path.write_text(json.dumps(value, indent=2, sort_keys=True, default=str) + "\n")
+    return path
+
+
+def read_stratification_manifest(run_dir: str | Path) -> dict[str, Any] | None:
+    """Read a stratified bundle manifest, returning ``None`` for normal runs."""
+    path = Path(run_dir) / "model" / "stratification_manifest.json"
+    if not path.exists():
+        return None
+    value = json.loads(path.read_text())
+    if value.get("schema_name") != "oracle_builder_stratified_classification_bundle":
+        raise ValueError(f"Unsupported stratification manifest at {path}")
+    if not isinstance(value.get("children"), list):
+        raise ValueError(f"Stratification manifest at {path} has no children list")
+    return value
 
 
 def write_load_test_report(run_dir: str | Path, report: dict[str, Any]) -> None:

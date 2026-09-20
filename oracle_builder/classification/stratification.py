@@ -99,3 +99,34 @@ def training_stratum(
     digest = hashlib.sha256(f"{seed}:{epoch}:{item_id}".encode("utf-8")).digest()
     draw = int.from_bytes(digest[:8], "big") / 2**64
     return values[index - 1] if draw < probability else canonical
+
+
+def summarize_records(
+    records: list[dict[str, Any]], config: dict[str, Any], *, split: str, epoch: int | None = None
+) -> dict[str, Any]:
+    """Return auditable canonical and (optionally) epoch routing counts."""
+    configured = dimensions(config)
+    canonical = {dimension: 0 for dimension in configured}
+    routed = {dimension: 0 for dimension in configured}
+    classes: dict[int, dict[int, int]] = {dimension: {} for dimension in configured}
+    for record in records:
+        shape = record.get("original_shape")
+        if not shape:
+            raise ValueError("Stratification requires original_shape on every classification record")
+        assigned = stratum_for_shape(shape, configured)
+        canonical[assigned] += 1
+        selected = training_stratum(
+            assigned, item_id=str(record["uuid"]), epoch=int(epoch), config=config
+        ) if epoch is not None else assigned
+        routed[selected] += 1
+        label = record.get("class_index")
+        if label is not None:
+            classes[selected][int(label)] = classes[selected].get(int(label), 0) + 1
+    return {
+        "split": split,
+        "epoch": epoch,
+        "canonical_counts": canonical,
+        "routed_counts": routed,
+        "class_counts": classes,
+        "batch_plan": batch_plan(config),
+    }

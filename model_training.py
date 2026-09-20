@@ -190,20 +190,32 @@ def main() -> int:
 
         if not split_manifest_matches_dataset(config, args.input):
             raise ValueError("The supplied dataset does not exactly match this run's split manifest")
-        resume_state = validate_recovery_state(
-            run_dir,
-            config,
-            artifact_id=manifest["artifact_id"],
-            run_id=manifest["run_id"],
-        )
+        if config.get("classification", {}).get("stratification", {}).get("enabled", False):
+            from oracle_builder.classification.stratified_training import (
+                validate_recovery_state as validate_stratified_recovery_state,
+            )
+
+            resume_state = validate_stratified_recovery_state(
+                run_dir, config, artifact_id=manifest["artifact_id"], run_id=manifest["run_id"]
+            )
+        else:
+            resume_state = validate_recovery_state(
+                run_dir,
+                config,
+                artifact_id=manifest["artifact_id"],
+                run_id=manifest["run_id"],
+            )
         if manifest["lifecycle"] == "sealed":
             reopen_run_artifact(run_dir, reason="resume from validated recovery snapshot")
         update_run_artifact(run_dir, status="running")
-        print(
-            f"Resuming {run_dir.name} at supervised epoch "
-            f"{int(resume_state['completed_epoch']) + 1}",
-            flush=True,
-        )
+        if config.get("classification", {}).get("stratification", {}).get("enabled", False):
+            print(f"Resuming stratified run {run_dir.name}", flush=True)
+        else:
+            print(
+                f"Resuming {run_dir.name} at supervised epoch "
+                f"{int(resume_state['completed_epoch']) + 1}",
+                flush=True,
+            )
     else:
         if not args.config or not args.input or not args.output:
             raise ValueError("New training requires --config, --input, and --output")
@@ -281,12 +293,17 @@ def main() -> int:
         resume=is_resume,
     )
     if is_resume:
+        resumed_payload = (
+            {"stratified": True, "children": resume_state.get("children", {})}
+            if config.get("classification", {}).get("stratification", {}).get("enabled", False)
+            else {"completed_epoch": int(resume_state["completed_epoch"])}
+        )
         log_event(
             training_log,
             run_id,
             "INFO",
             "Resumed from validated rolling recovery snapshot",
-            {"completed_epoch": int(resume_state["completed_epoch"])},
+            resumed_payload,
         )
 
     try:
@@ -317,6 +334,27 @@ def main() -> int:
         else:
             datasets, records_by_split = make_tf_datasets(args.input, config)
         log_event(training_log, run_id, "INFO", "Datasets loaded", {"splits": list(datasets)})
+        from oracle_builder.classification.stratification import (
+            enabled as stratification_enabled,
+            summarize_records,
+        )
+        if stratification_enabled(config):
+            summaries = {
+                split: summarize_records(records, config, split=split, epoch=0)
+                for split, records in records_by_split.items()
+            }
+            log_event(
+                training_log,
+                run_id,
+                "INFO",
+                "Stratification preflight counts",
+                {"status": "preflight", "splits": summaries},
+            )
+            print(
+                "Stratification configured; canonical and epoch-0 routed counts:\n"
+                + json.dumps(summaries, indent=2, sort_keys=True),
+                flush=True,
+            )
         if config["run"]["task"] == "classification":
             from oracle_builder.training.class_weights import (
                 resolve_class_weights,
@@ -348,6 +386,102 @@ def main() -> int:
                     "Resolved weighted cross entropy class weights",
                     resolved_weights,
                 )
+        if stratification_enabled(config):
+            # The controller owns the parent epoch loop so its seeded routing
+            # can reassign training examples between child resolutions.
+            from oracle_builder.classification.stratified_data import child_config
+            from oracle_builder.classification.stratified_training import (
+                build_indices,
+                make_canonical_bundle,
+                train_stratified_models,
+            )
+            from oracle_builder.classification.stratification import dimensions
+            from oracle_builder.saving.save_model import save_model_artifacts
+            from oracle_builder.classification.evidence import build_evidence_index_streaming
+            from oracle_builder.evaluation.classification import evaluate_classification_streaming
+
+            stratified = train_stratified_models(
+                config, args.input, run_dir, training_log, run_id, resume_state=resume_state
+            )
+            base_indices = build_indices(args.input, config)
+            child_reports = {}
+            class_names = {
+                int(row["class_index"]): str(row.get("name") or row["class_index"])
+                for row in config.get("dataset", {}).get("labels", [])
+            }
+            for dimension in dimensions(config):
+                child = child_config(config, dimension)
+                child_dir = run_dir / "model" / "strata" / str(dimension)
+                child_model = stratified.load_model(dimension)
+                save_report = save_model_artifacts(
+                    child_model, run_dir, child, model_dir=child_dir
+                )
+                canonical = make_canonical_bundle(
+                    args.input, config, dimension, indices=base_indices
+                )
+                evidence = None
+                if config.get("evidence", {}).get("enabled", True) and "train" in canonical.indices:
+                    train_index = canonical.indices["train"]
+                    evidence = build_evidence_index_streaming(
+                        child_model,
+                        canonical.source.indexed_image_dataset(
+                            train_index, batch_size=int(child["data"]["batch_size"])
+                        ),
+                        train_index,
+                        child_dir / "classification_evidence",
+                        progress=bool(config.get("inference", {}).get("progress", True)),
+                    )
+                evaluation = None
+                evaluation_split = "test" if "test" in canonical.indices else "validation"
+                if evaluation_split in canonical.indices:
+                    evaluation_index = canonical.indices[evaluation_split]
+                    evaluation = evaluate_classification_streaming(
+                        child_model,
+                        canonical.source.indexed_image_dataset(
+                            evaluation_index, batch_size=int(child["data"]["batch_size"])
+                        ),
+                        evaluation_index,
+                        child_dir,
+                        class_names=class_names,
+                        progress=bool(config.get("inference", {}).get("progress", True)),
+                        evaluation_settings=config.get("evaluation", {}),
+                        evaluation_context={"split": evaluation_split, "stratum_dimension": dimension},
+                    )
+                child_reports[str(dimension)] = {
+                    "save": save_report,
+                    "evaluation": evaluation.get("summary") if evaluation else None,
+                    "evidence_references": len(canonical.indices.get("train", [])) if evidence is not None else 0,
+                }
+                log_event(training_log, run_id, "INFO", "Finalized resolution stratum", {"dimension": dimension, **child_reports[str(dimension)]})
+                del child_model
+            config.setdefault("classification", {}).setdefault("stratification", {})["training_report"] = child_reports
+            write_run_config(run_dir, config)
+            from oracle_builder.artifacts import write_model_contract
+
+            write_model_contract(
+                run_dir,
+                {
+                    "task": "classification",
+                    "architecture": config["run"]["model"],
+                    "inputs": {
+                        "image": {
+                            "dtype": "float32",
+                            "routing": "canonical_max_original_dimension",
+                            "strata": dimensions(config),
+                            "preprocessing": config.get("preprocessing", {}),
+                        }
+                    },
+                    "outputs": {"logits": True, "probabilities": True, "identity_embedding": True},
+                    "stratification_manifest": "model/stratification_manifest.json",
+                },
+            )
+            from oracle_builder.classification.stratified_training import clear_recovery_state
+            clear_recovery_state(run_dir)
+            mark_run_complete(training_log, run_id, "complete")
+            update_run_artifact(run_dir, status="complete", summary={"stratification": child_reports})
+            seal_run_artifact(run_dir)
+            print(f"Stratified training run complete: {run_dir}", flush=True)
+            return 0
         self_supervised_dataset = None
         self_supervised = self_supervised_settings(config)
         if self_supervised.get("enabled", False) and resume_state is None:
