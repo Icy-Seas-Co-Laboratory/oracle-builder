@@ -201,16 +201,25 @@ class InferenceBundle:
             if not isinstance(children, list) or not children:
                 raise ValueError("Stratification manifest has no child models")
             child_bundles: dict[int, InferenceBundle] = {}
+            shared_model = (
+                load_model_for_run(run_dir, config, prefer_savedmodel=True)
+                if payload.get("weight_sharing") == "shared"
+                else None
+            )
             for entry in children:
                 dimension = int(entry["dimension"])
                 relative_child_path = Path(str(entry.get("path", f"strata/{dimension}")))
                 if relative_child_path.is_absolute() or ".." in relative_child_path.parts:
                     raise ValueError(f"Unsafe stratification child path {relative_child_path}")
                 child_path = run_dir / "model" / relative_child_path
-                if dimension in child_bundles or not child_path.is_dir():
+                if dimension in child_bundles or (
+                    shared_model is None and not child_path.is_dir()
+                ):
                     raise ValueError(f"Invalid stratification child {dimension}: {child_path}")
                 child_config = _stratified_child_config(config, entry, dimension)
-                child_model = load_model_from_dir(child_path, child_config, prefer_savedmodel=True)
+                child_model = shared_model or load_model_from_dir(
+                    child_path, child_config, prefer_savedmodel=True
+                )
                 evidence_path = child_path / "classification_evidence"
                 if not evidence_path.exists():
                     evidence_path = child_path / "classification_evidence.npz"

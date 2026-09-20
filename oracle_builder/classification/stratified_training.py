@@ -17,6 +17,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+import tensorflow as tf
 from tensorflow import keras
 
 from oracle_builder.classification.stratification import (
@@ -25,6 +26,7 @@ from oracle_builder.classification.stratification import (
     enabled,
     stratum_for_shape,
     summarize_records,
+    supra_epoch_schedule,
     training_stratum,
     validate,
 )
@@ -61,6 +63,7 @@ def recovery_config_hash(config: dict[str, Any]) -> str:
         },
         "data": config.get("data", {}),
         "model": config.get("model", {}),
+        "classification": config.get("classification", {}),
         "preprocessing": config.get("preprocessing", {}),
         "training": config.get("training", {}),
         "distribution": config.get("distribution", {}),
@@ -99,7 +102,9 @@ class StratifiedTrainingResult:
         return self.manifest_path.parent.parent / self.children[int(dimension)].model_path
 
     def load_model(self, dimension: int) -> keras.Model:
-        return keras.models.load_model(self.model_path(dimension))
+        # Finalization performs inference/evaluation only; avoiding optimizer
+        # deserialization also keeps custom training losses out of this path.
+        return keras.models.load_model(self.model_path(dimension), compile=False)
 
 
 def _atomic_json(path: Path, value: dict[str, Any]) -> None:
@@ -133,6 +138,19 @@ def child_config(config: dict[str, Any], dimension: int) -> dict[str, Any]:
     result.setdefault("classification", {}).setdefault("stratification", {})[
         "_active_dimension"
     ] = int(dimension)
+    return result
+
+
+def shared_model_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Build the one spatially-dynamic model configuration for all strata."""
+    result = copy.deepcopy(config)
+    input_shape = list(result["data"]["input_shape"])
+    if len(input_shape) != 3:
+        raise ValueError("Classification data.input_shape must be [height, width, channels]")
+    result["data"]["input_shape"] = [None, None, input_shape[-1]]
+    result.setdefault("classification", {}).setdefault("stratification", {})[
+        "weight_sharing"
+    ] = "shared"
     return result
 
 
@@ -228,7 +246,7 @@ def _canonical_counts(
 
 
 def epoch_stratum_schedule(config: dict[str, Any], total_epochs: int):
-    """Yield parent-epoch-major child turns in deterministic resolution order."""
+    """Legacy epoch-major view retained for callers that need individual turns."""
     for epoch in range(int(total_epochs)):
         for dimension in dimensions(config):
             yield epoch, dimension
@@ -282,6 +300,17 @@ def validate_recovery_state(
     if state.get("dimensions") != dimensions(config):
         raise ValueError("Stratified recovery dimensions do not match the configuration")
     root = Path(run_dir)
+    if state.get("weight_sharing") != "shared":
+        raise ValueError(
+            "This recovery snapshot predates shared-weight stratification; "
+            "start a new stratified training run."
+        )
+    shared = state.get("shared", {})
+    if not isinstance(shared, dict) or not shared.get("model_path"):
+        raise ValueError("Shared-weight stratified recovery is missing its model snapshot")
+    shared_target = root / str(shared["model_path"])
+    if not shared_target.exists() or _sha256(shared_target) != shared.get("model_sha256"):
+        raise ValueError("Shared stratified recovery model checksum mismatch")
     for key, child in state.get("children", {}).items():
         completed = int(child.get("completed_epochs", 0))
         if completed < 0 or completed > int(config["training"].get("epochs", 10)):
@@ -312,6 +341,8 @@ def _initial_recovery(config: dict[str, Any], run_id: str) -> dict[str, Any]:
         "config_sha256": recovery_config_hash(config),
         "dimensions": dimensions(config),
         "batch_plan": {str(k): v for k, v in batch_plan(config).items()},
+        "supra_epochs": int(config.get("classification", {}).get("stratification", {}).get("supra_epochs", 5)),
+        "weight_sharing": "shared",
         "children": {},
     }
 
@@ -368,6 +399,12 @@ def _write_manifest(
         .get("stratification", {})
         .get("training_routing", {}),
         "batch_plan": {str(k): v for k, v in batch_plan(config).items()},
+        "supra_epochs": int(
+            config.get("classification", {})
+            .get("stratification", {})
+            .get("supra_epochs", 5)
+        ),
+        "weight_sharing": "shared",
         "split_summaries": split_summaries,
         "children": [
             {
@@ -429,6 +466,12 @@ def train_stratified_models(
         {
             "dimensions": dimensions(config),
             "batch_plan": batch_plan(config),
+            "weight_sharing": "shared",
+            "supra_epochs": int(
+                config.get("classification", {})
+                .get("stratification", {})
+                .get("supra_epochs", 5)
+            ),
             "split_summaries": split_summaries,
             "distribution": asdict(distribution_info),
         },
@@ -436,15 +479,25 @@ def train_stratified_models(
     print(
         "Stratified training enabled\n"
         f"  dimensions: {dimensions(config)}\n"
-        f"  batch plan: {batch_plan(config)}",
+        f"  batch plan: {batch_plan(config)}\n"
+        "  weights: shared dynamic-spatial model\n"
+        f"  supra-epochs: {config.get('classification', {}).get('stratification', {}).get('supra_epochs', 5)}",
         flush=True,
     )
 
     state = resume_state or _initial_recovery(config, run_id)
     children: dict[int, StratifiedChildResult] = {}
+    shared_config = shared_model_config(config)
+    shared_recovery = state.get("shared", {})
+    with strategy.scope():
+        if shared_recovery.get("model_path"):
+            model = keras.models.load_model(run_path / shared_recovery["model_path"])
+        else:
+            model = build_and_compile_model(shared_config)
 
-    # Every child completes parent epoch N before any child starts N + 1.
-    for scheduled_epoch, dimension in epoch_stratum_schedule(config, total_epochs):
+    # Each child remains resident for a supra-epoch block, avoiding a model
+    # reload and graph rebuild for every individual parent epoch.
+    for block_start, block_stop, dimension in supra_epoch_schedule(config, total_epochs):
         child = child_config(config, dimension)
         child_dir = run_path / "model" / "strata" / str(dimension)
         child_dir.mkdir(parents=True, exist_ok=True)
@@ -455,11 +508,10 @@ def train_stratified_models(
             for key, values in recovered.get("history", _read_history(child_dir)).items()
         }
         control = dict(recovered.get("control", {}))
-        with strategy.scope():
-            if recovered.get("model_path"):
-                model = keras.models.load_model(run_path / recovered["model_path"])
-            else:
-                model = build_and_compile_model(child)
+        effective_batch_size = int(
+            control.get("effective_batch_size", child["data"]["batch_size"])
+        )
+        child["data"]["batch_size"] = effective_batch_size
         summary_path = child_dir / "model_summary.txt"
         write_model_summary(model, summary_path)
         canonical_validation = routed_index(
@@ -483,8 +535,8 @@ def train_stratified_models(
         completed_epochs = initial_epoch
 
         for epoch in range(
-            max(initial_epoch, scheduled_epoch),
-            min(total_epochs, scheduled_epoch + 1),
+            max(initial_epoch, block_start),
+            min(total_epochs, block_stop),
         ):
             if stopped_early:
                 break
@@ -515,10 +567,6 @@ def train_stratified_models(
                 flush=True,
             )
             if selected.refs:
-                source = SQLiteClassificationSource(sqlite_path, child)
-                train_data = source.training_dataset(
-                    selected, shuffle=True, augment=True
-                )
                 rich_status = RichTrainingStatusCallback(
                     phase=(
                         f"Stratified {dimension}×{dimension} "
@@ -530,14 +578,52 @@ def train_stratified_models(
                     training_log=training_log,
                     run_id=run_id,
                 )
-                epoch_history = model.fit(
-                    train_data,
-                    validation_data=validation_data,
-                    initial_epoch=epoch,
-                    epochs=epoch + 1,
-                    callbacks=[rich_status],
-                    verbose=0,
-                )
+                while True:
+                    source = SQLiteClassificationSource(sqlite_path, child)
+                    train_data = source.training_dataset(
+                        selected, shuffle=True, augment=True
+                    )
+                    try:
+                        epoch_history = model.fit(
+                            train_data,
+                            validation_data=validation_data,
+                            initial_epoch=epoch,
+                            epochs=epoch + 1,
+                            callbacks=[rich_status],
+                            verbose=0,
+                        )
+                        break
+                    except tf.errors.ResourceExhaustedError:
+                        next_batch_size = max(1, effective_batch_size // 2)
+                        if next_batch_size == effective_batch_size:
+                            raise
+                        previous_batch_size = effective_batch_size
+                        effective_batch_size = next_batch_size
+                        child["data"]["batch_size"] = effective_batch_size
+                        control["effective_batch_size"] = effective_batch_size
+                        validation_source = SQLiteClassificationSource(sqlite_path, child)
+                        validation_data = (
+                            validation_source.training_dataset(
+                                canonical_validation, shuffle=False, augment=False
+                            )
+                            if canonical_validation is not None and canonical_validation.refs
+                            else None
+                        )
+                        message = (
+                            f"GPU memory exhausted in {dimension}x{dimension}; retrying "
+                            f"epoch {epoch + 1} with batch size {effective_batch_size} "
+                            f"(was {previous_batch_size})"
+                        )
+                        print(message, flush=True)
+                        log_event(
+                            training_log, run_id, "WARNING", "Reduced stratum batch after GPU OOM",
+                            {
+                                "dimension": dimension,
+                                "epoch": epoch + 1,
+                                "previous_batch_size": previous_batch_size,
+                                "batch_size": effective_batch_size,
+                            },
+                        )
                 _append_history(history, epoch_history.history)
                 logs = {
                     name: float(values[-1])
@@ -616,8 +702,8 @@ def train_stratified_models(
                     "stopped_early": stopped_early,
                 },
             )
-            # Epoch-major scheduling needs a reloadable optimizer snapshot for
-            # every child turn, even if optional long-term recovery is off.
+            # Persist the resident shared model periodically so recovery keeps
+            # both its weights and optimizer state across stratum changes.
             if recovery_enabled and (completed % save_every == 0 or stopped_early):
                 _save_recovery_model(
                     model,
@@ -628,27 +714,14 @@ def train_stratified_models(
                     history,
                     control,
                 )
-        if (completed_epochs >= total_epochs or stopped_early) and (child_dir / "best.weights.h5").exists() and bool(
-            config.get("callbacks", {}).get("early_stopping", False)
-        ):
-            model.load_weights(child_dir / "best.weights.h5")
-        final_path = child_dir / "final.keras"
-        model.save(final_path)
-        _save_recovery_model(
-            model,
-            run_path,
-            dimension,
-            completed_epochs,
-            state,
-            history,
-            control,
-        )
+                state["shared"] = dict(state["children"][str(dimension)])
+                _atomic_json(_recovery_path(run_path), state)
         result = StratifiedChildResult(
             dimension=dimension,
-            batch_size=int(child["data"]["batch_size"]),
+            batch_size=effective_batch_size,
             completed_epochs=completed_epochs,
             stopped_early=stopped_early,
-            model_path=final_path.relative_to(run_path).as_posix(),
+            model_path="model/shared/final.keras",
             summary_path=summary_path.relative_to(run_path).as_posix(),
             history_path=_history_path(child_dir).relative_to(run_path).as_posix(),
             canonical_counts=_canonical_counts(indices, config, dimension),
@@ -664,11 +737,32 @@ def train_stratified_models(
             "Completed resolution stratum training",
             asdict(result),
         )
-        # Do not retain every model on the GPU.  Post-training code reloads one
-        # child at a time from the paths returned above.
-        del model
-        keras.backend.clear_session()
+        # The dynamic-spatial shared model intentionally remains resident while
+        # the next stratum is trained.
 
+    shared_dir = run_path / "model" / "shared"
+    shared_dir.mkdir(parents=True, exist_ok=True)
+    write_model_summary(model, shared_dir / "model_summary.txt")
+    for dimension in dimensions(config):
+        write_model_summary(
+            model,
+            run_path / "model" / "strata" / str(dimension) / "model_summary.txt",
+        )
+    model.save(shared_dir / "final.keras")
+    if children:
+        latest_dimension = dimensions(config)[-1]
+        latest = children[latest_dimension]
+        _save_recovery_model(
+            model,
+            run_path,
+            latest_dimension,
+            latest.completed_epochs,
+            state,
+            _read_history(run_path / latest.history_path),
+            state.get("children", {}).get(str(latest_dimension), {}).get("control", {}),
+        )
+        state["shared"] = dict(state["children"][str(latest_dimension)])
+        _atomic_json(_recovery_path(run_path), state)
     manifest = _write_manifest(
         run_path, config, split_summaries, children, status="trained"
     )

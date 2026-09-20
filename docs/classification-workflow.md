@@ -156,10 +156,15 @@ ROIs. Thus a `20×34` ROI maps to `64` here:
 enabled = true
 dimensions = [32, 64, 128]
 basis = "max_original_dimension"
+weight_sharing = "shared" # one dynamic-spatial network and optimizer
+supra_epochs = 5 # train five epochs per stratum before rotating
 ```
 
 Use `fit_pad` preprocessing so small ROIs are enlarged in their selected
 stratum and images larger than the last stratum are downscaled.
+The shared model remains in memory while the scheduler changes datasets;
+only preprocessing, effective batch size, and the currently routed examples
+vary by stratum.
 
 ## Create a curated or small test subset
 

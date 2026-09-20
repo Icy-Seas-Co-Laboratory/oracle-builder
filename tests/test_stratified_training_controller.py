@@ -12,6 +12,7 @@ from oracle_builder.classification.stratified_training import (
     epoch_stratum_schedule,
     recovery_config_hash,
     routed_index,
+    supra_epoch_schedule,
     train_stratified_models,
     validate_recovery_state,
 )
@@ -75,6 +76,16 @@ def test_schedule_completes_every_stratum_before_advancing_parent_epoch():
     ]
 
 
+def test_supra_epoch_schedule_keeps_each_child_active_for_the_configured_block():
+    config = _config()
+    config["classification"]["stratification"]["supra_epochs"] = 2
+    assert list(supra_epoch_schedule(config, 5)) == [
+        (0, 2, 32), (0, 2, 64),
+        (2, 4, 32), (2, 4, 64),
+        (4, 5, 32), (4, 5, 64),
+    ]
+
+
 def test_epoch_routing_assigns_every_reference_exactly_once(tmp_path):
     config = _config()
     base = SQLiteSplitIndex(
@@ -109,6 +120,7 @@ def test_stratified_recovery_validates_every_child_checksum(tmp_path):
         "run_id": "run-1",
         "config_sha256": recovery_config_hash(config),
         "dimensions": [32, 64],
+        "weight_sharing": "shared",
         "children": {
             "32": {
                 "completed_epochs": 1,
@@ -117,6 +129,7 @@ def test_stratified_recovery_validates_every_child_checksum(tmp_path):
             }
         },
     }
+    state["shared"] = dict(state["children"]["32"])
     recovery = tmp_path / "model" / "recovery" / "stratified_state.json"
     recovery.parent.mkdir(parents=True)
     recovery.write_text(json.dumps(state))

@@ -30,6 +30,15 @@ def validate(config: dict[str, Any]) -> None:
         raise ValueError("classification.stratification.basis must be 'max_original_dimension'")
     if str(settings(config).get("batch_size_policy", "constant_input_tensor")) != "constant_input_tensor":
         raise ValueError("classification.stratification.batch_size_policy must be 'constant_input_tensor'")
+    if str(settings(config).get("weight_sharing", "shared")) != "shared":
+        raise ValueError("classification.stratification.weight_sharing must be 'shared'")
+    supra_epochs = settings(config).get("supra_epochs", 5)
+    if (
+        isinstance(supra_epochs, bool)
+        or not isinstance(supra_epochs, int)
+        or supra_epochs < 1
+    ):
+        raise ValueError("classification.stratification.supra_epochs must be a positive integer")
     routing = settings(config).get("training_routing", {})
     if not isinstance(routing, dict):
         raise ValueError("classification.stratification.training_routing must be a table")
@@ -81,6 +90,24 @@ def batch_plan(config: dict[str, Any]) -> dict[int, int]:
         dimension: max(1, budget // (dimension * dimension * channels))
         for dimension in values
     }
+
+
+def supra_epochs(config: dict[str, Any]) -> int:
+    """Number of consecutive parent epochs a child remains active."""
+    return int(settings(config).get("supra_epochs", 5))
+
+
+def supra_epoch_schedule(config: dict[str, Any], total_epochs: int):
+    """Yield ``(start, stop, dimension)`` child turns.
+
+    Each child handles a contiguous block of parent epochs before the next
+    resolution is loaded.  A final partial block is emitted when necessary.
+    """
+    block_size = supra_epochs(config)
+    for start in range(0, int(total_epochs), block_size):
+        stop = min(int(total_epochs), start + block_size)
+        for dimension in dimensions(config):
+            yield start, stop, dimension
 
 
 def training_stratum(

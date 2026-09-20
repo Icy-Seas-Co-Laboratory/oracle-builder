@@ -1,4 +1,9 @@
-from oracle_builder.classification.stratification import batch_plan, summarize_records, training_stratum
+from oracle_builder.classification.stratification import (
+    batch_plan,
+    summarize_records,
+    supra_epoch_schedule,
+    training_stratum,
+)
 
 
 def _config():
@@ -35,3 +40,13 @@ def test_summary_reports_canonical_routed_and_class_counts():
     assert summary["canonical_counts"] == {32: 0, 64: 1, 128: 1}
     assert sum(summary["routed_counts"].values()) == 2
     assert summary["batch_plan"] == {32: 128, 64: 32, 128: 8}
+
+
+def test_supra_epoch_schedule_uses_contiguous_child_blocks():
+    config = _config()
+    config["classification"]["stratification"]["supra_epochs"] = 2
+    assert list(supra_epoch_schedule(config, 5)) == [
+        (0, 2, 32), (0, 2, 64), (0, 2, 128),
+        (2, 4, 32), (2, 4, 64), (2, 4, 128),
+        (4, 5, 32), (4, 5, 64), (4, 5, 128),
+    ]

@@ -393,6 +393,7 @@ def main() -> int:
             from oracle_builder.classification.stratified_training import (
                 build_indices,
                 make_canonical_bundle,
+                shared_model_config,
                 train_stratified_models,
             )
             from oracle_builder.classification.stratification import dimensions
@@ -409,13 +410,16 @@ def main() -> int:
                 int(row["class_index"]): str(row.get("name") or row["class_index"])
                 for row in config.get("dataset", {}).get("labels", [])
             }
+            # One dynamic-spatial model is saved at the standard run location.
+            # Per-stratum folders retain only their routed evidence, evaluation,
+            # histories, and identical architecture summaries.
+            shared_model = stratified.load_model(dimensions(config)[0])
+            shared_save_report = save_model_artifacts(
+                shared_model, run_dir, shared_model_config(config)
+            )
             for dimension in dimensions(config):
                 child = child_config(config, dimension)
                 child_dir = run_dir / "model" / "strata" / str(dimension)
-                child_model = stratified.load_model(dimension)
-                save_report = save_model_artifacts(
-                    child_model, run_dir, child, model_dir=child_dir
-                )
                 canonical = make_canonical_bundle(
                     args.input, config, dimension, indices=base_indices
                 )
@@ -423,7 +427,7 @@ def main() -> int:
                 if config.get("evidence", {}).get("enabled", True) and "train" in canonical.indices:
                     train_index = canonical.indices["train"]
                     evidence = build_evidence_index_streaming(
-                        child_model,
+                        shared_model,
                         canonical.source.indexed_image_dataset(
                             train_index, batch_size=int(child["data"]["batch_size"])
                         ),
@@ -436,7 +440,7 @@ def main() -> int:
                 if evaluation_split in canonical.indices:
                     evaluation_index = canonical.indices[evaluation_split]
                     evaluation = evaluate_classification_streaming(
-                        child_model,
+                        shared_model,
                         canonical.source.indexed_image_dataset(
                             evaluation_index, batch_size=int(child["data"]["batch_size"])
                         ),
@@ -448,12 +452,13 @@ def main() -> int:
                         evaluation_context={"split": evaluation_split, "stratum_dimension": dimension},
                     )
                 child_reports[str(dimension)] = {
-                    "save": save_report,
+                    "shared_model": "model/final.keras",
+                    "save": shared_save_report,
                     "evaluation": evaluation.get("summary") if evaluation else None,
                     "evidence_references": len(canonical.indices.get("train", [])) if evidence is not None else 0,
                 }
                 log_event(training_log, run_id, "INFO", "Finalized resolution stratum", {"dimension": dimension, **child_reports[str(dimension)]})
-                del child_model
+            del shared_model
             config.setdefault("classification", {}).setdefault("stratification", {})["training_report"] = child_reports
             write_run_config(run_dir, config)
             from oracle_builder.artifacts import write_model_contract

@@ -82,6 +82,8 @@ enabled = false
 dimensions = [32, 64, 128]
 basis = "max_original_dimension"
 batch_size_policy = "constant_input_tensor"
+weight_sharing = "shared"
+supra_epochs = 5
 [classification.stratification.training_routing]
 enabled = true
 adjacent_lower_probability = 0.10
