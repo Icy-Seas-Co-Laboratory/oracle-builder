@@ -392,6 +392,11 @@ def _recovery_path(run_dir: str | Path) -> Path:
     return Path(run_dir) / "model" / "recovery" / "stratified_state.json"
 
 
+def _recovery_model_path(run_dir: str | Path) -> Path:
+    """Return the single rolling shared-model snapshot for a stratified run."""
+    return Path(run_dir) / "model" / "recovery" / "latest.keras"
+
+
 def read_recovery_state(run_dir: str | Path) -> dict[str, Any]:
     path = _recovery_path(run_dir)
     if not path.exists():
@@ -443,6 +448,9 @@ def validate_recovery_state(
 
 def clear_recovery_state(run_dir: str | Path) -> None:
     _recovery_path(run_dir).unlink(missing_ok=True)
+    _recovery_model_path(run_dir).unlink(missing_ok=True)
+    # Remove the former per-stratum layout as well, so completed artifacts do
+    # not retain obsolete rolling snapshots after an upgrade.
     for dimension in (Path(run_dir) / "model" / "strata").glob("*/recovery"):
         for filename in ("latest.keras",):
             (dimension / filename).unlink(missing_ok=True)
@@ -472,17 +480,27 @@ def _save_recovery_model(
     history: dict[str, list[float]],
     control: dict[str, Any],
 ) -> None:
-    recovery_dir = run_dir / "model" / "strata" / str(dimension) / "recovery"
+    # The weights are shared by every stratum.  Keeping the snapshot in the
+    # conventional run-level recovery directory makes it discoverable and
+    # avoids duplicating a potentially large Keras archive for every stratum.
+    recovery_dir = run_dir / "model" / "recovery"
     recovery_dir.mkdir(parents=True, exist_ok=True)
-    target = recovery_dir / "latest.keras"
+    target = _recovery_model_path(run_dir)
     temporary = recovery_dir / f".latest.{uuid.uuid4().hex}.keras"
     model.save(temporary)
     os.replace(temporary, target)
     relative = target.relative_to(run_dir).as_posix()
+    checksum = _sha256(target)
+    # Child progress is historical metadata; every child intentionally points
+    # to this one *current* shared model.  Refreshing existing entries avoids
+    # retaining stale checksums after the next stratum updates the weights.
+    for child in state["children"].values():
+        child["model_path"] = relative
+        child["model_sha256"] = checksum
     state["children"][str(dimension)] = {
         "completed_epochs": int(completed_epochs),
         "model_path": relative,
-        "model_sha256": _sha256(target),
+        "model_sha256": checksum,
         "history": history,
         "control": control,
     }
@@ -662,7 +680,6 @@ def train_stratified_models(
         f"  supra-epochs: {config.get('classification', {}).get('stratification', {}).get('supra_epochs', 5)}",
         flush=True,
     )
-
     state = resume_state or _initial_recovery(config, run_id)
     children: dict[int, StratifiedChildResult] = {}
     cycle_control = dict(state.get("cycle_scheduler", {}))
@@ -844,6 +861,23 @@ def train_stratified_models(
             # Persist the resident shared model periodically so recovery keeps
             # both its weights and optimizer state across stratum changes.
             if recovery_enabled and (completed % save_every == 0 or stopped_early):
+                snapshot_data = {
+                    "dimension": dimension,
+                    "completed_epoch": completed,
+                    "path": "model/recovery/latest.keras",
+                }
+                log_event(
+                    training_log,
+                    run_id,
+                    "INFO",
+                    "Saving rolling stratified recovery snapshot",
+                    snapshot_data,
+                )
+                print(
+                    f"Saving stratified recovery snapshot after {dimension}x{dimension} "
+                    f"epoch {completed}",
+                    flush=True,
+                )
                 _save_recovery_model(
                     model,
                     run_path,
@@ -855,6 +889,18 @@ def train_stratified_models(
                 )
                 state["shared"] = dict(state["children"][str(dimension)])
                 _atomic_json(_recovery_path(run_path), state)
+                log_event(
+                    training_log,
+                    run_id,
+                    "INFO",
+                    "Saved rolling stratified recovery snapshot",
+                    snapshot_data,
+                )
+                print(
+                    f"Stratified recovery snapshot saved: "
+                    f"{snapshot_data['path']}",
+                    flush=True,
+                )
         result = StratifiedChildResult(
             dimension=dimension,
             batch_size=effective_batch_size,
@@ -1005,6 +1051,17 @@ def train_stratified_models(
         )
         state["shared"] = dict(state["children"][str(latest_dimension)])
         _atomic_json(_recovery_path(run_path), state)
+        log_event(
+            training_log,
+            run_id,
+            "INFO",
+            "Saved final rolling stratified recovery snapshot",
+            {
+                "dimension": latest_dimension,
+                "completed_epoch": latest.completed_epochs,
+                "path": "model/recovery/latest.keras",
+            },
+        )
     manifest = _write_manifest(
         run_path, config, split_summaries, children, status="trained"
     )

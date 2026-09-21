@@ -8,6 +8,7 @@ from pathlib import Path
 
 from oracle_builder.artifacts import (
     read_run_config,
+    read_run_manifest,
     read_run_runtime,
     split_manifest_matches_dataset,
 )
@@ -120,6 +121,22 @@ def main() -> int:
     )
     args = parser.parse_args()
     run_dir = Path(args.run).expanduser().resolve()
+    manifest = read_run_manifest(run_dir)
+    config = read_run_config(run_dir)
+    final_model = run_dir / "model" / "final.keras"
+    if not final_model.exists():
+        status = manifest.get("status", "unknown")
+        recovery_state = (
+            "model/recovery/stratified_state.json"
+            if config.get("classification", {}).get("stratification", {}).get("enabled", False)
+            else "model/recovery/state.json"
+        )
+        raise RuntimeError(
+            "This run does not yet have its published model artifact "
+            f"({final_model}). Its current status is {status!r}. "
+            "Allow stratified training to finish, or resume it from "
+            f"{recovery_state} before evaluating."
+        )
     runtime = read_run_runtime(run_dir)
     input_path = args.input or runtime.get("paths", {}).get("input_path")
     if not input_path:
@@ -140,7 +157,6 @@ def main() -> int:
     if output_dir.exists():
         raise FileExistsError(output_dir)
     output_dir.mkdir(parents=True)
-    config = read_run_config(run_dir)
     if not split_manifest_matches_dataset(config, input_path):
         raise ValueError(
             "Evaluation data does not match the dataset revision and fingerprint "

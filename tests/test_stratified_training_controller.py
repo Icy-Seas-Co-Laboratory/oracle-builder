@@ -208,3 +208,8 @@ def test_tiny_end_to_end_run_persists_both_children(tmp_path):
     assert all(result.model_path(dimension).exists() for dimension in (8, 16))
     assert all(result.children[dimension].completed_epochs == 1 for dimension in (8, 16))
     assert result.manifest_path.exists()
+    state = validate_recovery_state(
+        run_dir, config, artifact_id="artifact-1", run_id="run-1"
+    )
+    assert state["shared"]["model_path"] == "model/recovery/latest.keras"
+    assert (run_dir / state["shared"]["model_path"]).exists()
