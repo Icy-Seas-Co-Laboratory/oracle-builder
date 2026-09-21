@@ -89,6 +89,17 @@ def test_probability_metrics_include_ranking_calibration_and_proper_scores():
     assert 0 <= result["expected_calibration_error"] <= 1
 
 
+def test_top_k_metric_names_remain_stable_for_small_classifiers():
+    accumulator = ClassificationMetricAccumulator(2)
+    accumulator.update(
+        np.asarray([0, 1]),
+        np.asarray([[0.8, 0.2], [0.3, 0.7]]),
+    )
+    result = accumulator.result()
+    assert result["top_3_accuracy"] == 1.0
+    assert result["top_5_accuracy"] == 1.0
+
+
 def test_evaluation_writes_ranking_calibration_and_canonical_metric_tables(tmp_path):
     targets = np.array([0, 0, 1, 1, 2, 2])
     probabilities = np.array(

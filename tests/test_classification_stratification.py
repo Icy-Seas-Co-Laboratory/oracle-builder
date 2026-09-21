@@ -1,3 +1,11 @@
+import json
+import sqlite3
+
+from oracle_builder.classification.stratified_training import (
+    StratifiedChildResult,
+    StratifiedTrainingResult,
+    write_stratified_metric_artifacts,
+)
 from oracle_builder.classification.stratification import (
     batch_plan,
     summarize_records,
@@ -62,3 +70,45 @@ def test_largest_not_exceeding_policy_prefers_the_next_smaller_stratum():
     assert stratum_for_shape(
         (20, 500), dimensions, policy="largest_not_exceeding"
     ) == 128
+
+
+def test_stratified_metric_artifacts_publish_json_csv_jsonl_and_sqlite_rows(tmp_path):
+    history_path = tmp_path / "model" / "strata" / "32" / "training_history.json"
+    history_path.parent.mkdir(parents=True)
+    history_path.write_text(json.dumps({"loss": [0.8, 0.4], "accuracy": [0.5, 0.8]}))
+    log_path = tmp_path / "logs" / "training.sqlite"
+    log_path.parent.mkdir()
+    with sqlite3.connect(log_path) as connection:
+        connection.execute(
+            "CREATE TABLE epoch_metrics (run_id TEXT, epoch INTEGER, split TEXT, metric TEXT, value REAL)"
+        )
+    child = StratifiedChildResult(
+        dimension=32,
+        batch_size=8,
+        completed_epochs=2,
+        stopped_early=False,
+        model_path="model/shared/final.keras",
+        summary_path="model/strata/32/model_summary.txt",
+        history_path=history_path.relative_to(tmp_path).as_posix(),
+        canonical_counts={"train": 2},
+    )
+    result = StratifiedTrainingResult(
+        children={32: child},
+        manifest_path=tmp_path / "model" / "stratification_manifest.json",
+        recovery_path=tmp_path / "model" / "recovery" / "stratified_state.json",
+        split_summaries={},
+    )
+    report = write_stratified_metric_artifacts(
+        tmp_path,
+        "run-1",
+        {"classification": {"stratification": {"supra_epochs": 2}}},
+        result,
+    )
+    assert report["metric_records"] == 4
+    assert (tmp_path / "metrics" / "history.json").exists()
+    assert (tmp_path / "metrics" / "history.csv").exists()
+    records = [json.loads(line) for line in (tmp_path / "metrics" / "metrics.jsonl").read_text().splitlines()]
+    assert records[0]["stratum_dimension"] == 32
+    assert records[0]["epoch"] == 0
+    with sqlite3.connect(log_path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM epoch_metrics").fetchone()[0] == 4

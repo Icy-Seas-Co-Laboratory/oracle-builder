@@ -9,11 +9,14 @@ consumers use canonical (non-random) routing.
 from __future__ import annotations
 
 import copy
+import csv
 import hashlib
 import json
 import os
+import sqlite3
 import uuid
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -107,6 +110,115 @@ class StratifiedTrainingResult:
         # Finalization performs inference/evaluation only; avoiding optimizer
         # deserialization also keeps custom training losses out of this path.
         return keras.models.load_model(self.model_path(dimension), compile=False)
+
+
+def write_stratified_metric_artifacts(
+    run_dir: str | Path,
+    run_id: str,
+    config: dict[str, Any],
+    result: StratifiedTrainingResult | None = None,
+) -> dict[str, Any]:
+    """Publish standard metric artifacts for the shared stratified schedule."""
+    root = Path(run_dir)
+    metrics_dir = root / "metrics"
+    metrics_dir.mkdir(parents=True, exist_ok=True)
+    block_size = int(settings(config).get("supra_epochs", 5))
+    histories: dict[str, dict[str, list[float]]] = {}
+    rows: list[dict[str, Any]] = []
+    history_sources = (
+        {
+            int(dimension): root / child.history_path
+            for dimension, child in result.children.items()
+        }
+        if result is not None
+        else {
+            int(dimension): root / "model" / "strata" / str(dimension) / "training_history.json"
+            for dimension in dimensions(config)
+        }
+    )
+    for dimension, history_path in sorted(history_sources.items()):
+        history = _read_history(history_path)
+        histories[str(dimension)] = history
+        for metric, values in sorted(history.items()):
+            split = "validation" if metric.startswith("val_") else "train"
+            metric_name = metric[4:] if split == "validation" else metric
+            for stratum_epoch, value in enumerate(values, start=1):
+                parent_epoch = ((stratum_epoch - 1) // block_size) * block_size + (
+                    (stratum_epoch - 1) % block_size
+                ) + 1
+                rows.append(
+                    {
+                        "run_id": run_id,
+                        "phase": "stratified_training",
+                        "stratum_dimension": int(dimension),
+                        "stratum_epoch": stratum_epoch,
+                        "parent_epoch": parent_epoch,
+                        "epoch": parent_epoch - 1,
+                        "split": split,
+                        "metric": metric_name,
+                        "value": float(value),
+                    }
+                )
+    history_payload = {
+        "schema": "oracle_builder_stratified_history",
+        "schema_version": "1.0.0",
+        "weight_sharing": "shared",
+        "supra_epochs": block_size,
+        "strata": histories,
+    }
+    (metrics_dir / "history.json").write_text(
+        json.dumps(history_payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    fieldnames = [
+        "run_id", "phase", "stratum_dimension", "stratum_epoch",
+        "parent_epoch", "epoch", "split", "metric", "value",
+    ]
+    with (metrics_dir / "history.csv").open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    timestamp = datetime.now(timezone.utc).isoformat()
+    jsonl_path = metrics_dir / "metrics.jsonl"
+    with jsonl_path.open("w", encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(
+                json.dumps(
+                    {
+                        "schema": "oracle_training_metric",
+                        "schema_version": "1.0.0",
+                        "metric_id": str(uuid.uuid4()),
+                        "timestamp": timestamp,
+                        **row,
+                    },
+                    sort_keys=True,
+                )
+                + "\n"
+            )
+    log_path = root / "logs" / "training.sqlite"
+    if log_path.exists():
+        with sqlite3.connect(log_path) as connection:
+            connection.execute("DELETE FROM epoch_metrics WHERE run_id = ?", (run_id,))
+            connection.executemany(
+                "INSERT INTO epoch_metrics VALUES (?, ?, ?, ?, ?)",
+                [
+                    (
+                        row["run_id"],
+                        int(row["epoch"]),
+                        row["split"],
+                        f"stratum_{row['stratum_dimension']}_{row['metric']}",
+                        row["value"],
+                    )
+                    for row in rows
+                ],
+            )
+    return {
+        "history_path": "metrics/history.json",
+        "csv_path": "metrics/history.csv",
+        "jsonl_path": "metrics/metrics.jsonl",
+        "metric_records": len(rows),
+        "strata": sorted(histories),
+    }
 
 
 def _atomic_json(path: Path, value: dict[str, Any]) -> None:
@@ -261,7 +373,7 @@ def _history_path(child_dir: Path) -> Path:
 
 
 def _read_history(child_dir: Path) -> dict[str, list[float]]:
-    path = _history_path(child_dir)
+    path = child_dir if Path(child_dir).name == "training_history.json" else _history_path(child_dir)
     if not path.exists():
         return {}
     value = json.loads(path.read_text(encoding="utf-8"))
@@ -710,6 +822,9 @@ def train_stratified_models(
             completed = epoch + 1
             completed_epochs = completed
             _atomic_json(_history_path(child_dir), history)
+            # Make the normal run-level metric artifacts available during a
+            # long stratified run, not only after finalization.
+            write_stratified_metric_artifacts(run_path, run_id, config)
             if bool(config.get("output", {}).get("save_checkpoints", False)):
                 checkpoint = child_dir / "checkpoints" / f"epoch_{completed:03d}.keras"
                 checkpoint.parent.mkdir(parents=True, exist_ok=True)

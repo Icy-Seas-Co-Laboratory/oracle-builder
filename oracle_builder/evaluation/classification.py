@@ -81,9 +81,11 @@ class ClassificationMetricAccumulator:
             "expected_calibration_error": float(calibration_error),
         }
         for requested, correct in self.top_correct.items():
-            result[f"top_{min(requested, self.class_count)}_accuracy"] = (
-                correct / count
-            )
+            # Preserve the requested metric name even when a small classifier
+            # has fewer than K labels. In that case top-K is necessarily the
+            # same as top-``class_count`` accuracy, but consumers can still
+            # compare a stable top-3/top-5 schema across runs.
+            result[f"top_{requested}_accuracy"] = correct / count
         return result
 
     def calibration_rows(self) -> list[dict[str, float | int]]:

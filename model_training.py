@@ -395,6 +395,7 @@ def main() -> int:
                 make_canonical_bundle,
                 shared_model_config,
                 train_stratified_models,
+                write_stratified_metric_artifacts,
             )
             from oracle_builder.classification.stratification import dimensions
             from oracle_builder.saving.save_model import save_model_artifacts
@@ -458,22 +459,8 @@ def main() -> int:
                     "evidence_references": len(canonical.indices.get("train", [])) if evidence is not None else 0,
                 }
                 log_event(training_log, run_id, "INFO", "Finalized resolution stratum", {"dimension": dimension, **child_reports[str(dimension)]})
-            stratified_history = {
-                str(dimension): json.loads(
-                    (run_dir / child.history_path).read_text(encoding="utf-8")
-                )
-                for dimension, child in stratified.children.items()
-            }
-            history_payload = {
-                "schema": "oracle_builder_stratified_history",
-                "schema_version": "1.0.0",
-                "weight_sharing": "shared",
-                "strata": stratified_history,
-            }
-            layout.metrics_json.parent.mkdir(parents=True, exist_ok=True)
-            layout.metrics_json.write_text(
-                json.dumps(history_payload, indent=2, sort_keys=True) + "\n",
-                encoding="utf-8",
+            metric_artifacts = write_stratified_metric_artifacts(
+                run_dir, run_id, config, stratified
             )
             load_report = run_load_tests(run_dir, config, shared_save_report)
             write_load_test_report(run_dir, load_report)
@@ -482,7 +469,7 @@ def main() -> int:
                 run_id,
                 "INFO",
                 "Wrote shared stratified model load-test and history artifacts",
-                {"load_test": load_report, "history_path": "metrics/history.json"},
+                {"load_test": load_report, **metric_artifacts},
             )
             del shared_model
             config.setdefault("classification", {}).setdefault("stratification", {})["training_report"] = child_reports
