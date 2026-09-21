@@ -3,9 +3,14 @@ from __future__ import annotations
 
 import argparse
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 
-from oracle_builder.artifacts import read_run_config, split_manifest_matches_dataset
+from oracle_builder.artifacts import (
+    read_run_config,
+    read_run_runtime,
+    split_manifest_matches_dataset,
+)
 from oracle_builder.evaluation.reports import evaluate_run_model
 from oracle_builder.saving.load_test import load_model_for_run
 from oracle_builder.inference.batching import resolve_inference_batch_size
@@ -101,16 +106,33 @@ def evaluate_stratified_run(model, config: dict, input_path: str, output_dir: Pa
 def main() -> int:
     parser = argparse.ArgumentParser(description="Evaluate a saved oracle-builder run.")
     parser.add_argument("--run", required=True)
-    parser.add_argument("--input", required=True)
-    parser.add_argument("--split", required=True)
+    parser.add_argument(
+        "--input",
+        help="Frozen dataset SQLite path. Defaults to the path recorded by --run.",
+    )
+    parser.add_argument(
+        "--split", default="test",
+        help="Dataset split to evaluate (default: test; falls back to validation when empty).",
+    )
     parser.add_argument(
         "--output",
-        required=True,
-        help="New directory for evaluation outputs; sealed run artifacts are not modified.",
+        help="New directory for outputs. Defaults to a timestamped sibling evaluation directory.",
     )
     args = parser.parse_args()
     run_dir = Path(args.run).expanduser().resolve()
-    output_dir = Path(args.output).expanduser().resolve()
+    runtime = read_run_runtime(run_dir)
+    input_path = args.input or runtime.get("paths", {}).get("input_path")
+    if not input_path:
+        raise ValueError(
+            "The run artifact has no recorded input dataset path; supply --input DATASET.sqlite"
+        )
+    if args.output:
+        output_dir = Path(args.output).expanduser().resolve()
+    else:
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        output_dir = (
+            run_dir.parent.parent / "evaluations" / f"{run_dir.name}-{timestamp}"
+        ).resolve()
     if output_dir == run_dir or run_dir in output_dir.parents:
         raise ValueError(
             "Evaluation output must be outside the preserved run artifact"
@@ -119,7 +141,7 @@ def main() -> int:
         raise FileExistsError(output_dir)
     output_dir.mkdir(parents=True)
     config = read_run_config(run_dir)
-    if not split_manifest_matches_dataset(config, args.input):
+    if not split_manifest_matches_dataset(config, input_path):
         raise ValueError(
             "Evaluation data does not match the dataset revision and fingerprint "
             "recorded by this run's split manifest"
@@ -127,14 +149,14 @@ def main() -> int:
     model = load_model_for_run(run_dir, config)
     if config.get("classification", {}).get("stratification", {}).get("enabled", False):
         result = evaluate_stratified_run(
-            model, config, args.input, output_dir, args.split
+            model, config, input_path, output_dir, args.split
         )
     else:
         inference_batch_plan = resolve_inference_batch_size(model, config)
         result = evaluate_run_model(
             model,
             config,
-            args.input,
+            input_path,
             output_dir,
             split=args.split,
             inference_batch_size=inference_batch_plan.batch_size,
