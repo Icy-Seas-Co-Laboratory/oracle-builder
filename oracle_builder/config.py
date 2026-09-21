@@ -50,6 +50,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "epochs": 10,
         "optimizer": "adam",
         "learning_rate": 0.001,
+        # AdamW is selected automatically for Adam when this is nonzero.
+        "weight_decay": 0.0,
         "loss": None,
         "metrics": ["accuracy"],
         # Rich is the default terminal UI; text is a concise one-line-per-epoch
@@ -279,6 +281,8 @@ def validate_config(config: dict[str, Any]) -> None:
         "rich", "text", "off"
     }:
         raise ValueError("training.display must be 'rich', 'text', or 'off'")
+    if float(config.get("training", {}).get("weight_decay", 0.0)) < 0:
+        raise ValueError("training.weight_decay must be non-negative")
     if task in {"classification", "embedding"} and "num_classes" not in config["data"]:
         raise ValueError(
             "Could not infer data.num_classes from the classification database"

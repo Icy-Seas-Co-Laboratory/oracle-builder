@@ -216,11 +216,15 @@ families listed above, and cannot currently combine with self-supervision.
 `classification.stratification.enabled` turns it on. `dimensions` must be
 ascending, unique integers >= 2. The only supported `basis` is
 `max_original_dimension`, `batch_size_policy` is `constant_input_tensor`, and
-`weight_sharing` is `shared`. `supra_epochs` sets consecutive epochs per
-stratum. `training_routing.enabled`, `adjacent_lower_probability`, and `seed`
-optionally send some training examples to the next smaller stratum, a controlled
-regularizer; validation and inference use canonical routing. Larger strata get
-smaller effective batches to retain the smallest-stratum tensor budget.
+`weight_sharing` is `shared`. Use `schedule = "interleaved_steps"` to alternate
+optimizer steps by stratum; `steps_per_stratum` controls the number of
+consecutive batches a stratum receives before the next stratum's turn and
+`supra_epochs` controls mixed global epochs between validation passes.
+`normalization = "group"` avoids small-microbatch BatchNorm drift, while
+`conditioning` gives the shared network a learned stratum cue without masking
+classes. Keep training routing disabled for the initial canonical-routing
+baseline. Larger strata get smaller microbatches to retain the
+smallest-stratum tensor budget.
 
 ```toml
 [classification.stratification]
@@ -228,11 +232,23 @@ enabled = true
 dimensions = [32, 64, 128]
 basis = "max_original_dimension"
 weight_sharing = "shared"
-supra_epochs = 5
+schedule = "interleaved_steps"
+steps_per_stratum = 1
+supra_epochs = 1
+normalization = "group"
+group_norm_groups = 8
+
+[classification.stratification.conditioning]
+enabled = true
+embedding_dim = 16
 
 [classification.stratification.training_routing]
-enabled = true
-adjacent_lower_probability = 0.10
+enabled = false
+
+[classification.stratification.cycle_scheduler]
+aggregation = "equal_strata"
+guardrail_metric = "macro_f1"
+max_stratum_drop = 0.03
 ```
 
 ## 2. Batch inference

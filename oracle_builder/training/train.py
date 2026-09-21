@@ -35,9 +35,14 @@ def set_seed(seed: int) -> None:
 def compile_model(model: keras.Model, config: dict[str, Any]) -> keras.Model:
     training = config["training"]
     learning_rate = float(training.get("learning_rate", 0.001))
+    weight_decay = float(training.get("weight_decay", 0.0))
     optimizer_name = training.get("optimizer", "adam").lower()
     if optimizer_name == "adam":
-        optimizer = keras.optimizers.Adam(learning_rate=learning_rate)
+        optimizer = (
+            keras.optimizers.AdamW(learning_rate=learning_rate, weight_decay=weight_decay)
+            if weight_decay
+            else keras.optimizers.Adam(learning_rate=learning_rate)
+        )
     elif optimizer_name == "sgd":
         optimizer = keras.optimizers.SGD(learning_rate=learning_rate)
     else:

@@ -83,6 +83,29 @@ def test_resnet_like_default_uses_roi_input_and_raw_classifier_embeddings():
     assert config["model"]["normalize_embeddings"] is False
 
 
+@pytest.mark.parametrize("family", sorted(FAMILIES))
+def test_family_defaults_include_the_safe_shared_stratified_recipe(family):
+    config = load_toml(CONFIG_DIR / f"{family}.toml")
+    settings = config["classification"]["stratification"]
+
+    assert settings["enabled"] is False
+    assert settings["dimensions"] == [32, 64, 128]
+    assert settings["schedule"] == "interleaved_steps"
+    assert settings["supra_epochs"] == 1
+    assert settings["normalization"] == (
+        "group" if family == "resnet" else "batch"
+    )
+    assert settings["group_norm_groups"] == 8
+    assert settings["conditioning"] == {"enabled": True, "embedding_dim": 16}
+    assert settings["training_routing"]["enabled"] is False
+    assert settings["training_routing"]["adjacent_lower_probability"] == 0.0
+    assert settings["cycle_scheduler"]["aggregation"] == "equal_strata"
+    assert settings["cycle_scheduler"]["guardrail_metric"] == "macro_f1"
+    assert settings["cycle_scheduler"]["max_stratum_drop"] == 0.03
+    assert config["training"]["learning_rate"] == 0.0003
+    assert config["training"]["weight_decay"] == 0.0001
+
+
 @pytest.mark.parametrize(
     "path",
     classification_config_paths(),
@@ -100,10 +123,26 @@ def test_all_classification_examples_share_high_level_defaults(path):
     )
     assert user_config["training"]["class_weights"]["mode"] == "effective_number"
     assert user_config["training"]["metrics"] == ["accuracy", "macro_f1"]
-    assert user_config["augmentation"] == STANDARD_AUGMENTATION
+    if path.parent == CONFIG_DIR:
+        assert user_config["augmentation"] == {
+            **STANDARD_AUGMENTATION,
+            "rotation": 0.25,
+            "zoom": 0.10,
+            "translation": [0.075, 0.075],
+            "skew": 0.10,
+            "brightness": 0.10,
+            "contrast": 0.10,
+            "gaussian_noise": 0.02,
+        }
+    else:
+        assert user_config["augmentation"] == STANDARD_AUGMENTATION
     assert user_config["output"]["save_checkpoints"] is False
-    assert user_config["recovery"] == {"enabled": True, "save_every_epochs": 1}
+    assert user_config["recovery"]["save_every_epochs"] == 1
 
-    resolved = deep_merge(DEFAULT_CONFIG, user_config)
-    resolved["data"]["num_classes"] = 3
-    validate_config(resolved)
+    # The maintained family defaults are the supported shared-stratification
+    # recipes. Older top-level examples intentionally preserve their historic
+    # preprocessing/SSL demonstrations and are covered by their own tests.
+    if path.parent == CONFIG_DIR:
+        resolved = deep_merge(DEFAULT_CONFIG, user_config)
+        resolved["data"]["num_classes"] = 3
+        validate_config(resolved)

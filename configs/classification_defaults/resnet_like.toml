@@ -45,17 +45,13 @@ percentile_low = 1.0
 percentile_high = 99.0
 
 [distribution]
-# auto reserves one unused GPU; use mirrored explicitly for multi-GPU training.
+# auto uses MirroredStrategy when multiple GPUs are visible, otherwise one
+# device. Global data.batch_size must divide sensibly across all replicas.
 strategy = "auto"
 devices = []
 cross_device_ops = "auto"
 fallback_to_single = true
 memory_growth = true
-gpu_selection = "unused_first"
-require_unused_gpu = false # Permit light desktop/interactive GPU sharing.
-allow_busy_fallback = false
-gpu_light_share_memory_mb = 1024
-gpu_light_share_utilization_percent = 15
 
 [model]
 # Width of the three residual stages is base_filters, 2x, and 4x.
@@ -70,28 +66,46 @@ normalize_embeddings = false
 # Dropout applied before the final classifier.
 dropout = 0.20
 
-# [[model.auxiliary_features]]
-# name = "log_roi_area"
-# source = "roi.bounding_box_area_px"
-# transform = "log"
-# standardize = true
-# missing = "error"
-
 [classification.stratification]
+# Recommended shared-model recipe for size-correlated ROIs. It is opt-in: first
+# verify support for every configured stratum, then set enabled = true.
+# The scheduler interleaves optimizer steps across all strata, rather than
+# letting one resolution overwrite the others in a contiguous training block.
 enabled = false
 dimensions = [32, 64, 128]
 basis = "max_original_dimension"
 assignment_policy = "smallest_fitting"
 batch_size_policy = "constant_input_tensor"
 weight_sharing = "shared"
-supra_epochs = 5
-[classification.stratification.training_routing]
+schedule = "interleaved_steps"
+steps_per_stratum = 1
+# A global interleaved epoch completes before validation/checkpoint selection.
+supra_epochs = 1
+# GroupNorm remains stable when high-resolution microbatches are small. The
+# canonical ResNet builder supports it; other family examples retain batch
+# normalization until their builders gain an equivalent implementation.
+normalization = "batch"
+group_norm_groups = 8
+
+[classification.stratification.conditioning]
+# Give the shared model the selected resolution as a learned, soft cue. This
+# does not mask classes that happen to be absent from one training stratum.
 enabled = true
-adjacent_lower_probability = 0.10
+embedding_dim = 16
+
+[classification.stratification.training_routing]
+# Establish a canonical-routing baseline before introducing cross-stratum
+# resizing as an augmentation.
+enabled = false
+adjacent_lower_probability = 0.0
 seed = 123
 
 [classification.stratification.cycle_scheduler]
-aggregation = "sample_weighted"
+# Equal stratum weighting and a per-stratum guardrail prevent a populous or
+# easy bin from hiding catastrophic forgetting in another bin.
+aggregation = "equal_strata"
+guardrail_metric = "macro_f1"
+max_stratum_drop = 0.03
 reduce_lr_patience = 3
 reduce_lr_factor = 0.5
 
@@ -107,11 +121,15 @@ teacher_momentum = 0.99
 temperature = 0.10
 projection_dim = 128
 projection_hidden_dim = 256
+use_training_augmentation = true
 
 [training]
 epochs = 50
 optimizer = "adam"
 learning_rate = 0.0003
+# AdamW-style decoupled regularization is supported by the classification
+# trainer; this small value is a conservative first shared-model setting.
+weight_decay = 0.0001
 
 # Weighted cross entropy is the classification default. For already balanced
 # datasets, ordinary sparse_categorical_crossentropy is the simpler alternative.
@@ -146,20 +164,20 @@ enabled = true
 save_every_epochs = 1
 
 [augmentation]
-# Shared, moderately aggressive policy for fair architecture comparisons.
-# Rotation is a fraction of a full turn; 0.5 permits any orientation.
+# Conservative policy for a shared 32/64/128-pixel model. Apply stronger
+# transforms only after visually validating them for the 32-pixel inputs.
 enabled = true
 repeats_per_epoch = 1
 invert = false # Assume black background and light foreground.
-rotation = 0.5
-zoom = 0.20
-translation = [0.15, 0.15]
-skew = 0.20
+rotation = 0.25
+zoom = 0.10
+translation = [0.075, 0.075]
+skew = 0.10
 flip_horizontal = true
 flip_vertical = true
-brightness = 0.20
-contrast = 0.20
-gaussian_noise = 0.05
+brightness = 0.10
+contrast = 0.10
+gaussian_noise = 0.02
 fill_value = 0.0
 
 [inference]

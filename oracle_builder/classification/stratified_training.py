@@ -35,6 +35,7 @@ from oracle_builder.classification.stratification import (
     training_stratum,
     validate,
 )
+from oracle_builder.classification.stratified_data import add_stratum_dimension_input
 from oracle_builder.data.sqlite_stream import (
     SQLiteClassificationSource,
     SQLiteDatasetBundle,
@@ -123,6 +124,7 @@ def write_stratified_metric_artifacts(
     metrics_dir = root / "metrics"
     metrics_dir.mkdir(parents=True, exist_ok=True)
     block_size = int(settings(config).get("supra_epochs", 5))
+    schedule = str(settings(config).get("schedule", "interleaved_steps"))
     histories: dict[str, dict[str, list[float]]] = {}
     rows: list[dict[str, Any]] = []
     history_sources = (
@@ -143,9 +145,10 @@ def write_stratified_metric_artifacts(
             split = "validation" if metric.startswith("val_") else "train"
             metric_name = metric[4:] if split == "validation" else metric
             for stratum_epoch, value in enumerate(values, start=1):
-                parent_epoch = ((stratum_epoch - 1) // block_size) * block_size + (
-                    (stratum_epoch - 1) % block_size
-                ) + 1
+                # Interleaved histories have one entry per common parent
+                # epoch.  The old contiguous layout is retained for legacy
+                # artifacts, where an entry still maps to its local epoch.
+                parent_epoch = stratum_epoch
                 rows.append(
                     {
                         "run_id": run_id,
@@ -164,6 +167,7 @@ def write_stratified_metric_artifacts(
         "schema_version": "1.0.0",
         "weight_sharing": "shared",
         "supra_epochs": block_size,
+        "schedule": schedule,
         "strata": histories,
     }
     (metrics_dir / "history.json").write_text(
@@ -337,8 +341,8 @@ def make_canonical_bundle(
         if not selected.refs:
             continue
         child_indices[split] = selected
-        datasets[split] = source.training_dataset(
-            selected, shuffle=False, augment=False
+        datasets[split] = add_stratum_dimension_input(
+            source.training_dataset(selected, shuffle=False, augment=False), dimension, config
         )
     return SQLiteDatasetBundle(datasets, child_indices, source)
 
@@ -386,6 +390,59 @@ def _append_history(
     for name, values in epoch_history.items():
         if values:
             history.setdefault(str(name), []).append(float(values[-1]))
+
+
+def _train_interleaved_epoch(
+    model: keras.Model,
+    datasets: dict[int, tf.data.Dataset],
+    *,
+    steps_per_turn: int = 1,
+) -> dict[int, dict[str, float]]:
+    """Run one finite, round-robin update pass over resolution batches.
+
+    ``tf.data`` batches retain their own spatial dimensions, while the shared
+    model has dynamic spatial inputs.  Calling ``train_on_batch`` here is
+    deliberate: concatenating these batches would force an artificial common
+    resize and undo resolution stratification.  Values are sample-weighted so
+    a final short batch cannot dominate a stratum history.
+    """
+    iterators = {dimension: iter(dataset) for dimension, dataset in datasets.items()}
+    totals: dict[int, dict[str, float]] = {dimension: {} for dimension in datasets}
+    counts: dict[int, int] = {dimension: 0 for dimension in datasets}
+    active = list(sorted(iterators))
+    while active:
+        for dimension in list(active):
+            for _ in range(steps_per_turn):
+                try:
+                    batch = next(iterators[dimension])
+                except StopIteration:
+                    active.remove(dimension)
+                    break
+                # ``train_on_batch`` otherwise returns metric objects
+                # accumulated from previous strata. Resetting here makes the
+                # per-stratum history a true sample-weighted batch summary.
+                model.reset_metrics()
+                values = model.train_on_batch(*batch, return_dict=True)
+                inputs = batch[0]
+                if isinstance(inputs, dict):
+                    first = next(iter(inputs.values()))
+                else:
+                    first = inputs
+                sample_count = int(tf.shape(first)[0])
+                counts[dimension] += sample_count
+                for name, value in values.items():
+                    totals[dimension][str(name)] = (
+                        totals[dimension].get(str(name), 0.0)
+                        + float(value) * sample_count
+                    )
+    return {
+        dimension: {
+            name: value / counts[dimension]
+            for name, value in values.items()
+        }
+        for dimension, values in totals.items()
+        if counts[dimension]
+    }
 
 
 def _recovery_path(run_dir: str | Path) -> Path:
@@ -466,6 +523,7 @@ def _initial_recovery(config: dict[str, Any], run_id: str) -> dict[str, Any]:
         "dimensions": dimensions(config),
         "batch_plan": {str(k): v for k, v in batch_plan(config).items()},
         "supra_epochs": int(config.get("classification", {}).get("stratification", {}).get("supra_epochs", 5)),
+        "schedule": str(settings(config).get("schedule", "interleaved_steps")),
         "weight_sharing": "shared",
         "children": {},
     }
@@ -585,8 +643,10 @@ def _cycle_validation(
         child["data"]["batch_size"] = int(
             effective_batches.get(dimension, child["data"]["batch_size"])
         )
-        dataset = SQLiteClassificationSource(sqlite_path, child).training_dataset(
-            selected, shuffle=False, augment=False
+        dataset = add_stratum_dimension_input(
+            SQLiteClassificationSource(sqlite_path, child).training_dataset(
+                selected, shuffle=False, augment=False
+            ), dimension, config,
         )
         values = {
             str(name): float(value)
@@ -637,6 +697,7 @@ def _write_manifest(
             .get("stratification", {})
             .get("supra_epochs", 5)
         ),
+        "schedule": str(settings(config).get("schedule", "interleaved_steps")),
         "weight_sharing": "shared",
         "cycle_scheduler": config.get("classification", {})
         .get("stratification", {})
@@ -709,6 +770,7 @@ def train_stratified_models(
                 .get("stratification", {})
                 .get("supra_epochs", 5)
             ),
+            "schedule": str(settings(config).get("schedule", "interleaved_steps")),
             "split_summaries": split_summaries,
             "distribution": asdict(distribution_info),
         },
@@ -758,6 +820,8 @@ def train_stratified_models(
         else:
             model = build_and_compile_model(shared_config)
 
+    interleaved_step_mode = str(settings(config).get("schedule", "interleaved_steps")) == "interleaved_steps"
+    round_logs: dict[int, dict[int, dict[str, float]]] = {}
     # Each child remains resident for a supra-epoch block, avoiding a model
     # reload and graph rebuild for every individual parent epoch.
     for block_start, block_stop, dimension in supra_epoch_schedule(config, total_epochs):
@@ -784,9 +848,9 @@ def train_stratified_models(
         ) if "validation" in indices else None
         validation_source = SQLiteClassificationSource(sqlite_path, child)
         validation_data = (
-            validation_source.training_dataset(
+            add_stratum_dimension_input(validation_source.training_dataset(
                 canonical_validation, shuffle=False, augment=False
-            )
+            ), dimension, config)
             if canonical_validation is not None and canonical_validation.refs
             else None
         )
@@ -825,7 +889,7 @@ def train_stratified_models(
                 f"{epoch + 1}/{total_epochs}: {len(selected)} samples",
                 flush=True,
             )
-            if selected.refs:
+            if selected.refs and not interleaved_step_mode:
                 rich_status = RichTrainingStatusCallback(
                     phase=(
                         f"Stratified {dimension}×{dimension} "
@@ -839,9 +903,9 @@ def train_stratified_models(
                 )
                 while True:
                     source = SQLiteClassificationSource(sqlite_path, child)
-                    train_data = source.training_dataset(
+                    train_data = add_stratum_dimension_input(source.training_dataset(
                         selected, shuffle=True, augment=True
-                    )
+                    ), dimension, config)
                     try:
                         epoch_history = model.fit(
                             train_data,
@@ -862,9 +926,9 @@ def train_stratified_models(
                         control["effective_batch_size"] = effective_batch_size
                         validation_source = SQLiteClassificationSource(sqlite_path, child)
                         validation_data = (
-                            validation_source.training_dataset(
+                            add_stratum_dimension_input(validation_source.training_dataset(
                                 canonical_validation, shuffle=False, augment=False
-                            )
+                            ), dimension, config)
                             if canonical_validation is not None and canonical_validation.refs
                             else None
                         )
@@ -889,6 +953,37 @@ def train_stratified_models(
                     for name, values in epoch_history.history.items()
                     if values
                 }
+            elif selected.refs:
+                # Build every finite stratum dataset once, then alternate one
+                # optimizer update per dimension until all are exhausted.
+                # This is the shared-model schedule; individual model.fit
+                # calls above remain the legacy contiguous implementation.
+                if dimension == dimensions(config)[0]:
+                    round_datasets: dict[int, tf.data.Dataset] = {}
+                    for round_dimension in dimensions(config):
+                        round_child = child_config(config, round_dimension)
+                        round_selected = routed_index(
+                            indices["train"], config, round_dimension, epoch=epoch
+                        )
+                        if not round_selected.refs:
+                            continue
+                        round_source = SQLiteClassificationSource(sqlite_path, round_child)
+                        round_datasets[round_dimension] = add_stratum_dimension_input(
+                            round_source.training_dataset(
+                                round_selected, shuffle=True, augment=True
+                            ),
+                            round_dimension,
+                            config,
+                        )
+                    round_logs[epoch] = _train_interleaved_epoch(
+                        model,
+                        round_datasets,
+                        steps_per_turn=int(
+                            settings(config).get("steps_per_stratum", 1)
+                        ),
+                    )
+                logs = round_logs.get(epoch, {}).get(dimension, {})
+                _append_history(history, {name: [value] for name, value in logs.items()})
             else:
                 logs = {}
                 log_event(
@@ -985,8 +1080,17 @@ def train_stratified_models(
             "Completed resolution stratum training",
             asdict(result),
         )
+        # In the default interleaved schedule a parent epoch is a complete
+        # pass through every dimension.  ``supra_epochs`` now controls how
+        # often that stable, shared state is evaluated/checkpointed (rather
+        # than how long one dimension is allowed to train in isolation).
+        validation_due = (
+            block_stop % int(settings(config).get("supra_epochs", 5)) == 0
+            or block_stop == total_epochs
+        )
         if (
             dimension == dimensions(config)[-1]
+            and validation_due
             and block_stop not in completed_cycles
             and all(
                 children.get(value) is not None
@@ -1014,10 +1118,37 @@ def train_stratified_models(
                 )
             else:
                 mode = _monitor_mode(monitor)
+                scheduler = settings(config).get("cycle_scheduler", {})
                 best = cycle_control.get("best")
                 improved = _is_improvement(
                     float(value), float(best) if best is not None else None, mode
                 )
+                # An aggregate can improve while a small but important
+                # resolution silently collapses.  Guardrails compare every
+                # stratum to its own best observed validation score.  They
+                # intentionally affect checkpoint selection, not training:
+                # a later cycle may recover the stratum.
+                guardrail_metric = str(scheduler.get("guardrail_metric", monitor)) if isinstance(scheduler, dict) else monitor
+                max_drop = scheduler.get("max_stratum_drop") if isinstance(scheduler, dict) else None
+                best_per_stratum = dict(cycle_control.get("best_per_stratum", {}))
+                guardrail_failures: dict[str, dict[str, float]] = {}
+                if max_drop is not None:
+                    for stratum, record in cycle_metrics["per_stratum"].items():
+                        current = record["metrics"].get(guardrail_metric)
+                        if current is None:
+                            continue
+                        previous = best_per_stratum.get(stratum)
+                        if previous is not None:
+                            drop = (float(previous) - float(current)) if _monitor_mode(guardrail_metric) == "max" else (float(current) - float(previous))
+                            if drop > float(max_drop):
+                                guardrail_failures[stratum] = {
+                                    "best": float(previous), "current": float(current), "drop": drop,
+                                }
+                        if _is_improvement(float(current), float(previous) if previous is not None else None, _monitor_mode(guardrail_metric)):
+                            best_per_stratum[stratum] = float(current)
+                    cycle_control["best_per_stratum"] = best_per_stratum
+                checkpoint_eligible = not guardrail_failures
+                improved = improved and checkpoint_eligible
                 if improved:
                     cycle_control["best"] = float(value)
                     cycle_control["wait"] = 0
@@ -1030,7 +1161,6 @@ def train_stratified_models(
                     cycle_control["reduce_lr_wait"] = int(
                         cycle_control.get("reduce_lr_wait", 0)
                     ) + 1
-                scheduler = settings(config).get("cycle_scheduler", {})
                 reduce_patience = int(
                     scheduler.get("reduce_lr_patience", 3)
                     if isinstance(scheduler, dict)
@@ -1068,6 +1198,9 @@ def train_stratified_models(
                 cycle_metrics["monitor"] = monitor
                 cycle_metrics["monitor_value"] = float(value)
                 cycle_metrics["improved"] = improved
+                cycle_metrics["checkpoint_eligible"] = checkpoint_eligible
+                cycle_metrics["guardrail_metric"] = guardrail_metric
+                cycle_metrics["guardrail_failures"] = guardrail_failures
                 cycle_metrics["reduced_learning_rate"] = reduced_learning_rate
                 cycle_metrics["stopped_early"] = stop_training
                 print(

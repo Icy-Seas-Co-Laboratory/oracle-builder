@@ -5,7 +5,10 @@ from typing import Any
 from tensorflow import keras
 from tensorflow.keras import layers
 
-from oracle_builder.classification.features import classification_head, classifier_inputs, join_auxiliary_features
+from oracle_builder.classification.features import (
+    classification_head, classifier_inputs, join_auxiliary_features,
+    stratum_conditioning_input,
+)
 
 
 RESNET_VARIANTS = {
@@ -24,7 +27,24 @@ _BATCH_NORM_EPSILON = 1e-3
 _KERNEL_INITIALIZER = "he_normal"
 
 
-def _conv_bn(x, filters, kernel_size, stride=1, activation=True, name="conv"):
+def _normalization(config: dict[str, Any], name: str, channels: int):
+    settings = config.get("classification", {}).get("stratification", {})
+    mode = str(settings.get("normalization", "batch")).lower()
+    if mode == "group":
+        requested_groups = int(settings.get("group_norm_groups", 8))
+        # Keras requires groups to divide channels. Preserve the requested
+        # upper bound while making small test/custom backbones usable.
+        groups = max(
+            group for group in range(min(requested_groups, int(channels)), 0, -1)
+            if int(channels) % group == 0
+        )
+        return layers.GroupNormalization(groups=groups, epsilon=_BATCH_NORM_EPSILON, name=name)
+    return layers.BatchNormalization(
+        momentum=_BATCH_NORM_MOMENTUM, epsilon=_BATCH_NORM_EPSILON, name=name
+    )
+
+
+def _conv_bn(x, filters, kernel_size, config, stride=1, activation=True, name="conv"):
     x = layers.Conv2D(
         filters,
         kernel_size,
@@ -34,40 +54,34 @@ def _conv_bn(x, filters, kernel_size, stride=1, activation=True, name="conv"):
         kernel_initializer=_KERNEL_INITIALIZER,
         name=name,
     )(x)
-    x = layers.BatchNormalization(
-        momentum=_BATCH_NORM_MOMENTUM,
-        epsilon=_BATCH_NORM_EPSILON,
-        name=f"{name}_bn",
-    )(x)
+    x = _normalization(config, f"{name}_bn", filters)(x)
     if activation:
         x = layers.Activation("relu", name=f"{name}_relu")(x)
     return x
 
 
-def _basic_block(x, filters: int, stride: int, name: str):
+def _basic_block(x, filters: int, stride: int, name: str, config: dict[str, Any]):
     shortcut = x
-    x = _conv_bn(x, filters, 3, stride=stride, name=f"{name}_conv1")
-    x = _conv_bn(x, filters, 3, activation=False, name=f"{name}_conv2")
+    x = _conv_bn(x, filters, 3, config, stride=stride, name=f"{name}_conv1")
+    x = _conv_bn(x, filters, 3, config, activation=False, name=f"{name}_conv2")
     if stride != 1 or int(shortcut.shape[-1]) != filters:
         shortcut = _conv_bn(
-            shortcut, filters, 1, stride=stride, activation=False, name=f"{name}_projection"
+            shortcut, filters, 1, config, stride=stride, activation=False, name=f"{name}_projection"
         )
     x = layers.Add(name=f"{name}_add")([x, shortcut])
     return layers.Activation("relu", name=f"{name}_out")(x)
 
 
-def _bottleneck_block(x, filters: int, stride: int, name: str):
+def _bottleneck_block(x, filters: int, stride: int, name: str, config: dict[str, Any]):
     shortcut = x
     expanded_filters = filters * 4
-    x = _conv_bn(x, filters, 1, name=f"{name}_conv1")
-    x = _conv_bn(x, filters, 3, stride=stride, name=f"{name}_conv2")
-    x = _conv_bn(x, expanded_filters, 1, activation=False, name=f"{name}_conv3")
+    x = _conv_bn(x, filters, 1, config, name=f"{name}_conv1")
+    x = _conv_bn(x, filters, 3, config, stride=stride, name=f"{name}_conv2")
+    x = _conv_bn(x, expanded_filters, 1, config, activation=False, name=f"{name}_conv3")
     if stride != 1 or int(shortcut.shape[-1]) != expanded_filters:
         shortcut = _conv_bn(
             shortcut,
-            expanded_filters,
-            1,
-            stride=stride,
+            expanded_filters, 1, config, stride=stride,
             activation=False,
             name=f"{name}_projection",
         )
@@ -98,15 +112,17 @@ def build_model(config: dict[str, Any]):
     block = _basic_block if block_type == "basic" else _bottleneck_block
 
     inputs, metadata = classifier_inputs(input_shape, config)
-    x = _conv_bn(inputs, base_filters, stem_kernel, stride=stem_stride, name="stem_conv")
+    stratum_dimension = stratum_conditioning_input(config)
+    x = _conv_bn(inputs, base_filters, stem_kernel, config, stride=stem_stride, name="stem_conv")
     if stem_pool:
         x = layers.MaxPooling2D(3, strides=2, padding="same", name="stem_pool")(x)
     for stage, count in enumerate(block_counts):
         filters = base_filters * (2**stage)
         for index in range(count):
             stride = 2 if stage > 0 and index == 0 else 1
-            x = block(x, filters, stride, name=f"stage{stage + 1}_block{index + 1}")
+            x = block(x, filters, stride, name=f"stage{stage + 1}_block{index + 1}", config=config)
     x = layers.GlobalAveragePooling2D(name="global_pool")(x)
     x = join_auxiliary_features(x, metadata)
-    outputs = classification_head(x, num_classes, config, normalize_default=False)
-    return keras.Model([inputs, metadata] if metadata is not None else inputs, outputs, name=variant)
+    outputs = classification_head(x, num_classes, config, normalize_default=False, stratum_dimension=stratum_dimension)
+    model_inputs = [inputs] + ([metadata] if metadata is not None else []) + ([stratum_dimension] if stratum_dimension is not None else [])
+    return keras.Model(model_inputs if len(model_inputs) > 1 else inputs, outputs, name=variant)

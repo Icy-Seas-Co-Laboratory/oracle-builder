@@ -641,11 +641,24 @@ class InferenceBundle:
                 raw, self.config["data"]["input_shape"], self.config
             )
         image = np.asarray(prepared)
-        if auxiliary_features_enabled(self.config):
-            return {
+        stratification = self.config.get("classification", {}).get("stratification", {})
+        conditioning = stratification.get("conditioning", {}) if isinstance(stratification, dict) else {}
+        needs_stratum = bool(conditioning.get("enabled", False))
+        if needs_stratum and stratification.get("_active_dimension") is None:
+            raise ValueError("Conditioned stratified inference requires an active stratum dimension")
+        if auxiliary_features_enabled(self.config) or needs_stratum:
+            values = {
                 "image": image,
-                "metadata": auxiliary_feature_vector(self.config, item.metadata, np.asarray(raw).shape),
             }
+            if auxiliary_features_enabled(self.config):
+                values["metadata"] = auxiliary_feature_vector(
+                    self.config, item.metadata, np.asarray(raw).shape
+                )
+            if needs_stratum:
+                values["stratum_dimension"] = np.asarray(
+                    [int(stratification["_active_dimension"])], dtype="int32"
+                )
+            return values
         return image
 
     @staticmethod

@@ -5,7 +5,10 @@ from typing import Any
 from tensorflow import keras
 from tensorflow.keras import layers
 
-from oracle_builder.classification.features import classification_head, classifier_inputs, join_auxiliary_features
+from oracle_builder.classification.features import (
+    classification_head, classifier_inputs, join_auxiliary_features,
+    stratum_conditioning_input,
+)
 
 
 def build_model(config: dict[str, Any]):
@@ -14,6 +17,7 @@ def build_model(config: dict[str, Any]):
     base = int(config.get("model", {}).get("base_filters", 32))
 
     inputs, metadata = classifier_inputs(input_shape, config)
+    stratum_dimension = stratum_conditioning_input(config)
     x = layers.Conv2D(base, 3, padding="same", activation="relu")(inputs)
     x = layers.MaxPooling2D()(x)
     x = layers.Conv2D(base * 2, 3, padding="same", activation="relu")(x)
@@ -21,5 +25,6 @@ def build_model(config: dict[str, Any]):
     x = layers.Conv2D(base * 4, 3, padding="same", activation="relu")(x)
     x = layers.GlobalAveragePooling2D(name="global_pool")(x)
     x = join_auxiliary_features(x, metadata)
-    outputs = classification_head(x, num_classes, config, dropout_default=0.2)
-    return keras.Model([inputs, metadata] if metadata is not None else inputs, outputs, name="simple_cnn")
+    outputs = classification_head(x, num_classes, config, dropout_default=0.2, stratum_dimension=stratum_dimension)
+    model_inputs = [inputs] + ([metadata] if metadata is not None else []) + ([stratum_dimension] if stratum_dimension is not None else [])
+    return keras.Model(model_inputs if len(model_inputs) > 1 else inputs, outputs, name="simple_cnn")

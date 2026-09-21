@@ -32,6 +32,32 @@ def validate(config: dict[str, Any]) -> None:
         raise ValueError("classification.stratification.batch_size_policy must be 'constant_input_tensor'")
     if str(settings(config).get("weight_sharing", "shared")) != "shared":
         raise ValueError("classification.stratification.weight_sharing must be 'shared'")
+    normalization = str(settings(config).get("normalization", "batch")).lower()
+    if normalization not in {"batch", "group"}:
+        raise ValueError("classification.stratification.normalization must be 'batch' or 'group'")
+    if normalization == "group":
+        groups = settings(config).get("group_norm_groups", 8)
+        if isinstance(groups, bool) or not isinstance(groups, int) or groups < 1:
+            raise ValueError("classification.stratification.group_norm_groups must be a positive integer")
+        architecture = str(config.get("run", {}).get("model", "")).lower()
+        if architecture not in {"resnet", *[f"resnet{n}" for n in (18, 34, 50, 101, 152)]}:
+            raise ValueError("Group normalization is currently supported for ResNet classifiers only")
+    conditioning = settings(config).get("conditioning", {})
+    if not isinstance(conditioning, dict):
+        raise ValueError("classification.stratification.conditioning must be a table")
+    if conditioning.get("enabled", False):
+        architecture = str(config.get("run", {}).get("model", "")).lower()
+        if architecture not in {
+            "simple_cnn", "resnet", "densenet",
+            *[f"resnet{n}" for n in (18, 34, 50, 101, 152)],
+            *[f"densenet{n}" for n in (121, 169, 201)],
+        }:
+            raise ValueError("Stratum conditioning is currently supported for simple CNN, ResNet, and DenseNet classifiers only")
+        embedding_dim = conditioning.get("embedding_dim", 16)
+        if isinstance(embedding_dim, bool) or not isinstance(embedding_dim, int) or embedding_dim < 1:
+            raise ValueError(
+                "classification.stratification.conditioning.embedding_dim must be a positive integer"
+            )
     if assignment_policy(config) not in {"smallest_fitting", "largest_not_exceeding"}:
         raise ValueError(
             "classification.stratification.assignment_policy must be "
@@ -71,6 +97,26 @@ def validate(config: dict[str, Any]) -> None:
         raise ValueError(
             "classification.stratification.cycle_scheduler.reduce_lr_factor "
             "must be in (0, 1)"
+        )
+    schedule = str(settings(config).get("schedule", "interleaved_steps"))
+    if schedule not in {"interleaved_steps", "interleaved", "contiguous"}:
+        raise ValueError(
+            "classification.stratification.schedule must be 'interleaved_steps', "
+            "'interleaved', or 'contiguous'"
+        )
+    steps_per_stratum = settings(config).get("steps_per_stratum", 1)
+    if (
+        isinstance(steps_per_stratum, bool)
+        or not isinstance(steps_per_stratum, int)
+        or steps_per_stratum < 1
+    ):
+        raise ValueError(
+            "classification.stratification.steps_per_stratum must be a positive integer"
+        )
+    guardrail = scheduler.get("max_stratum_drop")
+    if guardrail is not None and float(guardrail) < 0:
+        raise ValueError(
+            "classification.stratification.cycle_scheduler.max_stratum_drop must be non-negative"
         )
     if config.get("run", {}).get("task") != "classification":
         raise ValueError("classification.stratification is only supported for classification")
@@ -153,9 +199,17 @@ def supra_epochs(config: dict[str, Any]) -> int:
 def supra_epoch_schedule(config: dict[str, Any], total_epochs: int):
     """Yield ``(start, stop, dimension)`` child turns.
 
-    Each child handles a contiguous block of parent epochs before the next
-    resolution is loaded.  A final partial block is emitted when necessary.
+    The default is an epoch-interleaved schedule: every resolution is visited
+    once before advancing the shared model's parent epoch.  ``contiguous`` is
+    retained solely for reproducing older experiments.  The controller's
+    cycle validation is only meaningful after all dimensions in an epoch have
+    run against the same shared weights.
     """
+    if str(settings(config).get("schedule", "interleaved_steps")) in {"interleaved_steps", "interleaved"}:
+        for epoch in range(int(total_epochs)):
+            for dimension in dimensions(config):
+                yield epoch, epoch + 1, dimension
+        return
     block_size = supra_epochs(config)
     for start in range(0, int(total_epochs), block_size):
         stop = min(int(total_epochs), start + block_size)

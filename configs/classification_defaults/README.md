@@ -38,9 +38,14 @@ To enable self-supervised training, set `self_supervised.enabled = true`. Choose
 for NT-Xent contrastive training. Both transfer the learned encoder into the
 selected classification family before supervised training.
 
-Each family config also includes disabled-by-default auxiliary metadata and
-resolution-stratification sections. `data.batch_size` is the baseline for the
-smallest configured resolution; `constant_input_tensor` derives larger-stratum
-batches by inverse image area. `distribution.strategy = "auto"` reserves one
-unused GPU for the run; use `strategy = "mirrored"` explicitly for synchronous
-multi-GPU training.
+Each family config also includes disabled-by-default auxiliary metadata and a
+safe shared resolution-stratification recipe: canonical 32/64/128-pixel
+routing, interleaved per-stratum optimizer steps, GroupNorm, learned size
+conditioning, conservative augmentation, and equal-stratum macro-F1
+guardrails. Confirm split and class support in every stratum before setting
+`classification.stratification.enabled = true`; the recipe deliberately does
+not include 16 or 256 pixels. `data.batch_size` is the smallest-resolution
+microbatch baseline; `constant_input_tensor` derives larger-stratum batches by
+inverse image area. `distribution.strategy = "auto"` reserves one unused GPU
+for the run; use `strategy = "mirrored"` explicitly for synchronous multi-GPU
+training.

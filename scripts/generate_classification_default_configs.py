@@ -25,6 +25,7 @@ base_filters = 32""",
 # This model has a fixed shallow topology. Use the resnet family when depth
 # selection or an ImageNet-style stem is important.
 base_filters = 32""",
+        "normalize_embeddings": "false",
     },
     "densenet_like": {
         "summary": "Compact fixed-depth densely connected CNN; a lightweight dense baseline.",
@@ -47,13 +48,14 @@ base_filters = 64
 
 # The stem downsamples by stem_stride and, when enabled, another 2x in stem_pool.
 # For small objects or low-resolution inputs, try kernel 3, stride 1, pool false.
-stem_kernel_size = 7
-stem_stride = 2
-stem_pool = true
+stem_kernel_size = 3
+stem_stride = 1
+stem_pool = false
 
 # Optional expert override; four positive stage depths are required. Leaving
 # this commented uses the selected variant's canonical layout.
 # block_counts = [2, 2, 2, 2]""",
+        "normalize_embeddings": "false",
     },
     "densenet": {
         "summary": "Configurable standard DenseNet family with feature reuse across layers.",
@@ -101,6 +103,9 @@ se_ratio = 0.25
     },
 }
 
+for _details in FAMILIES.values():
+    _details.setdefault("normalize_embeddings", "true")
+
 
 def render(family: str, details: dict[str, str]) -> str:
     # Keep all non-architecture settings byte-for-byte common across families.
@@ -121,7 +126,7 @@ notes = "Documented {family} baseline"
 [data]
 # Classification defaults assume one-channel images. Increase height/width when
 # fine detail matters, recognizing that memory use grows roughly with image area.
-input_shape = [224, 224, 1]
+input_shape = [128, 128]
 batch_size = 8
 shuffle_buffer = 4096
 
@@ -166,11 +171,54 @@ memory_growth = true
 # Every classifier exposes a fixed-size penultimate embedding named "features",
 # plus logits and softmax probabilities. 256 is a portable default for KNN.
 embedding_dim = 256
-normalize_embeddings = true
+normalize_embeddings = {details["normalize_embeddings"]}
 # {details["dropout_help"]}
 dropout = 0.20
 
-[pretraining]
+[classification.stratification]
+# Recommended shared-model recipe for size-correlated ROIs. It is opt-in: first
+# verify support for every configured stratum, then set enabled = true.
+# The scheduler interleaves optimizer steps across all strata, rather than
+# letting one resolution overwrite the others in a contiguous training block.
+enabled = false
+dimensions = [32, 64, 128]
+basis = "max_original_dimension"
+assignment_policy = "smallest_fitting"
+batch_size_policy = "constant_input_tensor"
+weight_sharing = "shared"
+schedule = "interleaved_steps"
+steps_per_stratum = 1
+# A global interleaved epoch completes before validation/checkpoint selection.
+supra_epochs = 1
+# GroupNorm remains stable when high-resolution microbatches are small. The
+# canonical ResNet builder supports it; other family examples retain batch
+# normalization until their builders gain an equivalent implementation.
+normalization = "{'group' if family == 'resnet' else 'batch'}"
+group_norm_groups = 8
+
+[classification.stratification.conditioning]
+# Give the shared model the selected resolution as a learned, soft cue. This
+# does not mask classes that happen to be absent from one training stratum.
+enabled = true
+embedding_dim = 16
+
+[classification.stratification.training_routing]
+# Establish a canonical-routing baseline before introducing cross-stratum
+# resizing as an augmentation.
+enabled = false
+adjacent_lower_probability = 0.0
+seed = 123
+
+[classification.stratification.cycle_scheduler]
+# Equal stratum weighting and a per-stratum guardrail prevent a populous or
+# easy bin from hiding catastrophic forgetting in another bin.
+aggregation = "equal_strata"
+guardrail_metric = "macro_f1"
+max_stratum_drop = 0.03
+reduce_lr_patience = 3
+reduce_lr_factor = 0.5
+
+[self_supervised]
 # Self-supervised pretraining initializes this same architecture before labels
 # are used. BYOL is less batch-size-sensitive. SimCLR uses in-batch negatives
 # and generally benefits from larger batches; temperature applies to SimCLR.
@@ -188,11 +236,14 @@ use_training_augmentation = true
 epochs = 50
 optimizer = "adam"
 learning_rate = 0.0003
+# AdamW-style decoupled regularization is supported by the classification
+# trainer; this small value is a conservative first shared-model setting.
+weight_decay = 0.0001
 
 # Weighted cross entropy is the classification default. For already balanced
 # datasets, ordinary sparse_categorical_crossentropy is the simpler alternative.
 loss = "weighted_sparse_categorical_crossentropy"
-metrics = ["accuracy"]
+metrics = ["accuracy", "macro_f1"]
 
 [training.class_weights]
 # Weights are calculated from the training split and saved in the run artifact.
@@ -222,20 +273,20 @@ enabled = true
 save_every_epochs = 1
 
 [augmentation]
-# Shared, moderately aggressive policy for fair architecture comparisons.
-# Rotation is a fraction of a full turn; 0.5 permits any orientation.
+# Conservative policy for a shared 32/64/128-pixel model. Apply stronger
+# transforms only after visually validating them for the 32-pixel inputs.
 enabled = true
 repeats_per_epoch = 1
 invert = false # Assume black background and light foreground.
-rotation = 0.5
-zoom = 0.20
-translation = [0.15, 0.15]
-skew = 0.20
+rotation = 0.25
+zoom = 0.10
+translation = [0.075, 0.075]
+skew = 0.10
 flip_horizontal = true
 flip_vertical = true
-brightness = 0.20
-contrast = 0.20
-gaussian_noise = 0.05
+brightness = 0.10
+contrast = 0.10
+gaussian_noise = 0.02
 fill_value = 0.0
 
 [inference]

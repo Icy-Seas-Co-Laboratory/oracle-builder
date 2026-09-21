@@ -397,7 +397,10 @@ def main() -> int:
         if stratification_enabled(config):
             # The controller owns the parent epoch loop so its seeded routing
             # can reassign training examples between child resolutions.
-            from oracle_builder.classification.stratified_data import child_config
+            from oracle_builder.classification.stratified_data import (
+                add_stratum_dimension_input,
+                child_config,
+            )
             from oracle_builder.classification.stratified_training import (
                 build_indices,
                 make_canonical_bundle,
@@ -437,8 +440,13 @@ def main() -> int:
                     train_index = canonical.indices["train"]
                     evidence = build_evidence_index_streaming(
                         shared_model,
-                        canonical.source.indexed_image_dataset(
-                            train_index, batch_size=int(child["data"]["batch_size"])
+                        add_stratum_dimension_input(
+                            canonical.source.indexed_image_dataset(
+                                train_index,
+                                batch_size=int(child["data"]["batch_size"]),
+                            ),
+                            dimension,
+                            config,
                         ),
                         train_index,
                         child_dir / "classification_evidence",
@@ -450,8 +458,13 @@ def main() -> int:
                     evaluation_index = canonical.indices[evaluation_split]
                     evaluation = evaluate_classification_streaming(
                         shared_model,
-                        canonical.source.indexed_image_dataset(
-                            evaluation_index, batch_size=int(child["data"]["batch_size"])
+                        add_stratum_dimension_input(
+                            canonical.source.indexed_image_dataset(
+                                evaluation_index,
+                                batch_size=int(child["data"]["batch_size"]),
+                            ),
+                            dimension,
+                            config,
                         ),
                         evaluation_index,
                         child_dir,

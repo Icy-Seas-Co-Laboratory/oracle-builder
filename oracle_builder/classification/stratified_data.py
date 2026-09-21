@@ -33,6 +33,34 @@ from oracle_builder.data.sqlite_stream import (
 RoutingMode = Literal["canonical", "training_stochastic"]
 
 
+def add_stratum_dimension_input(
+    dataset: tf.data.Dataset, dimension: int, config: dict[str, Any]
+) -> tf.data.Dataset:
+    """Decorate a classifier dataset with the constant runtime stratum input.
+
+    Kept as a no-op unless conditioned shared stratification is enabled, so the
+    normal one-input and image-plus-metadata model contracts remain unchanged.
+    """
+    settings = config.get("classification", {}).get("stratification", {})
+    conditioning = settings.get("conditioning", {}) if isinstance(settings, dict) else {}
+    if not (settings.get("enabled", False) and conditioning.get("enabled", False)):
+        return dataset
+
+    def decorate(features, target):
+        if isinstance(features, dict):
+            values = dict(features)
+            image = values["image"]
+        else:
+            values = {"image": features}
+            image = features
+        values["stratum_dimension"] = tf.fill(
+            [tf.shape(image)[0], 1], tf.cast(dimension, tf.int32)
+        )
+        return values, target
+
+    return dataset.map(decorate, num_parallel_calls=tf.data.AUTOTUNE)
+
+
 @dataclass
 class StratumDataset:
     """One split routed and resized for a single resolution child model."""

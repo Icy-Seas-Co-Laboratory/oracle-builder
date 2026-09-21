@@ -11,6 +11,7 @@ from tensorflow.keras import layers
 FEATURE_LAYER_NAME = "features"
 LOGITS_LAYER_NAME = "logits"
 DEFAULT_EMBEDDING_DIM = 256
+STRATUM_DIMENSION_INPUT_NAME = "stratum_dimension"
 
 
 @keras.utils.register_keras_serializable(package="oracle_builder")
@@ -36,6 +37,63 @@ def classifier_inputs(input_shape: tuple[int, ...], config: dict[str, Any]):
     return image, metadata
 
 
+@keras.utils.register_keras_serializable(package="oracle_builder")
+class StratumDimensionIndex(layers.Layer):
+    """Convert configured resolution values (for example 32) to embedding IDs."""
+
+    def __init__(self, dimensions: list[int], **kwargs):
+        super().__init__(**kwargs)
+        self.dimensions = tuple(int(value) for value in dimensions)
+
+    def call(self, inputs):
+        values = tf.cast(tf.reshape(inputs, [-1, 1]), tf.int32)
+        dimensions = tf.constant(self.dimensions, dtype=tf.int32)
+        matches = tf.equal(values, dimensions[tf.newaxis, :])
+        tf.debugging.assert_equal(
+            tf.reduce_any(matches, axis=1),
+            tf.ones(tf.shape(values)[0], dtype=tf.bool),
+            message="stratum_dimension is not configured for this model",
+        )
+        return tf.argmax(tf.cast(matches, tf.int32), axis=1, output_type=tf.int32)
+
+    def get_config(self):
+        return {**super().get_config(), "dimensions": list(self.dimensions)}
+
+
+def stratum_conditioning_input(config: dict[str, Any]):
+    """Create the runtime resolution input for an explicitly conditioned bundle."""
+    settings = config.get("classification", {}).get("stratification", {})
+    conditioning = settings.get("conditioning", {}) if isinstance(settings, dict) else {}
+    if not (settings.get("enabled", False) and conditioning.get("enabled", False)):
+        return None
+    return keras.Input(shape=(1,), dtype="int32", name=STRATUM_DIMENSION_INPUT_NAME)
+
+
+def join_stratum_conditioning(x, stratum_dimension, config: dict[str, Any]):
+    """Add a zero-initialized, resolution-specific residual adapter to ``x``.
+
+    The adapter begins as an identity mapping. This makes enabling conditioning
+    conservative: shared visual features remain the initial solution while each
+    resolution can learn a small correction during mixed-resolution training.
+    """
+    if stratum_dimension is None:
+        return x
+    settings = config["classification"]["stratification"]
+    conditioning = settings["conditioning"]
+    dimensions = [int(value) for value in settings["dimensions"]]
+    index = StratumDimensionIndex(dimensions, name="stratum_dimension_index")(stratum_dimension)
+    embedding_dim = int(conditioning.get("embedding_dim", 16))
+    embedding = layers.Embedding(
+        len(dimensions), embedding_dim, name="stratum_embedding"
+    )(index)
+    combined = layers.Concatenate(name="stratum_adapter_inputs")([x, embedding])
+    adapter = layers.Dense(
+        int(x.shape[-1]), kernel_initializer="zeros", bias_initializer="zeros",
+        name="stratum_adapter",
+    )(combined)
+    return layers.Add(name="stratum_conditioned_features")([x, adapter])
+
+
 def join_auxiliary_features(x, metadata):
     """Join standardized scalar features after global image pooling."""
     if metadata is None:
@@ -50,6 +108,7 @@ def classification_head(
     *,
     dropout_default: float = 0.0,
     normalize_default: bool = True,
+    stratum_dimension=None,
 ):
     """Attach the standard fixed-size embedding and classification head."""
     model_config = config.get("model", {})
@@ -61,6 +120,7 @@ def classification_head(
     if not 0 <= dropout < 1:
         raise ValueError("model.dropout must be in [0, 1)")
 
+    x = join_stratum_conditioning(x, stratum_dimension, config)
     x = layers.Dense(embedding_dim, name="embedding_projection")(x)
     if normalize:
         features = L2Normalization(name=FEATURE_LAYER_NAME)(x)
@@ -69,7 +129,22 @@ def classification_head(
     x = features
     if dropout:
         x = layers.Dropout(dropout, name="classifier_dropout")(x)
-    logits = layers.Dense(num_classes, name=LOGITS_LAYER_NAME)(x)
+    # Keep the public ``logits`` tensor aligned with the probabilities.  A
+    # conditioned model adds its per-stratum bias after the common classifier.
+    logits = layers.Dense(
+        num_classes,
+        name="shared_logits" if stratum_dimension is not None else LOGITS_LAYER_NAME,
+    )(x)
+    if stratum_dimension is not None:
+        settings = config["classification"]["stratification"]
+        index = StratumDimensionIndex(
+            [int(value) for value in settings["dimensions"]], name="stratum_bias_index"
+        )(stratum_dimension)
+        bias = layers.Embedding(
+            len(settings["dimensions"]), num_classes,
+            embeddings_initializer="zeros", name="stratum_classifier_bias",
+        )(index)
+        logits = layers.Add(name=LOGITS_LAYER_NAME)([logits, bias])
     return layers.Activation("softmax", name="predictions")(logits)
 
 

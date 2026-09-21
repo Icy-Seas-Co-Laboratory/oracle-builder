@@ -158,7 +158,27 @@ dimensions = [32, 64, 128]
 basis = "max_original_dimension"
 assignment_policy = "smallest_fitting" # or "largest_not_exceeding"
 weight_sharing = "shared" # one dynamic-spatial network and optimizer
-supra_epochs = 5 # train five epochs per stratum before rotating
+# Mix complete optimizer steps across the dimensions; avoid contiguous blocks.
+schedule = "interleaved_steps"
+steps_per_stratum = 1
+# Validate/checkpoint after every complete interleaved global epoch.
+supra_epochs = 1
+# Stable normalization for 128-pixel microbatches and a soft size cue.
+normalization = "group"
+group_norm_groups = 8
+
+[classification.stratification.conditioning]
+enabled = true
+embedding_dim = 16
+
+[classification.stratification.training_routing]
+# First establish a canonical-routing baseline.
+enabled = false
+
+[classification.stratification.cycle_scheduler]
+aggregation = "equal_strata"
+guardrail_metric = "macro_f1"
+max_stratum_drop = 0.03
 ```
 
 Use `fit_pad` preprocessing so small ROIs are enlarged in their selected
@@ -172,11 +192,17 @@ the 32-pixel stratum rather than 64 pixels. This deliberately permits more
 downscaling; images below the smallest configured dimension still use that
 smallest stratum, and images above the largest still use the largest.
 
-For shared weights, learning-rate reduction and early stopping run after a
-complete supra-epoch cycle. The controller evaluates each canonical validation
-stratum with the same final weights, then aggregates those losses using
-`cycle_scheduler.aggregation` (default `sample_weighted`; use `equal_strata`
-when each resolution should contribute equally).
+For shared weights, interleave at optimizer-step granularity. One
+`interleaved_steps` alternates `steps_per_stratum` batches from each active
+stratum until each finite training dataset has been consumed; it does not train
+a multi-epoch block at one resolution.
+`supra_epochs` is the number of these global mixed epochs between complete
+validation/checkpoint passes. The controller evaluates every canonical
+validation stratum with the same final weights. Use `equal_strata` aggregation
+and a `max_stratum_drop` macro-F1 guardrail to keep a strong 128-pixel cohort
+from masking regression in 32 or 64 pixels. GroupNorm avoids BatchNorm running
+statistics being dominated by a small high-resolution microbatch. Conditioning
+provides the selected stratum as a learned cue; it never hard-masks classes.
 
 ## Create a curated or small test subset
 

@@ -1,9 +1,12 @@
 import json
 import sqlite3
 
+import tensorflow as tf
+
 from oracle_builder.classification.stratified_training import (
     StratifiedChildResult,
     StratifiedTrainingResult,
+    _train_interleaved_epoch,
     write_stratified_metric_artifacts,
 )
 from oracle_builder.classification.stratification import (
@@ -51,14 +54,58 @@ def test_summary_reports_canonical_routed_and_class_counts():
     assert summary["batch_plan"] == {32: 128, 64: 32, 128: 8}
 
 
-def test_supra_epoch_schedule_uses_contiguous_child_blocks():
+def test_supra_epoch_schedule_interleaves_every_shared_parent_epoch():
     config = _config()
     config["classification"]["stratification"]["supra_epochs"] = 2
     assert list(supra_epoch_schedule(config, 5)) == [
-        (0, 2, 32), (0, 2, 64), (0, 2, 128),
-        (2, 4, 32), (2, 4, 64), (2, 4, 128),
+        (0, 1, 32), (0, 1, 64), (0, 1, 128),
+        (1, 2, 32), (1, 2, 64), (1, 2, 128),
+        (2, 3, 32), (2, 3, 64), (2, 3, 128),
+        (3, 4, 32), (3, 4, 64), (3, 4, 128),
         (4, 5, 32), (4, 5, 64), (4, 5, 128),
     ]
+
+
+def test_supra_epoch_schedule_keeps_contiguous_mode_for_reproduction():
+    config = _config()
+    config["classification"]["stratification"].update({"supra_epochs": 2, "schedule": "contiguous"})
+    assert list(supra_epoch_schedule(config, 3)) == [
+        (0, 2, 32), (0, 2, 64), (0, 2, 128),
+        (2, 3, 32), (2, 3, 64), (2, 3, 128),
+    ]
+
+
+def test_interleaved_epoch_round_robins_resolution_batches():
+    class FakeModel:
+        def __init__(self):
+            self.order = []
+
+        def reset_metrics(self):
+            pass
+
+        def train_on_batch(self, features, targets, *, return_dict):
+            del targets, return_dict
+            dimension = int(features["stratum_dimension"][0, 0])
+            self.order.append(dimension)
+            return {"loss": float(dimension)}
+
+    def dataset(dimension: int, batches: int):
+        return tf.data.Dataset.from_tensor_slices((
+            {
+                "image": tf.ones((batches, 1, 1, 1)),
+                "stratum_dimension": tf.fill((batches, 1), dimension),
+            },
+            tf.zeros((batches,), dtype=tf.int32),
+        )).batch(1)
+
+    model = FakeModel()
+    metrics = _train_interleaved_epoch(
+        model, {32: dataset(32, 2), 64: dataset(64, 3)}
+    )
+
+    assert model.order == [32, 64, 32, 64, 64]
+    assert metrics[32]["loss"] == 32.0
+    assert metrics[64]["loss"] == 64.0
 
 
 def test_largest_not_exceeding_policy_prefers_the_next_smaller_stratum():
