@@ -1006,18 +1006,6 @@ def train_stratified_models(
                             else None
                         ),
                     )
-                    if interleaved_status is not None:
-                        values = round_logs[epoch]
-                        aggregate_logs = {
-                            name: float(
-                                sum(row.get(name, 0.0) for row in values.values())
-                                / len(values)
-                            )
-                            for name in {
-                                metric for row in values.values() for metric in row
-                            }
-                        }
-                        interleaved_status.on_epoch_end(epoch, aggregate_logs)
                 logs = round_logs.get(epoch, {}).get(dimension, {})
                 _append_history(history, {name: [value] for name, value in logs.items()})
                 if not selected.refs:
@@ -1151,6 +1139,15 @@ def train_stratified_models(
             )
             monitor = _cycle_monitor_name(config)
             aggregate = cycle_metrics["aggregate"]
+            if interleaved_status is not None:
+                # ``train_on_batch`` reports one highly variable mini-batch at
+                # a time. Only publish metrics after every validation stratum
+                # has evaluated the same shared weights, and make their
+                # held-out provenance explicit in the display.
+                interleaved_status.on_epoch_end(
+                    block_stop - 1,
+                    {f"val_{name}": value for name, value in aggregate.items()},
+                )
             value = aggregate.get(monitor)
             if value is None:
                 log_event(

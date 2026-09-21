@@ -54,6 +54,7 @@ def test_status_retains_validation_metrics_and_metric_history_between_epochs():
 
     assert callback._metrics["val_loss"] == 1.2
     assert callback._metrics["val_accuracy"] == 0.6
+    assert "loss" not in callback._metrics
     assert callback._history["loss"] == [1.0]
 
 

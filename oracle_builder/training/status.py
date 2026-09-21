@@ -78,9 +78,10 @@ def _trend(values: list[float]) -> str:
 class RichTrainingStatusCallback(keras.callbacks.Callback):
     """A compact live board for Keras training, with log-safe text fallback.
 
-    The board is deliberately metric-agnostic: it formats whichever scalar
-    metrics a model reports, so custom SSL diagnostics and normal validation
-    metrics share exactly the same presentation.
+    Batch callbacks advance progress only. Metrics are refreshed at epoch
+    boundaries, where Keras has aggregated every batch and, when configured,
+    completed held-out validation. This deliberately avoids presenting a
+    transient mini-batch loss, accuracy, or F1 score as a model result.
     """
 
     def __init__(
@@ -197,10 +198,7 @@ class RichTrainingStatusCallback(keras.callbacks.Callback):
             print(f"[{self.phase}] epoch {self._epoch}/{self.epochs or '?'} started", file=self.stream, flush=True)
 
     def on_train_batch_end(self, batch: int, logs=None):
-        self._metrics = {
-            **self._latest_validation,
-            **_numeric_metrics(logs),
-        }
+        del logs
         if self._interactive and self._progress is not None and self._batch_task is not None:
             self._progress.update(self._batch_task, completed=int(batch) + 1)
             if self._live is not None:
