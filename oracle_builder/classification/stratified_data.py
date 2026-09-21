@@ -19,6 +19,7 @@ import tensorflow as tf
 from oracle_builder.classification.stratification import (
     batch_plan,
     dimensions,
+    assignment_policy,
     stratum_for_shape,
     training_stratum,
 )
@@ -105,7 +106,9 @@ def routed_index(
             raise ValueError(
                 f"Stratification requires original source dimensions; item {ref.uuid!r} has none"
             )
-        canonical = stratum_for_shape(shape, configured)
+        canonical = stratum_for_shape(
+            shape, configured, policy=assignment_policy(config)
+        )
         assigned = (
             training_stratum(canonical, item_id=ref.uuid, epoch=int(epoch), config=config)
             if routing_mode == "training_stochastic"

@@ -5,6 +5,9 @@ versioned contract to Pelagia mask refinement and future classification work.
 Callers retain ownership of inputs and outputs; the service does not persist
 operational data.
 
+For the full local inference and Oracle Serve option matrix, see the
+[Pipeline options reference](pipeline-options-reference.md).
+
 ## Install and serve
 
 ```bash

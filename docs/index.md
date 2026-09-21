@@ -11,6 +11,7 @@
 | Curate ROIs and refine masks | [Mask-refinement workflow](mask-refinement-workflow.md) |
 | Ingest a pre-existing Keras model | [External model products](model-products.md) |
 | Configure training, evaluation, or recovery | [Training, evaluation, and recovery](training-and-evaluation.md) |
+| Look up every training, inference, and Oracle Serve option | [Pipeline options reference](pipeline-options-reference.md) |
 | Diagnose installation or run problems | [Operations and troubleshooting](operations-and-troubleshooting.md) |
 | Serve models to operational systems | [Inference API](inference-api.md) |
 | Execute Oracle Builder work from an orchestrator | [Compute API](compute-api.md) |

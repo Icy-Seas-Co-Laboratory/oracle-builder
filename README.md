@@ -29,6 +29,7 @@ Choose the guide that matches what you want to do:
 - [Mask-refinement workflow](docs/mask-refinement-workflow.md) — build/edit an ROI mask dataset, train U-Net-family models, tile large ROIs, and visualize results.
 - [External model products](docs/model-products.md) — ingest and promote existing Keras models.
 - [Training, evaluation, and recovery](docs/training-and-evaluation.md) — configs, augmentation, streaming, multi-GPU, metrics, and resume behavior.
+- [Pipeline options reference](docs/pipeline-options-reference.md) — detailed training, inference, and Oracle Serve options with considerations and examples.
 - [Operations and troubleshooting](docs/operations-and-troubleshooting.md) — validation, packages, common problems, and analysis helpers.
 - [Inference API](docs/inference-api.md) — serve resident model bundles to Pelagia and other operational callers.
 

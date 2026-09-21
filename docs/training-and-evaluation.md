@@ -2,6 +2,8 @@
 
 This guide covers choices shared by classification and mask-refinement runs.
 
+For a pipeline-by-pipeline option reference, see the [Pipeline options reference](pipeline-options-reference.md).
+
 For a standalone self-supervised representation model, use
 `oracle-embed --config configs/example_embedding.toml ...`. It writes an
 embedding training record and does not fit cluster structure. The model's

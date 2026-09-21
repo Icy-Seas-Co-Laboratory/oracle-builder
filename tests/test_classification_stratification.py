@@ -2,6 +2,7 @@ from oracle_builder.classification.stratification import (
     batch_plan,
     summarize_records,
     supra_epoch_schedule,
+    stratum_for_shape,
     training_stratum,
 )
 
@@ -50,3 +51,14 @@ def test_supra_epoch_schedule_uses_contiguous_child_blocks():
         (2, 4, 32), (2, 4, 64), (2, 4, 128),
         (4, 5, 32), (4, 5, 64), (4, 5, 128),
     ]
+
+
+def test_largest_not_exceeding_policy_prefers_the_next_smaller_stratum():
+    dimensions = [32, 64, 128]
+    assert stratum_for_shape((20, 34), dimensions) == 64
+    assert stratum_for_shape(
+        (20, 34), dimensions, policy="largest_not_exceeding"
+    ) == 32
+    assert stratum_for_shape(
+        (20, 500), dimensions, policy="largest_not_exceeding"
+    ) == 128

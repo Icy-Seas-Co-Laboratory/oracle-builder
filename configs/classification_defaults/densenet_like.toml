@@ -81,6 +81,7 @@ dropout = 0.20
 enabled = false
 dimensions = [32, 64, 128]
 basis = "max_original_dimension"
+assignment_policy = "smallest_fitting"
 batch_size_policy = "constant_input_tensor"
 weight_sharing = "shared"
 supra_epochs = 5
@@ -88,6 +89,11 @@ supra_epochs = 5
 enabled = true
 adjacent_lower_probability = 0.10
 seed = 123
+
+[classification.stratification.cycle_scheduler]
+aggregation = "sample_weighted"
+reduce_lr_patience = 3
+reduce_lr_factor = 0.5
 
 [self_supervised]
 # Self-supervised pretraining initializes this same architecture before labels

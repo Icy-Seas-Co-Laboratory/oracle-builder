@@ -24,6 +24,8 @@ from oracle_builder.classification.stratification import (
     batch_plan,
     dimensions,
     enabled,
+    assignment_policy,
+    settings,
     stratum_for_shape,
     summarize_records,
     supra_epoch_schedule,
@@ -172,7 +174,9 @@ def routed_index(
             raise ValueError(
                 f"Stratification requires original dimensions for item {ref.item_id!r}"
             )
-        canonical = stratum_for_shape(shape, configured)
+        canonical = stratum_for_shape(
+            shape, configured, policy=assignment_policy(config)
+        )
         assigned = (
             training_stratum(
                 canonical,
@@ -381,6 +385,62 @@ def _monitor_mode(name: str) -> str:
     return "max" if any(token in name.lower() for token in ("acc", "f1", "auc")) else "min"
 
 
+def _cycle_validation(
+    model: keras.Model,
+    sqlite_path: str | Path,
+    indices: dict[str, SQLiteSplitIndex],
+    config: dict[str, Any],
+    effective_batches: dict[int, int],
+) -> dict[str, Any]:
+    """Evaluate stable shared weights over every canonical validation stratum."""
+    validation = indices.get("validation")
+    if validation is None or not validation.refs:
+        return {"aggregate": {}, "per_stratum": {}, "sample_count": 0}
+    scheduler = settings(config).get("cycle_scheduler", {})
+    aggregation = (
+        str(scheduler.get("aggregation", "sample_weighted"))
+        if isinstance(scheduler, dict)
+        else "sample_weighted"
+    )
+    weighted: dict[str, float] = {}
+    weights: dict[str, float] = {}
+    per_stratum: dict[str, dict[str, Any]] = {}
+    for dimension in dimensions(config):
+        selected = routed_index(validation, config, dimension)
+        if not selected.refs:
+            continue
+        child = child_config(config, dimension)
+        child["data"]["batch_size"] = int(
+            effective_batches.get(dimension, child["data"]["batch_size"])
+        )
+        dataset = SQLiteClassificationSource(sqlite_path, child).training_dataset(
+            selected, shuffle=False, augment=False
+        )
+        values = {
+            str(name): float(value)
+            for name, value in model.evaluate(dataset, verbose=0, return_dict=True).items()
+        }
+        count = len(selected)
+        per_stratum[str(dimension)] = {"samples": count, "metrics": values}
+        weight = float(count) if aggregation == "sample_weighted" else 1.0
+        for name, value in values.items():
+            weighted[name] = weighted.get(name, 0.0) + weight * value
+            weights[name] = weights.get(name, 0.0) + weight
+    return {
+        "aggregate": {
+            name: weighted[name] / weights[name] for name in sorted(weighted)
+        },
+        "per_stratum": per_stratum,
+        "sample_count": sum(row["samples"] for row in per_stratum.values()),
+        "aggregation": aggregation,
+    }
+
+
+def _cycle_monitor_name(config: dict[str, Any]) -> str:
+    monitor = str(config.get("callbacks", {}).get("checkpoint_monitor", "val_loss"))
+    return monitor[4:] if monitor.startswith("val_") else monitor
+
+
 def _write_manifest(
     run_dir: Path,
     config: dict[str, Any],
@@ -395,6 +455,7 @@ def _write_manifest(
         "status": status,
         "dimensions": dimensions(config),
         "basis": "max_original_dimension",
+        "assignment_policy": assignment_policy(config),
         "training_routing": config.get("classification", {})
         .get("stratification", {})
         .get("training_routing", {}),
@@ -405,6 +466,9 @@ def _write_manifest(
             .get("supra_epochs", 5)
         ),
         "weight_sharing": "shared",
+        "cycle_scheduler": config.get("classification", {})
+        .get("stratification", {})
+        .get("cycle_scheduler", {}),
         "split_summaries": split_summaries,
         "children": [
             {
@@ -467,6 +531,7 @@ def train_stratified_models(
             "dimensions": dimensions(config),
             "batch_plan": batch_plan(config),
             "weight_sharing": "shared",
+            "assignment_policy": assignment_policy(config),
             "supra_epochs": int(
                 config.get("classification", {})
                 .get("stratification", {})
@@ -481,12 +546,18 @@ def train_stratified_models(
         f"  dimensions: {dimensions(config)}\n"
         f"  batch plan: {batch_plan(config)}\n"
         "  weights: shared dynamic-spatial model\n"
+        f"  canonical routing: {assignment_policy(config)}\n"
         f"  supra-epochs: {config.get('classification', {}).get('stratification', {}).get('supra_epochs', 5)}",
         flush=True,
     )
 
     state = resume_state or _initial_recovery(config, run_id)
     children: dict[int, StratifiedChildResult] = {}
+    cycle_control = dict(state.get("cycle_scheduler", {}))
+    completed_cycles = {
+        int(value) for value in cycle_control.get("completed_block_stops", [])
+    }
+    stop_training = bool(cycle_control.get("stopped_early", False))
     shared_config = shared_model_config(config)
     shared_recovery = state.get("shared", {})
     with strategy.scope():
@@ -498,6 +569,8 @@ def train_stratified_models(
     # Each child remains resident for a supra-epoch block, avoiding a model
     # reload and graph rebuild for every individual parent epoch.
     for block_start, block_stop, dimension in supra_epoch_schedule(config, total_epochs):
+        if stop_training:
+            break
         child = child_config(config, dimension)
         child_dir = run_path / "model" / "strata" / str(dimension)
         child_dir.mkdir(parents=True, exist_ok=True)
@@ -525,21 +598,15 @@ def train_stratified_models(
             if canonical_validation is not None and canonical_validation.refs
             else None
         )
-        monitor = str(
-            config.get("callbacks", {}).get(
-                "checkpoint_monitor", "val_loss" if validation_data is not None else "loss"
-            )
-        )
-        mode = _monitor_mode(monitor)
-        stopped_early = bool(control.get("stopped_early", False))
+        # Shared-weight early stopping and LR adaptation happen after a whole
+        # resolution cycle, never from this stratum in isolation.
+        stopped_early = False
         completed_epochs = initial_epoch
 
         for epoch in range(
             max(initial_epoch, block_start),
             min(total_epochs, block_stop),
         ):
-            if stopped_early:
-                break
             selected = routed_index(
                 indices["train"], config, dimension, epoch=epoch
             )
@@ -640,49 +707,6 @@ def train_stratified_models(
                     {"dimension": dimension, "epoch": epoch + 1},
                 )
 
-            value = logs.get(monitor)
-            improved = False
-            if value is not None:
-                best = control.get("best")
-                if _is_improvement(float(value), float(best) if best is not None else None, mode):
-                    improved = True
-                    control["best"] = float(value)
-                    control["wait"] = 0
-                    control["reduce_lr_wait"] = 0
-                    model.save_weights(child_dir / "best.weights.h5")
-                else:
-                    control["wait"] = int(control.get("wait", 0)) + 1
-                    control["reduce_lr_wait"] = int(
-                        control.get("reduce_lr_wait", 0)
-                    ) + 1
-            if (
-                value is not None
-                and not improved
-                and bool(
-                    config.get("callbacks", {}).get("reduce_lr_on_plateau", False)
-                )
-                and int(control.get("reduce_lr_wait", 0)) >= 3
-            ):
-                learning_rate = model.optimizer.learning_rate
-                current_rate = float(keras.backend.get_value(learning_rate))
-                if hasattr(learning_rate, "assign"):
-                    learning_rate.assign(current_rate * 0.5)
-                else:
-                    model.optimizer.learning_rate = current_rate * 0.5
-                control["reduce_lr_wait"] = 0
-                control["learning_rate"] = current_rate * 0.5
-            if (
-                value is not None
-                and not improved
-                and bool(config.get("callbacks", {}).get("early_stopping", False))
-            ):
-                patience = int(
-                    config.get("callbacks", {}).get("early_stopping_patience", 5)
-                )
-                if int(control.get("wait", 0)) >= patience:
-                    stopped_early = True
-                    control["stopped_early"] = True
-
             completed = epoch + 1
             completed_epochs = completed
             _atomic_json(_history_path(child_dir), history)
@@ -737,11 +761,114 @@ def train_stratified_models(
             "Completed resolution stratum training",
             asdict(result),
         )
+        if (
+            dimension == dimensions(config)[-1]
+            and block_stop not in completed_cycles
+            and all(
+                children.get(value) is not None
+                and children[value].completed_epochs >= block_stop
+                for value in dimensions(config)
+            )
+        ):
+            cycle_metrics = _cycle_validation(
+                model,
+                sqlite_path,
+                indices,
+                config,
+                {value: children[value].batch_size for value in dimensions(config)},
+            )
+            monitor = _cycle_monitor_name(config)
+            aggregate = cycle_metrics["aggregate"]
+            value = aggregate.get(monitor)
+            if value is None:
+                log_event(
+                    training_log,
+                    run_id,
+                    "WARNING",
+                    "Skipped stratified cycle scheduler: monitor unavailable",
+                    {"monitor": monitor, "cycle": cycle_metrics},
+                )
+            else:
+                mode = _monitor_mode(monitor)
+                best = cycle_control.get("best")
+                improved = _is_improvement(
+                    float(value), float(best) if best is not None else None, mode
+                )
+                if improved:
+                    cycle_control["best"] = float(value)
+                    cycle_control["wait"] = 0
+                    cycle_control["reduce_lr_wait"] = 0
+                    best_path = run_path / "model" / "shared" / "best.weights.h5"
+                    best_path.parent.mkdir(parents=True, exist_ok=True)
+                    model.save_weights(best_path)
+                else:
+                    cycle_control["wait"] = int(cycle_control.get("wait", 0)) + 1
+                    cycle_control["reduce_lr_wait"] = int(
+                        cycle_control.get("reduce_lr_wait", 0)
+                    ) + 1
+                scheduler = settings(config).get("cycle_scheduler", {})
+                reduce_patience = int(
+                    scheduler.get("reduce_lr_patience", 3)
+                    if isinstance(scheduler, dict)
+                    else 3
+                )
+                reduced_learning_rate = None
+                if (
+                    not improved
+                    and bool(config.get("callbacks", {}).get("reduce_lr_on_plateau", False))
+                    and int(cycle_control.get("reduce_lr_wait", 0)) >= reduce_patience
+                ):
+                    factor = float(
+                        scheduler.get("reduce_lr_factor", 0.5)
+                        if isinstance(scheduler, dict)
+                        else 0.5
+                    )
+                    learning_rate = model.optimizer.learning_rate
+                    current_rate = float(keras.backend.get_value(learning_rate))
+                    reduced_learning_rate = current_rate * factor
+                    if hasattr(learning_rate, "assign"):
+                        learning_rate.assign(reduced_learning_rate)
+                    else:
+                        model.optimizer.learning_rate = reduced_learning_rate
+                    cycle_control["reduce_lr_wait"] = 0
+                    cycle_control["learning_rate"] = reduced_learning_rate
+                if (
+                    not improved
+                    and bool(config.get("callbacks", {}).get("early_stopping", False))
+                    and int(cycle_control.get("wait", 0)) >= int(
+                        config.get("callbacks", {}).get("early_stopping_patience", 5)
+                    )
+                ):
+                    stop_training = True
+                    cycle_control["stopped_early"] = True
+                cycle_metrics["monitor"] = monitor
+                cycle_metrics["monitor_value"] = float(value)
+                cycle_metrics["improved"] = improved
+                cycle_metrics["reduced_learning_rate"] = reduced_learning_rate
+                cycle_metrics["stopped_early"] = stop_training
+                print(
+                    f"Completed stratified cycle through epoch {block_stop}/{total_epochs}: "
+                    f"aggregate validation {monitor}={float(value):.6g}",
+                    flush=True,
+                )
+                log_event(
+                    training_log,
+                    run_id,
+                    "INFO",
+                    "Completed stratified cycle validation",
+                    cycle_metrics,
+                )
+            completed_cycles.add(block_stop)
+            cycle_control["completed_block_stops"] = sorted(completed_cycles)
+            state["cycle_scheduler"] = cycle_control
+            _atomic_json(_recovery_path(run_path), state)
         # The dynamic-spatial shared model intentionally remains resident while
         # the next stratum is trained.
 
     shared_dir = run_path / "model" / "shared"
     shared_dir.mkdir(parents=True, exist_ok=True)
+    if cycle_control.get("stopped_early") and (shared_dir / "best.weights.h5").exists():
+        model.load_weights(shared_dir / "best.weights.h5")
     write_model_summary(model, shared_dir / "model_summary.txt")
     for dimension in dimensions(config):
         write_model_summary(

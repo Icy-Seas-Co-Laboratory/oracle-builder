@@ -156,6 +156,7 @@ ROIs. Thus a `20×34` ROI maps to `64` here:
 enabled = true
 dimensions = [32, 64, 128]
 basis = "max_original_dimension"
+assignment_policy = "smallest_fitting" # or "largest_not_exceeding"
 weight_sharing = "shared" # one dynamic-spatial network and optimizer
 supra_epochs = 5 # train five epochs per stratum before rotating
 ```
@@ -165,6 +166,17 @@ stratum and images larger than the last stratum are downscaled.
 The shared model remains in memory while the scheduler changes datasets;
 only preprocessing, effective batch size, and the currently routed examples
 vary by stratum.
+
+Use `assignment_policy = "largest_not_exceeding"` to route a `20×34` ROI to
+the 32-pixel stratum rather than 64 pixels. This deliberately permits more
+downscaling; images below the smallest configured dimension still use that
+smallest stratum, and images above the largest still use the largest.
+
+For shared weights, learning-rate reduction and early stopping run after a
+complete supra-epoch cycle. The controller evaluates each canonical validation
+stratum with the same final weights, then aggregates those losses using
+`cycle_scheduler.aggregation` (default `sample_weighted`; use `equal_strata`
+when each resolution should contribute equally).
 
 ## Create a curated or small test subset
 
