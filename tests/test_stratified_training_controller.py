@@ -213,3 +213,17 @@ def test_tiny_end_to_end_run_persists_both_children(tmp_path):
     )
     assert state["shared"]["model_path"] == "model/recovery/latest.keras"
     assert (run_dir / state["shared"]["model_path"]).exists()
+
+    # A process can be interrupted after its final rolling snapshot but before
+    # outer run finalization.  Resuming then skips the already-completed
+    # epochs, so it must still rebuild the public child manifest entries.
+    resumed = train_stratified_models(
+        config,
+        database,
+        run_dir,
+        layout.training_log,
+        "run-1",
+        resume_state=state,
+    )
+    assert set(resumed.children) == {8, 16}
+    assert resumed.manifest_path.exists()

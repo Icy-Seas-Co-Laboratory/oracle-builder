@@ -123,6 +123,14 @@ def plot_history(history, run_dir: Path) -> None:
         fig.tight_layout()
         fig.savefig(figures / filename, dpi=150)
         plt.close(fig)
+    # Classification has richer epoch-wide metrics than Keras exposes in its
+    # History object (top-k, weighted, and per-class values).  Render those
+    # standard curves alongside the generic training figures when present.
+    from oracle_builder.evaluation.classification import (
+        plot_classification_training_metrics,
+    )
+
+    plot_classification_training_metrics(history_dict, run_dir)
 
 
 def parse_args() -> argparse.Namespace:
@@ -680,6 +688,12 @@ def main() -> int:
                 split="test",
                 inference_batch_size=inference_batch_size,
             )
+        if config["run"]["task"] == "classification":
+            from oracle_builder.evaluation.classification import (
+                plot_classification_roi_size_metrics,
+            )
+
+            plot_classification_roi_size_metrics(run_dir)
         if config.get("output", {}).get("save_predictions", True):
             with post_progress.stage(
                 "Generating and storing predictions for every dataset split"

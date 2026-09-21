@@ -17,6 +17,201 @@ from sklearn.metrics import (
 from oracle_builder.progress import BatchProgress
 
 
+def _save_line_plot(
+    series: dict[str, list[tuple[int, float]]], path: Path, *, title: str, ylabel: str
+) -> None:
+    """Write a compact epoch plot, ignoring metrics absent from a run."""
+    if not series:
+        return
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    for name, values in series.items():
+        if values:
+            epochs, measurements = zip(*values, strict=True)
+            ax.plot(epochs, measurements, marker="o", markersize=3, label=name)
+    ax.set_title(title)
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel(ylabel)
+    ax.set_xticks(
+        sorted({epoch for values in series.values() for epoch, _ in values})
+    )
+    ax.legend(loc="best", fontsize="small")
+    ax.grid(alpha=0.25)
+    fig.tight_layout()
+    fig.savefig(path, dpi=180)
+    plt.close(fig)
+
+
+def plot_classification_training_metrics(
+    history: dict[str, list[float]], run_dir: str | Path
+) -> None:
+    """Render default classification learning curves from Keras and rich logs.
+
+    Keras history supplies the optimization loss.  The richer epoch evaluation
+    records supply weighted, top-k, and per-class metrics without changing the
+    training callback contract.
+    """
+    root = Path(run_dir)
+    metrics_path = root / "metrics" / "metrics.jsonl"
+    figures = root / "figures"
+    figures.mkdir(parents=True, exist_ok=True)
+    records: list[dict[str, Any]] = []
+    if metrics_path.exists():
+        for line in metrics_path.read_text(encoding="utf-8").splitlines():
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if record.get("phase") == "epoch_evaluation":
+                records.append(record)
+    if not records and not {"macro_f1", "val_macro_f1"}.intersection(history):
+        return
+
+    def keras_series(names: dict[str, str]) -> dict[str, list[tuple[int, float]]]:
+        return {
+            label: [
+                (epoch + 1, float(value))
+                for epoch, value in enumerate(history[key])
+                if np.isfinite(value)
+            ]
+            for key, label in names.items()
+            if key in history
+        }
+
+    accuracy = keras_series(
+        {"accuracy": "Train accuracy", "val_accuracy": "Validation accuracy"}
+    )
+    f1 = keras_series(
+        {"macro_f1": "Train macro F1", "val_macro_f1": "Validation macro F1"}
+    )
+    for record in records:
+        metric = str(record.get("metric", ""))
+        split = str(record.get("split", "")).title()
+        label = record.get("label")
+        if metric in {"accuracy", "weighted_recall", "top_3_accuracy"}:
+            display = {
+                "accuracy": "Overall accuracy",
+                "weighted_recall": "Weighted accuracy",
+                "top_3_accuracy": "Top-3 accuracy",
+            }[metric]
+            accuracy.setdefault(f"{split} {display}", []).append(
+                (int(record["epoch"]) + 1, float(record["value"]))
+            )
+        elif metric == "recall" and label is not None:
+            accuracy.setdefault(f"{split} accuracy · {label}", []).append(
+                (int(record["epoch"]) + 1, float(record["value"]))
+            )
+        elif metric in {"macro_f1", "weighted_f1", "micro_f1"}:
+            display = {
+                "macro_f1": "Macro F1",
+                "weighted_f1": "Weighted F1",
+                "micro_f1": "Micro F1",
+            }[metric]
+            f1.setdefault(f"{split} {display}", []).append(
+                (int(record["epoch"]) + 1, float(record["value"]))
+            )
+        elif metric == "f1_score" and label is not None:
+            f1.setdefault(f"{split} F1 · {label}", []).append(
+                (int(record["epoch"]) + 1, float(record["value"]))
+            )
+
+    loss = keras_series({"loss": "Train loss", "val_loss": "Validation loss"})
+    for record in records:
+        if record.get("metric") == "log_loss":
+            loss.setdefault(
+                f"{str(record.get('split', '')).title()} log loss", []
+            ).append((int(record["epoch"]) + 1, float(record["value"])))
+    _save_line_plot(
+        accuracy,
+        figures / "classification_accuracy_by_epoch.png",
+        title="Classification accuracy by epoch",
+        ylabel="Accuracy",
+    )
+    _save_line_plot(
+        f1,
+        figures / "classification_f1_by_epoch.png",
+        title="Classification F1 by epoch",
+        ylabel="F1 score",
+    )
+    _save_line_plot(
+        loss,
+        figures / "classification_loss_by_epoch.png",
+        title="Classification loss by epoch",
+        ylabel="Loss",
+    )
+
+
+def plot_classification_roi_size_metrics(run_dir: str | Path) -> None:
+    """Plot final accuracy and macro F1 across equal-frequency ROI-area bins."""
+    root = Path(run_dir)
+    samples_path = root / "evaluation" / "sample_metrics.csv"
+    if not samples_path.exists():
+        return
+    samples = pd.read_csv(samples_path)
+    if "roi_area_px" not in samples or samples["roi_area_px"].notna().sum() < 2:
+        return
+    samples = samples.dropna(subset=["roi_area_px"]).copy()
+    bin_count = min(5, len(samples))
+    try:
+        samples["roi_size_bin"] = pd.qcut(samples["roi_area_px"], q=bin_count, duplicates="drop")
+    except ValueError:
+        return
+    rows = []
+    for size_bin, group in samples.groupby("roi_size_bin", observed=True):
+        report = classification_report(
+            group["y_true"], group["y_pred"], output_dict=True, zero_division=0
+        )
+        rows.append(
+            {
+                "ROI size bin (px²)": str(size_bin),
+                "Accuracy": float(report.get("accuracy", 0.0)),
+                "Macro F1": float(
+                    report.get("macro avg", {}).get("f1-score", 0.0)
+                ),
+                "Samples": len(group),
+            }
+        )
+    if not rows:
+        return
+    summary = pd.DataFrame(rows)
+    summary.to_csv(root / "evaluation" / "roi_size_metrics.csv", index=False)
+    figures = root / "figures"
+    figures.mkdir(parents=True, exist_ok=True)
+    for column, filename, title in (
+        ("Accuracy", "classification_accuracy_by_roi_size.png", "Classification accuracy by ROI size"),
+        ("Macro F1", "classification_f1_by_roi_size.png", "Classification F1 by ROI size"),
+    ):
+        fig, ax = plt.subplots(figsize=(8, 4.5))
+        ax.bar(summary["ROI size bin (px²)"], summary[column])
+        ax.set_title(title)
+        ax.set_xlabel("Equal-frequency ROI area bin")
+        ax.set_ylabel(column)
+        ax.set_ylim(0, 1)
+        ax.tick_params(axis="x", rotation=20)
+        for index, row in summary.iterrows():
+            ax.text(
+                index,
+                row[column],
+                f"n={int(row['Samples'])}",
+                ha="center",
+                va="bottom",
+                fontsize="small",
+            )
+        fig.tight_layout()
+        fig.savefig(figures / filename, dpi=180)
+        plt.close(fig)
+
+
+def _roi_area_px(shape: Any) -> int | None:
+    """Return source ROI area from an image shape, when its dimensions exist."""
+    try:
+        values = tuple(int(value) for value in shape)
+    except (TypeError, ValueError):
+        return None
+    if len(values) < 2 or values[0] < 1 or values[1] < 1:
+        return None
+    return values[0] * values[1]
+
+
 class ClassificationMetricAccumulator:
     def __init__(self, class_count: int, calibration_bins: int = 15):
         self.class_count = int(class_count)
@@ -146,6 +341,7 @@ def evaluate_classification(
             "correct": bool(int(true_value) == int(pred_value)),
             "confidence": float(np.max(probs)),
             "metadata": row.get("metadata", {}),
+            "roi_area_px": _roi_area_px(row.get("original_shape")),
         }
         for row, true_value, pred_value, probs in zip(
             records, y, predicted, probabilities, strict=False
@@ -220,6 +416,7 @@ def evaluate_classification_streaming(
                 "correct": bool(int(ref.target) == int(pred_value)),
                 "confidence": float(np.max(probs)),
                 "metadata": ref.record()["metadata"],
+                "roi_area_px": _roi_area_px(ref.record().get("original_shape")),
             }
         display.update(len(positions_array))
     display.close()

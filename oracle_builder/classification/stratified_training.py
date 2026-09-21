@@ -471,6 +471,48 @@ def _initial_recovery(config: dict[str, Any], run_id: str) -> dict[str, Any]:
     }
 
 
+def _recovered_children(
+    state: dict[str, Any],
+    config: dict[str, Any],
+    run_path: Path,
+    indices: dict[str, SQLiteSplitIndex],
+) -> dict[int, StratifiedChildResult]:
+    """Rebuild manifest entries for strata completed before a resume.
+
+    Recovery stores progress rather than the public bundle manifest.  The
+    controller can legitimately skip an already-completed supra-epoch block,
+    so these entries must be available before the first in-progress manifest
+    is written again.
+    """
+    recovered_children = state.get("children", {})
+    if not isinstance(recovered_children, dict):
+        return {}
+    result: dict[int, StratifiedChildResult] = {}
+    for dimension in dimensions(config):
+        recovered = recovered_children.get(str(dimension), {})
+        if not isinstance(recovered, dict):
+            continue
+        completed_epochs = int(recovered.get("completed_epochs", 0))
+        if completed_epochs <= 0:
+            continue
+        child = child_config(config, dimension)
+        control = recovered.get("control", {})
+        if not isinstance(control, dict):
+            control = {}
+        child_dir = run_path / "model" / "strata" / str(dimension)
+        result[dimension] = StratifiedChildResult(
+            dimension=dimension,
+            batch_size=int(control.get("effective_batch_size", child["data"]["batch_size"])),
+            completed_epochs=completed_epochs,
+            stopped_early=bool(control.get("stopped_early", False)),
+            model_path="model/shared/final.keras",
+            summary_path=(child_dir / "model_summary.txt").relative_to(run_path).as_posix(),
+            history_path=_history_path(child_dir).relative_to(run_path).as_posix(),
+            canonical_counts=_canonical_counts(indices, config, dimension),
+        )
+    return result
+
+
 def _save_recovery_model(
     model: keras.Model,
     run_dir: Path,
@@ -681,7 +723,28 @@ def train_stratified_models(
         flush=True,
     )
     state = resume_state or _initial_recovery(config, run_id)
-    children: dict[int, StratifiedChildResult] = {}
+    children = _recovered_children(state, config, run_path, indices)
+    if children:
+        message = (
+            "Restored completed stratified children from recovery: "
+            + ", ".join(
+                f"{dimension}x{dimension} (epoch {child.completed_epochs})"
+                for dimension, child in sorted(children.items())
+            )
+        )
+        print(message, flush=True)
+        log_event(
+            training_log,
+            run_id,
+            "INFO",
+            "Restored stratified children from recovery",
+            {
+                "children": {
+                    str(dimension): child.completed_epochs
+                    for dimension, child in sorted(children.items())
+                }
+            },
+        )
     cycle_control = dict(state.get("cycle_scheduler", {}))
     completed_cycles = {
         int(value) for value in cycle_control.get("completed_block_stops", [])

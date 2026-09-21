@@ -11,8 +11,37 @@ pytest.importorskip("sklearn")
 
 from oracle_builder.evaluation.classification import (
     ClassificationMetricAccumulator,
+    plot_classification_roi_size_metrics,
+    plot_classification_training_metrics,
     write_classification_evaluation,
 )
+
+
+def test_default_classification_plots_include_epoch_and_roi_size_metrics(tmp_path):
+    metrics_dir = tmp_path / "metrics"
+    metrics_dir.mkdir()
+    records = [
+        {"phase": "epoch_evaluation", "epoch": epoch, "split": "validation", "metric": metric, "value": value, **({"label": "copepod"} if metric in {"recall", "f1_score"} else {})}
+        for epoch, value in enumerate((0.5, 0.7))
+        for metric in ("accuracy", "weighted_recall", "top_3_accuracy", "macro_f1", "weighted_f1", "log_loss", "recall", "f1_score")
+    ]
+    (metrics_dir / "metrics.jsonl").write_text("\n".join(json.dumps(row) for row in records))
+    plot_classification_training_metrics(
+        {"loss": [1.0, 0.5], "val_loss": [1.2, 0.6], "macro_f1": [0.4, 0.6]},
+        tmp_path,
+    )
+    for filename in ("classification_accuracy_by_epoch.png", "classification_f1_by_epoch.png", "classification_loss_by_epoch.png"):
+        assert (tmp_path / "figures" / filename).exists()
+
+    evaluation_dir = tmp_path / "evaluation"
+    evaluation_dir.mkdir()
+    pd.DataFrame(
+        {"roi_area_px": [10, 20, 30, 40, 50], "y_true": [0, 0, 1, 1, 1], "y_pred": [0, 1, 1, 1, 0]}
+    ).to_csv(evaluation_dir / "sample_metrics.csv", index=False)
+    plot_classification_roi_size_metrics(tmp_path)
+    assert (evaluation_dir / "roi_size_metrics.csv").exists()
+    assert (tmp_path / "figures" / "classification_accuracy_by_roi_size.png").exists()
+    assert (tmp_path / "figures" / "classification_f1_by_roi_size.png").exists()
 
 
 def test_large_class_confusion_matrix_writes_scalable_outputs(tmp_path):
