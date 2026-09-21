@@ -7,6 +7,7 @@ from tensorflow.keras import layers
 
 from oracle_builder.classification.features import (
     classification_head, classifier_inputs, join_auxiliary_features,
+    classifier_normalization,
     stratum_conditioning_input,
 )
 
@@ -18,11 +19,26 @@ def build_model(config: dict[str, Any]):
 
     inputs, metadata = classifier_inputs(input_shape, config)
     stratum_dimension = stratum_conditioning_input(config)
-    x = layers.Conv2D(base, 3, padding="same", activation="relu")(inputs)
+    uses_group_norm = str(
+        config.get("classification", {}).get("stratification", {}).get(
+            "normalization", "batch"
+        )
+    ).lower() == "group"
+
+    def normalize(value, channels: int, name: str):
+        return classifier_normalization(config, channels, name)(value) if uses_group_norm else value
+
+    x = layers.Conv2D(base, 3, padding="same", use_bias=not uses_group_norm)(inputs)
+    x = normalize(x, base, "conv1_norm")
+    x = layers.Activation("relu")(x)
     x = layers.MaxPooling2D()(x)
-    x = layers.Conv2D(base * 2, 3, padding="same", activation="relu")(x)
+    x = layers.Conv2D(base * 2, 3, padding="same", use_bias=not uses_group_norm)(x)
+    x = normalize(x, base * 2, "conv2_norm")
+    x = layers.Activation("relu")(x)
     x = layers.MaxPooling2D()(x)
-    x = layers.Conv2D(base * 4, 3, padding="same", activation="relu")(x)
+    x = layers.Conv2D(base * 4, 3, padding="same", use_bias=not uses_group_norm)(x)
+    x = normalize(x, base * 4, "conv3_norm")
+    x = layers.Activation("relu")(x)
     x = layers.GlobalAveragePooling2D(name="global_pool")(x)
     x = join_auxiliary_features(x, metadata)
     outputs = classification_head(x, num_classes, config, dropout_default=0.2, stratum_dimension=stratum_dimension)

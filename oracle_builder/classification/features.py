@@ -14,6 +14,21 @@ DEFAULT_EMBEDDING_DIM = 256
 STRATUM_DIMENSION_INPUT_NAME = "stratum_dimension"
 
 
+def classifier_normalization(config: dict[str, Any], channels: int, name: str):
+    """Return the requested classifier normalization without batch-size drift."""
+    settings = config.get("classification", {}).get("stratification", {})
+    mode = str(settings.get("normalization", "batch")).lower()
+    if mode == "group":
+        requested = int(settings.get("group_norm_groups", 8))
+        groups = max(
+            group
+            for group in range(min(requested, int(channels)), 0, -1)
+            if int(channels) % group == 0
+        )
+        return layers.GroupNormalization(groups=groups, epsilon=1e-3, name=name)
+    return layers.BatchNormalization(momentum=0.99, epsilon=1e-3, name=name)
+
+
 @keras.utils.register_keras_serializable(package="oracle_builder")
 class L2Normalization(layers.Layer):
     """Normalize feature vectors, including a deterministic zero-vector fallback."""

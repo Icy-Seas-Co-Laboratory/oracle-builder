@@ -6,7 +6,8 @@ from tensorflow import keras
 from tensorflow.keras import layers
 
 from oracle_builder.classification.features import (
-    classification_head, classifier_inputs, join_auxiliary_features,
+    classification_head, classifier_inputs, classifier_normalization,
+    join_auxiliary_features,
     stratum_conditioning_input,
 )
 
@@ -18,8 +19,8 @@ DENSENET_VARIANTS = {
 }
 
 
-def _dense_layer(x, growth_rate: int, bottleneck_multiplier: int, dropout: float, name: str):
-    y = layers.BatchNormalization(name=f"{name}_bn1")(x)
+def _dense_layer(x, growth_rate: int, bottleneck_multiplier: int, dropout: float, name: str, config: dict[str, Any]):
+    y = classifier_normalization(config, int(x.shape[-1]), f"{name}_bn1")(x)
     y = layers.Activation("relu", name=f"{name}_relu1")(y)
     y = layers.Conv2D(
         growth_rate * bottleneck_multiplier,
@@ -28,7 +29,9 @@ def _dense_layer(x, growth_rate: int, bottleneck_multiplier: int, dropout: float
         use_bias=False,
         name=f"{name}_bottleneck",
     )(y)
-    y = layers.BatchNormalization(name=f"{name}_bn2")(y)
+    y = classifier_normalization(
+        config, growth_rate * bottleneck_multiplier, f"{name}_bn2"
+    )(y)
     y = layers.Activation("relu", name=f"{name}_relu2")(y)
     y = layers.Conv2D(growth_rate, 3, padding="same", use_bias=False, name=f"{name}_conv")(y)
     if dropout:
@@ -36,9 +39,9 @@ def _dense_layer(x, growth_rate: int, bottleneck_multiplier: int, dropout: float
     return layers.Concatenate(name=f"{name}_concat")([x, y])
 
 
-def _transition(x, compression: float, name: str):
+def _transition(x, compression: float, name: str, config: dict[str, Any]):
     filters = max(1, int(int(x.shape[-1]) * compression))
-    x = layers.BatchNormalization(name=f"{name}_bn")(x)
+    x = classifier_normalization(config, int(x.shape[-1]), f"{name}_bn")(x)
     x = layers.Activation("relu", name=f"{name}_relu")(x)
     x = layers.Conv2D(filters, 1, padding="same", use_bias=False, name=f"{name}_conv")(x)
     return layers.AveragePooling2D(2, strides=2, padding="same", name=f"{name}_pool")(x)
@@ -84,7 +87,7 @@ def build_model(config: dict[str, Any]):
         use_bias=False,
         name="stem_conv",
     )(inputs)
-    x = layers.BatchNormalization(name="stem_bn")(x)
+    x = classifier_normalization(config, initial_filters, "stem_bn")(x)
     x = layers.Activation("relu", name="stem_relu")(x)
     if stem_pool:
         x = layers.MaxPooling2D(3, strides=2, padding="same", name="stem_pool")(x)
@@ -96,10 +99,13 @@ def build_model(config: dict[str, Any]):
                 bottleneck_multiplier,
                 dropout,
                 name=f"dense{block_index + 1}_layer{layer_index + 1}",
+                config=config,
             )
         if block_index < len(block_config) - 1:
-            x = _transition(x, compression, name=f"transition{block_index + 1}")
-    x = layers.BatchNormalization(name="final_bn")(x)
+            x = _transition(
+                x, compression, name=f"transition{block_index + 1}", config=config
+            )
+    x = classifier_normalization(config, int(x.shape[-1]), "final_bn")(x)
     x = layers.Activation("relu", name="final_relu")(x)
     x = layers.GlobalAveragePooling2D(name="global_pool")(x)
     x = join_auxiliary_features(x, metadata)

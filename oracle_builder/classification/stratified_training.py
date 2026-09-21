@@ -397,6 +397,7 @@ def _train_interleaved_epoch(
     datasets: dict[int, tf.data.Dataset],
     *,
     steps_per_turn: int = 1,
+    on_batch_end=None,
 ) -> dict[int, dict[str, float]]:
     """Run one finite, round-robin update pass over resolution batches.
 
@@ -410,6 +411,7 @@ def _train_interleaved_epoch(
     totals: dict[int, dict[str, float]] = {dimension: {} for dimension in datasets}
     counts: dict[int, int] = {dimension: 0 for dimension in datasets}
     active = list(sorted(iterators))
+    batch_index = 0
     while active:
         for dimension in list(active):
             for _ in range(steps_per_turn):
@@ -423,6 +425,9 @@ def _train_interleaved_epoch(
                 # per-stratum history a true sample-weighted batch summary.
                 model.reset_metrics()
                 values = model.train_on_batch(*batch, return_dict=True)
+                if on_batch_end is not None:
+                    on_batch_end(batch_index, values)
+                batch_index += 1
                 inputs = batch[0]
                 if isinstance(inputs, dict):
                     first = next(iter(inputs.values()))
@@ -822,6 +827,18 @@ def train_stratified_models(
 
     interleaved_step_mode = str(settings(config).get("schedule", "interleaved_steps")) == "interleaved_steps"
     round_logs: dict[int, dict[int, dict[str, float]]] = {}
+    interleaved_status = None
+    if interleaved_step_mode:
+        interleaved_status = RichTrainingStatusCallback(
+            phase="Stratified shared model · interleaved resolutions",
+            epochs=total_epochs,
+            display=str(config.get("training", {}).get("display", "rich")),
+            training_log=training_log,
+            run_id=run_id,
+        )
+        interleaved_status.set_model(model)
+        interleaved_status.set_params({"epochs": total_epochs, "steps": None})
+        interleaved_status.on_train_begin()
     # Each child remains resident for a supra-epoch block, avoiding a model
     # reload and graph rebuild for every individual parent epoch.
     for block_start, block_stop, dimension in supra_epoch_schedule(config, total_epochs):
@@ -953,12 +970,14 @@ def train_stratified_models(
                     for name, values in epoch_history.history.items()
                     if values
                 }
-            elif selected.refs:
+            elif interleaved_step_mode:
                 # Build every finite stratum dataset once, then alternate one
                 # optimizer update per dimension until all are exhausted.
                 # This is the shared-model schedule; individual model.fit
                 # calls above remain the legacy contiguous implementation.
                 if dimension == dimensions(config)[0]:
+                    if interleaved_status is not None:
+                        interleaved_status.on_epoch_begin(epoch)
                     round_datasets: dict[int, tf.data.Dataset] = {}
                     for round_dimension in dimensions(config):
                         round_child = child_config(config, round_dimension)
@@ -981,9 +1000,34 @@ def train_stratified_models(
                         steps_per_turn=int(
                             settings(config).get("steps_per_stratum", 1)
                         ),
+                        on_batch_end=(
+                            interleaved_status.on_train_batch_end
+                            if interleaved_status is not None
+                            else None
+                        ),
                     )
+                    if interleaved_status is not None:
+                        values = round_logs[epoch]
+                        aggregate_logs = {
+                            name: float(
+                                sum(row.get(name, 0.0) for row in values.values())
+                                / len(values)
+                            )
+                            for name in {
+                                metric for row in values.values() for metric in row
+                            }
+                        }
+                        interleaved_status.on_epoch_end(epoch, aggregate_logs)
                 logs = round_logs.get(epoch, {}).get(dimension, {})
                 _append_history(history, {name: [value] for name, value in logs.items()})
+                if not selected.refs:
+                    log_event(
+                        training_log,
+                        run_id,
+                        "WARNING",
+                        "No samples routed to resolution stratum for epoch",
+                        {"dimension": dimension, "epoch": epoch + 1},
+                    )
             else:
                 logs = {}
                 log_event(
@@ -1223,6 +1267,8 @@ def train_stratified_models(
         # the next stratum is trained.
 
     shared_dir = run_path / "model" / "shared"
+    if interleaved_status is not None:
+        interleaved_status.on_train_end()
     shared_dir.mkdir(parents=True, exist_ok=True)
     if cycle_control.get("stopped_early") and (shared_dir / "best.weights.h5").exists():
         model.load_weights(shared_dir / "best.weights.h5")

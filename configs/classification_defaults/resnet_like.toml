@@ -81,10 +81,9 @@ schedule = "interleaved_steps"
 steps_per_stratum = 1
 # A global interleaved epoch completes before validation/checkpoint selection.
 supra_epochs = 1
-# GroupNorm remains stable when high-resolution microbatches are small. The
-# canonical ResNet builder supports it; other family examples retain batch
-# normalization until their builders gain an equivalent implementation.
-normalization = "batch"
+# GroupNorm remains stable when high-resolution microbatches are small and is
+# implemented consistently by every bundled classifier family.
+normalization = "group"
 group_norm_groups = 8
 
 [classification.stratification.conditioning]

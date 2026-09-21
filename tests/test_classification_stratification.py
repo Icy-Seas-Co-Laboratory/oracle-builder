@@ -99,11 +99,15 @@ def test_interleaved_epoch_round_robins_resolution_batches():
         )).batch(1)
 
     model = FakeModel()
+    reported_batches = []
     metrics = _train_interleaved_epoch(
-        model, {32: dataset(32, 2), 64: dataset(64, 3)}
+        model,
+        {32: dataset(32, 2), 64: dataset(64, 3)},
+        on_batch_end=lambda batch, logs: reported_batches.append((batch, logs["loss"])),
     )
 
     assert model.order == [32, 64, 32, 64, 64]
+    assert reported_batches == [(0, 32.0), (1, 64.0), (2, 32.0), (3, 64.0), (4, 64.0)]
     assert metrics[32]["loss"] == 32.0
     assert metrics[64]["loss"] == 64.0
 

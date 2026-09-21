@@ -6,7 +6,13 @@ from typing import Any
 from tensorflow import keras
 from tensorflow.keras import layers
 
-from oracle_builder.classification.features import classification_head, classifier_inputs, join_auxiliary_features
+from oracle_builder.classification.features import (
+    classification_head,
+    classifier_inputs,
+    classifier_normalization,
+    join_auxiliary_features,
+    stratum_conditioning_input,
+)
 
 
 EFFICIENTNET_VARIANTS = {
@@ -42,7 +48,7 @@ def _round_repeats(repeats: int, depth: float) -> int:
     return int(math.ceil(repeats * depth))
 
 
-def _mbconv(x, output_filters, expansion, kernel, stride, se_ratio, name):
+def _mbconv(x, output_filters, expansion, kernel, stride, se_ratio, name, config):
     input_filters = int(x.shape[-1])
     expanded_filters = input_filters * expansion
     shortcut = x
@@ -50,12 +56,16 @@ def _mbconv(x, output_filters, expansion, kernel, stride, se_ratio, name):
         x = layers.Conv2D(
             expanded_filters, 1, padding="same", use_bias=False, name=f"{name}_expand"
         )(x)
-        x = layers.BatchNormalization(name=f"{name}_expand_bn")(x)
+        x = classifier_normalization(
+            config, expanded_filters, f"{name}_expand_bn"
+        )(x)
         x = layers.Activation("swish", name=f"{name}_expand_activation")(x)
     x = layers.DepthwiseConv2D(
         kernel, strides=stride, padding="same", use_bias=False, name=f"{name}_depthwise"
     )(x)
-    x = layers.BatchNormalization(name=f"{name}_depthwise_bn")(x)
+    x = classifier_normalization(
+        config, expanded_filters, f"{name}_depthwise_bn"
+    )(x)
     x = layers.Activation("swish", name=f"{name}_depthwise_activation")(x)
     if se_ratio > 0:
         reduced_filters = max(1, int(input_filters * se_ratio))
@@ -66,7 +76,7 @@ def _mbconv(x, output_filters, expansion, kernel, stride, se_ratio, name):
     x = layers.Conv2D(
         output_filters, 1, padding="same", use_bias=False, name=f"{name}_project"
     )(x)
-    x = layers.BatchNormalization(name=f"{name}_project_bn")(x)
+    x = classifier_normalization(config, output_filters, f"{name}_project_bn")(x)
     if stride == 1 and input_filters == output_filters:
         x = layers.Add(name=f"{name}_add")([x, shortcut])
     return x
@@ -107,6 +117,7 @@ def build_model(config: dict[str, Any]):
         raise ValueError("model.se_ratio must be in [0, 1]")
 
     inputs, metadata = classifier_inputs(tuple(config["data"]["input_shape"]), config)
+    stratum_dimension = stratum_conditioning_input(config)
     x = layers.Conv2D(
         stem_filters,
         stem_kernel,
@@ -115,7 +126,7 @@ def build_model(config: dict[str, Any]):
         use_bias=False,
         name="stem_conv",
     )(inputs)
-    x = layers.BatchNormalization(name="stem_bn")(x)
+    x = classifier_normalization(config, stem_filters, "stem_bn")(x)
     x = layers.Activation("swish", name="stem_activation")(x)
     for stage, (expansion, kernel, stride, _in_filters, out_filters, repeats) in enumerate(BLOCKS):
         output_filters = _round_filters(out_filters, width)
@@ -128,9 +139,10 @@ def build_model(config: dict[str, Any]):
                 stride if index == 0 else 1,
                 se_ratio,
                 name=f"stage{stage + 1}_block{index + 1}",
+                config=config,
             )
     x = layers.Conv2D(top_filters, 1, padding="same", use_bias=False, name="top_conv")(x)
-    x = layers.BatchNormalization(name="top_bn")(x)
+    x = classifier_normalization(config, top_filters, "top_bn")(x)
     x = layers.Activation("swish", name="top_activation")(x)
     x = layers.GlobalAveragePooling2D(name="global_pool")(x)
     x = join_auxiliary_features(x, metadata)
@@ -139,5 +151,15 @@ def build_model(config: dict[str, Any]):
         int(config["data"]["num_classes"]),
         config,
         dropout_default=default_dropout,
+        stratum_dimension=stratum_dimension,
     )
-    return keras.Model([inputs, metadata] if metadata is not None else inputs, outputs, name=variant)
+    model_inputs = [inputs]
+    if metadata is not None:
+        model_inputs.append(metadata)
+    if stratum_dimension is not None:
+        model_inputs.append(stratum_dimension)
+    return keras.Model(
+        model_inputs if len(model_inputs) > 1 else inputs,
+        outputs,
+        name=variant,
+    )

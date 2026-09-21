@@ -92,9 +92,7 @@ def test_family_defaults_include_the_safe_shared_stratified_recipe(family):
     assert settings["dimensions"] == [32, 64, 128]
     assert settings["schedule"] == "interleaved_steps"
     assert settings["supra_epochs"] == 1
-    assert settings["normalization"] == (
-        "group" if family == "resnet" else "batch"
-    )
+    assert settings["normalization"] == "group"
     assert settings["group_norm_groups"] == 8
     assert settings["conditioning"] == {"enabled": True, "embedding_dim": 16}
     assert settings["training_routing"]["enabled"] is False

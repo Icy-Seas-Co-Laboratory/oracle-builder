@@ -6,7 +6,8 @@ from tensorflow import keras
 from tensorflow.keras import layers
 
 from oracle_builder.classification.features import (
-    classification_head, classifier_inputs, join_auxiliary_features,
+    classification_head, classifier_inputs, classifier_normalization,
+    join_auxiliary_features,
     stratum_conditioning_input,
 )
 
@@ -22,26 +23,11 @@ RESNET_VARIANTS = {
 # ROI classification commonly uses small batches.  Retain moving statistics
 # more conservatively than the ImageNet-style 0.9 setting so validation and
 # inference do not track an individual mini-batch too closely.
-_BATCH_NORM_MOMENTUM = 0.99
-_BATCH_NORM_EPSILON = 1e-3
 _KERNEL_INITIALIZER = "he_normal"
 
 
 def _normalization(config: dict[str, Any], name: str, channels: int):
-    settings = config.get("classification", {}).get("stratification", {})
-    mode = str(settings.get("normalization", "batch")).lower()
-    if mode == "group":
-        requested_groups = int(settings.get("group_norm_groups", 8))
-        # Keras requires groups to divide channels. Preserve the requested
-        # upper bound while making small test/custom backbones usable.
-        groups = max(
-            group for group in range(min(requested_groups, int(channels)), 0, -1)
-            if int(channels) % group == 0
-        )
-        return layers.GroupNormalization(groups=groups, epsilon=_BATCH_NORM_EPSILON, name=name)
-    return layers.BatchNormalization(
-        momentum=_BATCH_NORM_MOMENTUM, epsilon=_BATCH_NORM_EPSILON, name=name
-    )
+    return classifier_normalization(config, channels, name)
 
 
 def _conv_bn(x, filters, kernel_size, config, stride=1, activation=True, name="conv"):

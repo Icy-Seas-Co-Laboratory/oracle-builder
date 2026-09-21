@@ -39,20 +39,10 @@ def validate(config: dict[str, Any]) -> None:
         groups = settings(config).get("group_norm_groups", 8)
         if isinstance(groups, bool) or not isinstance(groups, int) or groups < 1:
             raise ValueError("classification.stratification.group_norm_groups must be a positive integer")
-        architecture = str(config.get("run", {}).get("model", "")).lower()
-        if architecture not in {"resnet", *[f"resnet{n}" for n in (18, 34, 50, 101, 152)]}:
-            raise ValueError("Group normalization is currently supported for ResNet classifiers only")
     conditioning = settings(config).get("conditioning", {})
     if not isinstance(conditioning, dict):
         raise ValueError("classification.stratification.conditioning must be a table")
     if conditioning.get("enabled", False):
-        architecture = str(config.get("run", {}).get("model", "")).lower()
-        if architecture not in {
-            "simple_cnn", "resnet", "densenet",
-            *[f"resnet{n}" for n in (18, 34, 50, 101, 152)],
-            *[f"densenet{n}" for n in (121, 169, 201)],
-        }:
-            raise ValueError("Stratum conditioning is currently supported for simple CNN, ResNet, and DenseNet classifiers only")
         embedding_dim = conditioning.get("embedding_dim", 16)
         if isinstance(embedding_dim, bool) or not isinstance(embedding_dim, int) or embedding_dim < 1:
             raise ValueError(

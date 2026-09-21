@@ -78,7 +78,9 @@ def test_schedule_completes_every_stratum_before_advancing_parent_epoch():
 
 def test_supra_epoch_schedule_keeps_each_child_active_for_the_configured_block():
     config = _config()
-    config["classification"]["stratification"]["supra_epochs"] = 2
+    config["classification"]["stratification"].update(
+        {"schedule": "contiguous", "supra_epochs": 2}
+    )
     assert list(supra_epoch_schedule(config, 5)) == [
         (0, 2, 32), (0, 2, 64),
         (2, 4, 32), (2, 4, 64),

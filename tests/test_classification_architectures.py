@@ -135,6 +135,61 @@ def test_existing_classifiers_follow_feature_contract(model_name):
     np.testing.assert_allclose(np.linalg.norm(outputs["features"], axis=1), 1.0, atol=1e-5)
 
 
+@pytest.mark.parametrize(
+    ("model_name", "options"),
+    [
+        ("simple_cnn", {"base_filters": 4}),
+        ("resnet_like", {"base_filters": 4}),
+        ("densenet_like", {"base_filters": 4}),
+        ("resnet", {"base_filters": 4, "block_counts": [1, 1, 1, 1]}),
+        (
+            "densenet",
+            {
+                "growth_rate": 4,
+                "initial_filters": 8,
+                "block_config": [1, 1, 1, 1],
+                "stem_pool": False,
+            },
+        ),
+        (
+            "efficientnet",
+            {
+                "width_coefficient": 0.25,
+                "depth_coefficient": 0.25,
+                "stem_filters": 8,
+                "top_filters": 16,
+            },
+        ),
+    ],
+)
+def test_all_classifier_families_support_group_norm_and_stratum_conditioning(
+    model_name, options
+):
+    config = classification_config(model_name, options)
+    config["classification"] = {
+        "stratification": {
+            "enabled": True,
+            "dimensions": [32, 64, 128],
+            "normalization": "group",
+            "group_norm_groups": 8,
+            "conditioning": {"enabled": True, "embedding_dim": 4},
+        }
+    }
+
+    model = get_model_builder(model_name)(config)
+
+    assert any(layer.__class__.__name__ == "GroupNormalization" for layer in model.layers)
+    assert "stratum_dimension" in {tensor.name.split(":")[0] for tensor in model.inputs}
+    predictions = model(
+        {
+            "image": np.ones((2, 32, 32, 3), dtype="float32"),
+            "stratum_dimension": np.array([[32], [64]], dtype="int32"),
+        },
+        training=False,
+    )
+    assert predictions.shape == (2, 4)
+
+
 def test_embedding_normalization_can_be_disabled():
     config = classification_config(
         "simple_cnn",
