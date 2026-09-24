@@ -27,6 +27,7 @@ from oracle_builder.data.sqlite_dataset import create_synthetic_classification
 from oracle_builder.data.classification_import import build_parser, import_folders
 from oracle_builder.datasets.schema import set_dataset_lifecycle
 from oracle_data_contracts.artifacts.run import _fingerprint
+from oracle_data_contracts.datasets.schema import dataset_fingerprint
 
 
 def example_config(tmp_path: Path) -> dict:
@@ -106,6 +107,29 @@ def test_auto_split_manifest_honors_complete_source_partitions(tmp_path):
         "source_metadata_key": "source_partition",
     }
     assert manifest["counts"] == {"train": 1, "validation": 1, "test": 1}
+
+
+def test_split_manifest_reuses_a_verified_fingerprint_without_a_second_full_scan(tmp_path, monkeypatch):
+    database = tmp_path / "dataset.sqlite"
+    create_synthetic_classification(database, n=4, shape=(8, 8, 1), classes=2)
+    with sqlite3.connect(database) as connection:
+        expected = dataset_fingerprint(connection)
+
+    import oracle_data_contracts.artifacts.splits as split_module
+
+    monkeypatch.setattr(
+        split_module,
+        "dataset_fingerprint",
+        lambda _connection: (_ for _ in ()).throw(AssertionError("must reuse verified fingerprint")),
+    )
+    manifest = split_module.create_split_manifest(
+        tmp_path / "run",
+        database,
+        {"run": {"seed": 123}, "data": {}},
+        verified_dataset_fingerprint=expected,
+    )
+
+    assert manifest["dataset"]["fingerprint_sha256"] == expected
 
 
 def add_completed_run_files(run: Path) -> None:

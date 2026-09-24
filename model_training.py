@@ -228,6 +228,10 @@ def main() -> int:
         if not args.config or not args.input or not args.output:
             raise ValueError("New training requires --config, --input, and --output")
         run_dir = Path(args.runs_dir) / args.output
+        print(
+            "[startup] Resolving configuration and verifying frozen dataset identity...",
+            flush=True,
+        )
         config = resolve_config(args.config, args.input, run_dir)
     if not args.preflight and not args.dry_run and config["dataset"]["lifecycle"] != "frozen":
         raise ValueError(
@@ -266,6 +270,7 @@ def main() -> int:
     if args.overwrite and run_dir.exists() and not is_resume:
         shutil.rmtree(run_dir)
     if not is_resume:
+        print("[startup] Creating versioned run artifact...", flush=True)
         run_dir = create_run_dir(args.runs_dir, args.output)
         run_id = str(uuid.uuid4())
         config["run"]["run_id"] = run_id
@@ -277,7 +282,16 @@ def main() -> int:
             config=config,
             source_config=args.config,
         )
-        split_manifest = create_split_manifest(run_dir, args.input, config)
+        print(
+            "[startup] Creating immutable train/validation/test split manifest...",
+            flush=True,
+        )
+        split_manifest = create_split_manifest(
+            run_dir,
+            args.input,
+            config,
+            verified_dataset_fingerprint=config["dataset"]["fingerprint_sha256"],
+        )
         attach_split_manifest(config, split_manifest)
         config["artifact"] = {
             "artifact_id": manifest["artifact_id"],
@@ -288,7 +302,14 @@ def main() -> int:
     else:
         run_id = config["run"]["run_id"]
     layout = RunLayout(run_dir)
+    print("[startup] Inspecting TensorFlow environment and available devices...", flush=True)
     environment = write_environment(run_dir)
+    devices = environment.get("gpus", [])
+    print(
+        "[startup] TensorFlow ready: "
+        + (f"GPU device(s): {', '.join(devices)}" if devices else "no GPU devices detected"),
+        flush=True,
+    )
     training_log = layout.training_log
     from oracle_builder.training.logging_callbacks import init_training_log, log_event, mark_run_complete
 
@@ -315,6 +336,7 @@ def main() -> int:
         )
 
     try:
+        print("[startup] Loading training components and preparing datasets...", flush=True)
         from oracle_builder.data.sqlite_dataset import load_arrays, load_prediction_arrays, make_tf_datasets
         from oracle_builder.evaluation.predictions import write_predictions_db
         from oracle_builder.evaluation.reports import evaluate_run_model
@@ -328,6 +350,7 @@ def main() -> int:
             config["run"]["task"] == "classification"
             and config.get("data", {}).get("streaming", {}).get("enabled", True)
         ):
+            print("[startup] Building streaming dataset indexes...", flush=True)
             from oracle_builder.data.sqlite_stream import (
                 build_classification_index,
                 make_streaming_classification_bundle,

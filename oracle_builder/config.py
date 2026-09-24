@@ -875,14 +875,20 @@ def resolve_config(config_path: str | Path, input_path: str | Path, run_dir: str
         if fitted:
             resolved.setdefault("model", {})["auxiliary_features_fitted"] = fitted
     from oracle_builder.datasets.schema import (
-        dataset_fingerprint,
         read_dataset_info,
         validate_database,
     )
 
     with sqlite3.connect(Path(input_path).expanduser()) as connection:
         dataset_info = read_dataset_info(connection)
-        dataset_report = validate_database(connection)
+        # Training accepts frozen checkpoints only. Their full binary payload
+        # checksums were validated as part of checkpoint creation, while the
+        # semantic fingerprint below is freshly computed for this run. Avoid a
+        # second, multi-gigabyte blob scan before every training invocation.
+        dataset_report = validate_database(
+            connection,
+            verify_payload_checksums=dataset_info["lifecycle"] != "frozen",
+        )
         if not dataset_report["valid"]:
             raise ValueError(
                 "Dataset validation failed: " + "; ".join(dataset_report["errors"])
@@ -906,7 +912,7 @@ def resolve_config(config_path: str | Path, input_path: str | Path, run_dir: str
             "schema_version": dataset_info["schema_version"],
             "version": dataset_info.get("version"),
             "lifecycle": dataset_info["lifecycle"],
-            "fingerprint_sha256": dataset_fingerprint(connection),
+            "fingerprint_sha256": dataset_report["fingerprint"],
         }
         imaging = dataset_info.get("metadata", {}).get("imaging", {})
         if not isinstance(imaging, dict):

@@ -114,6 +114,8 @@ def create_split_manifest(
     run_dir: str | Path,
     sqlite_path: str | Path,
     config: dict[str, Any],
+    *,
+    verified_dataset_fingerprint: str | None = None,
 ) -> dict[str, Any]:
     """Create the immutable dataset-item assignment protocol for one model run."""
     data = config["data"]
@@ -131,7 +133,11 @@ def create_split_manifest(
         raise ValueError("data.split_strategy must be auto, random, or source_partitions")
     with sqlite3.connect(Path(sqlite_path).expanduser().resolve()) as connection:
         info = read_dataset_info(connection)
-        fingerprint = dataset_fingerprint(connection)
+        # The training launcher has already validated its immutable checkpoint
+        # and calculated this canonical identity. Reuse that exact value rather
+        # than serializing every dataset row a second time before training can
+        # begin. Other callers retain the standalone verification behavior.
+        fingerprint = verified_dataset_fingerprint or dataset_fingerprint(connection)
         item_rows = [
             (str(row[0]), row[1])
             for row in connection.execute(

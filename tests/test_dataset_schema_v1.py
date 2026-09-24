@@ -64,6 +64,20 @@ def test_validation_reports_missing_use_case_table_instead_of_crashing():
     )
 
 
+def test_validation_can_skip_expensive_payload_checksums_for_a_frozen_consumer(tmp_path: Path):
+    database = tmp_path / "dataset.sqlite"
+    create_synthetic_classification(database, n=2, shape=(8, 8, 1), classes=2)
+    with sqlite3.connect(database) as connection:
+        connection.execute("UPDATE assets SET payload = X'00' WHERE rowid = 1")
+        connection.commit()
+
+        assert validate_database(connection, verify_payload_checksums=False)["valid"]
+        report = validate_database(connection)
+
+    assert not report["valid"]
+    assert any("checksum mismatch" in error for error in report["errors"])
+
+
 def test_checkpoint_is_frozen_and_source_remains_working(tmp_path: Path):
     source = tmp_path / "working.sqlite"
     create_synthetic_classification(source, n=4, shape=(8, 8, 1), classes=2)

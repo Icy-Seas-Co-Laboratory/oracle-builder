@@ -1438,7 +1438,19 @@ def workspace_fingerprint(connection: sqlite3.Connection) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def validate_database(connection: sqlite3.Connection) -> dict[str, Any]:
+def validate_database(
+    connection: sqlite3.Connection,
+    *,
+    verify_payload_checksums: bool = True,
+) -> dict[str, Any]:
+    """Validate the database contract and, optionally, every binary payload.
+
+    A frozen checkpoint has SQLite triggers that prevent semantic edits.  Its
+    payload checksums have already been verified while producing the checkpoint,
+    so consumers that also record a fresh semantic fingerprint may safely skip
+    the expensive, repeated full-blob scan.  The default remains exhaustive for
+    import, checkpoint, and explicit validation workflows.
+    """
     errors: list[str] = []
     warnings: list[str] = []
     try:
@@ -1513,31 +1525,32 @@ def validate_database(connection: sqlite3.Connection) -> dict[str, Any]:
     integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
     if integrity != "ok":
         errors.append(f"SQLite integrity check failed: {integrity}")
-    for asset_id, expected, payload in connection.execute(
-        "SELECT asset_id, content_sha256, payload FROM assets WHERE payload IS NOT NULL"
-    ):
-        observed = hashlib.sha256(payload).hexdigest()
-        if observed != expected:
-            errors.append(
-                f"Asset {asset_id} checksum mismatch: expected {expected}, got {observed}"
-            )
-    for name, expected, raw_text in connection.execute(
-        "SELECT name, sha256, raw_text FROM metadata_documents WHERE raw_text IS NOT NULL"
-    ):
-        observed = hashlib.sha256(raw_text.encode("utf-8")).hexdigest()
-        if observed != expected:
-            errors.append(
-                f"Metadata document {name!r} checksum mismatch: "
-                f"expected {expected}, got {observed}"
-            )
-    for array_id, expected, payload in connection.execute(
-        "SELECT array_id, content_sha256, payload FROM evidence_arrays"
-    ):
-        observed = hashlib.sha256(payload).hexdigest()
-        if observed != expected:
-            errors.append(
-                f"Evidence array {array_id} checksum mismatch: expected {expected}, got {observed}"
-            )
+    if verify_payload_checksums:
+        for asset_id, expected, payload in connection.execute(
+            "SELECT asset_id, content_sha256, payload FROM assets WHERE payload IS NOT NULL"
+        ):
+            observed = hashlib.sha256(payload).hexdigest()
+            if observed != expected:
+                errors.append(
+                    f"Asset {asset_id} checksum mismatch: expected {expected}, got {observed}"
+                )
+        for name, expected, raw_text in connection.execute(
+            "SELECT name, sha256, raw_text FROM metadata_documents WHERE raw_text IS NOT NULL"
+        ):
+            observed = hashlib.sha256(raw_text.encode("utf-8")).hexdigest()
+            if observed != expected:
+                errors.append(
+                    f"Metadata document {name!r} checksum mismatch: "
+                    f"expected {expected}, got {observed}"
+                )
+        for array_id, expected, payload in connection.execute(
+            "SELECT array_id, content_sha256, payload FROM evidence_arrays"
+        ):
+            observed = hashlib.sha256(payload).hexdigest()
+            if observed != expected:
+                errors.append(
+                    f"Evidence array {array_id} checksum mismatch: expected {expected}, got {observed}"
+                )
     item_count = connection.execute("SELECT count(*) FROM dataset_items").fetchone()[0]
     if item_count == 0:
         warnings.append("Dataset contains no items")
