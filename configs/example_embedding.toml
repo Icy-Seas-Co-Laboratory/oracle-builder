@@ -7,6 +7,31 @@ model = "simple_cnn"
 seed = 123
 notes = "Self-supervised ROI representation model"
 
+# Embedding runs use the same V2 input/encoder/representation contract as
+# classification, but intentionally omit classifier and fusion components.
+[architecture]
+version = 2
+[input]
+channels = ["intensity"]
+[input.geometry]
+type = "preserve_aspect_pad"
+[encoder]
+family = "simple_cnn"
+variant = "simple_cnn"
+[stem]
+type = "native"
+[normalization]
+type = "batch"
+[pooling]
+type = "avg"
+[image_embedding.projection]
+type = "linear"
+output_dim = 256
+l2_normalize = true
+[metadata]
+fields = []
+scaling = "standard"
+
 [data]
 input_shape = [64, 64, 1]
 batch_size = 1024

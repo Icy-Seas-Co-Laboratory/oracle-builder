@@ -4,6 +4,10 @@ model = "residual_unet"
 seed = 123
 notes = "Example residual U-Net segmentation run"
 
+# V2 artifact schema; the native spatial decoder remains task-specific.
+[architecture]
+version = 2
+
 [data]
 input_shape = [256, 256, 3]
 output_shape = [256, 256, 1]

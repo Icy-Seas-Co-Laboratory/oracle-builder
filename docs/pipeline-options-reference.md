@@ -164,12 +164,31 @@ blend_mode = "hann"
 ### 1.2 Classification
 
 Classification predicts a dataset label and can preserve a serving embedding
-and nearest-neighbor evidence. Available native architectures are `simple_cnn`,
-`resnet_like`, `densenet_like`, `resnet`/`resnet18`…`resnet152`, `densenet`/
-`densenet121`/`169`/`201`, `efficientnet`/`efficientnet_b0`…`b7`, and native
-`efficientnet_v2`/`efficientnet_v2_b0`…`b3` plus `efficientnet_v2_s`/`m`/`l`.
-SimpleCNN is the fast baseline; ResNet is a dependable default; DenseNet trades
-more memory for feature reuse; EfficientNet targets accuracy per compute.
+and nearest-neighbor evidence. New classification and embedding TOMLs use the
+explicit V2 assembly contract: set `[architecture] version = 2`, then select
+an `[encoder]` family and variant.  Use the maintained
+[`configs/classification_defaults/`](../configs/classification_defaults/)
+catalog as the source of canonical family and per-variant presets.  The legacy
+`run.model`/`model.variant` builder keys remain in the resolved configuration
+for compatibility, but should not be the only architecture declaration in a
+new recipe.
+
+Available native architectures are `simple_cnn`, `resnet_like`, `densenet_like`,
+ResNet (`resnet18`…`resnet152`), DenseNet (`densenet121`…`densenet201`),
+EfficientNet (`efficientnet_b0`…`efficientnet_b7`), EfficientNetV2
+(`efficientnet_v2_b0`…`b3`, `efficientnet_v2_s`/`m`/`l`), ConvNeXt
+(`convnext_tiny`, `convnext_small`), and MobileNetV3 (`mobilenet_v3_small`,
+`mobilenet_v3_large`). SimpleCNN is the fast baseline; ResNet is a dependable
+default; DenseNet trades more memory for feature reuse; EfficientNet targets
+accuracy per compute; MobileNetV3 is a compact deployment-oriented choice.
+
+V2 then composes the encoder with `[normalization]`, `[pooling]`,
+`[image_embedding.projection]`, optional `[metadata]` and `[fusion]`, and a
+`[classifier]` head. Pooling accepts `avg`, `max`, `avg_max`, or `gem`; image
+projection accepts `identity`, `linear`, or `mlp`; fusion accepts `concat` or
+`projected`; and classifier heads are `linear`, `mlp`, `cosine`, or
+`prototype`. See [Composable model architecture V2](composable-model-architecture-v2.md)
+for the component contract, migration policy, and examples.
 
 All families accept `embedding_dim`, `normalize_embeddings`, and usually
 `dropout`; simple families expose `base_filters`. ResNet exposes `variant`,

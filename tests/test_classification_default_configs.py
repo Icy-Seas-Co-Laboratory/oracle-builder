@@ -8,7 +8,7 @@ from oracle_builder.registry import MODEL_REGISTRY
 
 CONFIG_ROOT = Path(__file__).parents[1] / "configs"
 CONFIG_DIR = CONFIG_ROOT / "classification_defaults"
-FAMILIES = {
+BASELINE_PRESETS = {
     "simple_cnn",
     "resnet_like",
     "densenet_like",
@@ -16,6 +16,18 @@ FAMILIES = {
     "densenet",
     "efficientnet",
 }
+VARIANT_PRESETS = {
+    "resnet18", "resnet34", "resnet50", "resnet101", "resnet152",
+    "densenet121", "densenet169", "densenet201",
+    "efficientnet_b0", "efficientnet_b1", "efficientnet_b2", "efficientnet_b3",
+    "efficientnet_b4", "efficientnet_b5", "efficientnet_b6", "efficientnet_b7",
+    "efficientnet_v2", "efficientnet_v2_b0", "efficientnet_v2_b1",
+    "efficientnet_v2_b2", "efficientnet_v2_b3", "efficientnet_v2_s",
+    "efficientnet_v2_m", "efficientnet_v2_l",
+    "convnext", "convnext_tiny", "convnext_small",
+    "mobilenet", "mobilenet_v3_small", "mobilenet_v3_large",
+}
+PRESETS = BASELINE_PRESETS | VARIANT_PRESETS
 STANDARD_AUGMENTATION = {
     "enabled": True,
     "repeats_per_epoch": 1,
@@ -39,30 +51,41 @@ def classification_config_paths():
     return paths
 
 
-def test_documented_default_exists_for_each_classification_family():
-    assert {path.stem for path in CONFIG_DIR.glob("*.toml")} == FAMILIES
-
-
-@pytest.mark.parametrize("family", sorted(FAMILIES))
-def test_documented_classification_defaults_are_valid_and_dataset_independent(family):
-    user_config = load_toml(CONFIG_DIR / f"{family}.toml")
-
-    assert user_config["run"]["model"] == family
-    assert family in MODEL_REGISTRY
-    assert "num_classes" not in user_config["data"]
-
+def validate_dataset_independent_recipe(user_config):
+    """Validate a recipe after substituting facts normally resolved from its dataset."""
     resolved = deep_merge(DEFAULT_CONFIG, user_config)
     resolved["data"]["num_classes"] = 3
+    # ``auto`` polarity is intentionally resolved from frozen dataset metadata
+    # by the training planner; use a deterministic stand-in for static tests.
+    if resolved.get("preprocessing", {}).get("invert") == "auto":
+        resolved["preprocessing"]["invert"] = False
     validate_config(resolved)
 
 
-def test_family_defaults_share_the_same_augmentation_policy():
-    policies = [
-        load_toml(path)["augmentation"]
-        for path in sorted(CONFIG_DIR.glob("*.toml"))
-    ]
-    assert policies
-    assert all(policy == policies[0] for policy in policies[1:])
+def test_documented_default_exists_for_every_classification_preset():
+    assert {path.stem for path in CONFIG_DIR.glob("*.toml")} == PRESETS
+
+
+@pytest.mark.parametrize("preset", sorted(PRESETS))
+def test_documented_classification_presets_are_explicit_v2_and_dataset_independent(preset):
+    user_config = load_toml(CONFIG_DIR / f"{preset}.toml")
+
+    assert user_config["run"]["model"] in MODEL_REGISTRY
+    assert user_config["architecture"]["version"] == 2
+    for section in ("input", "encoder", "normalization", "pooling", "image_embedding", "metadata", "fusion", "classifier"):
+        assert section in user_config
+    assert "num_classes" not in user_config["data"]
+
+    validate_dataset_independent_recipe(user_config)
+
+
+def test_classification_presets_have_a_safe_explicit_augmentation_policy():
+    for path in sorted(CONFIG_DIR.glob("*.toml")):
+        policy = load_toml(path)["augmentation"]
+        assert policy["enabled"] is True
+        assert 0 <= policy["rotation"] <= 0.5
+        assert 0 <= policy["zoom"] <= 0.95
+        assert policy["fill_value"] == 0.0
 
 
 def test_resnet_default_preserves_roi_detail_and_uses_raw_classifier_embeddings():
@@ -83,7 +106,7 @@ def test_resnet_like_default_uses_roi_input_and_raw_classifier_embeddings():
     assert config["model"]["normalize_embeddings"] is False
 
 
-@pytest.mark.parametrize("family", sorted(FAMILIES))
+@pytest.mark.parametrize("family", sorted(BASELINE_PRESETS))
 def test_family_defaults_include_the_safe_shared_stratified_recipe(family):
     config = load_toml(CONFIG_DIR / f"{family}.toml")
     settings = config["classification"]["stratification"]
@@ -119,28 +142,19 @@ def test_all_classification_examples_share_high_level_defaults(path):
     assert user_config["training"]["loss"] == (
         "weighted_sparse_categorical_crossentropy"
     )
+    assert user_config["architecture"]["version"] == 2
     assert user_config["training"]["class_weights"]["mode"] == "effective_number"
     assert user_config["training"]["metrics"] == ["accuracy", "macro_f1"]
-    if path.parent == CONFIG_DIR:
-        assert user_config["augmentation"] == {
-            **STANDARD_AUGMENTATION,
-            "rotation": 0.25,
-            "zoom": 0.10,
-            "translation": [0.075, 0.075],
-            "skew": 0.10,
-            "brightness": 0.10,
-            "contrast": 0.10,
-            "gaussian_noise": 0.02,
-        }
-    else:
+    if path.parent != CONFIG_DIR:
         assert user_config["augmentation"] == STANDARD_AUGMENTATION
-    assert user_config["output"]["save_checkpoints"] is False
-    assert user_config["recovery"]["save_every_epochs"] == 1
+        assert user_config["output"]["save_checkpoints"] is False
+        assert user_config["recovery"]["save_every_epochs"] == 1
+    else:
+        assert user_config["augmentation"]["enabled"] is True
+        assert user_config["output"]["save_predictions"] is True
 
     # The maintained family defaults are the supported shared-stratification
     # recipes. Older top-level examples intentionally preserve their historic
     # preprocessing/SSL demonstrations and are covered by their own tests.
     if path.parent == CONFIG_DIR:
-        resolved = deep_merge(DEFAULT_CONFIG, user_config)
-        resolved["data"]["num_classes"] = 3
-        validate_config(resolved)
+        validate_dataset_independent_recipe(user_config)

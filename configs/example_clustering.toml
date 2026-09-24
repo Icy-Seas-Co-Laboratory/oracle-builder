@@ -3,6 +3,9 @@
 # LEGACY compatibility configuration. New runs should use
 # configs/example_embedding.toml and let downstream consumers define clusters.
 
+# Deprecated legacy reference: clustering is intentionally not a runnable V2
+# task. Train an embedding model with example_embedding.toml, then create a
+# separately versioned clustering analysis from that artifact.
 [run]
 task = "clustering"
 model = "simple_cnn"

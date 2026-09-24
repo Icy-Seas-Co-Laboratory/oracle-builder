@@ -98,3 +98,38 @@ save_checkpoints = false
 save_predictions = true
 save_figures = true
 export_savedmodel = true
+# Explicit V2 component contract. The encoder remains native; its output is
+# pooled, projected, optionally fused with declared metadata, then classified.
+[architecture]
+version = 2
+[input]
+channels = ["intensity"]
+[input.geometry]
+type = "preserve_aspect_pad"
+[encoder]
+family = "resnet"
+variant = "resnet18"
+[stem]
+type = "native"
+[normalization]
+type = "batch"
+[pooling]
+type = "avg"
+[image_embedding.projection]
+type = "linear"
+output_dim = 256
+l2_normalize = false
+[metadata]
+fields = []
+scaling = "standard"
+[metadata.encoder]
+type = "direct"
+[metadata.augmentation]
+gaussian_variance = 0.0
+probability = 1.0
+apply_to = "continuous"
+fields = []
+[fusion]
+type = "concat"
+[classifier]
+type = "linear"

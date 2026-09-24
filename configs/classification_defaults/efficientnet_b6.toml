@@ -1,0 +1,90 @@
+# EfficientNet B6: very large compound-scaled encoder.
+# Standalone V2 preset. Dataset class count and label order come from the Oracle SQLite dataset.
+
+[run]
+task = "classification"
+model = "efficientnet_b6"
+seed = 123
+notes = "efficientnet_b6 V2 classification preset"
+
+[architecture]
+version = 2
+[input]
+channels = ["intensity"]
+[input.geometry]
+type = "preserve_aspect_pad"
+[encoder]
+family = "efficientnet"
+variant = "efficientnet_b6"
+[stem]
+type = "native"
+[data]
+input_shape = [128, 128]
+batch_size = 16
+shuffle_buffer = 512
+validation_split = 0.20
+test_split = 0.10
+[preprocessing]
+resize_mode = "fit_pad"
+normalization = "dtype"
+rescale = true
+invert = "auto"
+pad_value = 0.0
+interpolation = "bilinear"
+channel_mode = "grayscale"
+[model]
+variant = "efficientnet_b6"
+embedding_dim = 256
+dropout = 0.0
+[normalization]
+type = "batch"
+[pooling]
+type = "avg"
+[image_embedding.projection]
+type = "linear"
+output_dim = 256
+l2_normalize = false
+[metadata]
+fields = []
+scaling = "standard"
+[metadata.encoder]
+type = "direct"
+[metadata.augmentation]
+gaussian_variance = 0.0
+probability = 1.0
+apply_to = "continuous"
+fields = []
+[fusion]
+type = "concat"
+[classifier]
+type = "linear"
+[training]
+epochs = 50
+optimizer = "adam"
+learning_rate = 0.001
+loss = "weighted_sparse_categorical_crossentropy"
+metrics = ["accuracy", "macro_f1"]
+[augmentation]
+enabled = true
+repeats_per_epoch = 1
+invert = false # Light foreground on the standard dark canvas.
+rotation = 0.5
+zoom = 0.20
+translation = [0.15, 0.15]
+skew = 0.20
+flip_horizontal = true
+flip_vertical = true
+brightness = 0.20
+contrast = 0.20
+gaussian_noise = 0.05
+fill_value = 0.0
+[output]
+save_predictions = true
+save_figures = true
+export_savedmodel = true
+
+[training.class_weights]
+# Effective-number weighting is less volatile than inverse frequency for rare classes.
+mode = "effective_number"
+beta = 0.999
+normalize = true

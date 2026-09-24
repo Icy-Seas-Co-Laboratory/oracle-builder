@@ -4,6 +4,10 @@ model = "unet_plus_plus"
 seed = 123
 notes = "Example U-Net++ segmentation run"
 
+# V2 artifact schema; classifier components are not part of segmentation.
+[architecture]
+version = 2
+
 [data]
 input_shape = [128, 128, 3]
 output_shape = [128, 128, 1]

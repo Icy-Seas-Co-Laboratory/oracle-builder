@@ -293,7 +293,7 @@ def test_classification_default_configs_resolve(
     assert config["data"]["num_classes"] == 3
 
 
-def test_classification_default_configs_share_augmentation():
+def test_classification_default_configs_have_explicit_safe_augmentation():
     directory = (
         Path(__file__).parents[1]
         / "configs"
@@ -304,5 +304,10 @@ def test_classification_default_configs_share_augmentation():
         for path in sorted(directory.glob("*.toml"))
     ]
 
-    assert len(augmentations) == 6
-    assert all(value == augmentations[0] for value in augmentations[1:])
+    assert len(augmentations) == 36
+    for augmentation in augmentations:
+        assert augmentation["enabled"] is True
+        assert 0 <= augmentation["rotation"] <= 0.5
+        assert 0 <= augmentation["zoom"] <= 0.95
+        assert augmentation["translation"]
+        assert augmentation["fill_value"] == 0.0

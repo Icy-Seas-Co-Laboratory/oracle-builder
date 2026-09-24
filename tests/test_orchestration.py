@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from oracle_builder.orchestration.service import Orchestrator
+from oracle_builder.registry import MODEL_REGISTRY
 
 
 def _create_sealed_product(path, source_config, *, artifact_type="model_product", metrics=None, dataset_fingerprint=None, task="classification", detailed_evidence=False):
@@ -419,6 +420,50 @@ def test_model_catalog_tags_and_versioned_v2_drafts(tmp_path):
     assert orchestrator.validate_model_draft(draft["draft_id"])["valid"]
     revised = orchestrator.update_model_draft(draft["draft_id"], name="V2 baseline revised")
     assert revised["revision"] == 2
+
+
+@pytest.mark.parametrize(
+    ("architecture", "preset", "variant"),
+    [
+        ("resnet", "resnet18", "resnet18"), ("resnet18", "resnet18", "resnet18"),
+        ("resnet34", "resnet34", "resnet34"), ("resnet50", "resnet50", "resnet50"),
+        ("resnet101", "resnet101", "resnet101"), ("resnet152", "resnet152", "resnet152"),
+        ("densenet", "densenet121", "densenet121"), ("densenet121", "densenet121", "densenet121"),
+        ("densenet169", "densenet169", "densenet169"), ("densenet201", "densenet201", "densenet201"),
+        ("efficientnet", "efficientnet_b0", "efficientnet_b0"), ("efficientnet_b0", "efficientnet_b0", "efficientnet_b0"),
+        ("efficientnet_b7", "efficientnet_b7", "efficientnet_b7"),
+        ("efficientnet_v2", "efficientnet_v2_b0", "efficientnet_v2_b0"),
+        ("efficientnetv2", "efficientnet_v2_b0", "efficientnet_v2_b0"),
+        ("efficientnetv2_b3", "efficientnet_v2_b3", "efficientnet_v2_b3"),
+        ("efficientnet_v2_s", "efficientnet_v2_s", "efficientnet_v2_s"),
+        ("efficientnet_v2_m", "efficientnet_v2_m", "efficientnet_v2_m"),
+        ("efficientnet_v2_l", "efficientnet_v2_l", "efficientnet_v2_l"),
+        ("convnext", "convnext_tiny", "convnext_tiny"), ("convnext_small", "convnext_small", "convnext_small"),
+        ("mobilenet", "mobilenet_v3_small", "mobilenet_v3_small"), ("mobilenet_v3_large", "mobilenet_v3_large", "mobilenet_v3_large"),
+    ],
+)
+def test_model_setup_routes_families_and_aliases_to_explicit_v2_variant_presets(tmp_path, architecture, preset, variant):
+    orchestrator = Orchestrator(tmp_path / "orchestrator.sqlite", workspace_root=tmp_path)
+
+    setup = orchestrator.model_setup(architecture)
+
+    assert orchestrator._architecture_config_path(architecture).name == f"{preset}.toml"
+    assert setup["config"]["architecture"]["version"] == 2
+    assert setup["config"]["run"]["model"] == architecture
+    assert setup["config"]["model"]["variant"] == variant
+
+
+@pytest.mark.parametrize(
+    "architecture",
+    sorted(MODEL_REGISTRY),
+)
+def test_every_registered_architecture_has_a_setup_recipe(tmp_path, architecture):
+    orchestrator = Orchestrator(tmp_path / "orchestrator.sqlite", workspace_root=tmp_path)
+
+    setup = orchestrator.model_setup(architecture)
+
+    assert orchestrator._architecture_config_path(architecture).is_file()
+    assert setup["config"]["architecture"]["version"] == 2
 
 
 def test_configuration_schema_and_planning_derive_class_count_from_frozen_dataset(tmp_path):

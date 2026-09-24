@@ -4,6 +4,11 @@ model = "unet"
 seed = 123
 notes = "Example U-Net segmentation run"
 
+# V2 is recorded for a uniform run-artifact schema. Segmentation keeps its
+# native spatial decoder; classifier-only V2 components do not apply here.
+[architecture]
+version = 2
+
 [data]
 input_shape = [256, 256, 3]
 output_shape = [256, 256, 1]

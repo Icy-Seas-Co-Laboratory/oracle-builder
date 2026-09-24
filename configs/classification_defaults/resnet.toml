@@ -1,4 +1,4 @@
-# Oracle Builder V1 classification example: resnet
+# Oracle Builder V2 classification default: resnet
 # Configurable standard ResNet family with basic and bottleneck variants.
 #
 # This file is intentionally dataset-independent. Oracle Builder reads the
@@ -212,3 +212,38 @@ save_predictions = true
 save_figures = true
 export_savedmodel = true
 prediction_commit_batches = 20
+
+# V2 assembly record: the native ResNet encoder feeds these reusable components.
+[architecture]
+version = 2
+[input]
+channels = ["intensity"]
+[input.geometry]
+type = "preserve_aspect_pad"
+[encoder]
+family = "resnet"
+variant = "resnet18"
+[stem]
+type = "native"
+[normalization]
+type = "batch"
+[pooling]
+type = "avg"
+[image_embedding.projection]
+type = "linear"
+output_dim = 256
+l2_normalize = false
+[metadata]
+fields = [] # Add declared dataset metadata fields here; leave empty for image-only runs.
+scaling = "standard"
+[metadata.encoder]
+type = "direct"
+[metadata.augmentation]
+gaussian_variance = 0.0 # Training-only continuous-metadata regularization.
+probability = 1.0
+apply_to = "continuous"
+fields = []
+[fusion]
+type = "concat"
+[classifier]
+type = "linear"

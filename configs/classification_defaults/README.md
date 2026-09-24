@@ -1,51 +1,39 @@
-# Classification configuration defaults
+# V2 classification preset catalog
 
-These examples are dataset-agnostic: the training command supplies the SQLite
-dataset, and Oracle Builder infers the class count from its label vocabulary.
-Copy the closest example and change only the settings your experiment needs.
+Every TOML in this directory declares `[architecture] version = 2` and the
+same explicit input, encoder, pooling, image-embedding, metadata, fusion, and
+classifier contract. Dataset-specific facts—classes, labels, splits, and
+metadata values—are read from the selected Oracle SQLite training set.
 
-| Configuration | Best starting use |
-| --- | --- |
-| `simple_cnn.toml` | Fast pipeline/dataset validation and low-compute baseline |
-| `resnet_like.toml` | Small residual model when canonical ResNet is too large |
-| `densenet_like.toml` | Small dense-connectivity experiment |
-| `resnet.toml` | General-purpose canonical ResNet-18/34/50/101/152 |
-| `densenet.toml` | Canonical DenseNet-121/169/201 with strong feature reuse |
-| `efficientnet.toml` | EfficientNet B0-B7 and custom compound scaling |
+| Family | Family default | Concrete variant recipes |
+| --- | --- | --- |
+| Compact | `simple_cnn.toml` | `simple_cnn.toml` |
+| Shallow residual | `resnet_like.toml` | `resnet_like.toml` |
+| Shallow dense | `densenet_like.toml` | `densenet_like.toml` |
+| ResNet | `resnet.toml` | `resnet18`, `resnet34`, `resnet50`, `resnet101`, `resnet152` |
+| DenseNet | `densenet.toml` | `densenet121`, `densenet169`, `densenet201` |
+| EfficientNet | `efficientnet.toml` | `efficientnet_b0` through `efficientnet_b7` |
+| EfficientNetV2 | `efficientnet_v2.toml` (B0) | `efficientnet_v2_b0` through `efficientnet_v2_b3`, `efficientnet_v2_s`, `efficientnet_v2_m`, `efficientnet_v2_l` |
+| ConvNeXt | `convnext.toml` (Tiny) | `convnext_tiny`, `convnext_small` |
+| MobileNetV3 | `mobilenet.toml` (Small) | `mobilenet_v3_small`, `mobilenet_v3_large` |
 
-All examples intentionally use the same preprocessing and augmentation policy so
-family comparisons are controlled. They assume grayscale input and disable
-per-epoch checkpoints while still saving the final portable model. DenseNet may
-need a smaller batch size than the shared default because dense feature
-concatenation uses more activation memory.
+The family aliases above document their concrete default explicitly; use a
+concrete variant file for a durable, unambiguous run record. The V2 metadata
+noise setting is intentionally zero by default. Raise
+`metadata.augmentation.gaussian_variance` only for declared continuous
+metadata fields and only when training-time regularization is desired.
 
-Weighted sparse categorical cross entropy is the default. Class weights are
-calculated from the run-owned training split using:
+All recipes are dataset-agnostic: the training command supplies the SQLite
+dataset and records its inferred class order, split membership, and source
+identity in the run artifact. They share grayscale `fit_pad` preprocessing,
+effective-number class weighting, and a conservative geometry-safe
+augmentation policy so family comparisons remain controlled. DenseNet and the
+largest compound-scaled variants may need a smaller batch size because their
+activation memory is higher.
 
-```toml
-[training.class_weights]
-mode = "effective_number"
-beta = 0.999
-normalize = true
-```
-
-Choose `inverse_frequency` for stronger balancing. Use `explicit` only when
-domain knowledge supports hand-selected weights. To opt out of weighting, use
-`loss = "sparse_categorical_crossentropy"`.
-
-To enable self-supervised training, set `self_supervised.enabled = true`. Choose
-`byol` for the student-teacher approach without negative examples, or `simclr`
-for NT-Xent contrastive training. Both transfer the learned encoder into the
-selected classification family before supervised training.
-
-Each family config also includes disabled-by-default auxiliary metadata and a
-safe shared resolution-stratification recipe: canonical 32/64/128-pixel
-routing, interleaved per-stratum optimizer steps, GroupNorm, learned size
-conditioning, conservative augmentation, and equal-stratum macro-F1
-guardrails. Confirm split and class support in every stratum before setting
-`classification.stratification.enabled = true`; the recipe deliberately does
-not include 16 or 256 pixels. `data.batch_size` is the smallest-resolution
-microbatch baseline; `constant_input_tensor` derives larger-stratum batches by
-inverse image area. `distribution.strategy = "auto"` reserves one unused GPU
-for the run; use `strategy = "mirrored"` explicitly for synchronous multi-GPU
-training.
+`effective_number` class weighting is the standard imbalance policy; choose
+`inverse_frequency` for stronger balancing, `explicit` only for a reviewed
+hand-selected protocol, or `sparse_categorical_crossentropy` to opt out. The
+family defaults also retain their disabled-by-default resolution-stratification
+recipes. Enable them only after checking each configured stratum has adequate
+class and split support.
