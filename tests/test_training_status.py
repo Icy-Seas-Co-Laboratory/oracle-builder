@@ -81,12 +81,26 @@ def test_sparkline_and_direction_make_static_and_changing_metrics_visible():
     assert _trend([0.6, 0.5]) == "↘"
 
 
-def test_rich_board_shows_every_metric_with_alternating_metric_rows():
+def test_rich_board_prioritizes_live_and_completed_metrics_over_an_empty_metric_table():
     callback = RichTrainingStatusCallback(phase="SSL", epochs=1, display="off")
-    callback._metrics = {f"metric_{index}": float(index) for index in range(20)}
+    callback._batch_metrics = {"loss": 1.2, "accuracy": 0.7}
+    callback._latest_validation = {"val_loss": 1.3, "val_accuracy": 0.6}
+    callback._metrics = {"loss": 1.1, "val_loss": 1.3}
 
     board = callback._board()
-    metrics = board.renderable.renderables[1]
+    metrics = board.renderable.renderables[2]
 
-    assert len(metrics.rows) == 21  # Header plus every supplied metric.
+    assert len(metrics.rows) == 3
     assert metrics.row_styles == ["", "on grey15"]
+
+
+def test_status_exposes_post_epoch_analysis_progress():
+    callback = RichTrainingStatusCallback(phase="Classification", epochs=1, display="off")
+    callback.begin_post_epoch_analysis("train", total_batches=20)
+    callback.update_post_epoch_analysis(5)
+
+    assert "Post-epoch analysis" in callback._external_summary()
+    assert "5/20 batches" in callback._external_summary()
+
+    callback.end_post_epoch_analysis()
+    assert callback._external_summary() is None

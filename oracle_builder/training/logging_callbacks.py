@@ -274,24 +274,38 @@ class ClassificationEpochMetricsLogger(keras.callbacks.Callback):
         run_id: str,
         datasets: dict[str, Any],
         class_names: dict[int, str],
+        status_callback: Any | None = None,
     ):
         super().__init__()
         self.sqlite_path = sqlite_path
         self.run_id = run_id
         self.datasets = datasets
         self.class_names = class_names
+        self.status_callback = status_callback
 
     def on_epoch_end(self, epoch: int, logs=None):
         del logs
         for split, dataset in self.datasets.items():
             if split not in {"train", "validation"}:
                 continue
+            try:
+                total_batches = len(dataset)
+            except TypeError:
+                total_batches = None
+            if self.status_callback is not None:
+                self.status_callback.begin_post_epoch_analysis(split, total_batches)
             targets: list[int] = []
             probabilities: list[np.ndarray] = []
-            for batch in dataset:
+            for batch_index, batch in enumerate(dataset, start=1):
                 images, labels = batch[:2]
                 probabilities.append(np.asarray(self.model(images, training=False)))
                 targets.extend(int(value) for value in labels.numpy().reshape(-1))
+                if self.status_callback is not None and (
+                    batch_index == 1
+                    or batch_index % 25 == 0
+                    or batch_index == total_batches
+                ):
+                    self.status_callback.update_post_epoch_analysis(batch_index)
             if not targets:
                 continue
             for metric in classification_epoch_metric_records(
@@ -313,6 +327,8 @@ class ClassificationEpochMetricsLogger(keras.callbacks.Callback):
                         **metric,
                     },
                 )
+        if self.status_callback is not None:
+            self.status_callback.end_post_epoch_analysis()
 
 
 def history_from_training_log(path: str | Path, run_id: str) -> dict[str, list[float]]:

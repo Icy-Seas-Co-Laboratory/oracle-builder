@@ -21,15 +21,16 @@ def build_callbacks(
     artifact_id: str | None = None,
     classification_metric_datasets: dict[str, Any] | None = None,
 ):
+    status_callback = RichTrainingStatusCallback(
+        phase="Supervised training",
+        epochs=int(config.get("training", {}).get("epochs", 10)),
+        display=str(config.get("training", {}).get("display", "rich")),
+        training_log=training_log,
+        run_id=run_id,
+    )
     callbacks: list[keras.callbacks.Callback] = [
         SQLiteMetricLogger(training_log, run_id),
-        RichTrainingStatusCallback(
-            phase="Supervised training",
-            epochs=int(config.get("training", {}).get("epochs", 10)),
-            display=str(config.get("training", {}).get("display", "rich")),
-            training_log=training_log,
-            run_id=run_id,
-        ),
+        status_callback,
     ]
     if classification_metric_datasets is not None:
         labels = {
@@ -43,6 +44,7 @@ def build_callbacks(
                 run_id,
                 classification_metric_datasets,
                 labels,
+                status_callback,
             ),
         )
     callback_config = config.get("callbacks", {})

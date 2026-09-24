@@ -118,6 +118,12 @@ class RichTrainingStatusCallback(keras.callbacks.Callback):
         self._metrics: dict[str, float] = {}
         self._latest_validation: dict[str, float] = {}
         self._history: dict[str, list[float]] = {}
+        self._batch_metrics: dict[str, float] = {}
+        self._completed_batches = 0
+        self._external_phase: str | None = None
+        self._external_completed: int | None = None
+        self._external_total: int | None = None
+        self._external_started_at: float | None = None
         self._batch_status = "Preparing first batch"
 
     def _event(self, message: str, details: dict[str, Any]) -> None:
@@ -131,33 +137,105 @@ class RichTrainingStatusCallback(keras.callbacks.Callback):
         except (AttributeError, TypeError, ValueError):
             return None
 
+    def _timing_summary(self) -> str:
+        """Return useful live throughput without pretending batch logs are epoch metrics."""
+        elapsed = time.perf_counter() - (self._epoch_started_at or time.perf_counter())
+        if not self._completed_batches or elapsed <= 0:
+            return f"epoch elapsed {elapsed:.0f}s"
+        seconds_per_batch = elapsed / self._completed_batches
+        rate = self._completed_batches / elapsed
+        remaining = (
+            max(self._steps - self._completed_batches, 0) * seconds_per_batch
+            if self._steps not in (None, -1)
+            else None
+        )
+        rendered = f"{rate:.2f} batches/s · {seconds_per_batch:.2f}s/batch"
+        if remaining is not None:
+            rendered += f" · epoch ETA {remaining / 60:.1f}m"
+        return rendered
+
+    def _external_summary(self) -> str | None:
+        if self._external_phase is None:
+            return None
+        elapsed = time.perf_counter() - (self._external_started_at or time.perf_counter())
+        progress = ""
+        if self._external_completed is not None:
+            if self._external_total:
+                percent = self._external_completed / self._external_total * 100
+                progress = (
+                    f" · {self._external_completed:,}/{self._external_total:,} batches "
+                    f"({percent:.0f}%)"
+                )
+            else:
+                progress = f" · {self._external_completed:,} batches"
+        return (
+            "[bold yellow]Post-epoch analysis (no optimizer updates)[/bold yellow] "
+            f"· {self._external_phase}{progress} · {elapsed / 60:.1f}m elapsed"
+        )
+
+    def _refresh(self) -> None:
+        if self._interactive and self._live is not None:
+            self._live.update(self._board())
+
+    def begin_post_epoch_analysis(self, split: str, total_batches: int | None = None) -> None:
+        """Expose expensive non-training work performed by another callback."""
+        self._external_phase = f"rich metrics: {split}"
+        self._external_completed = 0
+        self._external_total = total_batches if total_batches and total_batches > 0 else None
+        self._external_started_at = time.perf_counter()
+        self._refresh()
+
+    def update_post_epoch_analysis(self, completed_batches: int) -> None:
+        if self._external_phase is None:
+            return
+        self._external_completed = max(0, int(completed_batches))
+        self._refresh()
+
+    def end_post_epoch_analysis(self) -> None:
+        self._external_phase = None
+        self._external_completed = None
+        self._external_total = None
+        self._external_started_at = None
+        self._refresh()
+
     def _board(self):
         total_epochs = self.epochs or self.params.get("epochs") or "?"
+        run_state = Table.grid(expand=True, padding=(0, 2))
+        run_state.add_column(ratio=1)
+        run_state.add_column(justify="right", ratio=1)
+        steps = (
+            f"{self._completed_batches:,}/{self._steps:,} batches"
+            if self._steps not in (None, -1)
+            else f"{self._completed_batches:,} batches"
+        )
+        run_state.add_row(
+            f"[bold]Epoch {self._epoch}/{total_epochs}[/bold] · {steps}",
+            f"[dim]{self._timing_summary()}[/dim]",
+        )
+
         metrics = Table.grid(expand=True, padding=(0, 2))
+        metrics.add_column(style="bold", width=23)
+        metrics.add_column(ratio=1)
         metrics.row_styles = ["", "on grey15"]
-        metrics.add_row("[bold]metric[/bold]", "[bold]current[/bold]", "[bold]history[/bold]")
-        for name, value in _ordered_metrics(self._metrics):
-            history = list(self._history.get(name, []))
-            if not history or history[-1] != value:
-                history.append(value)
-            sparkline = _sparkline(history)
-            direction = _trend(history)
-            metrics.add_row(
-                f"[bold]{name}[/bold]",
-                f"{value:.5g}",
-                f"{sparkline} {direction}".rstrip(),
-            )
+        live = _rendered_metrics(self._batch_metrics, limit=5) or "waiting for the first completed batch"
+        validation = _rendered_metrics(self._latest_validation, limit=5) or "not available until epoch 1 completes"
+        metrics.add_row("Train (running)", live)
+        metrics.add_row("Last validation", validation)
+        if any(not name.startswith("val_") for name in self._metrics):
+            completed = _rendered_metrics(self._metrics, limit=5)
+            metrics.add_row("Last completed epoch", completed)
         learning_rate = self._learning_rate()
         if learning_rate is not None:
-            metrics.add_row("[bold]learning rate[/bold]", f"{learning_rate:.3g}")
-        if not self._metrics:
-            metrics.add_row("status", self._batch_status)
-        subtitle = f"Epoch {self._epoch}/{total_epochs}"
+            metrics.add_row("Learning rate", f"{learning_rate:.3g}")
+        status = Table.grid(expand=True)
+        status.add_row(f"[dim]{self._batch_status}[/dim]")
+        external = self._external_summary()
+        if external:
+            status.add_row(external)
         run_label = f" · run {self.run_id[:8]}" if self.run_id else ""
         return Panel(
-            Group(self._progress, metrics),
+            Group(run_state, self._progress, metrics, status),
             title=f"[bold cyan]{self.phase}{run_label}[/bold cyan]",
-            subtitle=subtitle,
             border_style="cyan",
         )
 
@@ -187,6 +265,9 @@ class RichTrainingStatusCallback(keras.callbacks.Callback):
         # Keras reports validation metrics only at an epoch boundary. Keep the
         # latest values visible while the next epoch's training batches arrive.
         self._metrics = dict(self._latest_validation)
+        self._batch_metrics = {}
+        self._completed_batches = 0
+        self.end_post_epoch_analysis()
         self._batch_status = "Preparing first batch"
         self._epoch_started_at = time.perf_counter()
         details = {"phase": self.phase, "epoch": self._epoch, "epochs": self.epochs}
@@ -194,8 +275,7 @@ class RichTrainingStatusCallback(keras.callbacks.Callback):
         if self._interactive and self._progress is not None and self._batch_task is not None:
             total = self._steps if self._steps not in (None, -1) else None
             self._progress.update(self._batch_task, completed=0, total=total, description="Batches")
-            if self._live is not None:
-                self._live.update(self._board())
+            self._refresh()
         elif self.display == "text":
             print(f"[{self.phase}] epoch {self._epoch}/{self.epochs or '?'} started", file=self.stream, flush=True)
 
@@ -212,8 +292,7 @@ class RichTrainingStatusCallback(keras.callbacks.Callback):
                 "Training first optimizer update started",
                 {"phase": self.phase, "epoch": self._epoch, "batch": batch_number},
             )
-        if self._interactive and self._live is not None:
-            self._live.update(self._board())
+        self._refresh()
 
     def on_input_batch_loading(self, batch: int):
         """Report input-pipeline work before a manual training update starts."""
@@ -224,12 +303,16 @@ class RichTrainingStatusCallback(keras.callbacks.Callback):
                 "Training first batch loading",
                 {"phase": self.phase, "epoch": self._epoch, "batch": batch_number},
             )
-        if self._interactive and self._live is not None:
-            self._live.update(self._board())
+        self._refresh()
 
     def on_train_batch_end(self, batch: int, logs=None):
-        del logs
         batch_number = int(batch) + 1
+        self._completed_batches = batch_number
+        self._batch_metrics = {
+            name: value
+            for name, value in _numeric_metrics(logs).items()
+            if not name.startswith("val_") and name not in {"batch", "size"}
+        }
         self._batch_status = f"Completed batch {batch_number}"
         if batch_number == 1 or batch_number % 100 == 0:
             self._event(
@@ -238,8 +321,7 @@ class RichTrainingStatusCallback(keras.callbacks.Callback):
             )
         if self._interactive and self._progress is not None and self._batch_task is not None:
             self._progress.update(self._batch_task, completed=int(batch) + 1)
-            if self._live is not None:
-                self._live.update(self._board())
+            self._refresh()
 
     def on_epoch_end(self, epoch: int, logs=None):
         self._metrics = _numeric_metrics(logs)
@@ -257,8 +339,8 @@ class RichTrainingStatusCallback(keras.callbacks.Callback):
             "metrics": self._metrics,
         }
         self._event("Training epoch completed", details)
-        if self._interactive and self._live is not None:
-            self._live.update(self._board())
+        if self._interactive:
+            self._refresh()
         elif self.display != "off":
             rendered = _rendered_metrics(self._metrics, limit=8)
             lr = self._learning_rate()
