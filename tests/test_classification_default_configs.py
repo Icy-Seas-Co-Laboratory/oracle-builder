@@ -74,6 +74,20 @@ def test_documented_classification_presets_are_explicit_v2_and_dataset_independe
     assert user_config["architecture"]["version"] == 2
     for section in ("input", "encoder", "normalization", "pooling", "image_embedding", "metadata", "fusion", "classifier"):
         assert section in user_config
+    stem = user_config["stem"]
+    assert stem["type"] == "native"
+    assert int(stem["kernel_size"]) >= 1
+    assert int(stem["stride"]) >= 1
+    assert stem["pool"] in {"none", "max", "avg"}
+    streaming = user_config["data"]["streaming"]
+    assert streaming["enabled"] is True
+    assert streaming["reader_workers"] >= 1
+    assert streaming["prefetch_batches"] >= 1
+    assert streaming["sqlite_cache_kib"] >= 1
+    distribution = user_config["distribution"]
+    assert distribution["strategy"] == "single"
+    assert distribution["devices"] == []
+    assert distribution["memory_growth"] is True
     assert "num_classes" not in user_config["data"]
 
     validate_dataset_independent_recipe(user_config)
@@ -143,8 +157,11 @@ def test_all_classification_examples_share_high_level_defaults(path):
         "weighted_sparse_categorical_crossentropy"
     )
     assert user_config["architecture"]["version"] == 2
+    assert {"type", "kernel_size", "stride", "pool"} <= set(user_config["stem"])
     assert user_config["training"]["class_weights"]["mode"] == "effective_number"
     assert user_config["training"]["metrics"] == ["accuracy", "macro_f1"]
+    assert user_config["data"]["streaming"]["enabled"] is True
+    assert user_config["distribution"]["strategy"] == "single"
     if path.parent != CONFIG_DIR:
         assert user_config["augmentation"] == STANDARD_AUGMENTATION
         assert user_config["output"]["save_checkpoints"] is False

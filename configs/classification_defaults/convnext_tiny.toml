@@ -18,6 +18,9 @@ family = "convnext"
 variant = "convnext_tiny"
 [stem]
 type = "native"
+kernel_size = 4
+stride = 4
+pool = "none"
 [data]
 input_shape = [128, 128]
 batch_size = 16
@@ -88,3 +91,26 @@ export_savedmodel = true
 mode = "effective_number"
 beta = 0.999
 normalize = true
+
+# Bounded SQLite data pipeline: decode only active examples and prefetch a
+# small number of batches rather than retaining image tensors in memory.
+[data.streaming]
+enabled = true
+reader_workers = 4
+prefetch_batches = 2
+deterministic = true
+sqlite_cache_kib = 65536
+
+# One-device execution. An empty device list uses one visible GPU when
+# present (and falls back to CPU if none is visible).
+[distribution]
+strategy = "single"
+devices = []
+cross_device_ops = "auto"
+fallback_to_single = true
+memory_growth = true
+gpu_selection = "unused_first"
+require_unused_gpu = false
+allow_busy_fallback = false
+gpu_light_share_memory_mb = 1024
+gpu_light_share_utilization_percent = 15

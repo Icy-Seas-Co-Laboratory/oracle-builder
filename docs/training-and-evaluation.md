@@ -115,8 +115,9 @@ fallback_to_single = true
 memory_growth = true
 ```
 
-When more than one GPU is visible, `auto` selects `MirroredStrategy`. Batch size
-is global and must divide evenly across replicas.
+`auto` leases one suitable visible GPU. Use `single` to use the first requested
+or visible device deterministically, and `mirrored` only when a multi-GPU run is
+intended; its global batch size must divide evenly across replicas.
 
 ## Evaluate and infer
 

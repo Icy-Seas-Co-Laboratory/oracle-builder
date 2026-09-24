@@ -45,13 +45,17 @@ percentile_low = 1.0
 percentile_high = 99.0
 
 [distribution]
-# auto uses MirroredStrategy when multiple GPUs are visible, otherwise one
-# device. Global data.batch_size must divide sensibly across all replicas.
-strategy = "auto"
+# One-device policy: use a visible GPU when available, otherwise CPU.
+strategy = "single"
 devices = []
 cross_device_ops = "auto"
 fallback_to_single = true
 memory_growth = true
+gpu_selection = "unused_first"
+require_unused_gpu = false
+allow_busy_fallback = false
+gpu_light_share_memory_mb = 1024
+gpu_light_share_utilization_percent = 15
 
 [model]
 # Valid variants: densenet121, densenet169, densenet201.
@@ -225,6 +229,9 @@ family = "densenet"
 variant = "densenet121"
 [stem]
 type = "native"
+kernel_size = 7
+stride = 2
+pool = "max"
 [normalization]
 type = "batch"
 [pooling]
