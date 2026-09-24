@@ -45,6 +45,35 @@ loss = "sparse_categorical_crossentropy"
     assert config["paths"]["run_dir"] == str(run_dir.resolve())
 
 
+def test_v2_center_roi_pad_geometry_resolves_to_center_pad(tmp_path: Path):
+    config_path = tmp_path / "config.toml"
+    input_path = tmp_path / "data.sqlite"
+    create_synthetic_classification(input_path, n=4, shape=(16, 16, 1), classes=2)
+    freeze(input_path)
+    config_path.write_text(
+        """
+[run]
+task = "classification"
+model = "simple_cnn"
+
+[architecture]
+version = 2
+
+[input.geometry]
+type = "center_roi_pad"
+
+[data]
+input_shape = [16, 16, 1]
+
+[training]
+loss = "sparse_categorical_crossentropy"
+"""
+    )
+    config = resolve_config(config_path, input_path, tmp_path / "run")
+    assert config["preprocessing"]["resize_mode"] == "center_pad"
+    assert config["preprocessing"]["pad_anchor"] == "center"
+
+
 def test_resolve_config_derives_classification_channels_from_two_dimensional_shape(tmp_path: Path):
     config_path = tmp_path / "config.toml"
     input_path = tmp_path / "data.sqlite"

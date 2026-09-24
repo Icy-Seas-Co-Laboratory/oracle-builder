@@ -19,6 +19,43 @@ CREATE TABLE IF NOT EXISTS artifacts (
   discovered_at TEXT NOT NULL, updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS artifacts_dataset_idx ON artifacts(dataset_id);
+-- UI-owned annotations deliberately live outside sealed artifact manifests.
+CREATE TABLE IF NOT EXISTS artifact_tags (
+  tag_id TEXT PRIMARY KEY, name TEXT NOT NULL COLLATE NOCASE UNIQUE,
+  color TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS artifact_tag_assignments (
+  artifact_id TEXT NOT NULL REFERENCES artifacts(artifact_id) ON DELETE CASCADE,
+  tag_id TEXT NOT NULL REFERENCES artifact_tags(tag_id) ON DELETE CASCADE,
+  created_at TEXT NOT NULL, PRIMARY KEY (artifact_id, tag_id)
+);
+CREATE INDEX IF NOT EXISTS artifact_tag_assignments_tag_idx ON artifact_tag_assignments(tag_id);
+-- Denormalized facts make catalog filtering predictable without mutating runs.
+CREATE TABLE IF NOT EXISTS artifact_facts (
+  artifact_id TEXT PRIMARY KEY REFERENCES artifacts(artifact_id) ON DELETE CASCADE,
+  training_set TEXT, classifier_type TEXT, stem_size INTEGER,
+  macro_f1 REAL, loss REAL, training_seconds REAL, facts_json TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS artifact_facts_macro_f1_idx ON artifact_facts(macro_f1);
+CREATE INDEX IF NOT EXISTS artifact_facts_classifier_idx ON artifact_facts(classifier_type);
+CREATE TABLE IF NOT EXISTS model_drafts (
+  draft_id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT NOT NULL,
+  source_artifact_id TEXT REFERENCES artifacts(artifact_id) ON DELETE SET NULL,
+  revision INTEGER NOT NULL, config_json TEXT NOT NULL, layout_json TEXT NOT NULL,
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS model_draft_revisions (
+  draft_id TEXT NOT NULL REFERENCES model_drafts(draft_id) ON DELETE CASCADE,
+  revision INTEGER NOT NULL, config_json TEXT NOT NULL, layout_json TEXT NOT NULL,
+  created_at TEXT NOT NULL, PRIMARY KEY (draft_id, revision)
+);
+CREATE TABLE IF NOT EXISTS training_catalog_entries (
+  catalog_id TEXT PRIMARY KEY, root_id TEXT NOT NULL, name TEXT NOT NULL,
+  path TEXT NOT NULL, source_type TEXT NOT NULL, fingerprint_sha256 TEXT,
+  metadata_json TEXT NOT NULL, scanned_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS training_catalog_entries_root_idx ON training_catalog_entries(root_id);
 CREATE TABLE IF NOT EXISTS recipes (
   recipe_id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT NOT NULL,
   config_path TEXT NOT NULL, config_sha256 TEXT NOT NULL,

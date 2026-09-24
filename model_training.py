@@ -363,7 +363,10 @@ def main() -> int:
                 + json.dumps(summaries, indent=2, sort_keys=True),
                 flush=True,
             )
-        if config["run"]["task"] == "classification":
+        if (
+            config["run"]["task"] == "classification"
+            and config.get("output", {}).get("intermediate_artifacts", {}).get("enabled", True)
+        ):
             from oracle_builder.training.class_weights import (
                 resolve_class_weights,
                 uses_weighted_cross_entropy,
@@ -689,6 +692,53 @@ def main() -> int:
             )
         with post_progress.stage("Saving portable model formats and manifests"):
             save_report = save_model_artifacts(model, run_dir, config)
+        representation_artifacts = None
+        if config["run"]["task"] == "classification":
+            with post_progress.stage("Writing memory-bounded representation artifacts"):
+                from oracle_builder.artifacts.representations import (
+                    write_representation_artifacts,
+                )
+                from oracle_builder.data.sqlite_stream import (
+                    SQLiteClassificationSource,
+                    build_classification_index,
+                )
+
+                artifact_settings = config.get("output", {}).get(
+                    "intermediate_artifacts", {}
+                )
+                requested_split = str(artifact_settings.get("split", "test"))
+                cache_index = build_classification_index(
+                    args.input, config, requested_split, labeled_only=False
+                )
+                if not cache_index.refs:
+                    # Small datasets can lack a test split; retain a useful,
+                    # explicit fallback rather than silently writing nothing.
+                    cache_index = build_classification_index(
+                        args.input, config, "validation", labeled_only=False
+                    )
+                if not cache_index.refs:
+                    cache_index = build_classification_index(
+                        args.input, config, "train", labeled_only=False
+                    )
+                if cache_index.refs:
+                    source = SQLiteClassificationSource(args.input, config)
+                    representation_artifacts = write_representation_artifacts(
+                        model,
+                        source.indexed_image_dataset(
+                            cache_index,
+                            batch_size=int(artifact_settings.get("batch_size", 256)),
+                        ),
+                        cache_index,
+                        config,
+                        run_dir,
+                    )
+                    log_event(
+                        training_log,
+                        run_id,
+                        "INFO",
+                        "Wrote representation artifacts",
+                        representation_artifacts,
+                    )
         with post_progress.stage("Reloading and testing saved model formats"):
             load_report = run_load_tests(run_dir, config, save_report)
             write_load_test_report(run_dir, load_report)
@@ -763,6 +813,8 @@ def main() -> int:
             "evaluation": evaluation.get("summary"),
             "inference_batching": inference_batch_plan.to_dict(),
         }
+        if representation_artifacts is not None:
+            summary["representation_artifacts"] = representation_artifacts
         if threshold_analysis is not None:
             summary["validation_threshold_analysis"] = {
                 key: value for key, value in threshold_analysis.items() if key != "curve"

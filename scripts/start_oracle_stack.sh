@@ -57,6 +57,18 @@ is_online() {
   curl --fail --silent --show-error "$1" >/dev/null 2>&1
 }
 
+has_startup_reconciliation() {
+  curl --fail --silent --show-error "$ORCHESTRATOR_URL/health/ready" | python3 -c '
+import json
+import sys
+try:
+    payload = json.load(sys.stdin)
+except json.JSONDecodeError:
+    raise SystemExit(1)
+raise SystemExit(0 if "startup_reconciliation" in payload else 1)
+'
+}
+
 stop_process() {
   local pid="$1"
   [[ -z "$pid" ]] && return 0
@@ -81,7 +93,7 @@ require_command uv
 require_command npm
 require_command curl
 require_command python3
-mkdir -p "$LOG_DIR" "$RUNTIME_DIR/artifacts"
+mkdir -p "$LOG_DIR" "$RUNTIME_DIR/artifacts" "$ROOT_DIR/runs" "$ROOT_DIR/datasets"
 
 # Reuse healthy development services. A port occupied by anything else remains
 # an error: it is unsafe to assume that an arbitrary process is Oracle Builder.
@@ -97,12 +109,12 @@ if is_online "$ORCHESTRATOR_URL/health/live"; then
   # A live endpoint alone is not enough: the GUI relies on the model setup
   # schema for architecture defaults and previews. Do not silently reuse an
   # older process that predates that API.
-  if is_online "$ORCHESTRATOR_URL/v1/model-setups/simple_cnn"; then
+  if is_online "$ORCHESTRATOR_URL/v1/model-setups/simple_cnn" && has_startup_reconciliation; then
     ORCHESTRATOR_RUNNING=1
     echo "Reusing oracle-orchestrator at $ORCHESTRATOR_URL"
   else
     echo "An older oracle-orchestrator is running at $ORCHESTRATOR_URL." >&2
-    echo "Restart it from this checkout so the model setup API is available, then run this script again." >&2
+    echo "Restart it from this checkout so model setup and startup reconciliation are available, then run this script again." >&2
     exit 1
   fi
 else
@@ -135,6 +147,8 @@ if [[ "$ORCHESTRATOR_RUNNING" == "0" ]]; then
       --database "$RUNTIME_DIR/orchestrator.sqlite" \
       --workspace-root "$ROOT_DIR" \
       --artifact-root "$RUNTIME_DIR/artifacts" \
+      --runs-root "$ROOT_DIR/runs" \
+      --datasets-root "$ROOT_DIR/datasets" \
       --oracle-serve "Local=${SERVE_URL}" \
       --host "$HOST" --port "$ORCHESTRATOR_PORT"
   ) >"$LOG_DIR/orchestrator.log" 2>&1 &

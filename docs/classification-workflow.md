@@ -281,7 +281,7 @@ python3 model_training.py \
 
 The class count, label order, and run-specific split assignments are resolved
 from the frozen database. Classification model families include simple CNN,
-ResNet, DenseNet, and EfficientNet variants. Every native classifier exposes
+ResNet, DenseNet, EfficientNet, and EfficientNetV2 variants. Every native classifier exposes
 probabilities, logits, and a fixed-size L2-normalized `features` embedding.
 
 To enable weighted loss and student–teacher/SimCLR self-supervised training, start with

@@ -118,6 +118,7 @@ class RichTrainingStatusCallback(keras.callbacks.Callback):
         self._metrics: dict[str, float] = {}
         self._latest_validation: dict[str, float] = {}
         self._history: dict[str, list[float]] = {}
+        self._batch_status = "Preparing first batch"
 
     def _event(self, message: str, details: dict[str, Any]) -> None:
         if self.training_log is not None and self.run_id is not None:
@@ -150,7 +151,7 @@ class RichTrainingStatusCallback(keras.callbacks.Callback):
         if learning_rate is not None:
             metrics.add_row("[bold]learning rate[/bold]", f"{learning_rate:.3g}")
         if not self._metrics:
-            metrics.add_row("status", "Waiting for first batch")
+            metrics.add_row("status", self._batch_status)
         subtitle = f"Epoch {self._epoch}/{total_epochs}"
         run_label = f" · run {self.run_id[:8]}" if self.run_id else ""
         return Panel(
@@ -186,6 +187,7 @@ class RichTrainingStatusCallback(keras.callbacks.Callback):
         # Keras reports validation metrics only at an epoch boundary. Keep the
         # latest values visible while the next epoch's training batches arrive.
         self._metrics = dict(self._latest_validation)
+        self._batch_status = "Preparing first batch"
         self._epoch_started_at = time.perf_counter()
         details = {"phase": self.phase, "epoch": self._epoch, "epochs": self.epochs}
         self._event("Training epoch started", details)
@@ -197,8 +199,43 @@ class RichTrainingStatusCallback(keras.callbacks.Callback):
         elif self.display == "text":
             print(f"[{self.phase}] epoch {self._epoch}/{self.epochs or '?'} started", file=self.stream, flush=True)
 
+    def on_train_batch_begin(self, batch: int, logs=None):
+        del logs
+        batch_number = int(batch) + 1
+        self._batch_status = (
+            "Computing first optimizer update (initial shape may compile)"
+            if batch_number == 1
+            else f"Computing batch {batch_number}"
+        )
+        if batch_number == 1:
+            self._event(
+                "Training first optimizer update started",
+                {"phase": self.phase, "epoch": self._epoch, "batch": batch_number},
+            )
+        if self._interactive and self._live is not None:
+            self._live.update(self._board())
+
+    def on_input_batch_loading(self, batch: int):
+        """Report input-pipeline work before a manual training update starts."""
+        batch_number = int(batch) + 1
+        self._batch_status = f"Loading batch {batch_number} from input pipeline"
+        if batch_number == 1:
+            self._event(
+                "Training first batch loading",
+                {"phase": self.phase, "epoch": self._epoch, "batch": batch_number},
+            )
+        if self._interactive and self._live is not None:
+            self._live.update(self._board())
+
     def on_train_batch_end(self, batch: int, logs=None):
         del logs
+        batch_number = int(batch) + 1
+        self._batch_status = f"Completed batch {batch_number}"
+        if batch_number == 1 or batch_number % 100 == 0:
+            self._event(
+                "Training batch progress",
+                {"phase": self.phase, "epoch": self._epoch, "batch": batch_number},
+            )
         if self._interactive and self._progress is not None and self._batch_task is not None:
             self._progress.update(self._batch_task, completed=int(batch) + 1)
             if self._live is not None:

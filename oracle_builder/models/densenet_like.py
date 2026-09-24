@@ -6,8 +6,9 @@ from tensorflow import keras
 from tensorflow.keras import layers
 
 from oracle_builder.classification.features import (
-    classification_head, classifier_inputs, classifier_normalization,
+    build_composable_classification_model, classification_head, classifier_inputs, classifier_normalization,
     join_auxiliary_features, stratum_conditioning_input,
+    uses_composable_graph,
 )
 
 
@@ -44,6 +45,11 @@ def build_model(config: dict[str, Any]):
     x = _dense_block(x, base // 2, 3, config, "dense2")
     x = _transition(x, base * 4, config, "transition2")
     x = _dense_block(x, base // 2, 3, config, "dense3")
+    if uses_composable_graph(config):
+        return build_composable_classification_model(
+            image=inputs, feature_map=x, metadata=metadata, num_classes=num_classes,
+            config=config, name="densenet_like", stratum_dimension=stratum_dimension,
+        )
     x = layers.GlobalAveragePooling2D(name="global_pool")(x)
     x = join_auxiliary_features(x, metadata)
     outputs = classification_head(

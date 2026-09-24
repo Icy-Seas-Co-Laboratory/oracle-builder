@@ -6,9 +6,9 @@ from tensorflow import keras
 from tensorflow.keras import layers
 
 from oracle_builder.classification.features import (
-    classification_head, classifier_inputs, join_auxiliary_features,
+    build_composable_classification_model, classification_head, classifier_inputs, join_auxiliary_features,
     classifier_normalization,
-    stratum_conditioning_input,
+    stratum_conditioning_input, uses_composable_graph,
 )
 
 
@@ -24,21 +24,30 @@ def build_model(config: dict[str, Any]):
             "normalization", "batch"
         )
     ).lower() == "group"
+    # V1 intentionally used un-normalized simple-CNN blocks unless resolution
+    # stratification requested GroupNorm. V2 makes normalization a component
+    # choice, so honor it without altering historical V1 graphs.
+    uses_configurable_norm = uses_group_norm or uses_composable_graph(config)
 
     def normalize(value, channels: int, name: str):
-        return classifier_normalization(config, channels, name)(value) if uses_group_norm else value
+        return classifier_normalization(config, channels, name)(value) if uses_configurable_norm else value
 
-    x = layers.Conv2D(base, 3, padding="same", use_bias=not uses_group_norm)(inputs)
+    x = layers.Conv2D(base, 3, padding="same", use_bias=not uses_configurable_norm)(inputs)
     x = normalize(x, base, "conv1_norm")
     x = layers.Activation("relu")(x)
     x = layers.MaxPooling2D()(x)
-    x = layers.Conv2D(base * 2, 3, padding="same", use_bias=not uses_group_norm)(x)
+    x = layers.Conv2D(base * 2, 3, padding="same", use_bias=not uses_configurable_norm)(x)
     x = normalize(x, base * 2, "conv2_norm")
     x = layers.Activation("relu")(x)
     x = layers.MaxPooling2D()(x)
-    x = layers.Conv2D(base * 4, 3, padding="same", use_bias=not uses_group_norm)(x)
+    x = layers.Conv2D(base * 4, 3, padding="same", use_bias=not uses_configurable_norm)(x)
     x = normalize(x, base * 4, "conv3_norm")
     x = layers.Activation("relu")(x)
+    if uses_composable_graph(config):
+        return build_composable_classification_model(
+            image=inputs, feature_map=x, metadata=metadata, num_classes=num_classes,
+            config=config, name="simple_cnn", stratum_dimension=stratum_dimension,
+        )
     x = layers.GlobalAveragePooling2D(name="global_pool")(x)
     x = join_auxiliary_features(x, metadata)
     outputs = classification_head(x, num_classes, config, dropout_default=0.2, stratum_dimension=stratum_dimension)

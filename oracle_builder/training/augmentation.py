@@ -5,10 +5,18 @@ from typing import Any
 
 import tensorflow as tf
 
+from oracle_builder.classification.metadata import gaussian_noise_indices
+from oracle_builder.data.channels import derive_channels_tensor, has_derived_channels
+
 
 def apply_training_augmentation(dataset, config: dict[str, Any]):
     augmentation = config.get("augmentation", {})
-    if not augmentation.get("enabled", False):
+    metadata_augmentation = config.get("metadata", {}).get("augmentation", {})
+    metadata_noise_enabled = bool(
+        isinstance(metadata_augmentation, dict)
+        and float(metadata_augmentation.get("gaussian_variance", 0.0)) > 0
+    )
+    if not augmentation.get("enabled", False) and not metadata_noise_enabled:
         return dataset
     element_spec = dataset.element_spec
     if isinstance(element_spec, (tuple, list)) and len(element_spec) == 3:
@@ -21,7 +29,12 @@ def apply_training_augmentation(dataset, config: dict[str, Any]):
 
 def augment_batch(x, y, config: dict[str, Any], sample_weight=None):
     augmentation = config.get("augmentation", {})
-    if not augmentation.get("enabled", False):
+    metadata_augmentation = config.get("metadata", {}).get("augmentation", {})
+    metadata_noise_enabled = bool(
+        isinstance(metadata_augmentation, dict)
+        and float(metadata_augmentation.get("gaussian_variance", 0.0)) > 0
+    )
+    if not augmentation.get("enabled", False) and not metadata_noise_enabled:
         if sample_weight is None:
             return x, y
         return x, y, sample_weight
@@ -29,8 +42,23 @@ def augment_batch(x, y, config: dict[str, Any], sample_weight=None):
     # dictionary. Geometric/photometric augmentation applies only to pixels;
     # ROI metadata describes the original item and must remain unchanged.
     auxiliary_inputs = x if isinstance(x, dict) else None
+    # Metadata regularization deliberately does not depend on image
+    # augmentation being enabled. It is training-only because this function is
+    # applied solely to the train dataset by both data loaders.
+    if not augmentation.get("enabled", False):
+        result_x = augment_metadata_inputs(auxiliary_inputs, config)
+        if sample_weight is not None:
+            return result_x if result_x is not None else x, y, sample_weight
+        return result_x if result_x is not None else x, y
     if auxiliary_inputs is not None:
         x = auxiliary_inputs["image"]
+    preprocessing = config.get("preprocessing", {})
+    # Materialized legacy datasets contain derived channels already.  Opt in to
+    # this policy to discard those stale features, augment intensity, then
+    # regenerate all requested channels from the augmented image.
+    derive_after_augmentation = bool(preprocessing.get("derive_after_augmentation", False)) and has_derived_channels(preprocessing)
+    if derive_after_augmentation:
+        x = x[..., :1]
     task = config["run"]["task"]
     x = tf.cast(x, tf.float32)
     y_dtype = y.dtype
@@ -62,6 +90,31 @@ def augment_batch(x, y, config: dict[str, Any], sample_weight=None):
                 fill_value=0.0 if config.get("tiling", {}).get("enabled", False) else 1.0,
                 )[..., 0]
 
+    crop_strength = float(augmentation.get("random_resized_crop", 0.0))
+    if crop_strength:
+        crop_boxes = build_random_resized_crop_boxes(x, crop_strength)
+        x = crop_input_channels(
+            x,
+            crop_boxes,
+            mask_channels=input_mask_channels(config, augmentation),
+            distance_channels=signed_distance_input_channels(config, augmentation),
+        )
+        if task == "segmentation":
+            y = apply_random_resized_crop(y, crop_boxes, interpolation="nearest")
+            y = tf.cast(y > 0.5, tf.float32)
+            if sample_weight is not None:
+                sample_weight = apply_random_resized_crop(
+                    sample_weight[..., None], crop_boxes, interpolation="bilinear"
+                )[..., 0]
+
+    if bool(augmentation.get("rotate_90", False)):
+        turns = random_right_angle_turns(x)
+        x = tf.image.rot90(x, turns)
+        if task == "segmentation":
+            y = tf.image.rot90(y, turns)
+            if sample_weight is not None:
+                sample_weight = tf.image.rot90(sample_weight[..., None], turns)[..., 0]
+
     if bool(augmentation.get("flip_horizontal", False)):
         do_flip = tf.random.uniform(()) < 0.5
         x = tf.cond(do_flip, lambda: tf.image.flip_left_right(x), lambda: x)
@@ -86,22 +139,55 @@ def augment_batch(x, y, config: dict[str, Any], sample_weight=None):
                 )
 
     x = apply_photometric_augmentation(x, config, augmentation)
+    if derive_after_augmentation:
+        x = derive_channels_tensor(x, preprocessing)
     result_x = (
         {**auxiliary_inputs, "image": x}
         if auxiliary_inputs is not None
         else x
     )
+    result_x = augment_metadata_inputs(result_x, config)
     if sample_weight is not None:
         return result_x, tf.cast(y, y_dtype), tf.cast(sample_weight, tf.float32)
     return result_x, tf.cast(y, y_dtype)
 
 
+def augment_metadata_inputs(inputs, config: dict[str, Any]):
+    """Add zero-mean Gaussian noise to selected *scaled* metadata columns."""
+    if not isinstance(inputs, dict) or "metadata" not in inputs:
+        return inputs
+    settings = config.get("metadata", {}).get("augmentation", {})
+    if not isinstance(settings, dict):
+        return inputs
+    variance = float(settings.get("gaussian_variance", 0.0))
+    probability = float(settings.get("probability", 1.0))
+    indices = gaussian_noise_indices(config)
+    if variance <= 0 or probability <= 0 or not indices:
+        return inputs
+    metadata = tf.cast(inputs["metadata"], tf.float32)
+    width = metadata.shape[-1]
+    if width is None:
+        raise ValueError("metadata Gaussian augmentation requires a known feature width")
+    if any(index >= int(width) for index in indices):
+        raise ValueError("metadata Gaussian augmentation index exceeds metadata input width")
+    eligible = tf.reduce_sum(
+        tf.one_hot(indices, depth=int(width), dtype=metadata.dtype), axis=0
+    )
+    noise = tf.random.normal(tf.shape(metadata), stddev=tf.sqrt(tf.cast(variance, metadata.dtype)))
+    apply = tf.cast(tf.random.uniform([tf.shape(metadata)[0], 1]) < probability, metadata.dtype)
+    return {**inputs, "metadata": metadata + noise * eligible[tf.newaxis, :] * apply}
+
+
 def build_random_affine_transforms(x, augmentation: dict[str, Any]):
     rotation = float(augmentation.get("rotation", 0.0))
     zoom = float(augmentation.get("zoom", 0.0))
+    zoom_x = augmentation.get("zoom_x", zoom)
+    zoom_y = augmentation.get("zoom_y", zoom)
+    zoom_x = zoom if zoom_x is None else float(zoom_x)
+    zoom_y = zoom if zoom_y is None else float(zoom_y)
     translation = augmentation.get("translation", 0.0)
     skew = float(augmentation.get("skew", augmentation.get("shear", 0.0)))
-    if not any((rotation, zoom, translation, skew)):
+    if not any((rotation, zoom_x, zoom_y, translation, skew)):
         return None
 
     batch = tf.shape(x)[0]
@@ -114,8 +200,10 @@ def build_random_affine_transforms(x, augmentation: dict[str, Any]):
     cos_a = tf.cos(angle)
     sin_a = tf.sin(angle)
 
-    zoom = min(max(zoom, 0.0), 0.95)
-    scale = tf.random.uniform([batch], 1.0 - zoom, 1.0 + zoom)
+    zoom_x = min(max(zoom_x, 0.0), 0.95)
+    zoom_y = min(max(zoom_y, 0.0), 0.95)
+    scale_x = tf.random.uniform([batch], 1.0 - zoom_x, 1.0 + zoom_x)
+    scale_y = tf.random.uniform([batch], 1.0 - zoom_y, 1.0 + zoom_y)
     shear_x = tf.random.uniform([batch], -skew, skew)
     shear_y = tf.zeros([batch], dtype=tf.float32)
     translate_y, translate_x = translation_fractions(translation)
@@ -134,7 +222,7 @@ def build_random_affine_transforms(x, augmentation: dict[str, Any]):
         tf.ones([batch]),
         tf.zeros([batch]),
     )
-    scale_matrix = matrix_from_values(scale, tf.zeros([batch]), tf.zeros([batch]), tf.zeros([batch]), scale, tf.zeros([batch]))
+    scale_matrix = matrix_from_values(scale_x, tf.zeros([batch]), tf.zeros([batch]), tf.zeros([batch]), scale_y, tf.zeros([batch]))
     forward = tf.linalg.matmul(move, tf.linalg.matmul(center, tf.linalg.matmul(rotate, tf.linalg.matmul(shear, tf.linalg.matmul(scale_matrix, uncenter)))))
     inverse = tf.linalg.inv(forward)
     return tf.stack(
@@ -150,6 +238,63 @@ def build_random_affine_transforms(x, augmentation: dict[str, Any]):
         ],
         axis=1,
     )
+
+
+def build_random_resized_crop_boxes(x, strength: float):
+    """Return one aspect-preserving random crop box per batch item.
+
+    A crop is resized back to the original geometry, which makes this safe for
+    batched training and keeps classification and segmentation paths aligned.
+    ``strength`` controls the smallest retained side fraction.
+    """
+    strength = float(strength)
+    if not 0 <= strength < 1:
+        raise ValueError("augmentation.random_resized_crop must be in [0, 1)")
+    batch = tf.shape(x)[0]
+    scale = tf.random.uniform([batch], 1.0 - strength, 1.0)
+    y0 = tf.random.uniform([batch], 0.0, 1.0) * (1.0 - scale)
+    x0 = tf.random.uniform([batch], 0.0, 1.0) * (1.0 - scale)
+    return tf.stack([y0, x0, y0 + scale, x0 + scale], axis=1)
+
+
+def apply_random_resized_crop(values, boxes, *, interpolation: str):
+    """Crop each batch member and resize to its original spatial shape."""
+    return tf.image.crop_and_resize(
+        tf.cast(values, tf.float32),
+        boxes,
+        tf.range(tf.shape(values)[0]),
+        tf.shape(values)[1:3],
+        method=interpolation,
+    )
+
+
+def crop_input_channels(x, boxes, *, mask_channels: list[int], distance_channels: list[int]):
+    """Crop image channels with the interpolation appropriate to their role."""
+    channel_count = x.shape[-1]
+    if channel_count is None:
+        raise ValueError("Input channel count must be known for geometric augmentation")
+    mask_set = set(mask_channels)
+    distance_set = set(distance_channels)
+    values = []
+    for index in range(int(channel_count)):
+        interpolation = "nearest" if index in mask_set else "bilinear"
+        # Signed distance fields are continuous, so they deliberately share
+        # bilinear interpolation with intensity and derived scalar channels.
+        if index in distance_set:
+            interpolation = "bilinear"
+        values.append(apply_random_resized_crop(x[..., index:index + 1], boxes, interpolation=interpolation))
+    return tf.concat(values, axis=-1)
+
+
+def random_right_angle_turns(x):
+    """Select a right-angle rotation without changing non-square tensor shape."""
+    height, width = x.shape[1], x.shape[2]
+    if height is not None and width is not None and height == width:
+        return tf.random.uniform((), minval=0, maxval=4, dtype=tf.int32)
+    # 180 degrees has the same geometry for any rectangular input.  Dynamic
+    # shapes use this conservative branch because tf.data requires static
+    # batch element shapes to remain compatible after mapping.
+    return 2 * tf.random.uniform((), minval=0, maxval=2, dtype=tf.int32)
 
 
 def translation_fractions(value: Any) -> tuple[float, float]:

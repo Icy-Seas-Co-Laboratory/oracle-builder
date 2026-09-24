@@ -9,7 +9,10 @@ of truth and may be re-ingested after recovery.
 ```bash
 oracle-orchestrator --database /oracle/control/orchestrator.sqlite \
   --workspace-root /oracle/workspace \
-  --artifact-root /oracle/artifacts \
+  --artifact-root /oracle/runtime-artifacts \
+  --runs-root /oracle/workspace/runs \
+  --datasets-root /oracle/workspace/datasets \
+  --training-catalog-root /oracle/training-sources \
   --oracle-serve Local=http://127.0.0.1:8100 --port 8110
 ```
 
@@ -44,14 +47,47 @@ immutable import specification with `POST /v1/model-imports`, then dispatch it
 through the same review gate. An optional registered dataset records provenance.
 
 The orchestrator owns output locations. For training it assigns
-`{artifact-root}/runs/{specification-id}` through `runs_dir` and `output`; for
-evaluations, imported products, and packages it assigns their corresponding
-subdirectories. UI clients may supply inputs and configuration references, but
-cannot choose arbitrary derived-artifact paths.
+`{runs-root}/{specification-id}` through `runs_dir` and `output`; for
+evaluations, imported products, upload staging, and packages it assigns
+subdirectories beneath `{artifact-root}`. UI clients may supply inputs and
+configuration references, but cannot choose arbitrary derived-artifact paths.
+
+When no roots are supplied, `{runs-root}` and `{datasets-root}` default to
+`{workspace-root}/runs` and `{workspace-root}/datasets`. On application startup
+the service safely scans the runs root for sealed artifacts and its dataset
+catalog roots for frozen Oracle SQLite revisions. Missing database records are
+registered; existing records are left intact. The resulting reconciliation
+summary is available from `GET /health/ready`.
 
 Training experiments create one immutable specification per selected recipe and
 seed. Every specification has a UUID, ordinal, generated configuration snapshot,
 configuration hash, and exact compute request.
+
+## Model workspace and training-source catalog
+
+`POST /v1/artifacts/catalog/query` provides paginated, server-side filtering
+and sorting of indexed artifacts. It exposes denormalized display facts such as
+training set, classifier, stem size, macro F1, loss, and training duration,
+while tags remain UI-owned annotations outside sealed artifacts. `POST
+/v1/artifact-tags/assign` applies tags to one or more selected models; `GET
+/v1/artifacts/{id}/architecture-view` derives a stable module graph from the
+resolved configuration.
+
+Model construction uses versioned drafts. Create, revise, validate, and clone
+them under `/v1/model-drafts`. `POST /v1/model-drafts/{id}:plan-training`
+validates the draft plus run-only overrides, records any initialization source,
+and writes an immutable TOML snapshot into the owned experiment directory.
+
+`--datasets-root` defaults to the project's `datasets` directory and is always
+included as a read-only source root. `--training-catalog-root` may be repeated
+to expose additional source directories. `POST /v1/training-catalog:scan`
+indexes only Oracle Builder SQLite dataset revisions; image folders are never
+treated as training sets and require an explicit conversion step. Catalog
+entries are grouped into training-set families and immutable revisions. Detail,
+comparison, lifecycle, and bounded JPEG preview endpoints let an operator
+assess a revision. Only frozen revisions can be selected for training; an
+operator may freeze a working revision explicitly with `POST
+/v1/training-catalog/{catalog_id}:freeze`.
 
 ## Results and comparisons
 

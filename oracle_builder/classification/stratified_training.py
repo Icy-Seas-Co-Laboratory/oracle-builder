@@ -397,6 +397,8 @@ def _train_interleaved_epoch(
     datasets: dict[int, tf.data.Dataset],
     *,
     steps_per_turn: int = 1,
+    on_batch_loading=None,
+    on_batch_begin=None,
     on_batch_end=None,
 ) -> dict[int, dict[str, float]]:
     """Run one finite, round-robin update pass over resolution batches.
@@ -415,6 +417,8 @@ def _train_interleaved_epoch(
     while active:
         for dimension in list(active):
             for _ in range(steps_per_turn):
+                if on_batch_loading is not None:
+                    on_batch_loading(batch_index)
                 try:
                     batch = next(iterators[dimension])
                 except StopIteration:
@@ -424,6 +428,8 @@ def _train_interleaved_epoch(
                 # accumulated from previous strata. Resetting here makes the
                 # per-stratum history a true sample-weighted batch summary.
                 model.reset_metrics()
+                if on_batch_begin is not None:
+                    on_batch_begin(batch_index)
                 values = model.train_on_batch(*batch, return_dict=True)
                 if on_batch_end is not None:
                     on_batch_end(batch_index, values)
@@ -999,6 +1005,16 @@ def train_stratified_models(
                         round_datasets,
                         steps_per_turn=int(
                             settings(config).get("steps_per_stratum", 1)
+                        ),
+                        on_batch_loading=(
+                            interleaved_status.on_input_batch_loading
+                            if interleaved_status is not None
+                            else None
+                        ),
+                        on_batch_begin=(
+                            interleaved_status.on_train_batch_begin
+                            if interleaved_status is not None
+                            else None
                         ),
                         on_batch_end=(
                             interleaved_status.on_train_batch_end

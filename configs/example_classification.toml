@@ -7,6 +7,17 @@ model = "simple_cnn"
 seed = 123
 notes = "Example classification run"
 
+# New runs use the composable graph by default. Keep this explicit in copied
+# experiment recipes so the architecture contract is visible at review time.
+[architecture]
+version = 2
+
+[input]
+channels = ["intensity"]
+
+[input.geometry]
+type = "preserve_aspect_pad"
+
 [data]
 # Classification defaults assume grayscale. Class count and split assignments
 # are inferred from the SQLite dataset and recorded in the run artifact.

@@ -4,6 +4,7 @@ import csv
 import hashlib
 import io
 import json
+import re
 import sqlite3
 import urllib.error
 import urllib.request
@@ -15,9 +16,9 @@ from typing import Any
 import numpy as np
 from PIL import Image
 
-from oracle_data_contracts.datasets import dataset_fingerprint, read_dataset_info
+from oracle_data_contracts.datasets import dataset_fingerprint, read_dataset_info, set_dataset_lifecycle
 from oracle_builder.data.decoders import decode_blob
-from oracle_builder.config import DEFAULT_CONFIG, deep_merge, load_toml
+from oracle_builder.config import DEFAULT_CONFIG, deep_merge, load_toml, validate_config
 from oracle_builder.orchestration.database import connect
 
 
@@ -33,7 +34,7 @@ def _row(row: sqlite3.Row | None) -> dict[str, Any] | None:
     if row is None:
         return None
     result = dict(row)
-    for key in ("metadata_json", "manifest_json", "plan_json", "parameters_json", "resources_json", "selection_json", "protocol_json", "summary_json", "validation_report_json", "readiness_json", "workers_json", "queue_json"):
+    for key in ("metadata_json", "manifest_json", "plan_json", "parameters_json", "resources_json", "selection_json", "protocol_json", "summary_json", "validation_report_json", "readiness_json", "workers_json", "queue_json", "facts_json", "config_json", "layout_json"):
         if key in result:
             raw = result.pop(key)
             result[key.removesuffix("_json")] = json.loads(raw) if raw is not None else None
@@ -48,7 +49,10 @@ class Orchestrator:
         database: str | Path,
         *,
         artifact_root: str | Path | None = None,
+        runs_root: str | Path | None = None,
+        datasets_root: str | Path | None = None,
         browse_roots: list[str | Path] | None = None,
+        training_catalog_roots: list[str | Path] | None = None,
         upload_limit_bytes: int = 10 * 1024 * 1024 * 1024,
         workspace_root: str | Path | None = None,
         compute_endpoints: list[tuple[str, str]] | None = None,
@@ -62,12 +66,32 @@ class Orchestrator:
         self.workspace_root = Path(workspace_root).expanduser().resolve() if workspace_root else Path.cwd().resolve()
         if not self.workspace_root.is_dir():
             raise NotADirectoryError(self.workspace_root)
+        # The control database and upload staging area are runtime concerns;
+        # ordinary Oracle Builder science products stay in the familiar project
+        # directories unless an operator chooses different roots explicitly.
+        self.runs_root = Path(runs_root).expanduser().resolve() if runs_root else self.workspace_root / "runs"
+        self.datasets_root = Path(datasets_root).expanduser().resolve() if datasets_root else self.workspace_root / "datasets"
+        self.runs_root.mkdir(parents=True, exist_ok=True)
+        self.datasets_root.mkdir(parents=True, exist_ok=True)
         self.browse_roots: dict[str, Path] = {"workspace": self.workspace_root, "artifacts": self.artifact_root}
         for index, root in enumerate(browse_roots or [], start=1):
             location = Path(root).expanduser().resolve()
             if not location.is_dir():
                 raise NotADirectoryError(location)
             self.browse_roots[f"root-{index}"] = location
+        for root_id, location in (("runs", self.runs_root), ("datasets", self.datasets_root)):
+            if not any(location.is_relative_to(allowed) for allowed in self.browse_roots.values()):
+                self.browse_roots[root_id] = location
+        configured_catalog_roots = [self.datasets_root, *(Path(root).expanduser().resolve() for root in training_catalog_roots or [])]
+        self.training_catalog_roots: dict[str, Path] = {}
+        for root in configured_catalog_roots:
+            location = Path(root).expanduser().resolve()
+            if not location.is_dir():
+                raise NotADirectoryError(location)
+            if location not in self.training_catalog_roots.values():
+                self.training_catalog_roots[f"catalog-{len(self.training_catalog_roots) + 1}"] = location
+            if not any(location.is_relative_to(allowed) for allowed in self.browse_roots.values()):
+                self.browse_roots[f"catalog-{len(self.browse_roots) + 1}"] = location
         with connect(self.database):
             pass
         for name, base_url in compute_endpoints or []:
@@ -103,6 +127,22 @@ class Orchestrator:
             "efficientnet_b5": root / "classification_defaults" / "efficientnet.toml",
             "efficientnet_b6": root / "classification_defaults" / "efficientnet.toml",
             "efficientnet_b7": root / "classification_defaults" / "efficientnet.toml",
+            "efficientnet_v2": root / "classification_defaults" / "efficientnet.toml",
+            "efficientnet_v2_b0": root / "classification_defaults" / "efficientnet.toml",
+            "efficientnet_v2_b1": root / "classification_defaults" / "efficientnet.toml",
+            "efficientnet_v2_b2": root / "classification_defaults" / "efficientnet.toml",
+            "efficientnet_v2_b3": root / "classification_defaults" / "efficientnet.toml",
+            "efficientnet_v2_s": root / "classification_defaults" / "efficientnet.toml",
+            "efficientnet_v2_m": root / "classification_defaults" / "efficientnet.toml",
+            "efficientnet_v2_l": root / "classification_defaults" / "efficientnet.toml",
+            "efficientnetv2": root / "classification_defaults" / "efficientnet.toml",
+            "efficientnetv2_b0": root / "classification_defaults" / "efficientnet.toml",
+            "efficientnetv2_b1": root / "classification_defaults" / "efficientnet.toml",
+            "efficientnetv2_b2": root / "classification_defaults" / "efficientnet.toml",
+            "efficientnetv2_b3": root / "classification_defaults" / "efficientnet.toml",
+            "efficientnetv2_s": root / "classification_defaults" / "efficientnet.toml",
+            "efficientnetv2_m": root / "classification_defaults" / "efficientnet.toml",
+            "efficientnetv2_l": root / "classification_defaults" / "efficientnet.toml",
             "unet": root / "example_segmentation_unet.toml",
             "residual_unet": root / "example_segmentation_residual_unet.toml",
             "unet_plus_plus": root / "example_segmentation_unet_plus_plus.toml",
@@ -132,6 +172,26 @@ class Orchestrator:
         for section in ("data", "model", "training"):
             collect(config.get(section, {}), section)
         return {"architecture": architecture, "task": config["run"].get("task"), "config": config, "fields": fields}
+
+    @staticmethod
+    def configuration_schema() -> dict[str, Any]:
+        """Return the editable resolved-config baseline for schema-driven clients.
+
+        The configuration dictionary is the single source of truth: clients may
+        render it as guided or advanced controls, then persist the same paths
+        through the draft and planning APIs.
+        """
+        defaults = deep_merge(DEFAULT_CONFIG, {})
+        defaults["self_supervised"] = deep_merge(defaults["pretraining"], {})
+        return {
+            "defaults": defaults,
+            "groups": [
+                "run", "architecture", "data", "input", "preprocessing", "encoder", "stem",
+                "normalization", "pooling", "image_embedding", "model", "metadata", "fusion",
+                "classifier", "posthoc", "training", "callbacks", "recovery", "augmentation",
+                "distribution", "self_supervised", "evidence", "inference", "output", "evaluation", "tiling",
+            ],
+        }
 
     def model_preview(self, *, architecture: str, dataset_id: str, overrides: dict[str, Any] | None = None) -> dict[str, Any]:
         """Build a disposable model for an honest pre-run structural summary."""
@@ -328,10 +388,10 @@ class Orchestrator:
         if config_overrides is not None and not isinstance(config_overrides, dict):
             raise ValueError("Configuration overrides must be an object")
         overrides = config_overrides or {}
-        allowed_override_sections = {"run", "data", "model", "training", "augmentation", "callbacks", "output"}
+        allowed_override_sections = {"run", "data", "model", "training", "augmentation", "callbacks", "output", "architecture", "input", "encoder", "stem", "normalization", "pooling", "image_embedding", "metadata", "fusion", "classifier", "preprocessing"}
         unknown_sections = set(overrides) - allowed_override_sections
         if unknown_sections or any(not isinstance(value, dict) for value in overrides.values()):
-            raise ValueError("Configuration overrides may contain only object-valued run, data, model, training, augmentation, callbacks, or output sections")
+            raise ValueError("Configuration overrides may contain only supported object-valued configuration sections")
         plan = {"kind": "training", "dataset_id": dataset_id, "recipe_ids": recipe_ids, "seeds": seeds, "resources": resources or {}, "config_overrides": overrides}
         config_dir = self.artifact_root / "experiments" / experiment_id / "configs"
         config_dir.mkdir(parents=True, exist_ok=True)
@@ -382,24 +442,28 @@ class Orchestrator:
         if not any(candidate.is_relative_to(root) for root in self.browse_roots.values()):
             raise ValueError("Path is outside the configured workspace roots")
 
-    def scan(self, root: str | Path) -> dict[str, Any]:
+    def scan(self, root: str | Path, *, only_unindexed: bool = False) -> dict[str, Any]:
         root_path = Path(root).expanduser().resolve()
         self._require_browse_path(root_path)
         if not root_path.is_dir():
             raise NotADirectoryError(root_path)
         discovered: list[str] = []
+        already_indexed: list[str] = []
         skipped: list[dict[str, str]] = []
         for manifest_path in root_path.rglob("artifact.json"):
             try:
-                from oracle_builder.artifacts import validate_run_artifact
-                validation = validate_run_artifact(manifest_path.parent)
-                if not validation.get("valid"):
-                    raise ValueError("artifact validation failed: " + "; ".join(validation.get("errors") or []))
                 manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
                 schema = manifest.get("artifact_schema", {})
                 if schema.get("name") != "oracle_builder_model_run":
                     raise ValueError("unsupported artifact schema")
                 artifact_id = str(uuid.UUID(str(manifest["artifact_id"])))
+                if only_unindexed and self.artifact(artifact_id) is not None:
+                    already_indexed.append(artifact_id)
+                    continue
+                from oracle_builder.artifacts import validate_run_artifact
+                validation = validate_run_artifact(manifest_path.parent)
+                if not validation.get("valid"):
+                    raise ValueError("artifact validation failed: " + "; ".join(validation.get("errors") or []))
                 now = _now()
                 model, dataset = manifest.get("model") or {}, manifest.get("dataset") or {}
                 values = (artifact_id, manifest.get("run_id"), manifest.get("artifact_type", "model_run"), manifest.get("name") or manifest_path.parent.name,
@@ -407,10 +471,283 @@ class Orchestrator:
                 with self._connection() as db:
                     db.execute("""INSERT INTO artifacts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                       ON CONFLICT(artifact_id) DO UPDATE SET run_id=excluded.run_id,artifact_type=excluded.artifact_type,name=excluded.name,task=excluded.task,architecture=excluded.architecture,variant=excluded.variant,status=excluded.status,lifecycle=excluded.lifecycle,dataset_id=excluded.dataset_id,dataset_fingerprint_sha256=excluded.dataset_fingerprint_sha256,fingerprint_sha256=excluded.fingerprint_sha256,path=excluded.path,manifest_json=excluded.manifest_json,updated_at=excluded.updated_at""", values)
+                    facts = self._build_artifact_facts(manifest, manifest_path.parent)
+                    db.execute("""INSERT INTO artifact_facts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(artifact_id) DO UPDATE SET training_set=excluded.training_set,classifier_type=excluded.classifier_type,stem_size=excluded.stem_size,macro_f1=excluded.macro_f1,loss=excluded.loss,training_seconds=excluded.training_seconds,facts_json=excluded.facts_json,updated_at=excluded.updated_at""",
+                        (artifact_id, facts.get("training_set"), facts.get("classifier_type"), facts.get("stem_size"), facts.get("macro_f1"), facts.get("loss"), facts.get("training_seconds"), _json(facts), now))
                 discovered.append(artifact_id)
             except (OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
                 skipped.append({"path": str(manifest_path.parent), "reason": str(exc)})
-        return {"root": str(root_path), "artifacts": discovered, "skipped": skipped}
+        return {"root": str(root_path), "artifacts": discovered, "already_indexed": already_indexed, "skipped": skipped}
+
+    def reconcile_startup(self) -> dict[str, Any]:
+        """Re-index durable local work without changing its source files.
+
+        This is deliberately safe to repeat.  Sealed run artifacts and frozen
+        dataset revisions have stable IDs, so existing database rows are left
+        intact and newly discovered records are inserted by the normal catalog
+        and ingestion paths.
+        """
+        result: dict[str, Any] = {"runs_root": str(self.runs_root), "datasets_root": str(self.datasets_root)}
+        try:
+            known_artifacts = {artifact["artifact_id"] for artifact in self.artifacts()}
+            artifact_report = self.scan(self.runs_root)
+            result["artifacts"] = {
+                "indexed": [artifact_id for artifact_id in artifact_report["artifacts"] if artifact_id not in known_artifacts],
+                "refreshed": [artifact_id for artifact_id in artifact_report["artifacts"] if artifact_id in known_artifacts],
+                "skipped": artifact_report["skipped"],
+            }
+        except (OSError, ValueError) as exc:
+            result["artifacts"] = {"indexed": [], "refreshed": [], "skipped": [{"path": str(self.runs_root), "reason": str(exc)}]}
+
+        dataset_report = self.scan_training_catalog()
+        imported, already_registered, skipped = [], [], []
+        for entry in dataset_report["entries"]:
+            if entry.get("source_type") != "oracle_sqlite":
+                continue
+            info = entry.get("dataset_info") if isinstance(entry.get("dataset_info"), dict) else {}
+            dataset_id = info.get("dataset_id")
+            if entry.get("status") != "frozen" or not isinstance(dataset_id, str):
+                skipped.append({"path": entry["path"], "reason": "Only frozen Oracle SQLite dataset revisions are registered"})
+                continue
+            if self.dataset(dataset_id) is not None:
+                already_registered.append(dataset_id)
+                continue
+            try:
+                self.ingest_dataset(entry["path"])
+                imported.append(dataset_id)
+            except (OSError, ValueError, sqlite3.DatabaseError) as exc:
+                skipped.append({"path": entry["path"], "reason": str(exc)})
+        result["datasets"] = {
+            "catalog_entries": len(dataset_report["entries"]),
+            "registered": imported,
+            "already_registered": already_registered,
+            "skipped": skipped,
+        }
+        return result
+
+    @staticmethod
+    def _nested(value: dict[str, Any], *keys: str) -> Any:
+        current: Any = value
+        for key in keys:
+            if not isinstance(current, dict):
+                return None
+            current = current.get(key)
+        return current
+
+    def _build_artifact_facts(self, manifest: dict[str, Any], root: Path) -> dict[str, Any]:
+        """Extract display/query facts while retaining the complete source map as JSON."""
+        config = self._json_file(root / "config" / "resolved.json") or {}
+        summary = manifest.get("summary") if isinstance(manifest.get("summary"), dict) else {}
+        evaluation = summary.get("evaluation") if isinstance(summary.get("evaluation"), dict) else {}
+        if not evaluation:
+            evaluation = self._json_file(root / "evaluation" / "evaluation_summary.json") or {}
+        runtime = self._json_file(root / "provenance" / "runtime.json") or {}
+        model = manifest.get("model") if isinstance(manifest.get("model"), dict) else {}
+        dataset = manifest.get("dataset") if isinstance(manifest.get("dataset"), dict) else {}
+        model_config = config.get("model") if isinstance(config.get("model"), dict) else {}
+        outputs = model.get("outputs") if isinstance(model.get("outputs"), dict) else {}
+        classifier = self._nested(config, "classifier") or self._nested(config, "model", "classifier") or {}
+        stem = self._nested(config, "stem") or self._nested(config, "model", "stem") or {}
+        pooling = self._nested(config, "pooling") or self._nested(config, "model", "pooling") or {}
+        metadata = config.get("metadata") if isinstance(config.get("metadata"), dict) else {}
+        posthoc = config.get("posthoc") if isinstance(config.get("posthoc"), dict) else config.get("post_hoc") if isinstance(config.get("post_hoc"), dict) else {}
+        training = config.get("training") if isinstance(config.get("training"), dict) else {}
+        seconds = runtime.get("training_seconds", runtime.get("duration_seconds")) if isinstance(runtime, dict) else None
+        try:
+            artifact_size = sum(path.stat().st_size for path in root.rglob("*") if path.is_file())
+            model_size = sum(path.stat().st_size for path in (root / "model").rglob("*") if path.is_file())
+        except OSError:
+            artifact_size, model_size = None, None
+        summary_text = ""
+        try:
+            summary_text = (root / "model" / "model_summary.txt").read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            pass
+        def summary_number(label: str) -> int | None:
+            match = re.search(rf"{label}\s*:\s*([\d,]+)", summary_text, flags=re.IGNORECASE)
+            return int(match.group(1).replace(",", "")) if match else None
+        metric_values = {key: value for key, value in evaluation.items() if isinstance(value, (int, float)) and not isinstance(value, bool)}
+        classifier_type = classifier.get("type") if isinstance(classifier, dict) else None
+        classifier_type = classifier_type or model_config.get("classifier_type") or model_config.get("classifier")
+        if not classifier_type and model.get("task") == "classification":
+            # V1 CNN artifacts used the standard final Dense logits layer.
+            classifier_type = "linear"
+        facts = {
+            "training_set": dataset.get("dataset_id") or dataset.get("name"),
+            "classifier_type": classifier_type,
+            "stem_size": stem.get("filters", stem.get("kernel_size", stem.get("size"))) if isinstance(stem, dict) else None,
+            "macro_f1": metric_values.get("macro_f1", metric_values.get("f1_macro")),
+            "loss": evaluation.get("loss", summary.get("loss")),
+            "training_seconds": seconds,
+            "created_at": manifest.get("created_at"), "completed_at": manifest.get("completed_at"),
+            "modified_at": datetime.fromtimestamp(root.stat().st_mtime, timezone.utc).isoformat() if root.exists() else None,
+            "artifact_size_bytes": artifact_size, "model_size_bytes": model_size,
+            "epochs": training.get("epochs"), "seed": (config.get("run") or {}).get("seed") if isinstance(config.get("run"), dict) else None,
+            "parameter_count": summary_number("Total params"), "trainable_parameters": summary_number("Trainable params"),
+            "input_shape": (config.get("data") or {}).get("input_shape") if isinstance(config.get("data"), dict) else model.get("input", {}).get("shape"),
+            "num_classes": (config.get("data") or {}).get("num_classes") if isinstance(config.get("data"), dict) else outputs.get("class_count"),
+            "embedding_dim": (config.get("image_embedding") or {}).get("dimension") if isinstance(config.get("image_embedding"), dict) else model_config.get("embedding_dim", outputs.get("embedding_dimension")),
+            "pooling_type": pooling.get("type") if isinstance(pooling, dict) else model_config.get("pooling"),
+            "metadata_field_count": len(metadata.get("fields", metadata.get("features", []))) if isinstance(metadata.get("fields", metadata.get("features", [])), list) else 0,
+            "posthoc_type": posthoc.get("type") if isinstance(posthoc, dict) else None,
+            "architecture_version": (config.get("architecture") or {}).get("version", 1) if isinstance(config.get("architecture"), dict) else 1,
+            "architecture": model.get("architecture"), "variant": model.get("variant"),
+            "task": model.get("task"), "dataset_fingerprint": dataset.get("fingerprint_sha256"),
+            "metrics": metric_values, "config": config, "evaluation": evaluation, "runtime": runtime,
+        }
+        facts.update(metric_values)
+        for key in ("stem_size", "epochs", "seed", "parameter_count", "trainable_parameters", "num_classes", "embedding_dim", "metadata_field_count", "architecture_version"):
+            if isinstance(facts[key], bool): facts[key] = None
+        for key in ("macro_f1", "loss", "training_seconds", "artifact_size_bytes", "model_size_bytes"):
+            if not isinstance(facts[key], (int, float)) or isinstance(facts[key], bool): facts[key] = None
+        return facts
+
+    def training_catalog_roots_info(self) -> list[dict[str, str]]:
+        return [{"root_id": root_id, "path": str(path)} for root_id, path in self.training_catalog_roots.items()]
+
+    def scan_training_catalog(self, root_id: str | None = None) -> dict[str, Any]:
+        """Safely inspect an allow-listed source directory without importing it."""
+        from oracle_builder.orchestration.training_catalog import scan_training_catalog
+        if root_id is not None and root_id not in self.training_catalog_roots:
+            raise KeyError(f"Unknown training catalog root: {root_id}")
+        root_ids = [root_id] if root_id else list(self.training_catalog_roots)
+        now = _now()
+        reports: list[tuple[str, dict[str, Any]]] = []
+        for selected_root_id in root_ids:
+            reports.append((selected_root_id, scan_training_catalog(self.training_catalog_roots[selected_root_id])))
+        with self._connection() as db:
+            for selected_root_id, report in reports:
+                catalog_ids = [entry["catalog_id"] for entry in report["entries"]]
+                if catalog_ids:
+                    db.execute(f"DELETE FROM training_catalog_entries WHERE root_id=? AND catalog_id NOT IN ({','.join('?' for _ in catalog_ids)})", [selected_root_id, *catalog_ids])
+                else:
+                    db.execute("DELETE FROM training_catalog_entries WHERE root_id=?", (selected_root_id,))
+                for entry in report["entries"]:
+                    db.execute("""INSERT INTO training_catalog_entries VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(catalog_id) DO UPDATE SET root_id=excluded.root_id,name=excluded.name,path=excluded.path,source_type=excluded.source_type,fingerprint_sha256=excluded.fingerprint_sha256,metadata_json=excluded.metadata_json,scanned_at=excluded.scanned_at,updated_at=excluded.updated_at""",
+                        (entry["catalog_id"], selected_root_id, entry["name"], entry["path"], entry["source_type"], entry.get("fingerprint_sha256"), _json(entry), report["scanned_at"], now))
+        entries = [entry for _, report in reports for entry in report["entries"]]
+        return {
+            "root_id": root_id,
+            "roots": [{"root_id": selected_root_id, "path": report["root"]} for selected_root_id, report in reports],
+            "entries": entries,
+            "scanned_at": now,
+        }
+
+    def training_catalog(self, *, root_id: str | None = None) -> list[dict[str, Any]]:
+        query, params = "SELECT * FROM training_catalog_entries", []
+        if root_id:
+            query += " WHERE root_id=?"; params.append(root_id)
+        query += " ORDER BY name COLLATE NOCASE"
+        with self._connection() as db:
+            return [self._training_catalog_view(_row(row)) for row in db.execute(query, params).fetchall()]  # type: ignore[list-item]
+
+    def training_catalog_bundles(self, *, root_id: str | None = None) -> list[dict[str, Any]]:
+        """Group compatible revisions without hiding their immutable identity."""
+        bundles: dict[str, dict[str, Any]] = {}
+        for entry in self.training_catalog(root_id=root_id):
+            family_id = str(entry.get("family_id") or entry.get("training_set_family") or entry["catalog_id"])
+            bundle = bundles.setdefault(family_id, {
+                "family_id": family_id,
+                "name": entry.get("training_set_family") or entry.get("name"),
+                "task": entry.get("task"),
+                "versions": [],
+            })
+            bundle["versions"].append(entry)
+        for bundle in bundles.values():
+            bundle["versions"].sort(key=lambda entry: (str(entry.get("modified_at") or ""), str(entry.get("training_set_version") or "")), reverse=True)
+            versions = bundle["versions"]
+            bundle["frozen_count"] = sum(entry.get("status") == "frozen" for entry in versions)
+            bundle["unfrozen_count"] = len(versions) - bundle["frozen_count"]
+            bundle["latest"] = versions[0]
+        return sorted(bundles.values(), key=lambda bundle: str(bundle["name"]).casefold())
+
+    def training_catalog_entry(self, catalog_id: str) -> dict[str, Any] | None:
+        with self._connection() as db:
+            return _row(db.execute("SELECT * FROM training_catalog_entries WHERE catalog_id=?", (catalog_id,)).fetchone())
+
+    @staticmethod
+    def _training_catalog_view(entry: dict[str, Any] | None) -> dict[str, Any]:
+        """Expose catalog metadata as convenient read-only fields without losing its source map."""
+        if entry is None:
+            return {}
+        result = dict(entry)
+        metadata = result.get("metadata")
+        if isinstance(metadata, dict):
+            for key, value in metadata.items():
+                result.setdefault(key, value)
+        return result
+
+    def _training_catalog_sqlite_path(self, entry: dict[str, Any]) -> Path:
+        if entry.get("source_type") != "oracle_sqlite":
+            raise KeyError(entry.get("catalog_id"))
+        path = Path(entry["path"]).resolve()
+        if not path.is_file() or not any(path.is_relative_to(root) for root in self.training_catalog_roots.values()):
+            raise FileNotFoundError(path)
+        return path
+
+    def training_catalog_previews(self, catalog_id: str, *, label: str | None = None, offset: int = 0, limit: int = 24) -> dict[str, Any]:
+        entry = self.training_catalog_entry(catalog_id)
+        if entry is None: raise KeyError(catalog_id)
+        path = self._training_catalog_sqlite_path(entry)
+        offset, limit = max(0, offset), min(max(1, limit), 100)
+        with sqlite3.connect(path) as db:
+            db.row_factory = sqlite3.Row
+            info = read_dataset_info(db)
+            where, params = "", []
+            if info["dataset_type"] == "classification":
+                if label:
+                    where, params = " WHERE l.name=?", [label]
+                total = int(db.execute("""SELECT count(*) FROM dataset_items di
+                    LEFT JOIN classification_annotations ca ON ca.item_id=di.item_id AND ca.is_current=1 AND ca.status='accepted'
+                    LEFT JOIN classification_labels l ON l.label_id=ca.label_id""" + where, params).fetchone()[0])
+                query = """SELECT di.item_id,di.source_key,l.name AS label FROM dataset_items di
+                    JOIN classification_items ci ON ci.item_id=di.item_id
+                    LEFT JOIN classification_annotations ca ON ca.item_id=di.item_id AND ca.is_current=1 AND ca.status='accepted'
+                    LEFT JOIN classification_labels l ON l.label_id=ca.label_id""" + where + " ORDER BY di.item_id LIMIT ? OFFSET ?"
+            else:
+                total = int(db.execute("SELECT count(*) FROM dataset_items").fetchone()[0])
+                query, params = """SELECT di.item_id,di.source_key,NULL AS label FROM dataset_items di
+                    JOIN mask_refinement_items mi ON mi.item_id=di.item_id ORDER BY di.item_id LIMIT ? OFFSET ?""", []
+            rows = [dict(row) for row in db.execute(query, [*params, limit, offset])]
+        items = [{**row, "preview_url": f"/api/v1/training-catalog/{catalog_id}/previews/{row['item_id']}"} for row in rows]
+        return {"catalog_id": catalog_id, "items": items, "total": total, "offset": offset, "limit": limit}
+
+    def training_catalog_preview_image(self, catalog_id: str, item_id: str, *, max_size: int = 320) -> bytes:
+        """Render a bounded JPEG preview for an allow-listed catalog image.
+
+        The UI receives opaque item IDs rather than source paths, so this never
+        turns the catalog endpoint into a general file reader.
+        """
+        entry = self.training_catalog_entry(catalog_id)
+        if entry is None: raise KeyError(catalog_id)
+        path = self._training_catalog_sqlite_path(entry)
+        return self._sqlite_preview_image(path, item_id, max_size=max_size)
+
+    def freeze_training_catalog_entry(self, catalog_id: str) -> dict[str, Any]:
+        """Freeze one explicit SQLite revision, then register its immutable state."""
+        entry = self.training_catalog_entry(catalog_id)
+        if entry is None: raise KeyError(catalog_id)
+        path = self._training_catalog_sqlite_path(entry)
+        with sqlite3.connect(path) as db:
+            info = read_dataset_info(db)
+            if info["lifecycle"] not in {"working", "frozen"}:
+                raise ValueError(f"Only working datasets can be frozen; this revision is {info['lifecycle']!r}")
+            if info["lifecycle"] == "working":
+                set_dataset_lifecycle(db, "frozen", actor="oracle-orchestrator", details={"catalog_id": catalog_id})
+            db.commit()
+        report = self.scan_training_catalog(entry["root_id"])
+        refreshed = next((item for item in report["entries"] if item["catalog_id"] == catalog_id), None)
+        if refreshed is None: raise RuntimeError("Frozen dataset was not returned by catalog reconciliation")
+        dataset = self.ingest_dataset(path)
+        return {"entry": refreshed, "dataset": dataset}
+
+    def compare_training_catalog(self, catalog_ids: list[str]) -> dict[str, Any]:
+        entries = [self.training_catalog_entry(value) for value in dict.fromkeys(catalog_ids)]
+        if len(entries) < 2 or any(entry is None for entry in entries): raise KeyError("Select at least two catalog entries")
+        values = [entry for entry in entries if entry]
+        return {"entries": [self._training_catalog_view(entry) for entry in values], "comparison": {"item_counts": {entry["catalog_id"]: entry["metadata"].get("item_count") for entry in values}, "class_counts": {entry["catalog_id"]: entry["metadata"].get("class_count") for entry in values}, "fingerprints": {entry["catalog_id"]: entry.get("fingerprint_sha256") for entry in values}}}
 
     @staticmethod
     def _duration_seconds(started_at: str | None, completed_at: str | None) -> float | None:
@@ -652,15 +989,13 @@ class Orchestrator:
                 items.append(item)
         return {"dataset_id": dataset_id, "offset": offset, "limit": limit, "total": total, "items": items}
 
-    def dataset_preview_image(self, dataset_id: str, item_id: str, *, kind: str = "image", max_size: int = 320) -> bytes:
-        """Decode one local dataset asset and emit a bounded JPEG preview."""
-        dataset = self.dataset(dataset_id)
-        if dataset is None:
-            raise KeyError(dataset_id)
+    @staticmethod
+    def _sqlite_preview_image(path: Path, item_id: str, *, kind: str = "image", max_size: int = 320) -> bytes:
+        """Decode an item from an allow-listed Oracle SQLite revision as JPEG."""
         if kind not in {"image", "mask", "candidate_mask"}:
             raise ValueError("Preview kind must be image, mask, or candidate_mask")
         max_size = min(max(32, max_size), 1024)
-        with sqlite3.connect(dataset["path"]) as db:
+        with sqlite3.connect(path) as db:
             db.row_factory = sqlite3.Row
             info = read_dataset_info(db)
             if info["dataset_type"] == "classification" and kind != "image":
@@ -700,6 +1035,13 @@ class Orchestrator:
         image.save(output, format="JPEG", quality=85, optimize=True)
         return output.getvalue()
 
+    def dataset_preview_image(self, dataset_id: str, item_id: str, *, kind: str = "image", max_size: int = 320) -> bytes:
+        """Decode one registered local dataset asset and emit a bounded JPEG preview."""
+        dataset = self.dataset(dataset_id)
+        if dataset is None:
+            raise KeyError(dataset_id)
+        return self._sqlite_preview_image(Path(dataset["path"]), item_id, kind=kind, max_size=max_size)
+
     def artifact_history(self, artifact_id: str, *, limit: int = 500) -> dict[str, Any]:
         artifact = self.artifact(artifact_id)
         if artifact is None:
@@ -725,7 +1067,7 @@ class Orchestrator:
         runtime = self._json_file(root / "provenance" / "runtime.json")
         config = self._json_file(root / "config" / "resolved.json")
         contract = self._json_file(root / "model" / "contract.json")
-        return {"artifact": self._artifact_result(artifact), "manifest": artifact["manifest"],
+        return {"artifact": self._artifact_result(artifact), "facts": self._artifact_facts(artifact_id), "manifest": artifact["manifest"],
                 "runtime": runtime, "config": config, "model_contract": contract,
                 "architecture": {"summary": model_summary, "available": model_summary is not None},
                 "history_url": f"/api/v1/artifacts/{artifact_id}/history",
@@ -829,8 +1171,307 @@ class Orchestrator:
 
     def artifact_catalog(self) -> list[dict[str, Any]]:
         """A compact, display-ready global run/artifact catalog for selection UIs."""
-        return [{**self._artifact_result(artifact), "timing": self._artifact_runtime(artifact["artifact_id"])}
-                for artifact in self.artifacts()]
+        return self.artifact_catalog_query()["artifacts"]
+
+    def _artifact_facts(self, artifact_id: str) -> dict[str, Any]:
+        with self._connection() as db:
+            row = db.execute("SELECT training_set,classifier_type,stem_size,macro_f1,loss,training_seconds,facts_json FROM artifact_facts WHERE artifact_id=?", (artifact_id,)).fetchone()
+        if row is None:
+            return {}
+        raw = dict(row)
+        raw["facts"] = json.loads(raw.pop("facts_json"))
+        return raw
+
+    _CATALOG_COLUMNS = {
+        "artifact_id": "artifacts.artifact_id", "name": "artifacts.name", "task": "artifacts.task",
+        "architecture": "artifacts.architecture", "variant": "artifacts.variant", "status": "artifacts.status",
+        "lifecycle": "artifacts.lifecycle", "dataset_id": "artifacts.dataset_id", "updated_at": "artifacts.updated_at",
+        "discovered_at": "artifacts.discovered_at", "training_set": "artifact_facts.training_set",
+        "classifier_type": "artifact_facts.classifier_type", "stem_size": "artifact_facts.stem_size",
+        "macro_f1": "artifact_facts.macro_f1", "loss": "artifact_facts.loss", "training_seconds": "artifact_facts.training_seconds",
+        "created_at": "json_extract(artifact_facts.facts_json, '$.created_at')",
+        "completed_at": "json_extract(artifact_facts.facts_json, '$.completed_at')",
+        "modified_at": "json_extract(artifact_facts.facts_json, '$.modified_at')",
+        "artifact_size_bytes": "json_extract(artifact_facts.facts_json, '$.artifact_size_bytes')",
+        "model_size_bytes": "json_extract(artifact_facts.facts_json, '$.model_size_bytes')",
+        "epochs": "json_extract(artifact_facts.facts_json, '$.epochs')",
+        "parameter_count": "json_extract(artifact_facts.facts_json, '$.parameter_count')",
+        "trainable_parameters": "json_extract(artifact_facts.facts_json, '$.trainable_parameters')",
+        "accuracy": "json_extract(artifact_facts.facts_json, '$.accuracy')",
+        "balanced_accuracy": "json_extract(artifact_facts.facts_json, '$.balanced_accuracy')",
+        "macro_precision": "json_extract(artifact_facts.facts_json, '$.macro_precision')",
+        "macro_recall": "json_extract(artifact_facts.facts_json, '$.macro_recall')",
+        "macro_average_precision": "json_extract(artifact_facts.facts_json, '$.macro_average_precision')",
+        "num_classes": "json_extract(artifact_facts.facts_json, '$.num_classes')",
+        "embedding_dim": "json_extract(artifact_facts.facts_json, '$.embedding_dim')",
+        "pooling_type": "json_extract(artifact_facts.facts_json, '$.pooling_type')",
+        "metadata_field_count": "json_extract(artifact_facts.facts_json, '$.metadata_field_count')",
+        "posthoc_type": "json_extract(artifact_facts.facts_json, '$.posthoc_type')",
+        "architecture_version": "json_extract(artifact_facts.facts_json, '$.architecture_version')",
+    }
+
+    def artifact_filter_schema(self) -> dict[str, Any]:
+        fields = [
+            {"key": key, "label": key.replace("_", " ").title(),
+             "type": "number" if key in {"stem_size", "macro_f1", "loss", "training_seconds", "artifact_size_bytes", "model_size_bytes", "epochs", "parameter_count", "trainable_parameters", "accuracy", "balanced_accuracy", "macro_precision", "macro_recall", "macro_average_precision", "num_classes", "embedding_dim", "metadata_field_count", "architecture_version"} else "datetime" if key in {"updated_at", "discovered_at", "created_at", "completed_at", "modified_at"} else "text",
+             "operators": ["eq", "in", "contains"] if key not in {"stem_size", "macro_f1", "loss", "training_seconds", "artifact_size_bytes", "model_size_bytes", "epochs", "parameter_count", "trainable_parameters", "accuracy", "balanced_accuracy", "macro_precision", "macro_recall", "macro_average_precision", "num_classes", "embedding_dim", "metadata_field_count", "architecture_version", "updated_at", "discovered_at", "created_at", "completed_at", "modified_at"} else ["eq", "gte", "lte"]}
+            for key in self._CATALOG_COLUMNS
+        ]
+        fields.append({"key": "tag", "label": "Tag", "type": "text", "operators": ["eq", "in"]})
+        return {"fields": fields, "default_columns": ["name", "status", "architecture", "variant", "classifier_type", "training_set", "macro_f1", "accuracy", "epochs", "artifact_size_bytes", "created_at", "tags"]}
+
+    def artifact_catalog_query(self, *, filters: dict[str, Any] | None = None, sort: str = "updated_at", order: str = "desc", offset: int = 0, limit: int = 100) -> dict[str, Any]:
+        """Server-side catalog paging with a deliberately small, typed filter language.
+
+        A filter can be a scalar, a list (membership), or ``{"gte": value}``,
+        ``{"lte": value}``, ``{"contains": text}``, and ``{"eq": value}``.
+        """
+        filters, params, clauses = filters or {}, [], []
+        for key, expression in filters.items():
+            if key == "search":
+                clauses.append("(LOWER(artifacts.name) LIKE ? OR LOWER(COALESCE(artifacts.architecture, '')) LIKE ? OR LOWER(COALESCE(artifacts.variant, '')) LIKE ? OR LOWER(COALESCE(artifact_facts.training_set, '')) LIKE ?)")
+                params.extend([f"%{str(expression).lower()}%"] * 4)
+                continue
+            if key == "tag":
+                values = expression if isinstance(expression, list) else [expression]
+                if not values: continue
+                clauses.append("EXISTS (SELECT 1 FROM artifact_tag_assignments ata JOIN artifact_tags at ON at.tag_id=ata.tag_id WHERE ata.artifact_id=artifacts.artifact_id AND at.name IN (%s))" % ",".join("?" for _ in values))
+                params.extend(str(item) for item in values)
+                continue
+            column = self._CATALOG_COLUMNS.get(key)
+            if column is None:
+                raise ValueError(f"Unsupported artifact catalog filter: {key}")
+            if isinstance(expression, dict):
+                for operator, value in expression.items():
+                    if operator == "eq": clauses.append(f"{column}=?"); params.append(value)
+                    elif operator == "gte": clauses.append(f"{column}>=?"); params.append(value)
+                    elif operator == "lte": clauses.append(f"{column}<=?"); params.append(value)
+                    elif operator == "contains": clauses.append(f"LOWER(CAST({column} AS TEXT)) LIKE ?"); params.append(f"%{str(value).lower()}%")
+                    else: raise ValueError(f"Unsupported artifact catalog operator: {operator}")
+            elif isinstance(expression, list):
+                if expression: clauses.append(f"{column} IN ({','.join('?' for _ in expression)})"); params.extend(expression)
+            else:
+                clauses.append(f"{column}=?"); params.append(expression)
+        sort_column = self._CATALOG_COLUMNS.get(sort)
+        if sort_column is None: raise ValueError(f"Unsupported artifact catalog sort: {sort}")
+        direction = "ASC" if order.lower() == "asc" else "DESC"
+        offset, limit = max(0, int(offset)), min(max(1, int(limit)), 500)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        source = " FROM artifacts LEFT JOIN artifact_facts USING (artifact_id)"
+        with self._connection() as db:
+            total = int(db.execute("SELECT COUNT(*)" + source + where, params).fetchone()[0])
+            rows = db.execute("SELECT artifacts.*,artifact_facts.training_set,artifact_facts.classifier_type,artifact_facts.stem_size,artifact_facts.macro_f1,artifact_facts.loss,artifact_facts.training_seconds,artifact_facts.facts_json" + source + where + f" ORDER BY {sort_column} {direction}, artifacts.artifact_id ASC LIMIT ? OFFSET ?", [*params, limit, offset]).fetchall()
+        values = []
+        for row in rows:
+            artifact = _row(row)
+            if artifact:
+                facts = {**(artifact.get("facts") if isinstance(artifact.get("facts"), dict) else {}), **{key: artifact.get(key) for key in ("training_set", "classifier_type", "stem_size", "macro_f1", "loss", "training_seconds")}}
+                values.append({**self._artifact_result(artifact), **facts, "timing": self._artifact_runtime(artifact["artifact_id"]), "tags": self.tags_for_artifact(artifact["artifact_id"])})
+        return {"artifacts": values, "total": total, "offset": offset, "limit": limit, "sort": sort, "order": direction.lower()}
+
+    def tags(self) -> list[dict[str, Any]]:
+        return self._many("SELECT * FROM artifact_tags ORDER BY name COLLATE NOCASE")
+
+    def create_tag(self, *, name: str, color: str | None = None) -> dict[str, Any]:
+        normalized = name.strip()
+        if not normalized or len(normalized) > 80: raise ValueError("Tag name must be between 1 and 80 characters")
+        now, tag_id = _now(), str(uuid.uuid4())
+        with self._connection() as db:
+            db.execute("INSERT INTO artifact_tags VALUES (?, ?, ?, ?, ?) ON CONFLICT(name) DO UPDATE SET color=COALESCE(excluded.color, artifact_tags.color),updated_at=excluded.updated_at", (tag_id, normalized, color, now, now))
+            row = db.execute("SELECT * FROM artifact_tags WHERE name=? COLLATE NOCASE", (normalized,)).fetchone()
+        return _row(row)  # type: ignore[return-value]
+
+    def tags_for_artifact(self, artifact_id: str) -> list[dict[str, Any]]:
+        with self._connection() as db:
+            return [_row(row) for row in db.execute("SELECT artifact_tags.* FROM artifact_tags JOIN artifact_tag_assignments USING (tag_id) WHERE artifact_id=? ORDER BY name COLLATE NOCASE", (artifact_id,)).fetchall()]  # type: ignore[list-item]
+
+    def set_artifact_tags(self, artifact_id: str, tag_names: list[str]) -> list[dict[str, Any]]:
+        if self.artifact(artifact_id) is None: raise KeyError(artifact_id)
+        names = list(dict.fromkeys(str(name).strip() for name in tag_names if str(name).strip()))
+        if len(names) > 30: raise ValueError("An artifact can have at most 30 tags")
+        now = _now()
+        with self._connection() as db:
+            db.execute("DELETE FROM artifact_tag_assignments WHERE artifact_id=?", (artifact_id,))
+            for name in names:
+                if len(name) > 80: raise ValueError("Tag name must be between 1 and 80 characters")
+                tag_id = str(uuid.uuid4())
+                db.execute("INSERT INTO artifact_tags VALUES (?, ?, NULL, ?, ?) ON CONFLICT(name) DO UPDATE SET updated_at=excluded.updated_at", (tag_id, name, now, now))
+                saved = db.execute("SELECT tag_id FROM artifact_tags WHERE name=? COLLATE NOCASE", (name,)).fetchone()[0]
+                db.execute("INSERT INTO artifact_tag_assignments VALUES (?, ?, ?)", (artifact_id, saved, now))
+        return self.tags_for_artifact(artifact_id)
+
+    @staticmethod
+    def architecture_view_from_config(config: dict[str, Any]) -> dict[str, Any]:
+        """Stable UI graph, intentionally derived from config rather than Keras internals."""
+        version = int((config.get("architecture") or {}).get("version", 1))
+        model = config.get("model") or {}
+        input_module = config.get("input") or config.get("data") or {}
+        modules = [
+            {"id": "input", "kind": "input", "label": "Input", "config": input_module},
+            {"id": "preprocessing", "kind": "preprocessing", "label": "Geometry & channels", "config": config.get("preprocessing") or {}},
+            {"id": "encoder", "kind": "encoder", "label": "CNN encoder", "config": config.get("encoder") or {"architecture": model.get("architecture") or (config.get("run") or {}).get("model"), "variant": model.get("variant")}},
+            {"id": "stem", "kind": "stem", "label": "Stem", "config": config.get("stem") or {}},
+            {"id": "pooling", "kind": "pooling", "label": "Pooling", "config": config.get("pooling") or {}},
+            {"id": "image_embedding", "kind": "embedding", "label": "Image embedding", "config": config.get("image_embedding") or {}},
+        ]
+        metadata = config.get("metadata") or {}
+        fusion = config.get("fusion") or {}
+        if metadata.get("fields") or metadata.get("enabled") or metadata.get("features"):
+            modules.extend([
+                {"id": "metadata", "kind": "metadata", "label": "Metadata encoder", "config": metadata},
+                {"id": "fusion", "kind": "fusion", "label": "Fusion", "config": fusion},
+            ])
+        modules.append({"id": "classifier", "kind": "classifier", "label": "Primary classifier", "config": config.get("classifier") or {}})
+        posthoc = (config.get("posthoc") or config.get("post_hoc") or {})
+        if posthoc.get("enabled") or posthoc.get("type"):
+            modules.append({"id": "posthoc", "kind": "posthoc", "label": "Post-hoc predictor", "config": posthoc})
+        return {"version": version, "modules": modules, "edges": [{"from": modules[index]["id"], "to": modules[index + 1]["id"]} for index in range(len(modules) - 1)],
+                "representations": ["feature_map", "image_embedding", "metadata_embedding", "fused_embedding", "projection_embedding"] if version >= 2 else ["features"]}
+
+    def artifact_architecture_view(self, artifact_id: str) -> dict[str, Any]:
+        artifact = self.artifact(artifact_id)
+        if artifact is None: raise KeyError(artifact_id)
+        config = self._json_file(Path(artifact["path"]) / "config" / "resolved.json") or {}
+        return {"artifact_id": artifact_id, "architecture": self.architecture_view_from_config(config), "config_available": bool(config)}
+
+    @staticmethod
+    def _draft_config(config: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(config, dict): raise ValueError("Draft config must be an object")
+        resolved = deep_merge(DEFAULT_CONFIG, config)
+        # Drafts are authored against the composable contract unless explicitly
+        # cloned from an archived V1 run.
+        resolved.setdefault("architecture", {}).setdefault("version", 2)
+        # A new visual draft is intentionally constructible before a dataset is
+        # selected. These placeholders are replaced during training planning.
+        resolved.setdefault("run", {}).setdefault("task", "classification")
+        resolved["run"].setdefault("model", "resnet18")
+        resolved.setdefault("data", {}).setdefault("input_shape", [128, 128])
+        resolved["data"].setdefault("num_classes", 2)
+        if not resolved.setdefault("training", {}).get("loss"):
+            resolved["training"]["loss"] = "sparse_categorical_crossentropy"
+        resolved.setdefault("preprocessing", {})["invert"] = bool(resolved["preprocessing"].get("invert") or False)
+        validate_config(resolved)
+        return resolved
+
+    def create_model_draft(self, *, name: str, config: dict[str, Any] | None = None, description: str = "", layout: dict[str, Any] | None = None, source_artifact_id: str | None = None) -> dict[str, Any]:
+        if source_artifact_id and self.artifact(source_artifact_id) is None: raise KeyError(source_artifact_id)
+        source_config: dict[str, Any] = {}
+        if source_artifact_id:
+            source = self.artifact(source_artifact_id)
+            source_config = self._json_file(Path(source["path"]) / "config" / "resolved.json") if source else {}
+            source_config = source_config or {}
+        resolved = self._draft_config(deep_merge(source_config, config or {}))
+        now, draft_id = _now(), str(uuid.uuid4())
+        safe_layout = layout if isinstance(layout, dict) else {}
+        with self._connection() as db:
+            db.execute("INSERT INTO model_drafts VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?)", (draft_id, name.strip() or "Untitled model", description, source_artifact_id, _json(resolved), _json(safe_layout), now, now))
+            db.execute("INSERT INTO model_draft_revisions VALUES (?, 1, ?, ?, ?)", (draft_id, _json(resolved), _json(safe_layout), now))
+        return self.model_draft(draft_id)  # type: ignore[return-value]
+
+    def model_drafts(self) -> list[dict[str, Any]]:
+        return self._many("SELECT * FROM model_drafts ORDER BY updated_at DESC")
+
+    def model_draft(self, draft_id: str) -> dict[str, Any] | None:
+        with self._connection() as db:
+            draft = _row(db.execute("SELECT * FROM model_drafts WHERE draft_id=?", (draft_id,)).fetchone())
+            if draft is not None:
+                draft["architecture"] = self.architecture_view_from_config(draft["config"])
+            return draft
+
+    def update_model_draft(self, draft_id: str, *, name: str | None = None, description: str | None = None, config: dict[str, Any] | None = None, layout: dict[str, Any] | None = None) -> dict[str, Any]:
+        current = self.model_draft(draft_id)
+        if current is None: raise KeyError(draft_id)
+        if config is not None and not isinstance(config, dict): raise ValueError("Draft config must be an object")
+        if layout is not None and not isinstance(layout, dict): raise ValueError("Draft layout must be an object")
+        resolved = self._draft_config(config if config is not None else current["config"])
+        next_layout = layout if layout is not None else current["layout"]
+        revision, now = int(current["revision"]) + 1, _now()
+        with self._connection() as db:
+            db.execute("UPDATE model_drafts SET name=?,description=?,revision=?,config_json=?,layout_json=?,updated_at=? WHERE draft_id=?", (name.strip() if isinstance(name, str) and name.strip() else current["name"], description if description is not None else current["description"], revision, _json(resolved), _json(next_layout), now, draft_id))
+            db.execute("INSERT INTO model_draft_revisions VALUES (?, ?, ?, ?, ?)", (draft_id, revision, _json(resolved), _json(next_layout), now))
+        return self.model_draft(draft_id)  # type: ignore[return-value]
+
+    def clone_model_draft(self, draft_id: str, *, name: str | None = None) -> dict[str, Any]:
+        draft = self.model_draft(draft_id)
+        if draft is None: raise KeyError(draft_id)
+        return self.create_model_draft(name=name or f"{draft['name']} copy", description=draft["description"], config=draft["config"], layout=draft["layout"], source_artifact_id=draft.get("source_artifact_id"))
+
+    def validate_model_draft(self, draft_id: str) -> dict[str, Any]:
+        draft = self.model_draft(draft_id)
+        if draft is None: raise KeyError(draft_id)
+        try:
+            config = self._draft_config(draft["config"])
+            return {"valid": True, "errors": [], "warnings": [], "architecture": self.architecture_view_from_config(config)}
+        except (TypeError, ValueError) as exc:
+            return {"valid": False, "errors": [str(exc)], "warnings": []}
+
+    def preview_model_draft(self, draft_id: str, *, dataset_id: str | None = None) -> dict[str, Any]:
+        draft = self.model_draft(draft_id)
+        if draft is None: raise KeyError(draft_id)
+        config = self._draft_config(draft["config"])
+        architecture = str((config.get("run") or {}).get("model") or (config.get("encoder") or {}).get("architecture") or "")
+        result = {"draft_id": draft_id, "architecture": self.architecture_view_from_config(config), "config": config}
+        if dataset_id:
+            result["model_preview"] = self.model_preview(architecture=architecture, dataset_id=dataset_id, overrides=config)
+        return result
+
+    def plan_draft_training(self, draft_id: str, *, name: str, dataset_id: str, description: str = "", resources: dict[str, Any] | None = None, training_overrides: dict[str, Any] | None = None, initialization: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Seal a draft revision into one planned training specification.
+
+        The draft itself remains editable; the generated TOML and initialization
+        record are owned by the experiment, making later UI changes harmless.
+        """
+        if not name.strip(): raise ValueError("A training plan requires a name")
+        draft, dataset = self.model_draft(draft_id), self.dataset(dataset_id)
+        if draft is None: raise KeyError("Model draft was not found")
+        if dataset is None: raise KeyError("Dataset was not found")
+        if dataset["lifecycle"] != "frozen": raise ValueError("Training requires a frozen registered dataset")
+        overrides, initialization = training_overrides or {}, initialization or {}
+        if not isinstance(overrides, dict) or not isinstance(initialization, dict): raise ValueError("Training overrides and initialization must be objects")
+        config = deep_merge(draft["config"], overrides)
+        # The selected frozen dataset is authoritative for the classifier
+        # output dimension. A draft can estimate capacity before data is
+        # selected, but it cannot accidentally seal an incompatible class head.
+        if str((config.get("run") or {}).get("task")) == "classification":
+            try:
+                with sqlite3.connect(dataset["path"]) as dataset_db:
+                    class_count = int(dataset_db.execute("SELECT count(*) FROM classification_labels").fetchone()[0])
+                if class_count > 0:
+                    config.setdefault("data", {})["num_classes"] = class_count
+            except sqlite3.DatabaseError:
+                pass
+        config = self._draft_config(config)
+        source_id = initialization.get("source_artifact_id")
+        if source_id:
+            source = self.artifact(str(source_id))
+            if source is None: raise KeyError("Initialization source artifact was not found")
+            if source.get("task") and source.get("task") != (config.get("run") or {}).get("task"):
+                raise ValueError("Initialization source task is incompatible with the draft task")
+            source_config = self._json_file(Path(source["path"]) / "config" / "resolved.json") or {}
+            source_shape = self._nested(source_config, "data", "input_shape")
+            target_shape = self._nested(config, "data", "input_shape")
+            if source_shape and target_shape and list(source_shape) != list(target_shape):
+                raise ValueError("Initialization source input shape is incompatible with the draft")
+        mode = str(initialization.get("mode", "scratch"))
+        if mode not in {"scratch", "fine_tune", "transfer_encoder", "resume"}: raise ValueError("Unsupported initialization mode")
+        if mode != "scratch" and not source_id: raise ValueError("A non-scratch initialization requires source_artifact_id")
+        experiment_id, specification_id, now = str(uuid.uuid4()), str(uuid.uuid4()), _now()
+        config_dir = self.artifact_root / "experiments" / experiment_id / "configs"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        config_path = config_dir / f"draft-{draft_id[:8]}-revision-{draft['revision']}.toml"
+        import tomli_w
+        def toml_safe(value: Any) -> Any:
+            if isinstance(value, dict): return {key: toml_safe(item) for key, item in value.items() if item is not None}
+            if isinstance(value, list): return [toml_safe(item) for item in value if item is not None]
+            return value
+        config_path.write_text(tomli_w.dumps(toml_safe(config)), encoding="utf-8")
+        parameters = self._assign_output_path("train", {"config": str(config_path), "input": dataset["path"], "dataset_id": dataset_id, "draft_id": draft_id, "draft_revision": draft["revision"], "initialization": initialization}, specification_id)
+        digest = hashlib.sha256(_json({"parameters": parameters, "dataset_fingerprint": dataset["fingerprint_sha256"]}).encode()).hexdigest()
+        plan = {"kind": "training", "dataset_id": dataset_id, "draft_id": draft_id, "draft_revision": draft["revision"], "resources": resources or {}, "initialization": initialization}
+        with self._connection() as db:
+            db.execute("INSERT INTO experiments VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", (experiment_id, None, name.strip(), description, dataset_id, "expanded", _json(plan), now, now))
+            db.execute("INSERT INTO run_specifications VALUES (?, ?, 1, ?, 'train', ?, ?, ?, 'planned', NULL, ?, ?)", (specification_id, experiment_id, name.strip(), _json(parameters), _json(resources or {}), digest, now, now))
+        return self.experiment(experiment_id)  # type: ignore[return-value]
 
     def _comparison_group_detail(self, group: dict[str, Any], members: list[dict[str, Any]]) -> dict[str, Any]:
         results: list[dict[str, Any]] = []
@@ -901,9 +1542,7 @@ class Orchestrator:
         """Assign paths owned by the orchestrator, never supplied by a UI client."""
         resolved = dict(parameters)
         if action == "train":
-            runs_dir = self.artifact_root / "runs"
-            runs_dir.mkdir(parents=True, exist_ok=True)
-            resolved["runs_dir"] = str(runs_dir)
+            resolved["runs_dir"] = str(self.runs_root)
             resolved["output"] = specification_id
         elif action == "evaluate":
             output = self.artifact_root / "evaluations" / specification_id
@@ -976,7 +1615,7 @@ class Orchestrator:
                     raise ValueError("GPU request must be a non-negative integer")
                 next_resources["gpu_count"] = gpu_count
             overrides = config_overrides or {}
-            allowed_sections = {"run", "data", "model", "training", "augmentation", "callbacks", "output"}
+            allowed_sections = {"run", "data", "model", "training", "augmentation", "callbacks", "output", "architecture", "input", "encoder", "stem", "normalization", "pooling", "image_embedding", "metadata", "fusion", "classifier", "preprocessing"}
             if set(overrides) - allowed_sections or any(not isinstance(value, dict) for value in overrides.values()):
                 raise ValueError("Configuration changes must use known configuration sections")
             if overrides:

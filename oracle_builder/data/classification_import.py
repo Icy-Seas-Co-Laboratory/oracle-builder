@@ -188,6 +188,10 @@ def _encoded_input(candidate: Candidate, options: argparse.Namespace):
             "rescale": options.rescale,
             "invert": options.invert,
             "pad_value": options.pad_value,
+            "upscale_limit": getattr(options, "upscale_limit", None),
+            "pad_anchor": getattr(options, "pad_anchor", "center"),
+            "pad_mode": getattr(options, "pad_mode", "constant"),
+            "crop_anchor": getattr(options, "crop_anchor", "center"),
             "interpolation": options.interpolation,
             "channel_mode": options.channel_mode,
             "derived_channels": {
@@ -617,7 +621,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--resize-mode",
-        choices=("fit_pad", "fit_pad_max_2x", "fit_pad_max_3x", "fill_crop", "stretch", "none", "fit"),
+        choices=(
+            "fit_pad", "fit_pad_max_2x", "fit_pad_max_3x", "center_pad",
+            "center_roi_pad", "fill_crop", "center_crop", "stretch", "none", "fit",
+        ),
         default="fit_pad",
     )
     parser.add_argument(
@@ -628,6 +635,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rescale", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--invert", action="store_true")
     parser.add_argument("--pad-value", type=float, default=0.0)
+    parser.add_argument("--upscale-limit", type=float)
+    parser.add_argument(
+        "--pad-anchor",
+        choices=("center", "top", "bottom", "left", "right", "top_left", "top_right", "bottom_left", "bottom_right"),
+        default="center",
+    )
+    parser.add_argument(
+        "--pad-mode", choices=("constant", "edge", "reflect", "symmetric"), default="constant"
+    )
+    parser.add_argument(
+        "--crop-anchor",
+        choices=("center", "top", "bottom", "left", "right", "top_left", "top_right", "bottom_left", "bottom_right"),
+        default="center",
+    )
     parser.add_argument(
         "--interpolation",
         choices=("nearest", "bilinear", "bicubic", "lanczos"),

@@ -16,3 +16,4 @@ const proxy: RequestHandler = async ({ request, params, url, fetch }) => {
 export const GET = proxy;
 export const POST = proxy;
 export const PATCH = proxy;
+export const PUT = proxy;

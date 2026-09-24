@@ -81,9 +81,68 @@ class ComparisonGroupRequest(BaseModel):
     baseline_artifact_id: str | None = None
 
 
+class ArtifactTagRequest(BaseModel):
+    tags: list[str] = Field(default_factory=list)
+
+
+class ArtifactCatalogQueryRequest(BaseModel):
+    filters: dict[str, Any] = Field(default_factory=dict)
+    sort: str = "updated_at"
+    order: str = "desc"
+    offset: int = Field(default=0, ge=0)
+    limit: int = Field(default=100, ge=1, le=500)
+
+
+class ArtifactTagAssignmentRequest(BaseModel):
+    artifact_ids: list[str]
+    tags: list[str] = Field(default_factory=list)
+
+
+class TagRequest(BaseModel):
+    name: str
+    color: str | None = None
+
+
+class ModelDraftRequest(BaseModel):
+    name: str = "Untitled model"
+    description: str = ""
+    config: dict[str, Any] = Field(default_factory=dict)
+    layout: dict[str, Any] = Field(default_factory=dict)
+    source_artifact_id: str | None = None
+
+
+class ModelDraftUpdateRequest(BaseModel):
+    name: str | None = None
+    description: str | None = None
+    config: dict[str, Any] | None = None
+    layout: dict[str, Any] | None = None
+
+
+class ModelDraftCloneRequest(BaseModel):
+    name: str | None = None
+
+
+class DraftTrainingPlanRequest(BaseModel):
+    name: str
+    dataset_id: str
+    description: str = ""
+    resources: dict[str, Any] = Field(default_factory=dict)
+    training_overrides: dict[str, Any] = Field(default_factory=dict)
+    initialization: dict[str, Any] = Field(default_factory=dict)
+
+
+class TrainingCatalogScanRequest(BaseModel):
+    root_id: str | None = None
+
+
+class TrainingCatalogCompareRequest(BaseModel):
+    catalog_ids: list[str]
+
+
 def create_app(orchestrator: Orchestrator) -> FastAPI:
     @asynccontextmanager
-    async def lifespan(_: FastAPI):
+    async def lifespan(app: FastAPI):
+        app.state.startup_reconciliation = orchestrator.reconcile_startup()
         yield
 
     app = FastAPI(title="Oracle Builder Orchestrator API", version="0.1.0", lifespan=lifespan)
@@ -101,7 +160,7 @@ def create_app(orchestrator: Orchestrator) -> FastAPI:
     def ready() -> dict[str, Any]:
         endpoints = orchestrator.compute_endpoints()
         available = sum(endpoint["status"] == "ready" for endpoint in endpoints)
-        return {"status": "ready" if available else "degraded", "database": "ready", "compute_endpoints": {"configured": len(endpoints), "ready": available}}
+        return {"status": "ready" if available else "degraded", "database": "ready", "compute_endpoints": {"configured": len(endpoints), "ready": available}, "startup_reconciliation": getattr(app.state, "startup_reconciliation", None)}
 
     @app.get("/v1/compute/endpoints")
     def compute_endpoints(refresh: bool = Query(default=False)) -> dict[str, Any]:
@@ -147,10 +206,52 @@ def create_app(orchestrator: Orchestrator) -> FastAPI:
     @app.get("/v1/datasets")
     def datasets() -> dict[str, Any]: return {"datasets": orchestrator.datasets()}
 
+    @app.get("/v1/training-catalog")
+    def training_catalog(root_id: str | None = Query(default=None)) -> dict[str, Any]:
+        return {"roots": orchestrator.training_catalog_roots_info(), "entries": orchestrator.training_catalog(root_id=root_id), "bundles": orchestrator.training_catalog_bundles(root_id=root_id)}
+
+    @app.post("/v1/training-catalog:scan")
+    def scan_training_catalog(body: TrainingCatalogScanRequest) -> dict[str, Any]:
+        try: return orchestrator.scan_training_catalog(**body.model_dump())
+        except KeyError as exc: raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except (OSError, ValueError) as exc: raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/v1/training-catalog/{catalog_id}:freeze")
+    def freeze_training_catalog_entry(catalog_id: str) -> dict[str, Any]:
+        try: return orchestrator.freeze_training_catalog_entry(catalog_id)
+        except KeyError as exc: raise HTTPException(status_code=404, detail="Training catalog entry was not found") from exc
+        except (OSError, ValueError) as exc: raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.get("/v1/training-catalog/{catalog_id}")
+    def training_catalog_entry(catalog_id: str) -> dict[str, Any]:
+        entry = required(orchestrator.training_catalog_entry(catalog_id), "Training catalog entry")
+        view = orchestrator._training_catalog_view(entry)
+        return {"entry": view, "classes": view.get("classes", []), "dimensions": view.get("dimensions", {}), "warnings": view.get("warnings", [])}
+
+    @app.get("/v1/training-catalog/{catalog_id}/previews")
+    def training_catalog_previews(catalog_id: str, label: str | None = Query(default=None), offset: int = Query(default=0, ge=0), limit: int = Query(default=24, ge=1, le=100)) -> dict[str, Any]:
+        try: return orchestrator.training_catalog_previews(catalog_id, label=label, offset=offset, limit=limit)
+        except KeyError as exc: raise HTTPException(status_code=404, detail="Training catalog entry was not found") from exc
+
+    @app.get("/v1/training-catalog/{catalog_id}/previews/{item_id}")
+    def training_catalog_preview_image(catalog_id: str, item_id: str, max_size: int = Query(default=320, ge=32, le=1024)) -> Response:
+        try:
+            return Response(orchestrator.training_catalog_preview_image(catalog_id, item_id, max_size=max_size), media_type="image/jpeg", headers={"Cache-Control": "private, max-age=3600"})
+        except (KeyError, FileNotFoundError) as exc: raise HTTPException(status_code=404, detail="Training catalog preview was not found") from exc
+        except (OSError, ValueError) as exc: raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/v1/training-catalog:compare")
+    def compare_training_catalog(body: TrainingCatalogCompareRequest) -> dict[str, Any]:
+        try: return orchestrator.compare_training_catalog(body.catalog_ids)
+        except KeyError as exc: raise HTTPException(status_code=404, detail=str(exc)) from exc
+
     @app.get("/v1/model-setups/{architecture}")
     def model_setup(architecture: str) -> dict[str, Any]:
         try: return orchestrator.model_setup(architecture)
         except ValueError as exc: raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.get("/v1/config-schema")
+    def configuration_schema() -> dict[str, Any]: return orchestrator.configuration_schema()
 
     @app.post("/v1/model-previews")
     def model_preview(body: ModelPreviewRequest) -> dict[str, Any]:
@@ -195,7 +296,41 @@ def create_app(orchestrator: Orchestrator) -> FastAPI:
     def artifacts() -> dict[str, Any]: return {"artifacts": orchestrator.artifacts()}
 
     @app.get("/v1/artifacts/catalog")
-    def artifact_catalog() -> dict[str, Any]: return {"artifacts": orchestrator.artifact_catalog()}
+    def artifact_catalog(filters: str | None = Query(default=None), sort: str = Query(default="updated_at"), order: str = Query(default="desc"), offset: int = Query(default=0, ge=0), limit: int = Query(default=100, ge=1, le=500)) -> dict[str, Any]:
+        import json
+        try:
+            parsed = json.loads(filters) if filters else {}
+            if not isinstance(parsed, dict): raise ValueError("filters must be a JSON object")
+            return orchestrator.artifact_catalog_query(filters=parsed, sort=sort, order=order, offset=offset, limit=limit)
+        except (json.JSONDecodeError, ValueError) as exc: raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.get("/v1/artifacts/filter-schema")
+    def artifact_filter_schema() -> dict[str, Any]: return orchestrator.artifact_filter_schema()
+
+    @app.post("/v1/artifacts/catalog/query")
+    def query_artifact_catalog(body: ArtifactCatalogQueryRequest) -> dict[str, Any]:
+        try: return orchestrator.artifact_catalog_query(**body.model_dump())
+        except ValueError as exc: raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.get("/v1/tags")
+    def tags() -> dict[str, Any]: return {"tags": orchestrator.tags()}
+
+    @app.get("/v1/artifact-tags")
+    def artifact_tags_catalog() -> dict[str, Any]: return {"tags": orchestrator.tags()}
+
+    @app.post("/v1/tags", status_code=201)
+    def create_tag(body: TagRequest) -> dict[str, Any]:
+        try: return orchestrator.create_tag(**body.model_dump())
+        except ValueError as exc: raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/v1/artifact-tags/assign")
+    def assign_artifact_tags(body: ArtifactTagAssignmentRequest) -> dict[str, Any]:
+        if not body.artifact_ids: raise HTTPException(status_code=422, detail="Select at least one artifact")
+        try:
+            assignments = {artifact_id: orchestrator.set_artifact_tags(artifact_id, body.tags) for artifact_id in dict.fromkeys(body.artifact_ids)}
+            return {"assignments": assignments}
+        except KeyError as exc: raise HTTPException(status_code=404, detail="Artifact was not found") from exc
+        except ValueError as exc: raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.get("/v1/artifacts/{artifact_id}")
     def artifact(artifact_id: str) -> dict[str, Any]: return required(orchestrator.artifact(artifact_id), "Artifact")
@@ -204,6 +339,64 @@ def create_app(orchestrator: Orchestrator) -> FastAPI:
     def artifact_detail(artifact_id: str) -> dict[str, Any]:
         try: return orchestrator.artifact_detail(artifact_id)
         except KeyError as exc: raise HTTPException(status_code=404, detail="Artifact was not found") from exc
+
+    @app.get("/v1/artifacts/{artifact_id}/architecture-view")
+    def artifact_architecture_view(artifact_id: str) -> dict[str, Any]:
+        try: return orchestrator.artifact_architecture_view(artifact_id)
+        except KeyError as exc: raise HTTPException(status_code=404, detail="Artifact was not found") from exc
+
+    @app.get("/v1/artifacts/{artifact_id}/tags")
+    def artifact_tags(artifact_id: str) -> dict[str, Any]:
+        if orchestrator.artifact(artifact_id) is None: raise HTTPException(status_code=404, detail="Artifact was not found")
+        return {"tags": orchestrator.tags_for_artifact(artifact_id)}
+
+    @app.put("/v1/artifacts/{artifact_id}/tags")
+    def set_artifact_tags(artifact_id: str, body: ArtifactTagRequest) -> dict[str, Any]:
+        try: return {"tags": orchestrator.set_artifact_tags(artifact_id, body.tags)}
+        except KeyError as exc: raise HTTPException(status_code=404, detail="Artifact was not found") from exc
+        except ValueError as exc: raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.get("/v1/model-drafts")
+    def model_drafts() -> dict[str, Any]: return {"drafts": orchestrator.model_drafts()}
+
+    @app.post("/v1/model-drafts", status_code=201)
+    def create_model_draft(body: ModelDraftRequest) -> dict[str, Any]:
+        try: return orchestrator.create_model_draft(**body.model_dump())
+        except KeyError as exc: raise HTTPException(status_code=404, detail="Source artifact was not found") from exc
+        except ValueError as exc: raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/v1/model-drafts/{draft_id}:clone", status_code=201)
+    def clone_model_draft(draft_id: str, body: ModelDraftCloneRequest) -> dict[str, Any]:
+        try: return orchestrator.clone_model_draft(draft_id, **body.model_dump())
+        except KeyError as exc: raise HTTPException(status_code=404, detail="Model draft was not found") from exc
+
+    @app.get("/v1/model-drafts/{draft_id}:validate")
+    def validate_model_draft(draft_id: str) -> dict[str, Any]:
+        try: return orchestrator.validate_model_draft(draft_id)
+        except KeyError as exc: raise HTTPException(status_code=404, detail="Model draft was not found") from exc
+
+    @app.get("/v1/model-drafts/{draft_id}:preview")
+    def preview_model_draft(draft_id: str, dataset_id: str | None = Query(default=None)) -> dict[str, Any]:
+        try: return orchestrator.preview_model_draft(draft_id, dataset_id=dataset_id)
+        except KeyError as exc: raise HTTPException(status_code=404, detail="Model draft or dataset was not found") from exc
+        except ValueError as exc: raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/v1/model-drafts/{draft_id}:plan-training", status_code=201)
+    def plan_draft_training(draft_id: str, body: DraftTrainingPlanRequest) -> dict[str, Any]:
+        try: return orchestrator.plan_draft_training(draft_id, **body.model_dump())
+        except KeyError as exc: raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc: raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    # Keep the bare parameter route after action routes: Starlette treats
+    # ``id:validate`` as a valid path parameter otherwise.
+    @app.get("/v1/model-drafts/{draft_id}")
+    def model_draft(draft_id: str) -> dict[str, Any]: return required(orchestrator.model_draft(draft_id), "Model draft")
+
+    @app.patch("/v1/model-drafts/{draft_id}")
+    def update_model_draft(draft_id: str, body: ModelDraftUpdateRequest) -> dict[str, Any]:
+        try: return orchestrator.update_model_draft(draft_id, **body.model_dump(exclude_unset=True))
+        except KeyError as exc: raise HTTPException(status_code=404, detail="Model draft was not found") from exc
+        except ValueError as exc: raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.get("/v1/artifacts/{artifact_id}/history")
     def artifact_history(artifact_id: str, limit: int = Query(default=500, ge=1, le=2000)) -> dict[str, Any]:

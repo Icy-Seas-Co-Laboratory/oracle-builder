@@ -7,11 +7,12 @@ from tensorflow import keras
 from tensorflow.keras import layers
 
 from oracle_builder.classification.features import (
+    build_composable_classification_model,
     classification_head,
     classifier_inputs,
     classifier_normalization,
     join_auxiliary_features,
-    stratum_conditioning_input,
+    stratum_conditioning_input, uses_composable_graph,
 )
 
 
@@ -144,6 +145,12 @@ def build_model(config: dict[str, Any]):
     x = layers.Conv2D(top_filters, 1, padding="same", use_bias=False, name="top_conv")(x)
     x = classifier_normalization(config, top_filters, "top_bn")(x)
     x = layers.Activation("swish", name="top_activation")(x)
+    if uses_composable_graph(config):
+        return build_composable_classification_model(
+            image=inputs, feature_map=x, metadata=metadata,
+            num_classes=int(config["data"]["num_classes"]), config=config,
+            name=variant, stratum_dimension=stratum_dimension,
+        )
     x = layers.GlobalAveragePooling2D(name="global_pool")(x)
     x = join_auxiliary_features(x, metadata)
     outputs = classification_head(

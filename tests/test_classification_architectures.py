@@ -51,6 +51,16 @@ def classification_config(model_name: str, model_options: dict | None = None):
                 "top_filters": 16,
             },
         ),
+        (
+            "efficientnet_v2",
+            "efficientnet_v2_b0",
+            {
+                "width_coefficient": 0.25,
+                "depth_coefficient": 0.2,
+                "stem_filters": 8,
+                "top_filters": 16,
+            },
+        ),
     ],
 )
 def test_classification_families_build_and_train(family, variant, options):

@@ -416,6 +416,58 @@ def test_capped_fit_pad_modes_limit_small_roi_upscaling_and_downsize_large_rois(
     assert np.count_nonzero(three_x) == 24 * 24
 
 
+def test_center_pad_preserves_native_roi_scale_and_centers_it():
+    value = prepare_classification_input(
+        np.full((4, 2), 255, dtype="uint8"),
+        [8, 8, 1],
+        {
+            "preprocessing": {
+                "resize_mode": "center_pad",
+                "normalization": "dtype",
+                "rescale": True,
+                "pad_value": 0.0,
+                "interpolation": "nearest",
+                "channel_mode": "grayscale",
+            }
+        },
+    )
+    assert value.shape == (8, 8, 1)
+    assert np.array_equal(value[2:6, 3:5, 0], np.ones((4, 2), dtype="float32"))
+    assert np.count_nonzero(value) == 8
+
+
+def test_padding_and_crop_anchors_and_nonconstant_padding_are_explicit():
+    pad_config = {
+        "preprocessing": {
+            "resize_mode": "center_pad",
+            "normalization": "dtype",
+            "rescale": True,
+            "pad_mode": "edge",
+            "interpolation": "nearest",
+            "channel_mode": "grayscale",
+        }
+    }
+    source = np.array([[0, 0, 0, 0], [255, 255, 255, 255]], dtype="uint8")
+    padded = prepare_classification_input(source, [6, 4, 1], pad_config)
+    assert np.all(padded[:2, :, 0] == 0.0)
+    assert np.all(padded[-2:, :, 0] == 1.0)
+
+    crop_config = {
+        "preprocessing": {
+            "resize_mode": "fill_crop",
+            "crop_anchor": "top_left",
+            "normalization": "dtype",
+            "rescale": True,
+            "interpolation": "nearest",
+            "channel_mode": "grayscale",
+        }
+    }
+    wide = np.zeros((4, 8), dtype="uint8")
+    wide[:, 4:] = 255
+    cropped = prepare_classification_input(wide, [4, 4, 1], crop_config)
+    assert np.all(cropped == 0.0)
+
+
 def test_repeat_import_skips_existing_samples_and_preserves_labels(tmp_path):
     source = tmp_path / "library"
     write_image(source / "cod" / "one.jpg", (10, 20, 30))

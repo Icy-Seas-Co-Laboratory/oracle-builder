@@ -96,6 +96,41 @@ def test_classification_augmentation_preserves_auxiliary_metadata_input():
     assert np.array_equal(labels.numpy(), [0, 1])
 
 
+def test_training_only_metadata_gaussian_noise_is_opt_in_and_field_scoped():
+    tf.random.set_seed(123)
+    config = {
+        "run": {"task": "classification"},
+        "data": {"input_shape": [4, 4, 1]},
+        # Metadata regularization must not depend on image augmentation.
+        "augmentation": {"enabled": False},
+        "metadata": {
+            "augmentation": {
+                "gaussian_variance": 0.25,
+                "probability": 1.0,
+                "fields": ["area"],
+            }
+        },
+        "model": {
+            "auxiliary_features_fitted": [
+                {"name": "area", "source": "metadata.area"},
+                {"name": "instrument", "source": "metadata.instrument", "augment": False},
+            ]
+        },
+    }
+    image = tf.ones((2, 4, 4, 1), dtype=tf.float32)
+    metadata = tf.constant([[1.0, 8.0], [2.0, 9.0]], dtype=tf.float32)
+    inputs, labels = augment_batch(
+        {"image": image, "metadata": metadata},
+        tf.constant([0, 1], dtype=tf.int64),
+        config,
+    )
+
+    assert np.array_equal(inputs["image"].numpy(), image.numpy())
+    assert not np.array_equal(inputs["metadata"].numpy()[:, 0], metadata.numpy()[:, 0])
+    assert np.array_equal(inputs["metadata"].numpy()[:, 1], metadata.numpy()[:, 1])
+    assert np.array_equal(labels.numpy(), [0, 1])
+
+
 def test_segmentation_augmentation_transforms_spatial_weights_with_masks():
     config = {
         "run": {"task": "segmentation"},
@@ -116,6 +151,37 @@ def test_segmentation_augmentation_transforms_spatial_weights_with_masks():
     assert augmented_y.shape == y.shape
     assert augmented_weights.shape == weights.shape
     assert float(tf.reduce_min(augmented_weights)) >= 1.0
+
+
+def test_random_resized_crop_and_right_angle_rotation_preserve_mask_alignment():
+    tf.random.set_seed(7)
+    config = {
+        "run": {"task": "segmentation"},
+        "data": {"input_shape": [8, 8, 2]},
+        "augmentation": {
+            "enabled": True,
+            "random_resized_crop": 0.3,
+            "rotate_90": True,
+            "zoom_x": 0.1,
+            "zoom_y": 0.2,
+            "mask_input_channels": [1],
+        },
+    }
+    x = np.zeros((1, 8, 8, 2), dtype="float32")
+    x[:, 2:6, 2:6, 0] = 0.5
+    x[:, 3:5, 3:5, 1] = 1.0
+    y = x[..., 1:2].copy()
+    weights = np.ones((1, 8, 8), dtype="float32")
+
+    augmented_x, augmented_y, augmented_weights = augment_batch(
+        tf.constant(x), tf.constant(y), config, tf.constant(weights)
+    )
+
+    assert augmented_x.shape == x.shape
+    assert augmented_y.shape == y.shape
+    assert augmented_weights.shape == weights.shape
+    assert set(np.unique(augmented_x.numpy()[..., 1])).issubset({0.0, 1.0})
+    assert set(np.unique(augmented_y.numpy())).issubset({0.0, 1.0})
 
 
 def test_candidate_sdf_channel_is_excluded_from_photometric_augmentation():

@@ -217,7 +217,9 @@ def test_upload_api_stages_allowed_files_in_owned_artifact_root(tmp_path):
     from oracle_builder.orchestration.api import create_app
 
     artifact_root = tmp_path / "artifacts"
-    with TestClient(create_app(Orchestrator(tmp_path / "orchestrator.sqlite", artifact_root=artifact_root))) as client:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    with TestClient(create_app(Orchestrator(tmp_path / "orchestrator.sqlite", artifact_root=artifact_root, workspace_root=workspace))) as client:
         response = client.post("/v1/uploads/configs/baseline.toml", content=b"[run]\n")
         assert response.status_code == 201
         uploaded = response.json()
@@ -387,3 +389,104 @@ def test_dataset_previews_and_artifact_inspector_are_bounded(tmp_path):
         assert client.get(f"/v1/datasets/{dataset['dataset_id']}/detail").status_code == 200
         assert client.get(f"/v1/datasets/{dataset['dataset_id']}/previews/{previews['items'][0]['item_id']}").headers["content-type"] == "image/jpeg"
         assert client.get(f"/v1/artifacts/{artifact['artifact_id']}/history").json()["rows"][1]["accuracy"] == 0.9
+
+
+def test_model_catalog_tags_and_versioned_v2_drafts(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    source = workspace / "source.toml"
+    source.write_text("[run]\ntask = 'classification'\n")
+    artifact_root = tmp_path / "artifacts"
+    orchestrator = Orchestrator(tmp_path / "orchestrator.sqlite", workspace_root=workspace, artifact_root=artifact_root)
+    artifact = _create_sealed_product(artifact_root / "baseline", source, metrics={"macro_f1": 0.81})
+    orchestrator.scan(artifact_root / "baseline")
+
+    tags = orchestrator.set_artifact_tags(artifact["artifact_id"], ["baseline", "reviewed"])
+    assert [tag["name"] for tag in tags] == ["baseline", "reviewed"]
+    catalog = orchestrator.artifact_catalog_query(filters={"tag": "baseline"})
+    assert catalog["total"] == 1
+    assert catalog["artifacts"][0]["artifact_id"] == artifact["artifact_id"]
+    assert catalog["artifacts"][0]["macro_f1"] == 0.81
+    assert catalog["artifacts"][0]["classifier_type"] == "linear"
+    assert catalog["artifacts"][0]["artifact_size_bytes"] > 0
+    assert catalog["artifacts"][0]["created_at"]
+    assert orchestrator.artifact_catalog_query(filters={"artifact_size_bytes": {"gte": 1}}, sort="artifact_size_bytes")["total"] == 1
+    assert orchestrator.artifact_detail(artifact["artifact_id"])["facts"]["macro_f1"] == 0.81
+    assert {"stem_size", "artifact_size_bytes", "epochs", "parameter_count", "accuracy", "created_at"} <= {field["key"] for field in orchestrator.artifact_filter_schema()["fields"]}
+
+    draft = orchestrator.create_model_draft(name="V2 baseline")
+    assert draft["architecture"]["version"] == 2
+    assert orchestrator.validate_model_draft(draft["draft_id"])["valid"]
+    revised = orchestrator.update_model_draft(draft["draft_id"], name="V2 baseline revised")
+    assert revised["revision"] == 2
+
+
+def test_configuration_schema_and_planning_derive_class_count_from_frozen_dataset(tmp_path):
+    import sqlite3
+
+    from oracle_builder.config import load_toml
+    from oracle_builder.data.sqlite_dataset import create_synthetic_classification
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    dataset_path = workspace / "three_classes.sqlite"
+    create_synthetic_classification(dataset_path, n=9, shape=(12, 12, 1), classes=3)
+    with sqlite3.connect(dataset_path) as db:
+        db.execute("UPDATE dataset SET lifecycle='frozen'")
+        db.commit()
+    orchestrator = Orchestrator(tmp_path / "orchestrator.sqlite", workspace_root=workspace, artifact_root=tmp_path / "artifacts")
+    dataset = orchestrator.ingest_dataset(dataset_path)
+    schema = orchestrator.configuration_schema()
+    assert schema["defaults"]["architecture"]["version"] == 2
+    assert "output" in schema["groups"]
+
+    draft = orchestrator.create_model_draft(name="Provisional count", config={
+        "data": {"input_shape": [12, 12, 1], "num_classes": 99},
+        "training": {"loss": "sparse_categorical_crossentropy"},
+    })
+    experiment = orchestrator.plan_draft_training(draft["draft_id"], name="derived classes", dataset_id=dataset["dataset_id"])
+    specification = orchestrator.specifications(experiment["experiment_id"])[0]
+    sealed_config = load_toml(specification["parameters"]["config"])
+    assert sealed_config["data"]["num_classes"] == 3
+
+
+def test_startup_reconciles_project_runs_and_frozen_datasets(tmp_path):
+    import sqlite3
+
+    from fastapi.testclient import TestClient
+    from oracle_builder.data.sqlite_dataset import create_synthetic_classification
+    from oracle_builder.orchestration.api import create_app
+
+    workspace = tmp_path / "workspace"
+    runs, datasets = workspace / "runs", workspace / "datasets"
+    runs.mkdir(parents=True)
+    datasets.mkdir()
+    source = workspace / "legacy-source.toml"
+    source.write_text("[run]\ntask = 'classification'\n")
+    artifact = _create_sealed_product(runs / "legacy-run", source, artifact_type="model_run", metrics={"macro_f1": 0.82})
+    dataset_path = datasets / "frozen.sqlite"
+    create_synthetic_classification(dataset_path, n=4, shape=(12, 12, 1))
+    with sqlite3.connect(dataset_path) as db:
+        db.execute("UPDATE dataset SET lifecycle='frozen'")
+        db.commit()
+
+    orchestrator = Orchestrator(tmp_path / "runtime" / "orchestrator.sqlite", workspace_root=workspace)
+    assert orchestrator.runs_root == runs.resolve()
+    assert orchestrator.datasets_root == datasets.resolve()
+    assert not orchestrator.artifacts()
+    assert not orchestrator.datasets()
+
+    with TestClient(create_app(orchestrator)) as client:
+        ready = client.get("/health/ready").json()
+        reconciliation = ready["startup_reconciliation"]
+        assert artifact["artifact_id"] in reconciliation["artifacts"]["indexed"]
+        assert len(reconciliation["datasets"]["registered"]) == 1
+        assert {item["artifact_id"] for item in orchestrator.artifacts()} == {artifact["artifact_id"]}
+        assert len(orchestrator.datasets()) == 1
+
+    # The same durable inputs can be reconciled repeatedly without duplicates.
+    second = orchestrator.reconcile_startup()
+    assert not second["artifacts"]["indexed"]
+    assert second["artifacts"]["refreshed"] == [artifact["artifact_id"]]
+    assert not second["datasets"]["registered"]
+    assert len(second["datasets"]["already_registered"]) == 1

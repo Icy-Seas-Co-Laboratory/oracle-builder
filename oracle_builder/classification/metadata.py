@@ -113,6 +113,27 @@ def fitted_specs(config: dict[str, Any]) -> list[dict[str, Any]]:
     return [dict(spec) for spec in config.get("model", {}).get("auxiliary_features_fitted", feature_specs(config))]
 
 
+def gaussian_noise_indices(config: dict[str, Any]) -> list[int]:
+    """Return continuous fitted-feature columns eligible for training noise.
+
+    A feature can opt out with ``augment = false`` or ``kind = "categorical"``.
+    When `metadata.augmentation.fields` is present it is an allow-list, which
+    is useful when only selected morphology measurements should be perturbed.
+    """
+    augmentation = config.get("metadata", {}).get("augmentation", {})
+    if not isinstance(augmentation, dict):
+        return []
+    selected = {str(value) for value in augmentation.get("fields", [])}
+    indices = []
+    for index, spec in enumerate(fitted_specs(config)):
+        name = str(spec.get("name", ""))
+        continuous = str(spec.get("kind", "continuous")).lower() == "continuous"
+        allowed = not selected or name in selected
+        if continuous and allowed and bool(spec.get("augment", True)):
+            indices.append(index)
+    return indices
+
+
 def vector(config: dict[str, Any], metadata: dict[str, Any], original_shape: Any) -> np.ndarray:
     result = []
     for spec in fitted_specs(config):

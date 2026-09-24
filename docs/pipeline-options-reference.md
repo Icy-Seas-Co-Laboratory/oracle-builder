@@ -50,8 +50,24 @@ interrupted non-embedding run with a valid recovery snapshot.
 `[preprocessing]` is a serving contract: the same transformation is applied
 during training and later inference. `resize_mode` is `fit_pad` (safe default),
 `fit_pad_max_2x`, `fit_pad_max_3x` (cap enlargement of small ROIs),
-`fill_crop`, `stretch`, `none`, or legacy `fit`. Choose `fit_pad` when aspect
-ratio carries meaning; use crop/stretch only when their distortion is accepted.
+`center_pad`/`center_roi_pad` (never enlarge; center the native-detail ROI on
+the canvas), `fill_crop`, `center_crop`, `stretch`, `none`, or legacy `fit`.
+Choose `fit_pad` when aspect ratio carries meaning; use crop/stretch only when
+their distortion is accepted.
+
+Padding and crops are independently anchored with `pad_anchor` and
+`crop_anchor`: `center`, each compass edge, or `top_left`, `top_right`,
+`bottom_left`, and `bottom_right`. `pad_mode` is `constant` (using
+`pad_value`), `edge`, `reflect`, or `symmetric`; use `edge` or `constant` for
+one-pixel ROIs. `upscale_limit` is a general positive cap for `fit_pad` when
+the fixed 2×/3× aliases do not match the experiment. For example:
+
+```toml
+[preprocessing]
+resize_mode = "center_pad" # preserve native ROI detail, then center/pad
+pad_mode = "edge"
+pad_anchor = "center"
+```
 
 `normalization` is `dtype`, `minmax`, `percentile`, or `none`. `rescale`,
 `pad_value`, `percentile_low`, and `percentile_high` refine it. `invert` is
@@ -150,7 +166,8 @@ blend_mode = "hann"
 Classification predicts a dataset label and can preserve a serving embedding
 and nearest-neighbor evidence. Available native architectures are `simple_cnn`,
 `resnet_like`, `densenet_like`, `resnet`/`resnet18`…`resnet152`, `densenet`/
-`densenet121`/`169`/`201`, and `efficientnet`/`efficientnet_b0`…`b7`.
+`densenet121`/`169`/`201`, `efficientnet`/`efficientnet_b0`…`b7`, and native
+`efficientnet_v2`/`efficientnet_v2_b0`…`b3` plus `efficientnet_v2_s`/`m`/`l`.
 SimpleCNN is the fast baseline; ResNet is a dependable default; DenseNet trades
 more memory for feature reuse; EfficientNet targets accuracy per compute.
 

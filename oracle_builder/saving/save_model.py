@@ -30,7 +30,13 @@ class _ClassificationExport(tf.Module):
     @tf.function
     def embed(self, inputs):
         outputs = self.feature_model(inputs, training=False)
-        return {"features": outputs["features"]}
+        # V1 consumers continue to read ``features``. V2 consumers can select
+        # an explicit image/fused/projection stage from this same signature.
+        return {
+            name: value
+            for name, value in outputs.items()
+            if name not in {"logits", "probabilities"}
+        }
 
     @tf.function
     def serve(self, inputs):

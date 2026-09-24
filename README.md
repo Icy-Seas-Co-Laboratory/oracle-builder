@@ -56,9 +56,13 @@ scripts/start_oracle_stack.sh
 ```
 
 It creates a local `.oracle-runtime/` directory for the central SQLite
-database, owned artifact root, logs, and a persisted `Local` Oracle Serve
-endpoint used by dispatch preflight. Set `ORACLE_RUNTIME_DIR`,
-`ORACLE_HOST`, or the `ORACLE_*_PORT` variables to override its defaults.
+database, GUI-upload staging, logs, and a persisted `Local` Oracle Serve
+endpoint used by dispatch preflight. Durable training products use `./runs/`
+and training sources use `./datasets/`, consistent with command-line Oracle
+Builder workflows. At startup the control plane safely indexes sealed runs and
+registers frozen SQLite datasets that are not yet in its runtime database. Set
+`ORACLE_RUNTIME_DIR`, `ORACLE_HOST`, or the `ORACLE_*_PORT` variables to
+override its defaults.
 
 The reference documents are authoritative for on-disk contracts. Workflow guides
 intentionally repeat the commands and decisions needed for a single task.

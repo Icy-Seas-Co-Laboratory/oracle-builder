@@ -58,6 +58,22 @@ def test_status_retains_validation_metrics_and_metric_history_between_epochs():
     assert callback._history["loss"] == [1.0]
 
 
+def test_status_distinguishes_first_batch_loading_from_optimizer_execution():
+    callback = RichTrainingStatusCallback(phase="Classification", epochs=1, display="off")
+    callback.set_params({"steps": 1})
+    callback.on_epoch_begin(0)
+    assert callback._batch_status == "Preparing first batch"
+
+    callback.on_input_batch_loading(0)
+    assert callback._batch_status == "Loading batch 1 from input pipeline"
+
+    callback.on_train_batch_begin(0)
+    assert callback._batch_status == "Computing first optimizer update (initial shape may compile)"
+
+    callback.on_train_batch_end(0)
+    assert callback._batch_status == "Completed batch 1"
+
+
 def test_sparkline_and_direction_make_static_and_changing_metrics_visible():
     assert _sparkline([0.5, 0.5, 0.5]) == "▅▅▅"
     assert _trend([0.5, 0.5]) == "→"

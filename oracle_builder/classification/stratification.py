@@ -163,6 +163,13 @@ def architecture_supported(config: dict[str, Any]) -> bool:
         "densenet121", "densenet169", "densenet201", "efficientnet",
         "efficientnet_b0", "efficientnet_b1", "efficientnet_b2", "efficientnet_b3",
         "efficientnet_b4", "efficientnet_b5", "efficientnet_b6", "efficientnet_b7",
+        "efficientnet_v2", "efficientnetv2", "efficientnet_v2_b0", "efficientnet_v2_b1",
+        "efficientnet_v2_b2", "efficientnet_v2_b3", "efficientnetv2_b0",
+        "efficientnetv2_b1", "efficientnetv2_b2", "efficientnetv2_b3",
+        "efficientnet_v2_s", "efficientnet_v2_m", "efficientnet_v2_l",
+        "efficientnetv2_s", "efficientnetv2_m", "efficientnetv2_l",
+        "convnext", "convnext_tiny", "convnext_small", "mobilenet",
+        "mobilenet_v3_small", "mobilenet_v3_large",
     }
 
 

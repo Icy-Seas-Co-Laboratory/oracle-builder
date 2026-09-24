@@ -14,6 +14,10 @@ except ModuleNotFoundError:  # pragma: no cover
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "run": {"seed": 123, "notes": ""},
+    # V2 is the default for new runs. Archived V1 resolved configurations do
+    # not contain this section and therefore continue to rebuild their
+    # historical graph through the V1 compatibility path.
+    "architecture": {"version": 2},
     "data": {
         "batch_size": 16,
         "shuffle_buffer": 512,
@@ -46,6 +50,36 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "embedding_dim": 256,
         "normalize_embeddings": True,
     },
+    # Component sections are the V2 model-assembly contract.  The historic
+    # ``run.model`` and ``model`` keys remain supported and are normalized into
+    # these values where that is unambiguous.  Keeping the sections explicit
+    # makes the resolved configuration an accurate scientific record instead
+    # of an architecture-name-specific collection of switches.
+    "input": {
+        "channels": ["intensity"],
+        "geometry": {"type": "preserve_aspect_pad"},
+    },
+    "encoder": {},
+    "stem": {},
+    "normalization": {"type": "batch"},
+    "pooling": {"type": "avg"},
+    "image_embedding": {"projection": {"type": "identity"}},
+    "metadata": {
+        "fields": [],
+        "scaling": "standard",
+        "encoder": {"type": "direct"},
+        # Noise is applied only to the training dataset after fitted metadata
+        # transforms/scaling. A variance of zero preserves deterministic V2
+        # behavior while recording the regularization policy in every run.
+        "augmentation": {
+            "gaussian_variance": 0.0,
+            "probability": 1.0,
+            "apply_to": "continuous",
+            "fields": [],
+        },
+    },
+    "fusion": {"type": "concat"},
+    "classifier": {"type": "linear"},
     "training": {
         "epochs": 10,
         "optimizer": "adam",
@@ -126,6 +160,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "rescale": True,
         "invert": "auto",
         "pad_value": 0.0,
+        # Geometry is part of the serving contract. ``fit_pad`` scales to fit
+        # and then centers the ROI; ``center_pad`` preserves native detail by
+        # prohibiting enlargement before centering it on the canvas.
+        "upscale_limit": None,
+        "pad_anchor": "center",
+        "pad_mode": "constant",
+        "crop_anchor": "center",
         "interpolation": "bilinear",
         "channel_mode": "grayscale",
         "percentile_low": 1.0,
@@ -161,8 +202,14 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "invert": False,
         "rotation": 0.0,
         "zoom": 0.0,
+        # Optional independent scale ranges.  ``None`` inherits ``zoom`` for
+        # backwards-compatible isotropic transforms.
+        "zoom_x": None,
+        "zoom_y": None,
         "translation": 0.0,
         "skew": 0.0,
+        "random_resized_crop": 0.0,
+        "rotate_90": False,
         "flip_horizontal": False,
         "flip_vertical": False,
         "brightness": 0.0,
@@ -176,6 +223,17 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "save_predictions": True,
         "save_figures": True,
         "export_savedmodel": True,
+        # The cache is written batch-by-batch, keeping representation analysis
+        # out of the hot training graph and avoiding a full-dataset tensor in
+        # memory.  "auto" selects Parquet when an engine is installed and the
+        # portable NPY/JSON manifest otherwise.
+        "intermediate_artifacts": {
+            "enabled": True,
+            "format": "auto",
+            "split": "test",
+            "batch_size": 256,
+            "include_feature_map": False,
+        },
     },
     "recovery": {
         "enabled": True,
@@ -245,6 +303,90 @@ def normalize_self_supervised_config(
     return config
 
 
+def normalize_component_config(
+    config: dict[str, Any], user_config: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """Translate the unambiguous V2 component syntax to legacy builder keys.
+
+    Native builders still accept their established options while they are
+    migrated to the shared assembly graph.  Performing this translation once
+    during resolution keeps artifacts reproducible and avoids every family
+    having its own interpretation of component settings.
+    """
+    architecture = config.get("architecture", {})
+    is_v2 = isinstance(architecture, dict) and int(architecture.get("version", 1)) >= 2
+    supplied_input = (user_config or {}).get("input", {})
+    if is_v2:
+        input_settings = config.get("input", {})
+        if (
+            isinstance(input_settings, dict)
+            and isinstance(supplied_input, dict)
+            and "channels" in supplied_input
+        ):
+            config.setdefault("preprocessing", {})["channels"] = list(input_settings["channels"])
+        geometry = input_settings.get("geometry", {}) if isinstance(input_settings, dict) else {}
+        supplied_geometry = supplied_input.get("geometry", {}) if isinstance(supplied_input, dict) else {}
+        if isinstance(geometry, dict) and isinstance(supplied_geometry, dict) and "type" in supplied_geometry:
+            resize_modes = {
+                "preserve_aspect_pad": "fit_pad",
+                "center_roi_pad": "center_pad",
+                "resize_crop": "fill_crop",
+                "center_crop": "center_crop",
+                "direct_resize": "stretch",
+            }
+            config.setdefault("preprocessing", {})["resize_mode"] = resize_modes.get(
+                str(geometry["type"]), str(geometry["type"])
+            )
+    encoder = config.get("encoder", {})
+    if isinstance(encoder, dict):
+        family = encoder.get("family")
+        variant = encoder.get("variant")
+        if family:
+            config.setdefault("run", {})["model"] = str(family)
+        if variant:
+            config.setdefault("model", {})["variant"] = str(variant)
+    stem = config.get("stem", {})
+    if isinstance(stem, dict):
+        model = config.setdefault("model", {})
+        aliases = {
+            "kernel_size": "stem_kernel_size",
+            "stride": "stem_stride",
+            "width": "stem_filters",
+        }
+        for source, destination in aliases.items():
+            if source in stem:
+                model[destination] = stem[source]
+        if "pool" in stem:
+            model["stem_pool"] = str(stem["pool"]).lower() not in {"none", "false", "off"}
+    image_embedding = config.get("image_embedding", {})
+    if isinstance(image_embedding, dict):
+        projection = image_embedding.get("projection", {})
+        if isinstance(projection, dict):
+            model = config.setdefault("model", {})
+            if "output_dim" in projection:
+                model["embedding_dim"] = projection["output_dim"]
+            if "normalize" in projection:
+                model["normalize_embeddings"] = bool(projection["normalize"])
+    # Metadata V2 retains the existing fitted scalar-data path until a custom
+    # transformer is requested.  This conversion gives straightforward field
+    # lists train-only scaling and serving compatibility immediately.
+    metadata = config.get("metadata", {})
+    if is_v2 and isinstance(metadata, dict) and metadata.get("fields"):
+        fields = metadata["fields"]
+        if not isinstance(fields, list):
+            raise ValueError("metadata.fields must be a list")
+        specs = []
+        for field in fields:
+            if isinstance(field, str):
+                specs.append({"name": field, "source": f"metadata.{field}"})
+            elif isinstance(field, dict):
+                specs.append(dict(field))
+            else:
+                raise ValueError("metadata.fields entries must be names or tables")
+        config.setdefault("model", {})["auxiliary_features"] = specs
+    return config
+
+
 def load_toml(path: str | Path) -> dict[str, Any]:
     with Path(path).open("rb") as handle:
         return tomllib.load(handle)
@@ -289,11 +431,64 @@ def validate_config(config: dict[str, Any]) -> None:
         )
     if task in {"classification", "embedding"} and int(config.get("model", {}).get("embedding_dim", 256)) < 1:
         raise ValueError("model.embedding_dim must be a positive integer")
+    architecture = config.get("architecture", {})
+    if architecture and (not isinstance(architecture, dict) or int(architecture.get("version", 1)) not in {1, 2}):
+        raise ValueError("architecture.version must be 1 or 2")
+    if isinstance(architecture, dict) and int(architecture.get("version", 1)) >= 2:
+        pooling = config.get("pooling", {})
+        if not isinstance(pooling, dict) or str(pooling.get("type", "avg")).lower() not in {"avg", "max", "avg_max", "gem"}:
+            raise ValueError("pooling.type must be avg, max, avg_max, or gem")
+        normalization = config.get("normalization", {})
+        if not isinstance(normalization, dict) or str(normalization.get("type", "batch")).lower() not in {"batch", "group", "layer", "layernorm", "layer_norm", "none"}:
+            raise ValueError("normalization.type must be batch, group, layer, or none")
+        fusion = config.get("fusion", {})
+        if not isinstance(fusion, dict) or str(fusion.get("type", "concat")).lower() not in {"concat", "projected"}:
+            raise ValueError("fusion.type must be concat or projected")
+        classifier = config.get("classifier", {})
+        if not isinstance(classifier, dict) or str(classifier.get("type", "linear")).lower() not in {"linear", "mlp", "cosine", "prototype"}:
+            raise ValueError("classifier.type must be linear, mlp, cosine, or prototype")
+        if int(classifier.get("prototypes_per_class", 1)) < 1:
+            raise ValueError("classifier.prototypes_per_class must be a positive integer")
+        if str(classifier.get("prototype_metric", "cosine")).lower() not in {"cosine", "euclidean"}:
+            raise ValueError("classifier.prototype_metric must be cosine or euclidean")
+    augmentation = config.get("augmentation", {})
+    if not isinstance(augmentation, dict):
+        raise ValueError("augmentation must be a table/object")
+    crop_strength = float(augmentation.get("random_resized_crop", 0.0))
+    if not 0 <= crop_strength < 1:
+        raise ValueError("augmentation.random_resized_crop must be in [0, 1)")
+    for axis in ("zoom", "zoom_x", "zoom_y"):
+        value = augmentation.get(axis)
+        if value is not None and not 0 <= float(value) <= 0.95:
+            raise ValueError(f"augmentation.{axis} must be in [0, 0.95]")
+    metadata_settings = config.get("metadata", {})
+    if not isinstance(metadata_settings, dict):
+        raise ValueError("metadata must be a table/object")
+    metadata_augmentation = metadata_settings.get("augmentation", {})
+    if not isinstance(metadata_augmentation, dict):
+        raise ValueError("metadata.augmentation must be a table/object")
+    metadata_variance = float(metadata_augmentation.get("gaussian_variance", 0.0))
+    if not np.isfinite(metadata_variance) or metadata_variance < 0:
+        raise ValueError("metadata.augmentation.gaussian_variance must be finite and non-negative")
+    metadata_probability = float(metadata_augmentation.get("probability", 1.0))
+    if not 0 <= metadata_probability <= 1:
+        raise ValueError("metadata.augmentation.probability must be in [0, 1]")
+    if str(metadata_augmentation.get("apply_to", "continuous")).lower() != "continuous":
+        raise ValueError("metadata.augmentation.apply_to currently supports only 'continuous'")
+    noise_fields = metadata_augmentation.get("fields", [])
+    if not isinstance(noise_fields, list) or not all(isinstance(value, str) for value in noise_fields):
+        raise ValueError("metadata.augmentation.fields must be a list of feature names")
+    if metadata_variance and task != "classification":
+        raise ValueError("metadata Gaussian augmentation is supported only for classification training")
     if task == "classification":
         from oracle_builder.classification.metadata import validate_feature_specs
         from oracle_builder.classification.stratification import architecture_supported, enabled as stratification_enabled, validate as validate_stratification
 
         validate_feature_specs(config)
+        if metadata_variance and not config.get("model", {}).get("auxiliary_features"):
+            raise ValueError(
+                "metadata Gaussian augmentation requires configured metadata fields"
+            )
         validate_stratification(config)
         if stratification_enabled(config) and not architecture_supported(config):
             raise ValueError("The selected classifier architecture does not support resolution stratification")
@@ -329,14 +524,31 @@ def validate_config(config: dict[str, Any]) -> None:
         "fit_pad",
         "fit_pad_max_2x",
         "fit_pad_max_3x",
+        "center_pad",
+        "center_roi_pad",
         "fill_crop",
+        "center_crop",
         "stretch",
         "none",
         "fit",
     }:
         raise ValueError(
-            "preprocessing.resize_mode must be fit_pad, fit_pad_max_2x, fit_pad_max_3x, fill_crop, stretch, none, or fit"
+            "preprocessing.resize_mode must be fit_pad, fit_pad_max_2x, fit_pad_max_3x, center_pad, center_roi_pad, fill_crop, center_crop, stretch, none, or fit"
         )
+    upscale_limit = preprocessing.get("upscale_limit")
+    if upscale_limit is not None and float(upscale_limit) <= 0:
+        raise ValueError("preprocessing.upscale_limit must be positive when provided")
+    anchors = {
+        "center", "top", "bottom", "left", "right",
+        "top_left", "top_right", "bottom_left", "bottom_right",
+    }
+    for key in ("pad_anchor", "crop_anchor"):
+        if str(preprocessing.get(key, "center")).lower() not in anchors:
+            raise ValueError(f"preprocessing.{key} must be a supported compass anchor")
+    if str(preprocessing.get("pad_mode", "constant")).lower() not in {
+        "constant", "edge", "reflect", "symmetric",
+    }:
+        raise ValueError("preprocessing.pad_mode must be constant, edge, reflect, or symmetric")
     if preprocessing.get("normalization", "dtype") not in {
         "dtype",
         "minmax",
@@ -355,15 +567,17 @@ def validate_config(config: dict[str, Any]) -> None:
         raise ValueError("Unsupported preprocessing.interpolation")
     if preprocessing.get("channel_mode", "auto") not in {"auto", "grayscale", "rgb", "rgba"}:
         raise ValueError("preprocessing.channel_mode must be auto, grayscale, rgb, or rgba")
+    from oracle_builder.data.channels import resolve_channel_names
+
     derived = preprocessing.get("derived_channels", {})
-    if not isinstance(derived, dict):
-        raise ValueError("preprocessing.derived_channels must be a table/object")
-    if float(derived.get("local_contrast_sigma", 3.0)) <= 0:
+    if not isinstance(derived, (dict, list, tuple)):
+        raise ValueError("preprocessing.derived_channels must be a table/object or channel list")
+    resolve_channel_names(preprocessing)
+    derived_options = derived if isinstance(derived, dict) else {}
+    if float(derived_options.get("local_contrast_sigma", derived_options.get("sigma", 3.0))) <= 0:
         raise ValueError("preprocessing.derived_channels.local_contrast_sigma must be positive")
     if task in {"classification", "embedding"}:
-        derived_count = int(bool(derived.get("gradient_magnitude", False))) + int(
-            bool(derived.get("local_contrast", False))
-        )
+        derived_count = len(resolve_channel_names(preprocessing)) - 1
         if (
             derived_count
             and len(config["data"]["input_shape"]) == 3
@@ -614,6 +828,7 @@ def resolve_config(config_path: str | Path, input_path: str | Path, run_dir: str
     user_config = load_toml(config_path)
     resolved = deep_merge(DEFAULT_CONFIG, user_config)
     normalize_self_supervised_config(resolved, user_config)
+    normalize_component_config(resolved, user_config)
     task = resolved.get("run", {}).get("task")
     if task not in {"classification", "embedding", "segmentation"}:
         if task == "clustering":
@@ -776,14 +991,16 @@ def _resolve_classification_channels(config: dict[str, Any]) -> None:
             "Classification data.input_shape must be [height, width] or the legacy "
             "[height, width, channels] form"
         )
-    derived = config.get("preprocessing", {}).get("derived_channels", {})
-    if not isinstance(derived, dict):
-        raise ValueError("preprocessing.derived_channels must be a table/object")
-    names = ["grayscale"]
-    if bool(derived.get("gradient_magnitude", False)):
-        names.append("gradient_magnitude")
-    if bool(derived.get("local_contrast", False)):
-        names.append("local_contrast")
+    from oracle_builder.data.channels import resolve_channel_names
+
+    names = resolve_channel_names(config.get("preprocessing", {}))
+    # Preserve the V1 artifact vocabulary for boolean derived-channel recipes;
+    # explicit V2 channel lists retain the canonical ``intensity`` name.
+    resolved_names = (
+        names
+        if "channels" in config.get("preprocessing", {})
+        else ["grayscale", *names[1:]]
+    )
     expected_channels = len(names)
     if len(input_shape) == 3 and len(names) > 1 and input_shape[-1] != expected_channels:
         raise ValueError(
@@ -798,7 +1015,7 @@ def _resolve_classification_channels(config: dict[str, Any]) -> None:
         ]
         return
     config["data"]["input_shape"] = [input_shape[0], input_shape[1], expected_channels]
-    config["preprocessing"]["resolved_channels"] = names
+    config["preprocessing"]["resolved_channels"] = resolved_names
 
 
 def infer_classification_num_classes(input_path: str | Path) -> int:
