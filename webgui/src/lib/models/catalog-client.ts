@@ -25,6 +25,9 @@ export const modelCatalogClient = {
 	artifactCatalogQuery: (query: CatalogQuery) => call<{ artifacts: RecordValue[]; total?: number; columns?: string[] }>(
 		'/v1/artifacts/catalog/query', { method: 'POST', body: JSON.stringify({ ...query, sort: query.sort?.field ?? 'updated_at', order: query.sort?.direction ?? 'desc' }) }
 	),
+	reindexArtifactCatalog: (artifactIds?: string[]) => call<{ refreshed: string[]; missing: string[]; skipped: RecordValue[]; artifact_files_changed: boolean }>(
+		'/v1/artifacts/catalog:reindex', { method: 'POST', body: JSON.stringify(artifactIds?.length ? { artifact_ids: artifactIds } : {}) }
+	),
 	artifactFilterSchema: () => call<{ fields: RecordValue[]; default_columns?: string[] }>('/v1/artifacts/filter-schema'),
 	artifactTags: () => call<{ tags: RecordValue[] }>('/v1/artifact-tags'),
 	assignArtifactTags: (artifactIds: string[], tags: string[]) => call<RecordValue>('/v1/artifact-tags/assign', {

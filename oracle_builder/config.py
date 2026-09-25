@@ -12,6 +12,32 @@ try:
 except ModuleNotFoundError:  # pragma: no cover
     import tomli as tomllib
 
+# These are the maintained, ordinary supervised-training choices.  They are
+# deliberately defined beside the runtime defaults rather than in a client so
+# the schema, TOML validation, and every UI all describe the same experiment.
+# More specialised Keras identifiers remain an expert/runtime capability, not
+# a separate guided authoring surface.
+SUPPORTED_TRAINING_TASKS: tuple[str, ...] = ("classification", "embedding", "segmentation")
+STANDARD_TRAINING_OPTIMIZERS: tuple[str, ...] = ("adam", "adamw", "sgd", "rmsprop")
+STANDARD_DISTRIBUTION_STRATEGIES: tuple[str, ...] = ("auto", "single", "mirrored", "cpu", "none")
+STANDARD_TRAINING_LOSSES_BY_TASK: dict[str, tuple[str, ...]] = {
+    "classification": (
+        "weighted_sparse_categorical_crossentropy",
+        "sparse_categorical_crossentropy",
+    ),
+    "embedding": ("sparse_categorical_crossentropy",),
+    "segmentation": (
+        "binary_crossentropy",
+        "bce_soft_dice",
+        "bce_soft_tversky",
+    ),
+}
+STANDARD_TRAINING_METRICS_BY_TASK: dict[str, tuple[str, ...]] = {
+    "classification": ("accuracy", "macro_f1"),
+    "embedding": ("accuracy", "macro_f1"),
+    "segmentation": ("accuracy", "dice", "iou"),
+}
+
 DEFAULT_CONFIG: dict[str, Any] = {
     "run": {"seed": 123, "notes": ""},
     # V2 is the default for new runs. Archived V1 resolved configurations do
@@ -44,6 +70,19 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "prefetch_batches": 2,
             "deterministic": True,
             "sqlite_cache_kib": 65536,
+        },
+        # An optional immutable cache for decoded, deterministic classification
+        # inputs. SQLite remains authoritative; this is never used for an
+        # unfrozen dataset and can be deleted/rebuilt without data loss.
+        "materialization": {
+            "mode": "off",
+            "root": ".oracle-runtime/cache/datasets",
+            "format": "npy_shards",
+            "dtype": "float32",
+            "shard_samples": 1024,
+            "build_if_missing": True,
+            "wait_seconds": 600,
+            "max_cache_gib": 0.0,
         },
     },
     "model": {
@@ -107,6 +146,18 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "tversky_alpha": 0.3,
         "tversky_beta": 0.7,
         "soft_tversky_smooth": 1e-6,
+    },
+    # Sealed, user-facing guardrails for the live training dashboard. They
+    # observe metrics only; they never alter optimizer behavior or stop a run.
+    "monitoring": {
+        "primary_metric": "auto",
+        "target_enabled": False,
+        "target_metric": "val_macro_f1",
+        "target_value": 0.0,
+        "max_validation_loss_increase_enabled": False,
+        "max_validation_loss_increase": 0.05,
+        "max_generalization_gap_enabled": False,
+        "max_generalization_gap": 0.10,
     },
     "pretraining": {
         "enabled": False,
@@ -278,6 +329,105 @@ def deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]
     return merged
 
 
+# Public definition authoring is deliberately stricter than the runtime
+# resolver below.  The latter still understands archived V1 artifacts and
+# translates V2 components for builders that have not yet shed their internal
+# compatibility keys.  New WebGUI/API definitions must use this surface.
+_V2_FORBIDDEN_PATHS = {"run.model", "data.num_classes"}
+_V2_FORBIDDEN_PREFIXES = ("model.", "pretraining.")
+
+
+def _leaf_paths(value: Any, prefix: str = "") -> list[str]:
+    if isinstance(value, dict):
+        return [
+            path
+            for key, item in value.items()
+            for path in _leaf_paths(item, f"{prefix}.{key}" if prefix else key)
+        ]
+    return [prefix]
+
+
+def v2_validation_errors(config: dict[str, Any]) -> list[dict[str, str]]:
+    """Return structured authoring errors for a V2 model definition.
+
+    This is intentionally safe for interactive callers: errors identify a
+    field path and never require a database or GPU.  Runtime validation stays
+    in :func:`validate_config` after dataset facts have been resolved.
+    """
+    errors: list[dict[str, str]] = []
+    if not isinstance(config, dict):
+        return [{"path": "", "code": "invalid_type", "message": "Configuration must be an object."}]
+    for path in _leaf_paths(config):
+        if path in _V2_FORBIDDEN_PATHS or path.startswith(_V2_FORBIDDEN_PREFIXES):
+            errors.append({
+                "path": path,
+                "code": "legacy_field",
+                "message": f"{path} is not authorable in Architecture V2.",
+            })
+    architecture = config.get("architecture")
+    if not isinstance(architecture, dict) or architecture.get("version") != 2:
+        errors.append({
+            "path": "architecture.version",
+            "code": "v2_required",
+            "message": "architecture.version must be 2.",
+        })
+    encoder = config.get("encoder")
+    if not isinstance(encoder, dict):
+        errors.append({"path": "encoder", "code": "required", "message": "An encoder family and variant are required."})
+    else:
+        family, variant = encoder.get("family"), encoder.get("variant")
+        if not family:
+            errors.append({"path": "encoder.family", "code": "required", "message": "encoder.family is required."})
+        if not variant:
+            errors.append({"path": "encoder.variant", "code": "required", "message": "encoder.variant is required."})
+        if family and variant:
+            # Kept local to avoid making the runtime configuration module
+            # depend on the public catalog during normal training imports.
+            from oracle_builder.config_schema import ARCHITECTURE_VARIANTS_BY_FAMILY
+
+            supported = ARCHITECTURE_VARIANTS_BY_FAMILY.get(str(family))
+            if supported is None:
+                errors.append({"path": "encoder.family", "code": "unsupported_choice", "message": f"Unsupported encoder family {family!r}."})
+            elif variant not in supported:
+                errors.append({
+                    "path": "encoder.variant",
+                    "code": "invalid_variant_for_family",
+                    "message": f"{variant!r} is not a variant of encoder family {family!r}.",
+                })
+    return errors
+
+
+def validate_v2_config(config: dict[str, Any]) -> None:
+    """Raise a concise error when a submitted model definition is not V2."""
+    errors = v2_validation_errors(config)
+    if errors:
+        raise ValueError("; ".join(error["message"] for error in errors))
+
+
+def resolve_v2_config(
+    authoring_config: dict[str, Any], *, dataset_facts: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """Resolve a V2 definition for UI/planning without exposing V1 aliases.
+
+    ``dataset_facts`` may contain trusted server-derived values (for example
+    ``num_classes``).  Caller input may not set them.  The returned document
+    remains V2 authoring data; execution translation is intentionally deferred
+    to the runtime resolver.
+    """
+    validate_v2_config(authoring_config)
+    defaults = deep_merge(DEFAULT_CONFIG, {})
+    defaults["self_supervised"] = deep_merge(defaults.pop("pretraining"), {})
+    defaults.pop("model", None)
+    defaults.get("run", {}).pop("model", None)
+    resolved = deep_merge(defaults, authoring_config)
+    if dataset_facts:
+        allowed = {"num_classes"}
+        data_facts = {key: value for key, value in dataset_facts.items() if key in allowed}
+        if data_facts:
+            resolved.setdefault("data", {}).update(data_facts)
+    return resolved
+
+
 def self_supervised_settings(config: dict[str, Any]) -> dict[str, Any]:
     """Return the canonical self-supervised settings with legacy fallback.
 
@@ -425,6 +575,18 @@ def validate_config(config: dict[str, Any]) -> None:
         raise ValueError("training.display must be 'rich', 'text', or 'off'")
     if float(config.get("training", {}).get("weight_decay", 0.0)) < 0:
         raise ValueError("training.weight_decay must be non-negative")
+    monitoring = config.get("monitoring", {})
+    if not isinstance(monitoring, dict):
+        raise ValueError("monitoring must be a table/object")
+    for name in ("target_enabled", "max_validation_loss_increase_enabled", "max_generalization_gap_enabled"):
+        if not isinstance(monitoring.get(name, False), bool):
+            raise ValueError(f"monitoring.{name} must be boolean")
+    for name in ("max_validation_loss_increase", "max_generalization_gap"):
+        value = float(monitoring.get(name, 0.0))
+        if not np.isfinite(value) or value < 0:
+            raise ValueError(f"monitoring.{name} must be finite and non-negative")
+    if not np.isfinite(float(monitoring.get("target_value", 0.0))):
+        raise ValueError("monitoring.target_value must be finite")
     if task in {"classification", "embedding"} and "num_classes" not in config["data"]:
         raise ValueError(
             "Could not infer data.num_classes from the classification database"
@@ -593,6 +755,26 @@ def validate_config(config: dict[str, Any]) -> None:
         raise ValueError("data.streaming.prefetch_batches must be at least 1")
     if int(streaming.get("sqlite_cache_kib", 65536)) < 1:
         raise ValueError("data.streaming.sqlite_cache_kib must be at least 1")
+    materialization = config.get("data", {}).get("materialization", {})
+    if not isinstance(materialization, dict):
+        raise ValueError("data.materialization must be a table/object")
+    if str(materialization.get("mode", "off")).lower() not in {"off", "run", "shared"}:
+        raise ValueError("data.materialization.mode must be off, run, or shared")
+    if str(materialization.get("format", "npy_shards")).lower() != "npy_shards":
+        raise ValueError("data.materialization.format currently supports only npy_shards")
+    if str(materialization.get("dtype", "float32")).lower() not in {"float16", "float32"}:
+        raise ValueError("data.materialization.dtype must be float16 or float32")
+    if int(materialization.get("shard_samples", 1024)) < 1:
+        raise ValueError("data.materialization.shard_samples must be at least 1")
+    if float(materialization.get("wait_seconds", 600)) < 0:
+        raise ValueError("data.materialization.wait_seconds must be non-negative")
+    if float(materialization.get("max_cache_gib", 0.0)) < 0:
+        raise ValueError("data.materialization.max_cache_gib must be non-negative")
+    if (
+        str(materialization.get("mode", "off")).lower() != "off"
+        and task != "classification"
+    ):
+        raise ValueError("data.materialization is currently supported for classification runs only")
     distribution = config.get("distribution", {})
     if distribution.get("strategy", "auto") not in {
         "auto",

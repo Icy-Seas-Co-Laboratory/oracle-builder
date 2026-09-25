@@ -93,6 +93,11 @@ class ArtifactCatalogQueryRequest(BaseModel):
     limit: int = Field(default=100, ge=1, le=500)
 
 
+class ArtifactCatalogReindexRequest(BaseModel):
+    """Optional registered artifact subset; omitted means all catalog rows."""
+    artifact_ids: list[str] | None = None
+
+
 class ArtifactTagAssignmentRequest(BaseModel):
     artifact_ids: list[str]
     tags: list[str] = Field(default_factory=list)
@@ -120,6 +125,49 @@ class ModelDraftUpdateRequest(BaseModel):
 
 class ModelDraftCloneRequest(BaseModel):
     name: str | None = None
+
+
+class ModelDefinitionRequest(BaseModel):
+    name: str
+    template_id: str
+    description: str = ""
+    config: dict[str, Any] = Field(default_factory=dict)
+
+
+class ModelDefinitionUpdateRequest(BaseModel):
+    expected_revision: int = Field(ge=1)
+    name: str | None = None
+    description: str | None = None
+    config: dict[str, Any] | None = None
+
+
+class ModelDefinitionDuplicateRequest(BaseModel):
+    revision: int | None = Field(default=None, ge=1)
+    name: str | None = None
+    lineage_kind: str = "duplicate"
+
+
+class ValidatedQueueRunRequest(BaseModel):
+    name: str
+    dataset_id: str
+    endpoint_id: str
+    revision: int | None = Field(default=None, ge=1)
+    description: str = ""
+    resources: dict[str, Any] = Field(default_factory=dict)
+    initialization: dict[str, Any] = Field(default_factory=dict)
+    batch_size_mode: str = "manual"
+    batch_size: int | None = Field(default=None, ge=1)
+    maximum_batch_size: int = Field(default=256, ge=1)
+
+
+class QueueStartRequest(BaseModel):
+    endpoint_id: str
+    queued_run_ids: list[str] = Field(default_factory=list)
+    all_ready: bool = False
+
+
+class QueueMaintenanceRequest(BaseModel):
+    endpoint_id: str | None = None
 
 
 class DraftTrainingPlanRequest(BaseModel):
@@ -312,6 +360,12 @@ def create_app(orchestrator: Orchestrator) -> FastAPI:
         try: return orchestrator.artifact_catalog_query(**body.model_dump())
         except ValueError as exc: raise HTTPException(status_code=422, detail=str(exc)) from exc
 
+    @app.post("/v1/artifacts/catalog:reindex")
+    def reindex_artifact_catalog(body: ArtifactCatalogReindexRequest | None = None) -> dict[str, Any]:
+        # This route only refreshes database-owned catalog facts.  It accepts
+        # IDs, never paths, so it cannot be used to inspect arbitrary files.
+        return orchestrator.reindex_artifact_catalog(artifact_ids=body.artifact_ids if body else None)
+
     @app.get("/v1/tags")
     def tags() -> dict[str, Any]: return {"tags": orchestrator.tags()}
 
@@ -386,6 +440,76 @@ def create_app(orchestrator: Orchestrator) -> FastAPI:
         try: return orchestrator.plan_draft_training(draft_id, **body.model_dump())
         except KeyError as exc: raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc: raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    # V2 model definitions replace drafts for new authoring workflows.  They
+    # are complete, versioned configurations whose revisions can be pinned by
+    # the queue without exposing mutable client state.
+    @app.get("/v1/model-definition-templates")
+    def model_definition_templates() -> dict[str, Any]:
+        return {"templates": orchestrator.model_definition_templates()}
+
+    @app.get("/v1/model-definitions")
+    def model_definitions() -> dict[str, Any]:
+        return {"definitions": orchestrator.model_definitions()}
+
+    @app.post("/v1/model-definitions", status_code=201)
+    def create_model_definition(body: ModelDefinitionRequest) -> dict[str, Any]:
+        try: return orchestrator.create_model_definition(**body.model_dump())
+        except KeyError as exc: raise HTTPException(status_code=404, detail="Model-definition template was not found") from exc
+        except ValueError as exc: raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/v1/model-definitions/{definition_id}:duplicate", status_code=201)
+    def duplicate_model_definition(definition_id: str, body: ModelDefinitionDuplicateRequest) -> dict[str, Any]:
+        try: return orchestrator.duplicate_model_definition(definition_id, **body.model_dump())
+        except KeyError as exc: raise HTTPException(status_code=404, detail="Model definition or revision was not found") from exc
+        except ValueError as exc: raise HTTPException(status_code=409 if "conflict" in str(exc).lower() else 422, detail=str(exc)) from exc
+
+    @app.get("/v1/model-definitions/{definition_id}/revisions")
+    def model_definition_revisions(definition_id: str) -> dict[str, Any]:
+        try: return {"revisions": orchestrator.model_definition_revisions(definition_id)}
+        except KeyError as exc: raise HTTPException(status_code=404, detail="Model definition was not found") from exc
+
+    @app.get("/v1/model-definitions/{definition_id}")
+    def model_definition(definition_id: str, revision: int | None = Query(default=None, ge=1)) -> dict[str, Any]:
+        return required(orchestrator.model_definition(definition_id, revision=revision), "Model definition")
+
+    @app.patch("/v1/model-definitions/{definition_id}")
+    def update_model_definition(definition_id: str, body: ModelDefinitionUpdateRequest) -> dict[str, Any]:
+        try: return orchestrator.update_model_definition(definition_id, **body.model_dump(exclude_unset=True))
+        except KeyError as exc: raise HTTPException(status_code=404, detail="Model definition was not found") from exc
+        except ValueError as exc: raise HTTPException(status_code=409 if "conflict" in str(exc).lower() else 422, detail=str(exc)) from exc
+
+    @app.post("/v1/model-definitions/{definition_id}:validate-and-queue", status_code=201)
+    def validate_and_queue_model_definition(definition_id: str, body: ValidatedQueueRunRequest) -> dict[str, Any]:
+        try: return orchestrator.validate_and_queue_model_definition(definition_id, **body.model_dump())
+        except KeyError as exc: raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except (OSError, ValueError, RuntimeError) as exc: raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.get("/v1/queued-runs")
+    def queued_runs() -> dict[str, Any]:
+        return {"queued_runs": orchestrator.queued_runs()}
+
+    @app.post("/v1/queued-runs:start")
+    def start_queued_runs(body: QueueStartRequest) -> dict[str, Any]:
+        try: return orchestrator.authorize_queued_runs(**body.model_dump())
+        except KeyError as exc: raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except (ValueError, RuntimeError) as exc: raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/v1/queued-runs/{queued_run_id}:cancel")
+    def cancel_queued_run(queued_run_id: str) -> dict[str, Any]:
+        try: return orchestrator.cancel_queued_run(queued_run_id)
+        except KeyError as exc: raise HTTPException(status_code=404, detail="Queued run was not found") from exc
+        except ValueError as exc: raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/v1/queued-runs:clear")
+    def clear_queued_runs(body: QueueMaintenanceRequest) -> dict[str, Any]:
+        try: return orchestrator.clear_queued_runs(**body.model_dump())
+        except KeyError as exc: raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/v1/jobs:reset-stuck")
+    def reset_stuck_jobs(body: QueueMaintenanceRequest) -> dict[str, Any]:
+        try: return orchestrator.reset_stuck_jobs(**body.model_dump())
+        except KeyError as exc: raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     # Keep the bare parameter route after action routes: Starlette treats
     # ``id:validate`` as a valid path parameter otherwise.
@@ -515,10 +639,38 @@ def create_app(orchestrator: Orchestrator) -> FastAPI:
         required(orchestrator.job(job_id), "Job")
         return {"events": orchestrator.job_events(job_id)}
 
+    @app.get("/v1/jobs/{job_id}/training-status")
+    def job_training_status(job_id: str) -> dict[str, Any]:
+        try:
+            return orchestrator.job_training_status(job_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Job was not found") from exc
+
     @app.post("/v1/jobs/{job_id}:reconcile")
     def reconcile(job_id: str) -> dict[str, Any]:
         try: return orchestrator.reconcile_job(job_id)
         except KeyError as exc: raise HTTPException(status_code=404, detail="Job was not found") from exc
+        except RuntimeError as exc: raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    @app.post("/v1/jobs/{job_id}:pause")
+    def pause_job(job_id: str) -> dict[str, Any]:
+        try: return orchestrator.control_job(job_id, "pause")
+        except KeyError as exc: raise HTTPException(status_code=404, detail="Job was not found") from exc
+        except ValueError as exc: raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except RuntimeError as exc: raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    @app.post("/v1/jobs/{job_id}:resume")
+    def resume_job(job_id: str) -> dict[str, Any]:
+        try: return orchestrator.control_job(job_id, "resume")
+        except KeyError as exc: raise HTTPException(status_code=404, detail="Job was not found") from exc
+        except ValueError as exc: raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except RuntimeError as exc: raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    @app.post("/v1/jobs/{job_id}:cancel")
+    def cancel_job(job_id: str) -> dict[str, Any]:
+        try: return orchestrator.control_job(job_id, "cancel")
+        except KeyError as exc: raise HTTPException(status_code=404, detail="Job was not found") from exc
+        except ValueError as exc: raise HTTPException(status_code=422, detail=str(exc)) from exc
         except RuntimeError as exc: raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     return app

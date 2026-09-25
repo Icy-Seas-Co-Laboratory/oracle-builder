@@ -1,27 +1,28 @@
-# High-throughput self-supervised ROI organization with spherical k-means.
-# The input must be a frozen classification Dataset V1 SQLite database. Existing
-# LEGACY compatibility configuration. New runs should use
-# configs/example_embedding.toml and let downstream consumers define clusters.
+# V2 embedding recipe for a downstream clustering workflow.
+# Oracle Builder no longer trains task = "clustering" directly. Train this
+# versioned embedding artifact, then version clustering separately from its cache.
 
-# Deprecated legacy reference: clustering is intentionally not a runnable V2
-# task. Train an embedding model with example_embedding.toml, then create a
-# separately versioned clustering analysis from that artifact.
 [run]
-task = "clustering"
+task = "embedding"
 model = "simple_cnn"
 seed = 123
-notes = "High-throughput BYOL SimpleCNN encoder followed by cosine-space ROI clustering"
+notes = "V2 BYOL embedding recipe for downstream spherical k-means"
+[architecture]
+version = 2
+
+[input]
+channels = ["intensity"]
+[input.geometry]
+type = "preserve_aspect_pad"
 
 [data]
-# Keep this resolution aligned with the standard ROI contract. A global batch of
-# 1024 is divided across visible replicas by TensorFlow (512 per GPU on two GPUs).
-input_shape = [224, 224, 1]
-batch_size = 1024
+input_shape = [128, 128]
+batch_size = 256
 shuffle_buffer = 16384
-
+validation_split = 0.20
+test_split = 0.10
+split_strategy = "auto"
 [data.streaming]
-# Parallel SQLite decoding and bounded prefetch keep the GPUs supplied without
-# retaining the complete ROI collection in memory.
 enabled = true
 reader_workers = 8
 prefetch_batches = 4
@@ -29,43 +30,52 @@ deterministic = false
 sqlite_cache_kib = 262144
 
 [preprocessing]
-# These values are part of the eventual sealed encoder contract. "auto" polarity
-# uses the source dataset's recorded imaging polarity.
-resize_mode = "fit_pad"
+resize_mode = "fit_pad" # Kept equivalent to input.geometry.
 normalization = "dtype"
 rescale = true
 invert = "auto"
 pad_value = 0.0
+upscale_limit = 2.0
+pad_anchor = "center"
+pad_mode = "constant"
+crop_anchor = "center"
 interpolation = "bilinear"
 channel_mode = "grayscale"
 percentile_low = 1.0
 percentile_high = 99.0
+derive_after_augmentation = false
+[preprocessing.derived_channels]
+gradient_magnitude = false
+local_contrast = false
+local_contrast_sigma = 3.0
 
-[distribution]
-# Legacy reference only: retain a one-device execution policy for readers that
-# adapt it into a supported embedding recipe.
-strategy = "single"
-devices = []
-cross_device_ops = "auto"
-fallback_to_single = true
-memory_growth = true
-gpu_selection = "unused_first"
-require_unused_gpu = false
-allow_busy_fallback = false
-gpu_light_share_memory_mb = 1024
-gpu_light_share_utilization_percent = 15
-
-[model]
-# SimpleCNN is the fastest useful baseline for typical ROI clustering runs.
-# base_filters controls the three convolution widths: 32, 64, and 128.
-base_filters = 32
+[encoder]
+family = "simple_cnn"
+variant = "simple_cnn"
+[stem]
+type = "native"
+kernel_size = 3
+stride = 1
+pool = "none"
+[normalization]
+type = "batch"
+[pooling]
+type = "avg"
+[image_embedding.projection]
+type = "linear"
+output_dim = 256
+l2_normalize = true
+normalize = true
 dropout = 0.0
+[model]
+# SimpleCNN is a compact, high-throughput encoder. Increase base_filters only
+# after confirming that GPU compute rather than decode is the bottleneck.
+base_filters = 32
 embedding_dim = 256
 normalize_embeddings = true
+dropout = 0.0
 
 [self_supervised]
-# BYOL avoids explicit negative-pair sampling and is a good default for large
-# global batches. View augmentation is scoped here and does not use [augmentation].
 enabled = true
 method = "byol"
 epochs = 50
@@ -75,32 +85,21 @@ teacher_momentum = 0.99
 projection_dim = 128
 projection_hidden_dim = 256
 temperature = 0.10
-
-# AdamW is a stable general-purpose optimizer for the encoder and projection heads.
+minimum_global_batch_size = 2
+collapse_std_threshold = 0.001
+collapse_embedding_spread_threshold = 0.005
 ssl_optimizer = "adamw"
 weight_decay = 0.0001
 beta_1 = 0.9
 beta_2 = 0.999
 optimizer_epsilon = 0.0000001
-
-# SSL diagnostics and collapse safeguards.
-minimum_global_batch_size = 2
-collapse_std_threshold = 0.001
-collapse_embedding_spread_threshold = 0.005
 vicreg_variance_weight = 25.0
 vicreg_covariance_weight = 1.0
 vicreg_target_std = 1.0
-
-# SimCLR retains a disposable projector, but these terms protect the
-# unit-normalized encoder embedding exported to clustering and inference.
 encoder_variance_weight = 25.0
 encoder_covariance_weight = 1.0
 encoder_target_std = 0.05
-
 [self_supervised.embedding_health]
-# Product-space checks are computed from unaugmented serving embeddings before
-# the artifact is sealed. They prevent a successful projector loss from hiding
-# a narrow-cone encoder collapse.
 enabled = true
 sample_count = 4096
 pair_count = 32768
@@ -108,10 +107,7 @@ minimum_effective_rank = 8.0
 maximum_mean_pairwise_cosine = 0.95
 maximum_p95_pairwise_cosine = 0.995
 maximum_mean_direction_norm = 0.95
-
 [self_supervised.augmentation]
-# Moderate, domain-agnostic ROI perturbations. Adjust only these values when
-# orientation, scale, or intensity is known to carry semantic information.
 enabled = true
 invert = false
 rotation = 0.08
@@ -125,35 +121,38 @@ contrast = 0.20
 gaussian_noise = 0.03
 fill_value = 0.0
 
-[clustering]
-method = "spherical_kmeans"
-n_clusters = 8
-novelty_percentile = 5.0
-top_k = 5
-
-# Bound the expensive silhouette calculation and the persistent serving index.
-# All ROIs still contribute to centroids, cluster sizes, and novelty thresholds.
-silhouette_max_samples = 2000
-reference_neighbors_per_cluster = 64
-fit_batch_size = 4096
+[recovery]
+enabled = true
+save_every_epochs = 1
+[distribution]
+strategy = "single"
+devices = []
+cross_device_ops = "auto"
+fallback_to_single = true
+memory_growth = true
+gpu_selection = "unused_first"
+require_unused_gpu = false
+allow_busy_fallback = false
+gpu_light_share_memory_mb = 1024
+gpu_light_share_utilization_percent = 15
+gpu_lease_directory = "/tmp/oracle-builder-gpu-leases"
 
 [inference]
-# Auto probing chooses the largest verified extraction batch up to 1024 while
-# retaining a bounded memory budget. This affects embedding extraction only.
 batch_size = "auto"
 minimum_batch_size = 64
 maximum_batch_size = 1024
 memory_budget_mb = 4096
 progress = false
-
 [output]
 save_checkpoints = false
 save_predictions = false
 save_figures = false
 export_savedmodel = true
 prediction_commit_batches = 20
-
-[evaluation.benchmark]
+[output.intermediate_artifacts]
+# The downstream clustering job reads this bounded representation cache.
 enabled = true
-warmup_batches = 2
-measured_batches = 10
+format = "auto"
+split = "test"
+batch_size = 256
+include_feature_map = false

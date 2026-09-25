@@ -1,4 +1,5 @@
 import io
+import json
 
 from oracle_builder.training.callbacks import build_callbacks
 from oracle_builder.training.status import RichTrainingStatusCallback, _sparkline, _trend
@@ -104,3 +105,72 @@ def test_status_exposes_post_epoch_analysis_progress():
 
     callback.end_post_epoch_analysis()
     assert callback._external_summary() is None
+
+
+def test_status_writes_versioned_atomic_web_snapshot_with_transient_batch_metrics(tmp_path):
+    status_path = tmp_path / "training-status.json"
+    callback = RichTrainingStatusCallback(
+        phase="Classification",
+        epochs=2,
+        display="off",
+        status_path=status_path,
+        status_interval_seconds=0,
+    )
+    callback.set_params({"steps": 4, "epochs": 2})
+    callback.on_train_begin()
+    callback.on_epoch_begin(0)
+    callback.on_train_batch_end(0, {"loss": 1.2, "accuracy": 0.6})
+    callback.begin_post_epoch_analysis("validation", total_batches=3)
+
+    snapshot = json.loads(status_path.read_text())
+    assert snapshot["schema_version"] == 1
+    assert snapshot["phase"] == "Classification"
+    assert snapshot["progress"] == {
+        "epoch": 1,
+        "total_epochs": 2,
+        "completed_batches": 1,
+        "total_batches": 4,
+    }
+    assert snapshot["metrics"]["current_batch"] == {"loss": 1.2, "accuracy": 0.6}
+    assert snapshot["metrics"]["current_epoch_history"] == [
+        {"batch": 1, "elapsed_seconds": snapshot["metrics"]["current_epoch_history"][0]["elapsed_seconds"], "loss": 1.2, "accuracy": 0.6}
+    ]
+    assert snapshot["metrics"]["validation"] == {}
+    assert snapshot["external_analysis"]["phase"] == "rich metrics: validation"
+
+    callback.on_epoch_end(0, {"loss": 1.0, "val_loss": 1.1})
+    completed = json.loads(status_path.read_text())
+    assert completed["metrics"]["last_completed_epoch"] == {"loss": 1.0, "val_loss": 1.1}
+    assert completed["metrics"]["last_completed_epoch"]["val_loss"] == 1.1
+    assert completed["metrics"]["history"]["loss"] == [1.0]
+
+
+def test_status_publishes_the_sealed_dashboard_watchlist(tmp_path):
+    status_path = tmp_path / "training-status.json"
+    callback = RichTrainingStatusCallback(
+        phase="Classification",
+        display="off",
+        status_path=status_path,
+        monitoring={"target_enabled": True, "target_metric": "val_macro_f1", "target_value": 0.9},
+    )
+    callback.on_train_begin()
+
+    assert json.loads(status_path.read_text())["watchlist"] == {
+        "target_enabled": True,
+        "target_metric": "val_macro_f1",
+        "target_value": 0.9,
+    }
+
+
+def test_status_keeps_a_bounded_current_epoch_metric_trace():
+    callback = RichTrainingStatusCallback(phase="Classification", display="off")
+    callback.set_params({"steps": 500})
+    callback.on_train_begin()
+    callback.on_epoch_begin(0)
+    for batch in range(361):
+        callback.on_train_batch_end(batch, {"loss": float(batch), "macro_f1": 0.4})
+
+    trace = callback._status_snapshot()["metrics"]["current_epoch_history"]
+    assert len(trace) <= 181
+    assert trace[-1]["batch"] == 361
+    assert trace[-1]["macro_f1"] == 0.4

@@ -5,18 +5,17 @@
 	import ModelComparisonView from '$lib/models/ModelComparisonView.svelte';
 	import TrainingSetCatalogView from '$lib/TrainingSetCatalogView.svelte';
 	import ModelConstructionView from '$lib/ModelConstructionView.svelte';
-	import TrainingStudio from '$lib/TrainingStudio.svelte';
+	import ValidatedQueueView from '$lib/ValidatedQueueView.svelte';
 
-	type Page = 'models' | 'comparison' | 'datasets' | 'construction' | 'training';
+	type Page = 'models' | 'comparison' | 'datasets' | 'construction' | 'queue';
 	let datasets: RecordValue[] = [];
-	let recipes: RecordValue[] = [];
 	let artifacts: RecordValue[] = [];
 	let jobs: RecordValue[] = [];
+	let queuedRuns: RecordValue[] = [];
 	let computeEndpoints: RecordValue[] = [];
 	let systemHealth: RecordValue | null = null;
 	let activePage: Page = 'models';
 	let comparisonIds: string[] = [];
-	let trainingDraftId = '';
 	let loading = true;
 	let notice = '';
 	let failure = '';
@@ -26,44 +25,56 @@
 		{ id: 'comparison', number: '02', title: 'Comparison', detail: 'Compare evidence' },
 		{ id: 'datasets', number: '03', title: 'Training Sets', detail: 'Browse sources' },
 		{ id: 'construction', number: '04', title: 'Construction', detail: 'Compose a model' },
-		{ id: 'training', number: '05', title: 'Training', detail: 'Plan execution' }
+		{ id: 'queue', number: '05', title: 'Queue', detail: 'Validate & schedule' }
 	];
-	const activeStatuses = ['queued', 'running', 'submitted', 'dispatching', 'validating'];
-	const activeJobs = () => jobs.filter((job) => activeStatuses.includes(String(job.status))).length;
+	const activeStatuses = new Set(['preparing', 'queued', 'running', 'paused', 'submitted', 'dispatching', 'training', 'validating', 'sealing', 'indexing']);
+	$: activeJobCount = new Set([
+		...jobs.filter((job) => activeStatuses.has(String(job.status))).map((job) => String(job.queued_run_id ?? job.job_id)),
+		...queuedRuns.filter((run) => activeStatuses.has(String(run.status))).map((run) => String(run.queued_run_id ?? run.job_id))
+	]).size;
 	const healthEndpoints = () => systemHealth?.compute_endpoints && typeof systemHealth.compute_endpoints === 'object' ? systemHealth.compute_endpoints as RecordValue : null;
 	const serviceReady = () => systemHealth?.database === 'ready' && (Number(healthEndpoints()?.ready ?? 0) > 0 || computeEndpoints.some((endpoint) => endpoint.status === 'ready'));
 
 	async function refresh(silent = false) {
 		if (!silent) loading = true;
 		try {
-			const [datasetResult, recipeResult, artifactResult, jobResult, endpointResult, healthResult] = await Promise.all([
-				api.datasets(), api.recipes(), api.artifacts(), api.jobs(true), api.computeEndpoints(true), api.health()
+			const [datasetResult, artifactResult, jobResult, queuedResult, endpointResult, healthResult] = await Promise.all([
+				api.datasets(), api.artifacts(), api.jobs(true), api.queuedRuns(), api.computeEndpoints(true), api.health()
 			]);
-			datasets = datasetResult.datasets; recipes = recipeResult.recipes; artifacts = artifactResult.artifacts;
-			jobs = jobResult.jobs; computeEndpoints = endpointResult.endpoints; systemHealth = healthResult;
+			datasets = datasetResult.datasets; artifacts = artifactResult.artifacts; jobs = jobResult.jobs; queuedRuns = queuedResult.queued_runs; computeEndpoints = endpointResult.endpoints; systemHealth = healthResult;
 		} catch (error) { failure = error instanceof Error ? error.message : 'Could not reach the Oracle Builder control plane.'; }
 		finally { if (!silent) loading = false; }
 	}
+	function syncPageFromLocation() {
+		if (typeof window === 'undefined') return;
+		const page = window.location.hash.slice(1) as Page;
+		if (pageMeta.some((item) => item.id === page)) activePage = page;
+	}
 	function navigate(page: Page) { activePage = page; if (typeof window !== 'undefined') window.history.replaceState(null, '', `#${page}`); }
 	function compared(ids: string[]) { comparisonIds = ids; navigate('comparison'); }
-	function useDraft(draftId: string) { trainingDraftId = draftId; navigate('training'); }
+	function useDraft(_definitionId: string) { navigate('queue'); }
 	function changed(message: string) { notice = message; failure = ''; void refresh(true); }
 
 	onMount(() => {
-		const page = window.location.hash.slice(1) as Page;
-		if (pageMeta.some((item) => item.id === page)) activePage = page;
+		syncPageFromLocation();
 		void refresh(); const timer = window.setInterval(() => void refresh(true), 10_000);
-		return () => window.clearInterval(timer);
+		window.addEventListener('hashchange', syncPageFromLocation);
+		window.addEventListener('popstate', syncPageFromLocation);
+		return () => {
+			window.clearInterval(timer);
+			window.removeEventListener('hashchange', syncPageFromLocation);
+			window.removeEventListener('popstate', syncPageFromLocation);
+		};
 	});
 </script>
 
-<svelte:head><title>Oracle Builder</title><meta name="description" content="A scientific workspace for model evidence, data, and reproducible training." /></svelte:head>
+<svelte:head><title>{pageMeta.find((page) => page.id === activePage)?.title ?? 'Workspace'} · Oracle Builder</title><meta name="description" content="A scientific workspace for model evidence, data, and reproducible training." /></svelte:head>
 
 <div class="app-shell">
 	<aside class="app-sidebar">
-		<button class="brand" on:click={() => navigate('models')} aria-label="Oracle Builder home"><span class="brand-mark">OB</span><span><strong>Oracle Builder</strong><small>Scientific model workspace</small></span></button>
-		<div class="sidebar-group"><p class="nav-label">WORKSPACE</p><nav class="workflow-nav" aria-label="Primary navigation">{#each pageMeta as page}<button class:active={activePage === page.id} on:click={() => navigate(page.id)}><span class="nav-step">{page.number}</span><span><strong>{page.title}</strong><small>{page.detail}</small></span>{#if page.id === 'models' && artifacts.length}<i>{artifacts.length}</i>{:else if page.id === 'training' && activeJobs()}<i>{activeJobs()}</i>{/if}</button>{/each}</nav></div>
-		<div class="sidebar-context"><p class="nav-label">SYSTEM</p><dl><div><dt>Models</dt><dd>{artifacts.length}</dd></div><div><dt>Frozen data</dt><dd>{datasets.filter((dataset) => dataset.lifecycle === 'frozen').length}</dd></div><div><dt>Active jobs</dt><dd>{activeJobs()}</dd></div></dl></div>
+		<button class="brand" on:click={() => navigate('models')} aria-label="Oracle Builder home"><img class="brand-mark" src="/brand/oracle-builder-mark.webp" alt="" /><span><strong>Oracle Builder</strong><small>Scientific model workspace</small></span></button>
+		<div class="sidebar-group"><p class="nav-label">WORKSPACE</p><nav class="workflow-nav" aria-label="Primary navigation">{#each pageMeta as page}<button class:active={activePage === page.id} on:click={() => navigate(page.id)}><span class="nav-step">{page.number}</span><span><strong>{page.title}</strong><small>{page.detail}</small></span>{#if page.id === 'models' && artifacts.length}<i>{artifacts.length}</i>{:else if page.id === 'queue' && activeJobCount}<i>{activeJobCount}</i>{/if}</button>{/each}</nav></div>
+		<div class="sidebar-context"><p class="nav-label">SYSTEM</p><dl><div><dt>Models</dt><dd>{artifacts.length}</dd></div><div><dt>Frozen data</dt><dd>{datasets.filter((dataset) => dataset.lifecycle === 'frozen').length}</dd></div><div><dt>Active jobs</dt><dd>{activeJobCount}</dd></div></dl></div>
 		<div class="side-foot"><span class:offline={!serviceReady()} class="pulse"></span>{loading ? 'Updating workspace…' : serviceReady() ? 'Compute connected' : 'Plan offline; dispatch later'}</div>
 	</aside>
 	<div class="app-frame">
@@ -74,8 +85,8 @@
 			{#if activePage === 'models'}<ModelRunsView oncompare={compared} onfailure={(message) => failure = message} />
 			{:else if activePage === 'comparison'}<ModelComparisonView artifactIds={comparisonIds} onback={() => navigate('models')} onfailure={(message) => failure = message} />
 			{:else if activePage === 'datasets'}<TrainingSetCatalogView onuse={() => changed('Catalog sources are read-only. Register and freeze a revision before training.')} onfailure={(message) => failure = message} />
-			{:else if activePage === 'construction'}<ModelConstructionView {artifacts} onnotice={changed} onfailure={(message) => failure = message} ontrain={useDraft} />
-			{:else}<TrainingStudio {datasets} {recipes} {artifacts} initialDraftId={trainingDraftId} onnotice={changed} onfailure={(message) => failure = message} onplanned={() => { trainingDraftId = ''; void refresh(true); }} />{/if}
+			{:else if activePage === 'construction'}<ModelConstructionView onnotice={changed} onfailure={(message) => failure = message} ontrain={useDraft} />
+			{:else}<ValidatedQueueView {datasets} {computeEndpoints} onchanged={changed} onfailure={(message) => failure = message} />{/if}
 		</main>
 	</div>
 </div>

@@ -50,6 +50,58 @@ CREATE TABLE IF NOT EXISTS model_draft_revisions (
   revision INTEGER NOT NULL, config_json TEXT NOT NULL, layout_json TEXT NOT NULL,
   created_at TEXT NOT NULL, PRIMARY KEY (draft_id, revision)
 );
+-- V2 model definitions are the user-owned, versioned scientific source of
+-- truth.  They intentionally do not share the draft tables: queued work must
+-- pin a definition revision without inheriting mutable draft semantics.
+CREATE TABLE IF NOT EXISTS model_definitions (
+  definition_id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT NOT NULL,
+  revision INTEGER NOT NULL, template_id TEXT, template_sha256 TEXT,
+  parent_definition_id TEXT REFERENCES model_definitions(definition_id) ON DELETE SET NULL,
+  parent_revision INTEGER, lineage_kind TEXT NOT NULL,
+  config_json TEXT NOT NULL, config_sha256 TEXT NOT NULL, catalog_fingerprint TEXT,
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+-- Definition names are user-facing identifiers in the construction library.
+-- Keeping them unique makes server-generated "V.N" duplicate names safe even
+-- when multiple browser sessions create copies at the same time.
+CREATE UNIQUE INDEX IF NOT EXISTS model_definitions_name_idx
+  ON model_definitions(name COLLATE NOCASE);
+CREATE INDEX IF NOT EXISTS model_definitions_updated_idx ON model_definitions(updated_at DESC);
+CREATE TABLE IF NOT EXISTS model_definition_revisions (
+  definition_id TEXT NOT NULL REFERENCES model_definitions(definition_id) ON DELETE CASCADE,
+  revision INTEGER NOT NULL, config_json TEXT NOT NULL, config_sha256 TEXT NOT NULL,
+  catalog_fingerprint TEXT, created_at TEXT NOT NULL,
+  PRIMARY KEY (definition_id, revision)
+);
+-- A queued run is a sealed pairing of a model-definition revision and a
+-- frozen dataset.  It is deliberately distinct from ``jobs``: a job is one
+-- dispatch attempt while the queued run remains the durable user decision.
+CREATE TABLE IF NOT EXISTS queued_runs (
+  queued_run_id TEXT PRIMARY KEY,
+  definition_id TEXT NOT NULL REFERENCES model_definitions(definition_id),
+  definition_revision INTEGER NOT NULL,
+  dataset_id TEXT NOT NULL REFERENCES datasets(dataset_id),
+  dataset_fingerprint_sha256 TEXT,
+  name TEXT NOT NULL,
+  description TEXT NOT NULL,
+  specification_id TEXT REFERENCES run_specifications(specification_id),
+  resolved_toml_path TEXT NOT NULL,
+  resolved_toml_sha256 TEXT NOT NULL,
+  config_schema_fingerprint TEXT,
+  resources_json TEXT NOT NULL,
+  initialization_json TEXT NOT NULL,
+  preflight_endpoint_id TEXT REFERENCES compute_endpoints(endpoint_id),
+  preflight_status TEXT NOT NULL,
+  preflight_report_json TEXT NOT NULL,
+  status TEXT NOT NULL,
+  start_authorized INTEGER NOT NULL DEFAULT 0,
+  priority INTEGER NOT NULL DEFAULT 0,
+  failure_reason TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS queued_runs_ready_idx
+  ON queued_runs(status, start_authorized, priority, created_at);
 CREATE TABLE IF NOT EXISTS training_catalog_entries (
   catalog_id TEXT PRIMARY KEY, root_id TEXT NOT NULL, name TEXT NOT NULL,
   path TEXT NOT NULL, source_type TEXT NOT NULL, fingerprint_sha256 TEXT,
@@ -132,6 +184,7 @@ def connect(path: str | Path) -> sqlite3.Connection:
         "output_path": "TEXT",
         "validation_status": "TEXT",
         "validation_report_json": "TEXT",
+        "queued_run_id": "TEXT",
     }
     for column, data_type in migrations.items():
         if column not in existing:

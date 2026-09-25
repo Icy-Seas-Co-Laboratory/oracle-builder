@@ -7,6 +7,12 @@ model = "simple_cnn"
 seed = 123
 notes = "Example classification run"
 
+[architecture]
+version = 2
+[input]
+channels = ["intensity"]
+[input.geometry]
+type = "preserve_aspect_pad"
 [data]
 # Classification defaults assume grayscale. Class count and split assignments
 # are inferred from the SQLite dataset and recorded in the run artifact.
@@ -15,6 +21,13 @@ batch_size = 16
 shuffle_buffer = 512
 validation_split = 0.20
 test_split = 0.10
+
+[data.streaming]
+enabled = true
+reader_workers = 4
+prefetch_batches = 2
+deterministic = true
+sqlite_cache_kib = 65536
 
 [preprocessing]
 # fit_pad preserves the full image. Preprocessing travels with the saved model.
@@ -26,6 +39,44 @@ pad_value = 0.0
 interpolation = "bilinear"
 channel_mode = "grayscale"
 
+
+[encoder]
+family = "simple_cnn"
+variant = "simple_cnn"
+[stem]
+type = "native"
+kernel_size = 3
+stride = 1
+pool = "none"
+[normalization]
+type = "batch"
+[pooling]
+type = "avg"
+[image_embedding.projection]
+type = "linear"
+output_dim = 256
+l2_normalize = false
+[metadata]
+fields = []
+scaling = "standard"
+[metadata.encoder]
+type = "direct"
+[metadata.augmentation]
+gaussian_variance = 0.0
+probability = 1.0
+apply_to = "continuous"
+fields = []
+[fusion]
+type = "concat"
+[classifier]
+type = "linear"
+
+[model]
+# base_filters controls overall capacity; embedding_dim fixes feature size.
+base_filters = 16
+dropout = 0.20
+embedding_dim = 256
+normalize_embeddings = true
 
 [self_supervised]
 # Self-supervised pretraining initializes this same architecture before labels
@@ -39,18 +90,6 @@ teacher_momentum = 0.99
 temperature = 0.10
 projection_dim = 128
 projection_hidden_dim = 256
-
-[model]
-# base_filters controls overall capacity; embedding_dim fixes feature size.
-base_filters = 16
-dropout = 0.20
-embedding_dim = 256
-normalize_embeddings = true
-
-[evidence]
-# Preserve embeddings, prototypes, and KNN evidence with predictions.
-enabled = true
-knn_k = 5
 
 [training]
 epochs = 50
@@ -94,61 +133,6 @@ contrast = 0.20
 gaussian_noise = 0.05
 fill_value = 0.0
 
-[output]
-# The final model is saved; per-epoch checkpoints are opt-in.
-save_checkpoints = false
-save_predictions = true
-save_figures = true
-export_savedmodel = false
-# Explicit V2 component contract. The encoder remains native; its output is
-# pooled, projected, optionally fused with declared metadata, then classified.
-[architecture]
-version = 2
-[input]
-channels = ["intensity"]
-[input.geometry]
-type = "preserve_aspect_pad"
-[encoder]
-family = "simple_cnn"
-variant = "simple_cnn"
-[stem]
-type = "native"
-kernel_size = 3
-stride = 1
-pool = "none"
-[normalization]
-type = "batch"
-[pooling]
-type = "avg"
-[image_embedding.projection]
-type = "linear"
-output_dim = 256
-l2_normalize = false
-[metadata]
-fields = []
-scaling = "standard"
-[metadata.encoder]
-type = "direct"
-[metadata.augmentation]
-gaussian_variance = 0.0
-probability = 1.0
-apply_to = "continuous"
-fields = []
-[fusion]
-type = "concat"
-[classifier]
-type = "linear"
-
-# Bounded SQLite data pipeline: decode active examples lazily and retain only
-# a small prefetch queue in memory.
-[data.streaming]
-enabled = true
-reader_workers = 4
-prefetch_batches = 2
-deterministic = true
-sqlite_cache_kib = 65536
-
-# Use one visible GPU when available; an empty list permits CPU fallback.
 [distribution]
 strategy = "single"
 devices = []
@@ -160,3 +144,14 @@ require_unused_gpu = false
 allow_busy_fallback = false
 gpu_light_share_memory_mb = 1024
 gpu_light_share_utilization_percent = 15
+[evidence]
+# Preserve embeddings, prototypes, and KNN evidence with predictions.
+enabled = true
+knn_k = 5
+
+[output]
+# The final model is saved; per-epoch checkpoints are opt-in.
+save_checkpoints = false
+save_predictions = true
+save_figures = true
+export_savedmodel = false

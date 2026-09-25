@@ -15,6 +15,27 @@ version = 2
 channels = ["intensity"]
 [input.geometry]
 type = "preserve_aspect_pad"
+[data]
+input_shape = [64, 64, 1]
+batch_size = 1024
+shuffle_buffer = 16384
+split_strategy = "auto"
+
+[data.streaming]
+enabled = true
+reader_workers = 4
+prefetch_batches = 2
+deterministic = true
+sqlite_cache_kib = 65536
+[preprocessing]
+resize_mode = "fit_pad"
+normalization = "dtype"
+rescale = true
+invert = "auto"
+pad_value = 0.0
+interpolation = "bilinear"
+channel_mode = "grayscale"
+
 [encoder]
 family = "simple_cnn"
 variant = "simple_cnn"
@@ -34,21 +55,6 @@ l2_normalize = true
 [metadata]
 fields = []
 scaling = "standard"
-
-[data]
-input_shape = [64, 64, 1]
-batch_size = 1024
-shuffle_buffer = 16384
-split_strategy = "auto"
-
-[preprocessing]
-resize_mode = "fit_pad"
-normalization = "dtype"
-rescale = true
-invert = "auto"
-pad_value = 0.0
-interpolation = "bilinear"
-channel_mode = "grayscale"
 
 [model]
 base_filters = 32
@@ -112,11 +118,3 @@ export_savedmodel = true
 save_checkpoints = false
 save_predictions = false
 save_figures = false
-
-# SQLite examples are decoded lazily; this bounds host-memory use for large sets.
-[data.streaming]
-enabled = true
-reader_workers = 4
-prefetch_batches = 2
-deterministic = true
-sqlite_cache_kib = 65536

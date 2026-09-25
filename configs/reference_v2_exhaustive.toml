@@ -1,0 +1,441 @@
+# Oracle Builder Architecture V2 — authoritative exhaustive training reference.
+#
+# Copy this file to start a run. Every maintained V2 training option appears
+# below either as the active default or as an adjacent commented alternative.
+# Values described as dataset-defined, Keras-defined, or free-form cannot have
+# a finite list of legal values. Do not add runtime-owned fields such as
+# run_id, run_name, dataset identity, or fitted metadata statistics.
+#
+# This active recipe is a DenseNet-121 classification run. To author embedding
+# or segmentation runs, change [run] and use the task-specific commented
+# settings in the relevant sections; see the focused examples in this folder.
+
+[run]
+task = "classification" # classification | embedding | segmentation
+model = "densenet" # Registered family/alias; [encoder] is authoritative in V2.
+seed = 123
+notes = "Copy of the authoritative V2 configuration reference"
+
+[architecture]
+version = 2 # V1 is compatibility-only; do not author new V1 recipes.
+
+[input]
+# Canonical channel names: intensity, gradient_magnitude, local_contrast.
+channels = ["intensity"]
+
+[input.geometry]
+# preserve_aspect_pad | center_roi_pad | resize_crop | center_crop | direct_resize
+# This V2 declaration is authoritative and resolves preprocessing.resize_mode.
+type = "preserve_aspect_pad"
+
+[data]
+# Classification/embedding accept [height, width] and infer channels from
+# [input]. Segmentation requires [height, width, channels] plus output_shape.
+input_shape = [128, 128]
+# output_shape = [128, 128, 1] # Required for segmentation.
+# num_classes is inferred from an Oracle SQLite classification dataset.
+batch_size = 16
+shuffle_buffer = 512
+validation_split = 0.20
+test_split = 0.10
+split_strategy = "auto" # auto | random | source_partitions
+
+# Segmentation-only candidate/mask distance settings.
+candidate_sdf = false # Legacy alias for candidate_distance = "euclidean_sdf".
+candidate_sdf_clip_distance = 32.0
+candidate_distance = "none" # none | euclidean_sdf | geodesic
+candidate_distance_clip = 32.0
+
+[data.geodesic_distance]
+# Used only when candidate_distance = "geodesic".
+epsilon = 0.001
+intensity_weight = 1.0
+intensity_gamma = 1.0
+gradient_weight = 1.0
+connectivity = 8 # 4 | 8
+
+[data.streaming]
+# Lazy SQLite decode keeps host memory bounded. Increase workers only after
+# confirming that CPU decode, rather than GPU compute, limits throughput.
+enabled = true
+reader_workers = 4
+prefetch_batches = 2
+deterministic = true
+sqlite_cache_kib = 65536
+
+[data.materialization]
+# Optional frozen-dataset cache: Parquet/JSONL describes split rows while NPY
+# shards hold deterministic prepared tensors. SQLite remains authoritative.
+mode = "off" # off | run (inside the run artifact) | shared (cross-run cache)
+root = ".oracle-runtime/cache/datasets" # Shared-cache root; ignored by mode = "run".
+format = "npy_shards" # The currently supported tensor payload format.
+dtype = "float32" # float32 is exact; float16 reduces cache disk pressure.
+shard_samples = 1024 # Keep individual memory-mapped shard files manageable.
+build_if_missing = true # false falls back to SQLite when no matching cache exists.
+wait_seconds = 600 # Wait for another process building this immutable cache.
+max_cache_gib = 0.0 # 0 is unlimited; otherwise refuse an oversized new cache.
+# Augmentation deliberately remains online and fresh for each epoch. Do not
+# materialize randomized views unless a separately versioned analysis requires it.
+
+[preprocessing]
+# Keep this equivalent to [input.geometry].type. The listed aliases are:
+# fit_pad | fit_pad_max_2x | fit_pad_max_3x | center_pad | center_roi_pad |
+# fill_crop | center_crop | stretch | none | fit.
+resize_mode = "fit_pad"
+normalization = "dtype" # dtype | minmax | percentile | none
+rescale = true
+invert = "auto" # auto resolves from dataset polarity; true | false are explicit.
+pad_value = 0.0
+# A positive limit caps enlargement; omit this key to let the resize mode decide.
+# upscale_limit = 2.0
+pad_anchor = "center" # center | top | bottom | left | right | top_left | top_right | bottom_left | bottom_right
+pad_mode = "constant" # constant | edge | reflect | symmetric
+crop_anchor = "center" # Same anchor values as pad_anchor.
+interpolation = "bilinear" # nearest | bilinear | bicubic | lanczos
+channel_mode = "grayscale" # auto | grayscale | rgb | rgba
+percentile_low = 1.0 # Used by normalization = "percentile".
+percentile_high = 99.0
+derive_after_augmentation = false # Regenerate derived channels after image transforms.
+
+[preprocessing.derived_channels]
+gradient_magnitude = false
+local_contrast = false
+local_contrast_sigma = 3.0
+# Alternative legacy syntax: derived_channels = ["gradient_magnitude", "local_contrast"].
+
+[encoder]
+# family identifies the builder; variant identifies its concrete topology.
+family = "densenet"
+variant = "densenet121"
+# Families/variants: simple_cnn; resnet{18,34,50,101,152}; densenet{121,169,201};
+# efficientnet_b{0..7}; efficientnet_v2_{b0,b1,b2,b3,s,m,l};
+# mobilenet_v3_{small,large}; convnext_{tiny,small}; unet | residual_unet | unet_plus_plus.
+
+[stem]
+# Native is currently the supported implementation. Kernel/stride/width/pool
+# normalize to the native family builder; use the family’s conventional values.
+type = "native"
+kernel_size = 7
+stride = 2
+width = 64
+pool = "max" # none disables pooling; max is conventional for DenseNet.
+
+[normalization]
+type = "batch" # batch | group | layer (layernorm/layer_norm aliases) | none
+groups = "auto" # Group-normalization only: auto or a positive integer.
+
+[pooling]
+type = "avg" # avg | max | avg_max | gem
+p = 3.0 # GeM only.
+trainable_p = false # GeM only.
+
+[image_embedding.projection]
+type = "linear" # identity | linear | mlp
+output_dim = 256 # identity must retain the pooled feature width.
+l2_normalize = false # Normalize the image embedding before optional metadata fusion.
+normalize = true # Normalize the exported fused `features` representation.
+dropout = 0.0
+# hidden_units = [512, 256] # MLP only; each unit must be positive.
+# activation = "gelu" # MLP only; any Keras activation identifier.
+
+[metadata]
+# A field is a name or inline table. Names resolve as metadata.<name>.
+fields = []
+# fields = [{ name = "roi_area", source = "roi.bounding_box_area_px", transform = "log1p", missing = "error", standardize = true, kind = "continuous", augment = true }]
+# Supported sources: roi.original_width_px | roi.original_height_px |
+# roi.bounding_box_area_px | metadata.<dataset-defined dotted path>.
+# Transform: identity | log | log1p | sqrt. Missing: error | mean | zero.
+scaling = "standard"
+
+[metadata.encoder]
+type = "direct" # direct | mlp
+# output_dim = 32 # Required for an MLP; optional projection for direct.
+# hidden_units = [64, 32] # MLP only.
+activation = "relu"
+dropout = 0.0
+
+[metadata.augmentation]
+# Training-only Gaussian perturbation after metadata scaling.
+gaussian_variance = 0.0
+probability = 1.0
+apply_to = "continuous" # Currently the only supported value.
+fields = [] # Empty means all eligible continuous fields; otherwise an allow-list.
+
+[fusion]
+type = "concat" # concat | projected
+# output_dim = 256 # Required when type = "projected".
+# activation = "relu" # Projected fusion only.
+
+[classifier]
+type = "linear" # linear | mlp | cosine | prototype
+hidden_units = [] # MLP only.
+activation = "relu" # MLP only.
+dropout = 0.0 # MLP only (otherwise harmless).
+cosine_scale = 16.0 # Cosine/prototype only.
+prototypes_per_class = 1 # Prototype only; positive integer.
+prototype_metric = "cosine" # cosine | euclidean; prototype only.
+
+[model]
+# Family-specific native-builder settings. V2 component settings above take
+# precedence for shared stem/projection/classifier behavior.
+variant = "densenet121"
+embedding_dim = 256 # Legacy compatibility alias for projection output_dim.
+normalize_embeddings = true # Legacy compatibility alias for projection normalize.
+dropout = 0.0
+
+# DenseNet: variants densenet121 | densenet169 | densenet201.
+block_config = [6, 12, 24, 16]
+growth_rate = 32
+initial_filters = 64
+bottleneck_multiplier = 4
+compression = 0.5
+
+# ResNet: variants resnet18 | resnet34 | resnet50 | resnet101 | resnet152.
+# block_counts = [2, 2, 2, 2]
+# base_filters = 64
+
+# EfficientNet and EfficientNetV2: width/depth scale the supplied variant.
+# width_coefficient = 1.0
+# depth_coefficient = 1.0
+# se_ratio = 0.25
+# top_filters = 1280
+
+# MobileNetV3: variants mobilenet_v3_small | mobilenet_v3_large.
+# stage_widths = [16, 24, 40, 48, 96]
+# stage_repeats = [1, 2, 2, 2, 3]
+# expansion = 4
+
+# ConvNeXt: variants convnext_tiny | convnext_small.
+# stage_depths = [3, 3, 9, 3]
+# stage_widths = [96, 192, 384, 768]
+# drop_path = 0.0
+
+# U-Net / residual U-Net / U-Net++ (segmentation only).
+# base_filters = 32
+# depth = 4
+# activation = "relu"
+# final_activation = "sigmoid"
+# deep_supervision = false # U-Net++ only.
+
+# Legacy shared native-builder aliases; set by [stem] during V2 resolution.
+# stem_kernel_size = 7
+# stem_stride = 2
+# stem_filters = 64
+# stem_pool = true
+
+[classification.stratification]
+# Advanced classification-only shared model across ROI-resolution strata.
+enabled = false
+dimensions = [64, 128, 256]
+basis = "max_original_dimension"
+batch_size_policy = "constant_input_tensor"
+weight_sharing = "shared"
+normalization = "batch" # batch | group
+group_norm_groups = 8
+assignment_policy = "smallest_fitting" # smallest_fitting | largest_not_exceeding
+supra_epochs = 5
+schedule = "interleaved_steps" # interleaved_steps | interleaved | contiguous
+steps_per_stratum = 1
+
+[classification.stratification.conditioning]
+enabled = false
+embedding_dim = 16
+
+[classification.stratification.training_routing]
+enabled = false # Enable only when intentionally routing examples across strata.
+seed = 123
+adjacent_lower_probability = 0.0
+
+[classification.stratification.cycle_scheduler]
+aggregation = "sample_weighted" # sample_weighted | equal_strata
+guardrail_metric = "macro_f1" # History metric used by max_stratum_drop.
+reduce_lr_patience = 3
+reduce_lr_factor = 0.5
+max_stratum_drop = 0.05 # Optional per-stratum regression guardrail.
+
+[self_supervised]
+# Canonical V2 spelling. [pretraining] is read-only legacy compatibility.
+enabled = false
+method = "byol" # byol | student_teacher | simclr | grayscale_reconstruction
+epochs = 10
+verbose = 1 # 0 | 1 | 2
+learning_rate = 0.001
+teacher_momentum = 0.99
+projection_dim = 128
+projection_hidden_dim = 256
+temperature = 0.10 # SimCLR only.
+reconstruction_foreground_weight = 4.0 # Grayscale reconstruction only.
+minimum_global_batch_size = 2
+collapse_std_threshold = 0.001
+collapse_embedding_spread_threshold = 0.005
+ssl_optimizer = "adam" # adam | adamw
+weight_decay = 0.0001
+beta_1 = 0.9
+beta_2 = 0.999
+optimizer_epsilon = 0.0000001
+vicreg_variance_weight = 25.0
+vicreg_covariance_weight = 1.0
+vicreg_target_std = 1.0
+encoder_variance_weight = 25.0
+encoder_covariance_weight = 1.0
+encoder_target_std = 0.05
+# database = "datasets/other.sqlite" # Optional grayscale-reconstruction source.
+
+[self_supervised.embedding_health]
+enabled = true
+sample_count = 4096
+pair_count = 32768
+minimum_effective_rank = 8.0
+maximum_mean_pairwise_cosine = 0.95
+maximum_p95_pairwise_cosine = 0.995
+maximum_mean_direction_norm = 0.95
+
+[self_supervised.augmentation]
+# SSL-only image augmentation overrides. It accepts the same keys as
+# [augmentation], including geometric, photometric, and fill controls.
+enabled = true
+rotation = 0.08
+zoom = 0.15
+translation = 0.10
+skew = 0.05
+flip_horizontal = true
+flip_vertical = false
+brightness = 0.20
+contrast = 0.20
+gaussian_noise = 0.03
+invert = false
+fill_value = 0.0
+
+[training]
+epochs = 50
+optimizer = "adam" # adam | sgd | other Keras optimizer identifiers
+learning_rate = 0.001
+weight_decay = 0.0 # Adam uses AdamW when nonzero.
+loss = "weighted_sparse_categorical_crossentropy"
+# Metrics: accuracy, macro_f1 (macro-f1 alias), dice, and Keras metric names.
+# iou is retained as a compatibility request but is not compiled as a metric.
+metrics = ["accuracy", "macro_f1"]
+display = "rich" # rich | text | off
+
+# Segmentation-only alternatives:
+# segmentation_target = "validated_mask" # validated_mask | candidate_delta
+# loss = "bce_soft_dice" # bce_soft_dice | bce_soft_tversky | Keras loss
+# spatial_edge_weighting = false
+# edge_weight_lambda = 1.0
+# edge_weight_sigma = 5.0
+# bce_weight = 1.0
+# soft_dice_weight = 1.0
+# soft_tversky_weight = 1.0
+# tversky_alpha = 0.3
+# tversky_beta = 0.7
+# soft_tversky_smooth = 0.000001
+
+[training.class_weights]
+mode = "effective_number" # explicit | inverse_frequency | effective_number
+beta = 0.999 # Effective-number only; [0, 1).
+normalize = true
+values = [] # Required for mode = "explicit"; one value per class.
+
+[callbacks]
+early_stopping = true
+early_stopping_patience = 18
+reduce_lr_on_plateau = true
+checkpoint_monitor = "val_loss" # Any available Keras history metric name.
+
+[recovery]
+enabled = true
+save_every_epochs = 1
+
+[augmentation]
+enabled = true
+repeats_per_epoch = 1
+invert = false
+rotation = 0.5 # Fraction of a full turn; 0 disables.
+zoom = 0.20
+# zoom_x = 0.10 # Omit to inherit zoom; otherwise [0, 0.95].
+# zoom_y = 0.10
+translation = [0.15, 0.15] # Scalar or [vertical, horizontal] fractions.
+skew = 0.20
+random_resized_crop = 0.0 # [0, 1).
+rotate_90 = false
+flip_horizontal = true
+flip_vertical = true
+brightness = 0.20
+contrast = 0.20
+gaussian_noise = 0.05
+fill_value = 0.0
+mask_fill_value = 0.0
+# signed_distance_fill_value = -1.0 # Segmentation signed-distance channel.
+# photometric_channels = [0] # Explicit image channels receiving photometric transforms.
+# mask_input_channels = [1] # Explicit nearest-neighbor input mask channels.
+# signed_distance_input_channels = [2]
+
+[distribution]
+# auto leases one suitably idle visible GPU; single selects the first visible
+# or requested GPU; mirrored uses all selected GPUs; cpu forces CPU; none is a
+# legacy alias for single.
+strategy = "single" # auto | single | mirrored | cpu | none
+devices = [] # e.g. ["/GPU:0"] or ["/GPU:0", "/GPU:1"].
+cross_device_ops = "auto" # auto | nccl | hierarchical_copy
+fallback_to_single = true
+memory_growth = true
+gpu_selection = "unused_first"
+require_unused_gpu = false
+allow_busy_fallback = false
+gpu_light_share_memory_mb = 1024
+gpu_light_share_utilization_percent = 15
+gpu_lease_directory = "/tmp/oracle-builder-gpu-leases"
+
+[inference]
+batch_size = "auto" # auto or a positive integer.
+minimum_batch_size = 1
+maximum_batch_size = 64
+memory_budget_mb = 512
+progress = true
+
+[evaluation]
+segmentation_threshold = 0.5
+
+[evaluation.uncertainty]
+enabled = false
+# group_metadata_key = "tow_id" # Required when enabled; dataset-defined key.
+bootstrap_replicates = 1000
+confidence_level = 0.95
+seed = 123
+
+[evaluation.benchmark]
+enabled = true
+warmup_batches = 2
+measured_batches = 10
+
+[tiling]
+# Segmentation only. Input/output spatial dimensions must match when enabled.
+enabled = false
+overlap_fraction = 0.5
+blend_mode = "hann" # hann | uniform
+tile_large_rois_only = true
+normalize_training_coverage = true
+
+[evidence]
+enabled = true
+knn_k = 5
+
+[output]
+save_checkpoints = false
+save_predictions = true
+save_figures = true
+export_savedmodel = true
+prediction_commit_batches = 20
+
+[output.intermediate_artifacts]
+# Writes bounded, analysis-friendly intermediate representations after training.
+enabled = true
+format = "auto" # auto selects Parquet when available, otherwise portable NPY/JSON.
+split = "test" # test | validation | train; falls back when a split is absent.
+batch_size = 256
+include_feature_map = false
+
+# [posthoc] is UI/catalog metadata today; it does not train a post-hoc model.
+# enabled = false
+# representation = "fused_embedding"
+# estimator = "logistic_regression"

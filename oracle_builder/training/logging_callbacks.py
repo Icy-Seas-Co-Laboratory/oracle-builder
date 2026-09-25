@@ -266,7 +266,7 @@ class JSONLMetricLogger(keras.callbacks.Callback):
 
 
 class ClassificationEpochMetricsLogger(keras.callbacks.Callback):
-    """Append rich, non-test classification metrics after every epoch."""
+    """Append rich, unaugmented validation metrics after every epoch."""
 
     def __init__(
         self,
@@ -286,7 +286,7 @@ class ClassificationEpochMetricsLogger(keras.callbacks.Callback):
     def on_epoch_end(self, epoch: int, logs=None):
         del logs
         for split, dataset in self.datasets.items():
-            if split not in {"train", "validation"}:
+            if split != "validation":
                 continue
             try:
                 total_batches = len(dataset)

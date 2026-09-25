@@ -28,6 +28,17 @@ class ComputeJobRequest(BaseModel):
     resources: dict[str, Any] = Field(default_factory=dict)
 
 
+class ComputePreflightRequest(BaseModel):
+    action: JobAction
+    parameters: dict[str, Any] = Field(default_factory=dict)
+    resources: dict[str, Any] = Field(default_factory=dict)
+
+
+class BatchTuneRequest(BaseModel):
+    parameters: dict[str, Any] = Field(default_factory=dict)
+    resources: dict[str, Any] = Field(default_factory=dict)
+
+
 def create_app(
     registry: InferenceModelRegistry,
     *,
@@ -97,6 +108,34 @@ def create_app(
         authorize(authorization)
         return require_compute().status()
 
+    @app.post("/compute/preflight")
+    def compute_preflight(
+        body: ComputePreflightRequest,
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        authorize(authorization)
+        try:
+            return require_compute().preflight(
+                action=body.action,
+                parameters=body.parameters,
+                resources=body.resources,
+            )
+        except ComputeRequestError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/compute/batch-size-tune")
+    def compute_batch_size_tune(
+        body: BatchTuneRequest,
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        authorize(authorization)
+        try:
+            return require_compute().tune_batch_size(
+                parameters=body.parameters, resources=body.resources,
+            )
+        except ComputeRequestError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
     @app.post("/compute/jobs", status_code=202)
     def submit_compute_job(
         body: ComputeJobRequest,
@@ -133,6 +172,17 @@ def create_app(
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="Compute job was not found") from exc
 
+    @app.get("/compute/jobs/{job_id}/training-status")
+    def compute_job_training_status(
+        job_id: str,
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        authorize(authorization)
+        try:
+            return require_compute().training_status(job_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Compute job was not found") from exc
+
     @app.post("/compute/jobs/{job_id}/cancel")
     def cancel_compute_job(job_id: str, authorization: str | None = Header(default=None)) -> dict[str, Any]:
         authorize(authorization)
@@ -140,6 +190,26 @@ def create_app(
             return require_compute().cancel(job_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="Compute job was not found") from exc
+
+    @app.post("/compute/jobs/{job_id}/pause")
+    def pause_compute_job(job_id: str, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+        authorize(authorization)
+        try:
+            return require_compute().pause(job_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Compute job was not found") from exc
+        except ComputeRequestError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/compute/jobs/{job_id}/resume")
+    def resume_compute_job(job_id: str, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+        authorize(authorization)
+        try:
+            return require_compute().resume(job_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Compute job was not found") from exc
+        except ComputeRequestError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.get("/v1/models")
     def models(

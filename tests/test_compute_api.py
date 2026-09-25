@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import uuid
+import json
 
 from fastapi.testclient import TestClient
 
 from oracle_builder.api.app import create_app
-from oracle_builder.api.compute import ComputeService
+from oracle_builder.api.compute import ComputeService, Job
 from oracle_builder.api.registry import InferenceModelRegistry
 
 
@@ -69,5 +70,97 @@ def test_compute_completion_reports_the_resolved_output_path():
     try:
         assert job["result"] is None
         assert compute._jobs[job_id].output_path == "/tmp/oracle-runs/run-id"
+    finally:
+        compute.close()
+
+
+def test_compute_preflight_seals_explicit_gpu_ids_and_rejects_unknown_devices(monkeypatch):
+    compute = ComputeService()
+    monkeypatch.setattr(compute, "_discover_gpus", lambda: [
+        {"id": "0", "free_memory_mib": 8000, "total_memory_mib": 10000, "telemetry": "nvidia-smi"},
+        {"id": "1", "free_memory_mib": 12000, "total_memory_mib": 16000, "telemetry": "nvidia-smi"},
+    ])
+    try:
+        report = compute.preflight(
+            action="run_validate", parameters={"run": "/tmp/run"},
+            resources={"gpu_count": 1, "gpu_ids": ["1"]},
+        )
+        assert report["ready"] is True
+        assert report["allocation"] == {"mode": "explicit", "gpu_ids": ["1"], "gpu_count": 1}
+        assert report["vram"]["verified"] is True
+
+        unavailable = compute.preflight(
+            action="run_validate", parameters={"run": "/tmp/run"},
+            resources={"gpu_count": 1, "gpu_ids": ["7"]},
+        )
+        assert unavailable["ready"] is False
+        assert "not advertised" in unavailable["reasons"][0]
+    finally:
+        compute.close()
+
+
+def test_compute_training_status_is_job_scoped_and_available_before_artifacts(tmp_path):
+    compute = ComputeService()
+    app = create_app(InferenceModelRegistry(), compute=compute, preload=False)
+    job_id = str(uuid.uuid4())
+    run_dir = tmp_path / "runs" / "run-1"
+    with TestClient(app) as client:
+        accepted = client.post(
+            "/compute/jobs",
+            json={
+                "job_id": job_id,
+                "action": "train",
+                "parameters": {
+                    "config": "/tmp/config.toml", "input": "/tmp/input.sqlite",
+                    "runs_dir": str(tmp_path / "runs"), "output": "run-1",
+                },
+            },
+        )
+        assert accepted.status_code == 202
+        pending = client.get(f"/compute/jobs/{job_id}/training-status")
+        assert pending.status_code == 200
+        assert pending.json()["available"] is False
+
+        run_dir.mkdir(parents=True)
+        (run_dir / "training-status.json").write_text(json.dumps({
+            "schema_version": 1, "phase": "Training", "metrics": {},
+        }))
+        live = client.get(f"/compute/jobs/{job_id}/training-status")
+        assert live.status_code == 200
+        assert live.json()["available"] is True
+        assert live.json()["snapshot"]["phase"] == "Training"
+
+        unknown = client.get(f"/compute/jobs/{uuid.uuid4()}/training-status")
+        assert unknown.status_code == 404
+
+
+def test_compute_running_job_can_pause_resume_and_cancel_without_stranding_process():
+    class Process:
+        def __init__(self): self.signals = []; self.terminated = False
+        def send_signal(self, value): self.signals.append(value)
+        def terminate(self): self.terminated = True
+
+    compute = ComputeService()
+    job_id, process = str(uuid.uuid4()), Process()
+    try:
+        job = Job(job_id=job_id, action="train", parameters={}, resources={}, status="running", process=process)  # type: ignore[arg-type]
+        compute._jobs[job_id] = job
+        compute._worker.status = "busy"
+
+        paused = compute.pause(job_id)
+        assert paused["status"] == "paused"
+        assert process.signals
+        assert compute.workers()[0]["status"] == "paused"
+
+        resumed = compute.resume(job_id)
+        assert resumed["status"] == "running"
+        assert len(process.signals) == 2
+        assert compute.workers()[0]["status"] == "busy"
+
+        compute.pause(job_id)
+        compute.cancel(job_id)
+        assert process.terminated is True
+        # Cancel wakes a paused process before terminating it.
+        assert len(process.signals) == 4
     finally:
         compute.close()

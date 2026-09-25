@@ -27,6 +27,8 @@ def build_callbacks(
         display=str(config.get("training", {}).get("display", "rich")),
         training_log=training_log,
         run_id=run_id,
+        status_path=Path(run_dir) / "training-status.json",
+        monitoring=config.get("monitoring") if isinstance(config.get("monitoring"), dict) else None,
     )
     callbacks: list[keras.callbacks.Callback] = [
         SQLiteMetricLogger(training_log, run_id),

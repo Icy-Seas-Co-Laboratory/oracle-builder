@@ -1,3 +1,6 @@
+# U-Net++ segmentation baseline. Its nested skip paths trade additional memory
+# and compute for multi-scale decoder fusion; begin with ordinary U-Net first.
+
 [run]
 task = "segmentation"
 model = "unet_plus_plus"
@@ -26,6 +29,13 @@ intensity_gamma = 1.0
 gradient_weight = 1.0 # Penalize travel across intensity boundaries.
 connectivity = 8
 
+[data.streaming]
+enabled = true
+reader_workers = 4
+prefetch_batches = 2
+deterministic = true
+sqlite_cache_kib = 65536
+
 [model]
 base_filters = 32
 depth = 4
@@ -36,9 +46,9 @@ deep_supervision = false
 
 [self_supervised]
 # Optional grayscale-only reconstruction self-supervised training from either dataset type.
-enabled = true
+enabled = false # Set true only after providing a valid reconstruction database.
 method = "grayscale_reconstruction"
-database = "./datasets/ROI-Refinement/dataset.checkpoint-20260811T191330.260682Z.sqlite"
+# database = "datasets/classification-corpus.sqlite" # Required only when enabled.
 epochs = 10
 learning_rate = 0.001
 # Gives bright image structure more influence than the large dark background.
@@ -83,29 +93,6 @@ mask_fill_value = 0.0
 photometric_channels = [0]
 mask_input_channels = [1]
 
-[output]
-save_checkpoints = false
-save_predictions = true
-save_figures = true
-export_savedmodel = true
-
-[tiling]
-enabled = true
-overlap_fraction = 0.5
-blend_mode = "hann"
-tile_large_rois_only = true
-normalize_training_coverage = true
-
-# Bounded SQLite pipeline. Segmentation batches retain only the active images,
-# masks, and a small prefetch queue.
-[data.streaming]
-enabled = true
-reader_workers = 4
-prefetch_batches = 2
-deterministic = true
-sqlite_cache_kib = 65536
-
-# Use exactly one visible GPU when available; otherwise TensorFlow uses CPU.
 [distribution]
 strategy = "single"
 devices = []
@@ -117,3 +104,15 @@ require_unused_gpu = false
 allow_busy_fallback = false
 gpu_light_share_memory_mb = 1024
 gpu_light_share_utilization_percent = 15
+[tiling]
+enabled = true
+overlap_fraction = 0.5
+blend_mode = "hann"
+tile_large_rois_only = true
+normalize_training_coverage = true
+
+[output]
+save_checkpoints = false
+save_predictions = true
+save_figures = true
+export_savedmodel = true

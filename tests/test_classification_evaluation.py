@@ -11,6 +11,7 @@ pytest.importorskip("sklearn")
 
 from oracle_builder.evaluation.classification import (
     ClassificationMetricAccumulator,
+    _binary_decision_metrics,
     plot_classification_roi_size_metrics,
     plot_classification_training_metrics,
     write_classification_evaluation,
@@ -127,6 +128,27 @@ def test_top_k_metric_names_remain_stable_for_small_classifiers():
     result = accumulator.result()
     assert result["top_3_accuracy"] == 1.0
     assert result["top_5_accuracy"] == 1.0
+
+
+def test_binary_decision_metrics_handles_large_confusion_count_products():
+    """MCC's four count factors can exceed NumPy's fixed-width integers."""
+    count = 2**15
+    targets = np.concatenate(
+        (np.ones(2 * count, dtype=bool), np.zeros(2 * count, dtype=bool))
+    )
+    predicted = np.concatenate(
+        (
+            np.ones(count, dtype=bool),
+            np.zeros(count, dtype=bool),
+            np.ones(count, dtype=bool),
+            np.zeros(count, dtype=bool),
+        )
+    )
+
+    metrics = _binary_decision_metrics(targets, predicted)
+
+    assert metrics["balanced_accuracy"] == 0.5
+    assert metrics["matthews_correlation_coefficient"] == 0.0
 
 
 def test_evaluation_writes_ranking_calibration_and_canonical_metric_tables(tmp_path):

@@ -1,6 +1,6 @@
-# Description for an externally supplied Keras model product.  This file is
-# copied into the immutable product artifact and remains its human-readable
-# provenance record.
+# Description for an externally supplied Keras model product. This is not a
+# training-run TOML, so `[architecture].version = 2` does not apply. It is
+# copied into the immutable product artifact as human-readable provenance.
 
 [product]
 name = "example-external-classifier"

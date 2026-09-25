@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
@@ -61,23 +62,18 @@ class SQLiteSplitIndex:
 class SQLiteDatasetBundle:
     datasets: dict[str, tf.data.Dataset]
     indices: dict[str, SQLiteSplitIndex]
-    source: "SQLiteClassificationSource"
+    source: Any
+    materialization: dict[str, Any] | None = None
 
     @property
     def counts(self) -> dict[str, int]:
         return {split: len(index) for split, index in self.indices.items()}
 
 
-def build_classification_index(
-    sqlite_path: str | Path,
-    config: dict[str, Any],
-    split: str,
-    *,
-    labeled_only: bool,
-) -> SQLiteSplitIndex:
+def _classification_rows(sqlite_path: str | Path):
     path = Path(sqlite_path)
     with sqlite3.connect(path) as connection:
-        rows = connection.execute(
+        return connection.execute(
             """
             SELECT di.item_id, l.class_index, a.encoding, a.shape_json,
                    di.metadata_json
@@ -90,20 +86,32 @@ def build_classification_index(
             ORDER BY di.item_id
             """
         ).fetchall()
+
+
+def build_classification_indices(
+    sqlite_path: str | Path,
+    config: dict[str, Any],
+    *,
+    labeled_only: bool,
+    splits: tuple[str, ...] = ("train", "validation", "test"),
+) -> dict[str, SQLiteSplitIndex]:
+    """Read the lightweight SQLite index once, then partition it in memory."""
+    path = Path(sqlite_path)
+    rows = _classification_rows(path)
     split_records = assign_run_splits(
         [{"uuid": str(row[0])} for row in rows],
         config,
     )
     resolved_splits = {row["uuid"]: row["split"] for row in split_records}
-    refs = []
+    grouped = {split: [] for split in splits}
     for row in rows:
         resolved_split = resolved_splits[str(row[0])]
-        if resolved_split != split:
+        if resolved_split not in grouped:
             continue
         target = int(row[1]) if row[1] is not None else None
         if labeled_only and target is None:
             continue
-        refs.append(
+        grouped[resolved_split].append(
             SQLiteSampleRef(
                 item_id=str(row[0]),
                 uuid=str(row[0]),
@@ -114,7 +122,22 @@ def build_classification_index(
                 metadata_json=row[4],
             )
         )
-    return SQLiteSplitIndex(path, split, refs)
+    return {
+        split: SQLiteSplitIndex(path, split, refs)
+        for split, refs in grouped.items()
+    }
+
+
+def build_classification_index(
+    sqlite_path: str | Path,
+    config: dict[str, Any],
+    split: str,
+    *,
+    labeled_only: bool,
+) -> SQLiteSplitIndex:
+    return build_classification_indices(
+        sqlite_path, config, labeled_only=labeled_only, splits=(split,)
+    )[split]
 
 
 def build_all_classification_index(
@@ -127,16 +150,10 @@ def build_all_classification_index(
         return build_classification_index(
             sqlite_path, config, "inference", labeled_only=labeled_only
         )
-    refs = []
-    for split in ("train", "validation", "test"):
-        refs.extend(
-            build_classification_index(
-                sqlite_path,
-                config,
-                split,
-                labeled_only=labeled_only,
-            ).refs
-        )
+    indices = build_classification_indices(
+        sqlite_path, config, labeled_only=labeled_only
+    )
+    refs = [ref for index in indices.values() for ref in index.refs]
     return SQLiteSplitIndex(Path(sqlite_path), "all", refs)
 
 
@@ -148,6 +165,24 @@ class SQLiteClassificationSource:
         self.config = config
         self.input_shape = tuple(int(value) for value in config["data"]["input_shape"])
         self._local = threading.local()
+        self._statistics_lock = threading.Lock()
+        self._statistics = {"reads": 0, "read_seconds": 0.0}
+
+    def _record_read(self, started: float) -> None:
+        with self._statistics_lock:
+            self._statistics["reads"] += 1
+            self._statistics["read_seconds"] += time.perf_counter() - started
+
+    def statistics(self) -> dict[str, Any]:
+        with self._statistics_lock:
+            reads = int(self._statistics["reads"])
+            seconds = float(self._statistics["read_seconds"])
+        return {
+            "source": "sqlite_stream",
+            "reads": reads,
+            "read_seconds": seconds,
+            "mean_read_milliseconds": (1000 * seconds / reads) if reads else 0.0,
+        }
 
     def _connection(self) -> sqlite3.Connection:
         connection = getattr(self._local, "connection", None)
@@ -164,43 +199,51 @@ class SQLiteClassificationSource:
         return connection
 
     def read_image(self, item_id: str) -> np.ndarray:
-        row = self._connection().execute(
-            """
-            SELECT a.payload, a.encoding, a.shape_json, di.metadata_json
-            FROM classification_items ci
-            JOIN dataset_items di ON di.item_id = ci.item_id
-            JOIN assets a ON a.asset_id = ci.image_asset_id
-            WHERE ci.item_id = ?
-            """,
-            (str(item_id),),
-        ).fetchone()
-        if row is None:
-            raise KeyError(f"SQLite dataset item {item_id!r} no longer exists")
-        decoded = decode_blob(row[0], row[1], row[2])
-        metadata = json.loads(row[3]) if row[3] else {}
-        return prepare_dataset_classification_input(
-            decoded, self.input_shape, self.config, metadata
-        )
+        started = time.perf_counter()
+        try:
+            row = self._connection().execute(
+                """
+                SELECT a.payload, a.encoding, a.shape_json, di.metadata_json
+                FROM classification_items ci
+                JOIN dataset_items di ON di.item_id = ci.item_id
+                JOIN assets a ON a.asset_id = ci.image_asset_id
+                WHERE ci.item_id = ?
+                """,
+                (str(item_id),),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"SQLite dataset item {item_id!r} no longer exists")
+            decoded = decode_blob(row[0], row[1], row[2])
+            metadata = json.loads(row[3]) if row[3] else {}
+            return prepare_dataset_classification_input(
+                decoded, self.input_shape, self.config, metadata
+            )
+        finally:
+            self._record_read(started)
 
     def read_input(self, item_id: str):
-        row = self._connection().execute(
-            """
-            SELECT a.payload, a.encoding, a.shape_json, di.metadata_json
-            FROM classification_items ci
-            JOIN dataset_items di ON di.item_id = ci.item_id
-            JOIN assets a ON a.asset_id = ci.image_asset_id
-            WHERE ci.item_id = ?
-            """,
-            (str(item_id),),
-        ).fetchone()
-        if row is None:
-            raise KeyError(f"SQLite dataset item {item_id!r} no longer exists")
-        decoded = decode_blob(row[0], row[1], row[2])
-        metadata = json.loads(row[3]) if row[3] else {}
-        image = prepare_dataset_classification_input(decoded, self.input_shape, self.config, metadata)
-        if auxiliary_features_enabled(self.config):
-            return image, auxiliary_feature_vector(self.config, metadata, np.asarray(decoded).shape)
-        return image
+        started = time.perf_counter()
+        try:
+            row = self._connection().execute(
+                """
+                SELECT a.payload, a.encoding, a.shape_json, di.metadata_json
+                FROM classification_items ci
+                JOIN dataset_items di ON di.item_id = ci.item_id
+                JOIN assets a ON a.asset_id = ci.image_asset_id
+                WHERE ci.item_id = ?
+                """,
+                (str(item_id),),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"SQLite dataset item {item_id!r} no longer exists")
+            decoded = decode_blob(row[0], row[1], row[2])
+            metadata = json.loads(row[3]) if row[3] else {}
+            image = prepare_dataset_classification_input(decoded, self.input_shape, self.config, metadata)
+            if auxiliary_features_enabled(self.config):
+                return image, auxiliary_feature_vector(self.config, metadata, np.asarray(decoded).shape)
+            return image
+        finally:
+            self._record_read(started)
 
     def _tf_read_image(self, item_id):
         image = tf.py_function(
@@ -315,19 +358,25 @@ def make_streaming_classification_bundle(
     sqlite_path: str | Path,
     config: dict[str, Any],
 ) -> SQLiteDatasetBundle:
-    source = SQLiteClassificationSource(sqlite_path, config)
-    indices = {}
+    cache_indices = build_classification_indices(sqlite_path, config, labeled_only=False)
+    indices = {
+        split: SQLiteSplitIndex(index.sqlite_path, split, [ref for ref in index.refs if ref.target is not None])
+        for split, index in cache_indices.items()
+    }
+    source: Any = SQLiteClassificationSource(sqlite_path, config)
+    materialization = None
+    from oracle_builder.data.materialization import materialized_classification_source
+
+    # The cache includes every item, including unlabeled records used by SSL or
+    # final prediction export. Supervised datasets below still use only labels.
+    prepared = materialized_classification_source(config, cache_indices)
+    if prepared is not None:
+        source = prepared
+        materialization = prepared.report
     datasets = {}
-    for split in ("train", "validation", "test"):
-        index = build_classification_index(
-            sqlite_path,
-            config,
-            split,
-            labeled_only=True,
-        )
+    for split, index in indices.items():
         if not index.refs:
             continue
-        indices[split] = index
         datasets[split] = source.training_dataset(
             index,
             shuffle=split == "train",
@@ -335,4 +384,9 @@ def make_streaming_classification_bundle(
         )
     if "train" not in datasets:
         raise ValueError("Dataset must contain or create a train split")
-    return SQLiteDatasetBundle(datasets=datasets, indices=indices, source=source)
+    return SQLiteDatasetBundle(
+        datasets=datasets,
+        indices={split: index for split, index in indices.items() if index.refs},
+        source=source,
+        materialization=materialization,
+    )

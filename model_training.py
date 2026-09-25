@@ -356,12 +356,42 @@ def main() -> int:
                 make_streaming_classification_bundle,
             )
 
+            materialization_mode = str(
+                config.get("data", {}).get("materialization", {}).get("mode", "off")
+            ).lower()
+            if materialization_mode != "off":
+                print(
+                    "[startup] Preparing or reusing immutable training-input cache...",
+                    flush=True,
+                )
             streaming_bundle = make_streaming_classification_bundle(args.input, config)
             datasets = streaming_bundle.datasets
             records_by_split = {
                 split: list(index.iter_records())
                 for split, index in streaming_bundle.indices.items()
             }
+            if streaming_bundle.materialization is not None:
+                layout.data_materialization.write_text(
+                    json.dumps(streaming_bundle.materialization, indent=2, sort_keys=True, default=str)
+                    + "\n",
+                    encoding="utf-8",
+                )
+                log_event(
+                    training_log,
+                    run_id,
+                    "INFO",
+                    "Prepared-input cache ready",
+                    {
+                        key: streaming_bundle.materialization.get(key)
+                        for key in ("status", "cache_id", "path", "source")
+                    },
+                )
+                print(
+                    "[startup] Prepared-input cache "
+                    f"{streaming_bundle.materialization['status']}: "
+                    f"{streaming_bundle.materialization['path']}",
+                    flush=True,
+                )
         else:
             datasets, records_by_split = make_tf_datasets(args.input, config)
         log_event(training_log, run_id, "INFO", "Datasets loaded", {"splits": list(datasets)})
@@ -396,16 +426,20 @@ def main() -> int:
             )
 
             if uses_weighted_cross_entropy(config):
-                from oracle_builder.data.sqlite_stream import (
-                    build_classification_index,
+                weight_index = (
+                    streaming_bundle.indices["train"]
+                    if streaming_bundle is not None
+                    else None
                 )
+                if weight_index is None:
+                    from oracle_builder.data.sqlite_stream import build_classification_index
 
-                weight_index = build_classification_index(
-                    args.input,
-                    config,
-                    "train",
-                    labeled_only=True,
-                )
+                    weight_index = build_classification_index(
+                        args.input,
+                        config,
+                        "train",
+                        labeled_only=True,
+                    )
                 resolved_weights = resolve_class_weights(
                     [ref.target for ref in weight_index.refs],
                     int(config["data"]["num_classes"]),
@@ -562,7 +596,14 @@ def main() -> int:
                     "train",
                     labeled_only=False,
                 )
-                self_supervised_dataset = streaming_bundle.source.image_dataset(
+                pretraining_source = streaming_bundle.source
+                if hasattr(pretraining_source, "supports_index") and not pretraining_source.supports_index(pretraining_index):
+                    # Retain SQLite as a safe fallback for an index that is not
+                    # represented by this immutable prepared-input cache.
+                    from oracle_builder.data.sqlite_stream import SQLiteClassificationSource
+
+                    pretraining_source = SQLiteClassificationSource(args.input, config)
+                self_supervised_dataset = pretraining_source.image_dataset(
                     pretraining_index,
                     shuffle=True,
                 )
@@ -603,6 +644,14 @@ def main() -> int:
             resume_state=resume_state,
             classification_metric_datasets=classification_metric_datasets,
         )
+        if streaming_bundle is not None and hasattr(streaming_bundle.source, "statistics"):
+            log_event(
+                training_log,
+                run_id,
+                "INFO",
+                "Input pipeline statistics",
+                streaming_bundle.source.statistics(),
+            )
         from oracle_builder.inference.batching import (
             resolve_inference_batch_size,
         )

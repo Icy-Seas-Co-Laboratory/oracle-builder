@@ -1,0 +1,91 @@
+# Self-supervised embedding baseline.
+#
+# This is a strict Architecture V2 authoring document: it intentionally has
+# no [model], [pretraining], or run.model compatibility aliases.  Runtime
+# resolution derives the internal builder settings only when this immutable
+# definition is launched.
+
+[run]
+task = "embedding"
+seed = 123
+notes = "ResNet-18 SimCLR embedding baseline"
+
+[architecture]
+version = 2
+
+[input]
+channels = ["intensity"]
+
+[input.geometry]
+type = "preserve_aspect_pad"
+
+[data]
+input_shape = [128, 128]
+batch_size = 32
+shuffle_buffer = 512
+validation_split = 0.2
+test_split = 0.1
+
+[encoder]
+family = "resnet"
+variant = "resnet18"
+
+[stem]
+type = "native"
+kernel_size = 3
+stride = 1
+pool = "none"
+
+[pooling]
+type = "avg"
+
+[image_embedding.projection]
+type = "linear"
+output_dim = 256
+l2_normalize = true
+
+[self_supervised]
+enabled = true
+method = "simclr"
+epochs = 100
+learning_rate = 0.001
+temperature = 0.1
+projection_dim = 128
+projection_hidden_dim = 256
+minimum_global_batch_size = 2
+
+[self_supervised.augmentation]
+enabled = true
+rotation = 0.08
+zoom = 0.15
+translation = 0.10
+skew = 0.05
+flip_horizontal = true
+flip_vertical = false
+brightness = 0.20
+contrast = 0.20
+gaussian_noise = 0.03
+invert = false
+fill_value = 0.0
+
+[training]
+# The embedding runner performs self-supervised training; this is retained as
+# an explicit protocol default for downstream compatibility and provenance.
+epochs = 100
+optimizer = "adam"
+learning_rate = 0.001
+metrics = ["accuracy"]
+
+[augmentation]
+enabled = false
+
+[distribution]
+strategy = "single"
+devices = []
+memory_growth = true
+fallback_to_single = true
+
+[output]
+save_predictions = false
+save_figures = true
+export_savedmodel = true

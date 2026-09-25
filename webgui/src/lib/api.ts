@@ -1,8 +1,8 @@
 export type RecordValue = Record<string, unknown>;
 
-async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
+async function request<T>(path: string, options: RequestInit = {}, timeoutMs = 15_000): Promise<T> {
 	const controller = new AbortController();
-	const timeout = window.setTimeout(() => controller.abort(), 15_000);
+	const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
 	let response: Response;
 	try {
 		response = await fetch(`/api${path}`, {
@@ -11,7 +11,7 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
 			headers: { 'content-type': 'application/json', ...options.headers }
 		});
 	} catch (error) {
-		if (controller.signal.aborted) throw new Error('The service did not respond within 15 seconds.');
+		if (controller.signal.aborted) throw new Error(`The service did not respond within ${Math.ceil(timeoutMs / 1_000)} seconds.`);
 		throw error;
 	} finally { window.clearTimeout(timeout); }
 	if (!response.ok) {
@@ -24,6 +24,18 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
 export const api = {
 	datasets: () => request<{ datasets: RecordValue[] }>('/v1/datasets'),
 	configurationSchema: () => request<RecordValue>('/v1/config-schema'),
+	modelDefinitionTemplates: () => request<{ templates: RecordValue[] }>('/v1/model-definition-templates'),
+	modelDefinitions: () => request<{ definitions: RecordValue[] }>('/v1/model-definitions'),
+	modelDefinition: (id: string, revision?: number) => request<RecordValue>(`/v1/model-definitions/${encodeURIComponent(id)}${revision ? `?revision=${revision}` : ''}`),
+	createModelDefinition: (body: RecordValue) => request<RecordValue>('/v1/model-definitions', { method: 'POST', body: JSON.stringify(body) }),
+	updateModelDefinition: (id: string, body: RecordValue) => request<RecordValue>(`/v1/model-definitions/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(body) }),
+	duplicateModelDefinition: (id: string, body: RecordValue = {}) => request<RecordValue>(`/v1/model-definitions/${encodeURIComponent(id)}:duplicate`, { method: 'POST', body: JSON.stringify(body) }),
+	validateAndQueueDefinition: (id: string, body: RecordValue) => request<RecordValue>(`/v1/model-definitions/${encodeURIComponent(id)}:validate-and-queue`, { method: 'POST', body: JSON.stringify(body) }, 960_000),
+	queuedRuns: () => request<{ queued_runs: RecordValue[] }>('/v1/queued-runs'),
+	startQueuedRuns: (body: RecordValue) => request<RecordValue>('/v1/queued-runs:start', { method: 'POST', body: JSON.stringify(body) }),
+	cancelQueuedRun: (id: string) => request<RecordValue>(`/v1/queued-runs/${encodeURIComponent(id)}:cancel`, { method: 'POST' }),
+	clearQueuedRuns: (endpointId?: string) => request<RecordValue>('/v1/queued-runs:clear', { method: 'POST', body: JSON.stringify(endpointId ? { endpoint_id: endpointId } : {}) }),
+	resetStuckJobs: (endpointId?: string) => request<RecordValue>('/v1/jobs:reset-stuck', { method: 'POST', body: JSON.stringify(endpointId ? { endpoint_id: endpointId } : {}) }),
 	modelSetup: (architecture: string) => request<RecordValue>(`/v1/model-setups/${encodeURIComponent(architecture)}`),
 	modelPreview: (body: RecordValue) => request<RecordValue>('/v1/model-previews', { method: 'POST', body: JSON.stringify(body) }),
 	datasetDetail: (id: string) => request<RecordValue>(`/v1/datasets/${id}/detail`),
@@ -55,6 +67,10 @@ export const api = {
 	health: () => request<RecordValue>('/health/ready'),
 	computeEndpoints: (refresh = false) => request<{ endpoints: RecordValue[] }>(`/v1/compute/endpoints${refresh ? '?refresh=true' : ''}`),
 	jobEvents: (id: string) => request<{ events: RecordValue[] }>(`/v1/jobs/${id}/events`),
+	jobTrainingStatus: (id: string) => request<RecordValue>(`/v1/jobs/${encodeURIComponent(id)}/training-status`),
+	pauseJob: (id: string) => request<RecordValue>(`/v1/jobs/${encodeURIComponent(id)}:pause`, { method: 'POST' }),
+	resumeJob: (id: string) => request<RecordValue>(`/v1/jobs/${encodeURIComponent(id)}:resume`, { method: 'POST' }),
+	cancelJob: (id: string) => request<RecordValue>(`/v1/jobs/${encodeURIComponent(id)}:cancel`, { method: 'POST' }),
 	fileRoots: () => request<{ roots: RecordValue[] }>('/v1/files/roots'),
 	files: (root: string, path = '') => request<RecordValue>(`/v1/files?root=${encodeURIComponent(root)}&path=${encodeURIComponent(path)}`),
 	upload: async (kind: 'datasets' | 'configs' | 'models', file: File): Promise<RecordValue> => {

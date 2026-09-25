@@ -71,7 +71,7 @@ def test_epoch_classification_records_include_summary_and_per_class_metrics():
     )
 
 
-def test_epoch_classification_logger_writes_train_and_validation_but_not_test(tmp_path):
+def test_epoch_classification_logger_writes_validation_only(tmp_path):
     inputs = np.array([[1.0, 0.0], [0.0, 1.0]], dtype="float32")
     labels = np.array([0, 1], dtype="int64")
     datasets = {
@@ -91,7 +91,7 @@ def test_epoch_classification_logger_writes_train_and_validation_but_not_test(tm
         json.loads(line)
         for line in (tmp_path / "metrics" / "metrics.jsonl").read_text().splitlines()
     ]
-    assert {row["split"] for row in rows} == {"train", "validation"}
+    assert {row["split"] for row in rows} == {"validation"}
     assert all(row["phase"] == "epoch_evaluation" for row in rows)
     assert any(row["metric"] == "macro_f1" for row in rows)
 

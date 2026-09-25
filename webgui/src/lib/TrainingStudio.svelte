@@ -40,6 +40,7 @@
 	let creating = false;
 	let advancedOverrides: RecordValue = {};
 	let schemaDefaults: RecordValue = {};
+	let schemaFields: RecordValue[] = [];
 	let synchronizedDraftId = '';
 
 	$: if (!datasetId && datasets.length) datasetId = String(datasets[0].dataset_id);
@@ -54,7 +55,7 @@
 	onMount(async () => {
 		try {
 			const [draftResult, schema] = await Promise.all([api.modelDrafts(), api.configurationSchema()]);
-			drafts = records(draftResult.drafts); schemaDefaults = record(schema.defaults);
+			drafts = records(draftResult.drafts); schemaDefaults = record(schema.defaults); schemaFields = records(schema.fields);
 		} catch { drafts = []; }
 	});
 	function normalOverrides(): RecordValue {
@@ -115,6 +116,6 @@
 		<div class="panel-head section-break"><div><h3>Preprocessing & augmentation</h3><p>Applied only according to the sealed run contract.</p></div></div>
 		<div class="editor-fields"><label>Image polarity<select bind:value={polarity} on:change={persistNormal}><option value="auto">Use recorded polarity</option><option value="false">Light foreground</option><option value="true">Dark foreground / invert</option></select></label><label>Rotation strength<input type="number" min="0" max="1" step="0.05" bind:value={rotation} on:change={persistNormal} /></label><label>Metadata Gaussian variance<input type="number" min="0" step="0.001" bind:value={metadataVariance} on:change={persistNormal} /></label></div>
 		<div class="training-plan"><div><span>Will seal</span><strong>{draftId ? 'Draft revision + run overrides' : 'Recipe + run overrides'}</strong><small>Dataset fingerprint, initialization source, preprocessing, optimizer, and resources are recorded.</small></div><button disabled={creating || !runName.trim() || !datasetId || (!draftId && !recipeId) || (initialization !== 'scratch' && !sourceArtifactId)} on:click={plan}>{creating ? 'Creating…' : 'Create training plan'}</button></div>
-		<AdvancedConfigEditor config={advancedOverrides} title="Advanced run options" description="These values are synchronized with the quick controls above and sealed only into this training plan." sections={runSections} on:change={(event) => syncAdvanced(event.detail.config)} />
+		<AdvancedConfigEditor config={advancedOverrides} fieldDefinitions={schemaFields} title="Advanced run options" description="Frequently useful tuning controls. Enable expert controls only for low-level runtime and architecture overrides." sections={runSections} on:change={(event) => syncAdvanced(event.detail.config)} />
 	</section>
 </div>

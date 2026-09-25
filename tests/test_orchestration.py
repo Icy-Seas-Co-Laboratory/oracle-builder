@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import pytest
 
+from oracle_builder.config import load_toml
 from oracle_builder.orchestration.service import Orchestrator
 from oracle_builder.registry import MODEL_REGISTRY
 
@@ -82,6 +83,59 @@ def test_dispatch_and_reconcile_keeps_orchestrator_job_identity(tmp_path, monkey
     reconciled = orchestrator.reconcile_job(job["job_id"])
     assert reconciled["status"] == "artifact_invalid"
     assert reconciled["worker_id"] == "gpu-a"
+
+
+def test_job_training_status_proxies_live_snapshot_and_degrades_gracefully(tmp_path, monkeypatch):
+    """The browser gets a stable payload even before a worker has a snapshot."""
+    from fastapi.testclient import TestClient
+    from oracle_builder.orchestration.api import create_app
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    model, info = workspace / "external.keras", workspace / "external.toml"
+    model.write_bytes(b"placeholder")
+    info.write_text("[product]\nname = 'External'\n")
+    orchestrator = Orchestrator(tmp_path / "orchestrator.sqlite", workspace_root=workspace)
+    endpoint = orchestrator.register_compute_endpoint(name="local", base_url="http://oracle-serve:8100")
+    specification = orchestrator.specifications(
+        orchestrator.create_model_import(name="external", model_path=model, info_path=info)["experiment_id"]
+    )[0]
+
+    def live_request(base, method, route, body=None):
+        if route == "/health/ready":
+            return {"status": "ready", "compute_enabled": True}
+        if route == "/compute/status":
+            return {"status": "ready", "queue": {"depth": 0, "capacity": 1}, "workers": [{
+                "worker_id": "gpu-a", "status": "idle", "capabilities": {"actions": ["model_ingest"], "gpus": []},
+            }]}
+        if route == "/compute/jobs":
+            return {"status": "queued", "worker_id": None}
+        if route.endswith("/training-status"):
+            return {"phase": "training", "epoch": 3, "available": True, "stale": False}
+        raise AssertionError(route)
+
+    monkeypatch.setattr(orchestrator, "_request", live_request)
+    job = orchestrator.dispatch(specification["specification_id"], endpoint["endpoint_id"])
+    with TestClient(create_app(orchestrator)) as client:
+        response = client.get(f"/v1/jobs/{job['job_id']}/training-status")
+        assert response.status_code == 200
+        assert response.json() == {
+            "phase": "training", "epoch": 3, "available": True, "stale": False, "controls": ["cancel"],
+            "job_id": job["job_id"], "job_status": "submitted", "message": None,
+        }
+        assert client.get("/v1/jobs/not-a-job/training-status").status_code == 404
+
+    def unavailable_request(base, method, route, body=None):
+        if route.endswith("/training-status"):
+            raise RuntimeError("oracle-serve returned 404: status snapshot not found")
+        return live_request(base, method, route, body)
+
+    monkeypatch.setattr(orchestrator, "_request", unavailable_request)
+    status = orchestrator.job_training_status(job["job_id"])
+    assert status["available"] is False
+    assert status["stale"] is True
+    assert status["job_status"] == "submitted"
+    assert "temporarily unavailable" in status["message"]
 
 
 def test_orchestrator_api_creates_a_model_import_specification(tmp_path):
@@ -422,6 +476,42 @@ def test_model_catalog_tags_and_versioned_v2_drafts(tmp_path):
     assert revised["revision"] == 2
 
 
+def test_catalog_reindex_backfills_metadata_with_provenance_without_writing_artifact(tmp_path):
+    from fastapi.testclient import TestClient
+    from oracle_builder.orchestration.api import create_app
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    source = workspace / "source.toml"
+    source.write_text("[run]\ntask = 'classification'\n")
+    artifact_root = tmp_path / "artifacts"
+    orchestrator = Orchestrator(tmp_path / "orchestrator.sqlite", workspace_root=workspace, artifact_root=artifact_root)
+    artifact = _create_sealed_product(artifact_root / "legacy", source, metrics={})
+    orchestrator.scan(artifact_root / "legacy")
+    root = artifact_root / "legacy"
+    before = (root / "artifact.json").read_bytes()
+    (root / "config").mkdir(exist_ok=True)
+    (root / "config" / "resolved.json").write_text(json.dumps({"training": {"epochs": 12}, "data": {"num_classes": 4}}))
+    (root / "metrics").mkdir(exist_ok=True)
+    (root / "metrics" / "history.csv").write_text("epoch,val_loss,val_accuracy\n0,1.0,0.5\n11,0.2,0.9\n")
+    (root / "model").mkdir(exist_ok=True)
+    (root / "model" / "model_summary.txt").write_text("Total params: 1,234\nTrainable params: 1,200\n")
+
+    report = orchestrator.reindex_artifact_catalog([artifact["artifact_id"]])
+    assert report == {"requested": [artifact["artifact_id"]], "refreshed": [artifact["artifact_id"]], "missing": [], "skipped": [], "artifact_files_changed": False}
+    assert (root / "artifact.json").read_bytes() == before
+    facts = orchestrator.artifact_detail(artifact["artifact_id"])["facts"]["facts"]
+    assert facts["epochs"] == 12
+    assert facts["parameter_count"] == 1234
+    assert facts["accuracy"] == 0.9
+    assert facts["field_sources"]["epochs"] == {"source": "resolved_config", "status": "recorded"}
+    assert facts["field_sources"]["accuracy"] == {"source": "training_history", "status": "inferred"}
+    with TestClient(create_app(orchestrator)) as client:
+        response = client.post("/v1/artifacts/catalog:reindex", json={"artifact_ids": [artifact["artifact_id"], "not-a-real-artifact"]})
+        assert response.status_code == 200
+        assert response.json()["missing"] == ["not-a-real-artifact"]
+
+
 @pytest.mark.parametrize(
     ("architecture", "preset", "variant"),
     [
@@ -449,7 +539,9 @@ def test_model_setup_routes_families_and_aliases_to_explicit_v2_variant_presets(
 
     assert orchestrator._architecture_config_path(architecture).name == f"{preset}.toml"
     assert setup["config"]["architecture"]["version"] == 2
-    assert setup["config"]["run"]["model"] == architecture
+    # Model setup exposes the runtime translation of a V2 document: the
+    # builder receives a family plus the selected concrete variant.
+    assert setup["config"]["run"]["model"] == setup["config"]["encoder"]["family"]
     assert setup["config"]["model"]["variant"] == variant
 
 
@@ -493,6 +585,152 @@ def test_configuration_schema_and_planning_derive_class_count_from_frozen_datase
     specification = orchestrator.specifications(experiment["experiment_id"])[0]
     sealed_config = load_toml(specification["parameters"]["config"])
     assert sealed_config["data"]["num_classes"] == 3
+
+
+def test_v2_model_definitions_are_template_based_versioned_and_pinned(tmp_path):
+    orchestrator = Orchestrator(tmp_path / "orchestrator.sqlite", workspace_root=Path.cwd())
+    template = next(item for item in orchestrator.model_definition_templates() if item["template_id"] == "resnet18")
+    assert template["config"]["architecture"]["version"] == 2
+    definition = orchestrator.create_model_definition(name="exp001-resnet-128", template_id="resnet18")
+    assert "model" not in definition["config"]
+    assert "model" not in definition["config"]["run"]
+    assert definition["revision"] == 1
+    assert definition["template_id"] == "resnet18"
+    assert "pretraining" not in definition["config"]
+
+    duplicate = orchestrator.duplicate_model_definition(definition["definition_id"], revision=1, lineage_kind="sensitivity")
+    assert duplicate["name"] == "exp001-resnet-128 V.2"
+    assert duplicate["parent_definition_id"] == definition["definition_id"]
+    assert duplicate["parent_revision"] == 1
+    assert duplicate["lineage_kind"] == "sensitivity"
+
+    sequential_duplicate = orchestrator.duplicate_model_definition(duplicate["definition_id"])
+    assert sequential_duplicate["name"] == "exp001-resnet-128 V.3"
+    # An already-used later version is skipped deterministically, including
+    # when the copy originates from the unversioned parent.
+    orchestrator.create_model_definition(name="exp001-resnet-128 V.4", template_id="resnet18")
+    skipped_duplicate = orchestrator.duplicate_model_definition(definition["definition_id"])
+    assert skipped_duplicate["name"] == "exp001-resnet-128 V.5"
+    assert skipped_duplicate["parent_definition_id"] == definition["definition_id"]
+    assert skipped_duplicate["parent_revision"] == 1
+    assert skipped_duplicate["lineage_kind"] == "duplicate"
+
+    with pytest.raises(ValueError, match="name already exists"):
+        orchestrator.create_model_definition(name="EXP001-RESNET-128", template_id="resnet18")
+    independently_named = orchestrator.create_model_definition(name="another definition", template_id="resnet18")
+    with pytest.raises(ValueError, match="name already exists"):
+        orchestrator.update_model_definition(
+            independently_named["definition_id"],
+            expected_revision=1,
+            name=definition["name"],
+        )
+
+    revised = orchestrator.update_model_definition(definition["definition_id"], expected_revision=1, name="exp001 revised", config=definition["config"])
+    assert revised["revision"] == 2
+    assert len(orchestrator.model_definition_revisions(definition["definition_id"])) == 2
+    with pytest.raises(ValueError, match="revision conflict"):
+        orchestrator.update_model_definition(definition["definition_id"], expected_revision=1, config=definition["config"])
+
+
+def test_first_class_ssl_and_mask_refinement_templates_are_strict_v2(tmp_path):
+    """The product task templates must be usable without V1 authoring keys."""
+    orchestrator = Orchestrator(tmp_path / "orchestrator.sqlite", workspace_root=Path.cwd())
+    templates = {item["template_id"]: item for item in orchestrator.model_definition_templates()}
+
+    ssl = templates["ssl_embedding_resnet18"]
+    assert ssl["task"] == "embedding"
+    assert ssl["config"]["self_supervised"]["enabled"] is True
+    assert ssl["config"]["self_supervised"]["method"] == "simclr"
+    assert ssl["config"]["encoder"] == {"family": "resnet", "variant": "resnet18"}
+
+    mask = templates["mask_refinement_unet"]
+    assert mask["task"] == "segmentation"
+    assert mask["config"]["encoder"] == {"family": "unet", "variant": "unet"}
+    assert mask["config"]["data"]["output_shape"] == [256, 256, 1]
+    assert mask["config"]["training"]["segmentation_target"] == "candidate_delta"
+
+    for template_id, template in (("ssl_embedding_resnet18", ssl), ("mask_refinement_unet", mask)):
+        definition = orchestrator.create_model_definition(
+            name=f"first-class {template_id}", template_id=template_id
+        )
+        assert definition["config"] == template["config"]
+        assert "model" not in definition["config"]
+        assert "model" not in definition["config"]["run"]
+        assert "pretraining" not in definition["config"]
+
+    # The queued artifact remains an authoring V2 document; runtime aliases
+    # are introduced only by resolve_config on the compute worker.
+    sealed_mask = orchestrator._definition_queue_config(
+        orchestrator.create_model_definition(
+            name="queued mask refinement", template_id="mask_refinement_unet"
+        ),
+        {"path": str(tmp_path / "not-read-for-segmentation.sqlite")},
+    )
+    assert sealed_mask["run"]["task"] == "segmentation"
+    assert "model" not in sealed_mask
+    assert "model" not in sealed_mask["run"]
+    assert "pretraining" not in sealed_mask
+
+
+def test_validated_queue_seals_definition_and_requires_explicit_start(tmp_path, monkeypatch):
+    import sqlite3
+
+    from oracle_builder.data.sqlite_dataset import create_synthetic_classification
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    dataset_path = workspace / "frozen.sqlite"
+    create_synthetic_classification(dataset_path, n=9, shape=(16, 16, 1), classes=3)
+    with sqlite3.connect(dataset_path) as db:
+        db.execute("UPDATE dataset SET lifecycle='frozen'")
+        db.commit()
+    orchestrator = Orchestrator(tmp_path / "orchestrator.sqlite", workspace_root=workspace, artifact_root=tmp_path / "artifacts")
+    dataset = orchestrator.ingest_dataset(dataset_path)
+    endpoint = orchestrator.register_compute_endpoint(name="local", base_url="http://oracle-serve:8100")
+    definition = orchestrator.create_model_definition(name="exp001-resnet-128", template_id="resnet18")
+    requests = []
+
+    def request(base, method, route, body=None, *, timeout_seconds=15):
+        requests.append((base, method, route, body, timeout_seconds))
+        if route == "/health/ready":
+            return {"status": "ready", "compute_enabled": True}
+        if route == "/compute/status":
+            return {"status": "ready", "queue": {"depth": 0, "capacity": 10}, "workers": [{"worker_id": "gpu-a", "status": "idle", "capabilities": {"actions": ["train"], "gpus": [{"id": "0"}]}}]}
+        if route == "/compute/batch-size-tune":
+            assert body["resources"] == {"gpu_count": 1, "gpu_ids": ["0"]}
+            assert body["parameters"]["maximum_batch_size"] == 64
+            return {
+                "ready": True, "probe_kind": "representative_forward_backward",
+                "recommended_batch_size": 24, "largest_verified_batch_size": 32,
+                "safety_factor": 0.8,
+            }
+        if route == "/compute/preflight":
+            return {"ready": True, "reasons": [], "vram": {"verified": True}}
+        if route == "/compute/jobs":
+            return {"status": "queued", "worker_id": "gpu-a"}
+        raise AssertionError(route)
+
+    monkeypatch.setattr(orchestrator, "_request", request)
+    queued = orchestrator.validate_and_queue_model_definition(
+        definition["definition_id"], name="exp001 on frozen", dataset_id=dataset["dataset_id"], endpoint_id=endpoint["endpoint_id"], resources={"gpu_count": 1, "gpu_ids": ["0"]}, batch_size_mode="auto", maximum_batch_size=64,
+    )
+    assert queued["status"] == "ready"
+    assert queued["start_authorized"] is False
+    assert queued["batch_size"] == 24
+    assert queued["resources"] == {"gpu_count": 1, "gpu_ids": ["0"]}
+    batch_tune_requests = [item for item in requests if item[2] == "/compute/batch-size-tune"]
+    assert batch_tune_requests[0][4] == 930
+    preflight_requests = [body for _, _, route, body, _ in requests if route == "/compute/preflight"]
+    assert preflight_requests[0]["resources"] == {"gpu_count": 1, "gpu_ids": ["0"]}
+    assert not any(route == "/compute/jobs" for _, _, route, _, _ in requests)
+    assert Path(queued["resolved_toml_path"]).is_file()
+    sealed = load_toml(queued["resolved_toml_path"])
+    assert sealed["data"]["batch_size"] == 24
+    assert sealed["distribution"]["strategy"] == "single"
+
+    started = orchestrator.authorize_queued_runs(queued_run_ids=[queued["queued_run_id"]], endpoint_id=endpoint["endpoint_id"])
+    assert started["dispatched"]
+    assert any(route == "/compute/jobs" for _, _, route, _, _ in requests)
 
 
 def test_startup_reconciles_project_runs_and_frozen_datasets(tmp_path):

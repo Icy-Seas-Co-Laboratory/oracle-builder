@@ -18,7 +18,16 @@ from PIL import Image
 
 from oracle_data_contracts.datasets import dataset_fingerprint, read_dataset_info, set_dataset_lifecycle
 from oracle_builder.data.decoders import decode_blob
-from oracle_builder.config import DEFAULT_CONFIG, deep_merge, load_toml, validate_config
+from oracle_builder.config import (
+    DEFAULT_CONFIG,
+    deep_merge,
+    load_toml,
+    normalize_component_config,
+    resolve_v2_config,
+    validate_config,
+    validate_v2_config,
+)
+from oracle_builder.config_schema import configuration_schema as v2_configuration_schema
 from oracle_builder.orchestration.database import connect
 
 
@@ -34,7 +43,7 @@ def _row(row: sqlite3.Row | None) -> dict[str, Any] | None:
     if row is None:
         return None
     result = dict(row)
-    for key in ("metadata_json", "manifest_json", "plan_json", "parameters_json", "resources_json", "selection_json", "protocol_json", "summary_json", "validation_report_json", "readiness_json", "workers_json", "queue_json", "facts_json", "config_json", "layout_json"):
+    for key in ("metadata_json", "manifest_json", "plan_json", "parameters_json", "resources_json", "selection_json", "protocol_json", "summary_json", "validation_report_json", "readiness_json", "workers_json", "queue_json", "facts_json", "config_json", "layout_json", "initialization_json", "preflight_report_json"):
         if key in result:
             raw = result.pop(key)
             result[key.removesuffix("_json")] = json.loads(raw) if raw is not None else None
@@ -171,6 +180,10 @@ class Orchestrator:
         source = load_toml(self._architecture_config_path(architecture))
         source.setdefault("run", {})["model"] = architecture
         config = deep_merge(DEFAULT_CONFIG, source)
+        # model_setup is a runtime-preview helper, not the V2 authoring API.
+        # Translate its temporary alias so existing builders and previews see
+        # the same internal structure they will receive at execution.
+        normalize_component_config(config, source)
         fields: list[dict[str, Any]] = []
 
         def collect(value: dict[str, Any], prefix: str) -> None:
@@ -189,23 +202,608 @@ class Orchestrator:
 
     @staticmethod
     def configuration_schema() -> dict[str, Any]:
-        """Return the editable resolved-config baseline for schema-driven clients.
+        """Return the complete V2 contract for TOML, GUI, and planning clients."""
+        return v2_configuration_schema()
 
-        The configuration dictionary is the single source of truth: clients may
-        render it as guided or advanced controls, then persist the same paths
-        through the draft and planning APIs.
+    # Model definitions -------------------------------------------------
+    # Maintained TOMLs are deliberately read-only sources.  A user must make
+    # a definition (or duplicate an existing definition) before changing any
+    # scientific setting, which gives queueing a stable revision to pin.
+    @property
+    def _model_template_root(self) -> Path:
+        # Templates ship with Oracle Builder rather than with an arbitrary
+        # project workspace.  Definitions persist the template digest, so a
+        # later package/template change cannot rewrite prior science.
+        return Path(__file__).resolve().parents[2] / "configs" / "classification_defaults"
+
+    @property
+    def _first_class_template_root(self) -> Path:
+        """Maintained V2 templates whose task is part of the product surface.
+
+        Classification family defaults predate model definitions and retain
+        their stable short identifiers (for example ``resnet18``).  New
+        first-class workflows live separately so their template names describe
+        the scientific task rather than being confused with a family preset.
         """
-        defaults = deep_merge(DEFAULT_CONFIG, {})
-        defaults["self_supervised"] = deep_merge(defaults["pretraining"], {})
-        return {
-            "defaults": defaults,
-            "groups": [
-                "run", "architecture", "data", "input", "preprocessing", "encoder", "stem",
-                "normalization", "pooling", "image_embedding", "model", "metadata", "fusion",
-                "classifier", "posthoc", "training", "callbacks", "recovery", "augmentation",
-                "distribution", "self_supervised", "evidence", "inference", "output", "evaluation", "tiling",
-            ],
+        return Path(__file__).resolve().parents[2] / "configs" / "model_definition_templates"
+
+    @staticmethod
+    def _config_digest(config: dict[str, Any]) -> str:
+        return hashlib.sha256(_json(config).encode("utf-8")).hexdigest()
+
+    def _definition_catalog_fingerprint(self) -> str | None:
+        # Schema work evolves independently of persistence.  A definition is
+        # still valid without a catalog fingerprint; once the catalog is
+        # available its immutable fingerprint is recorded on new revisions.
+        try:
+            schema = self.configuration_schema()
+        except (TypeError, ValueError):
+            return None
+        return schema.get("fingerprint") or schema.get("schema_fingerprint")
+
+    def _definition_config(self, config: dict[str, Any]) -> dict[str, Any]:
+        """Resolve and enforce the only user-authorable configuration dialect."""
+        # Definition records are public V2 documents.  Runtime-only aliases
+        # (run.model/model/pretraining) are created only by resolve_config at
+        # execution time and never leak back through this API.
+        validate_v2_config(config)
+        return resolve_v2_config(config)
+
+    def _template_path(self, template_id: str) -> Path:
+        if not isinstance(template_id, str) or not template_id or "/" in template_id or "\\" in template_id:
+            raise ValueError("Invalid model-definition template ID")
+        for item_id, candidate in self._template_sources():
+            if item_id == template_id:
+                return candidate
+        raise KeyError(template_id)
+
+    def _template_sources(self) -> list[tuple[str, Path]]:
+        classification = [
+            (path.stem, path) for path in sorted(self._model_template_root.glob("*.toml"))
+        ]
+        first_class = [
+            (path.stem, path)
+            for path in sorted(self._first_class_template_root.glob("*.toml"))
+        ]
+        # Only templates which already satisfy the V2 definition contract are
+        # offered here.  Historical examples remain runnable through their CLI
+        # paths, but cannot silently become authoring templates.
+        sources = classification + first_class
+        ids = [template_id for template_id, _ in sources]
+        if len(ids) != len(set(ids)):
+            raise ValueError("Model-definition template IDs must be unique")
+        return [
+            (template_id, path.resolve())
+            for template_id, path in sources
+            if path.is_file()
+        ]
+
+    def model_definition_templates(self) -> list[dict[str, Any]]:
+        templates: list[dict[str, Any]] = []
+        for template_id, path in self._template_sources():
+            raw = path.read_bytes()
+            source = load_toml(path)
+            try:
+                config = self._definition_config(source)
+            except (TypeError, ValueError):
+                # A maintained file that is not V2 must never leak into the
+                # authoring catalog.  It remains visible on disk for migration.
+                continue
+            templates.append({
+                "template_id": template_id,
+                "name": template_id.replace("_", " "),
+                "path": str(path),
+                "sha256": hashlib.sha256(raw).hexdigest(),
+                "task": (config.get("run") or {}).get("task"),
+                "architecture": {"family": (config.get("encoder") or {}).get("family"), "variant": (config.get("encoder") or {}).get("variant")},
+                "config": config,
+            })
+        return templates
+
+    def model_definition_template(self, template_id: str) -> dict[str, Any]:
+        for template in self.model_definition_templates():
+            if template["template_id"] == template_id:
+                return template
+        raise KeyError(template_id)
+
+    def _definition_result(self, definition: dict[str, Any]) -> dict[str, Any]:
+        definition["architecture"] = self.architecture_view_from_config(definition["config"])
+        return definition
+
+    def model_definitions(self) -> list[dict[str, Any]]:
+        return [self._definition_result(item) for item in self._many("SELECT * FROM model_definitions ORDER BY updated_at DESC")]
+
+    def model_definition(self, definition_id: str, *, revision: int | None = None) -> dict[str, Any] | None:
+        with self._connection() as db:
+            if revision is None:
+                item = _row(db.execute("SELECT * FROM model_definitions WHERE definition_id=?", (definition_id,)).fetchone())
+            else:
+                item = _row(db.execute("""SELECT d.definition_id,d.name,d.description,r.revision,d.template_id,d.template_sha256,
+                    d.parent_definition_id,d.parent_revision,d.lineage_kind,r.config_json,r.config_sha256,r.catalog_fingerprint,
+                    d.created_at,r.created_at AS updated_at FROM model_definitions d JOIN model_definition_revisions r
+                    ON d.definition_id=r.definition_id WHERE d.definition_id=? AND r.revision=?""", (definition_id, int(revision))).fetchone())
+        return self._definition_result(item) if item is not None else None
+
+    def model_definition_revisions(self, definition_id: str) -> list[dict[str, Any]]:
+        if self.model_definition(definition_id) is None:
+            raise KeyError(definition_id)
+        with self._connection() as db:
+            rows = db.execute("SELECT definition_id,revision,config_json,config_sha256,catalog_fingerprint,created_at FROM model_definition_revisions WHERE definition_id=? ORDER BY revision DESC", (definition_id,)).fetchall()
+        return [_row(row) for row in rows]  # type: ignore[list-item]
+
+    def create_model_definition(self, *, name: str, template_id: str, description: str = "", config: dict[str, Any] | None = None) -> dict[str, Any]:
+        template = self.model_definition_template(template_id)
+        if config is not None and not isinstance(config, dict):
+            raise ValueError("Model definition config must be an object")
+        resolved = self._definition_config(deep_merge(template["config"], config or {}))
+        definition_id, now = str(uuid.uuid4()), _now()
+        digest, fingerprint = self._config_digest(resolved), self._definition_catalog_fingerprint()
+        with self._connection() as db:
+            definition_name = name.strip() or template["name"]
+            try:
+                db.execute("""INSERT INTO model_definitions VALUES (?, ?, ?, 1, ?, ?, NULL, NULL, 'template', ?, ?, ?, ?, ?)""",
+                           (definition_id, definition_name, description, template_id, template["sha256"], _json(resolved), digest, fingerprint, now, now))
+            except sqlite3.IntegrityError as exc:
+                if "model_definitions_name_idx" in str(exc) or "model_definitions.name" in str(exc):
+                    raise ValueError(f"Model definition name already exists: {definition_name}") from exc
+                raise
+            db.execute("INSERT INTO model_definition_revisions VALUES (?, 1, ?, ?, ?, ?)", (definition_id, _json(resolved), digest, fingerprint, now))
+        return self.model_definition(definition_id)  # type: ignore[return-value]
+
+    def update_model_definition(self, definition_id: str, *, expected_revision: int, name: str | None = None, description: str | None = None, config: dict[str, Any] | None = None) -> dict[str, Any]:
+        current = self.model_definition(definition_id)
+        if current is None: raise KeyError(definition_id)
+        if int(current["revision"]) != int(expected_revision):
+            raise ValueError("Model definition revision conflict; refresh before saving")
+        if config is not None and not isinstance(config, dict): raise ValueError("Model definition config must be an object")
+        resolved = self._definition_config(config if config is not None else current["config"])
+        revision, now = int(current["revision"]) + 1, _now()
+        digest, fingerprint = self._config_digest(resolved), self._definition_catalog_fingerprint()
+        with self._connection() as db:
+            definition_name = name.strip() if isinstance(name, str) and name.strip() else current["name"]
+            try:
+                updated = db.execute("""UPDATE model_definitions SET name=?,description=?,revision=?,config_json=?,config_sha256=?,catalog_fingerprint=?,updated_at=?
+                    WHERE definition_id=? AND revision=?""", (definition_name, description if description is not None else current["description"], revision, _json(resolved), digest, fingerprint, now, definition_id, expected_revision)).rowcount
+            except sqlite3.IntegrityError as exc:
+                if "model_definitions_name_idx" in str(exc) or "model_definitions.name" in str(exc):
+                    raise ValueError(f"Model definition name already exists: {definition_name}") from exc
+                raise
+            if updated != 1: raise ValueError("Model definition revision conflict; refresh before saving")
+            db.execute("INSERT INTO model_definition_revisions VALUES (?, ?, ?, ?, ?, ?)", (definition_id, revision, _json(resolved), digest, fingerprint, now))
+        return self.model_definition(definition_id)  # type: ignore[return-value]
+
+    def duplicate_model_definition(self, definition_id: str, *, revision: int | None = None, name: str | None = None, lineage_kind: str = "duplicate") -> dict[str, Any]:
+        source = self.model_definition(definition_id, revision=revision)
+        if source is None: raise KeyError(definition_id)
+        if lineage_kind not in {"duplicate", "sensitivity", "fork"}: raise ValueError("Unsupported definition lineage kind")
+        new_id, now = str(uuid.uuid4()), _now()
+        digest, fingerprint = self._config_digest(source["config"]), self._definition_catalog_fingerprint()
+        requested_name = name.strip() if isinstance(name, str) and name.strip() else None
+        with self._connection() as db:
+            # Naming has to be decided inside a write transaction.  Otherwise
+            # two users duplicating the same definition could both observe
+            # "V.2" as available and create indistinguishable library rows.
+            db.execute("BEGIN IMMEDIATE")
+            duplicate_name = requested_name or self._next_definition_duplicate_name(db, source["name"])
+            try:
+                db.execute("""INSERT INTO model_definitions VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                           (new_id, duplicate_name, source["description"], source.get("template_id"), source.get("template_sha256"), definition_id, source["revision"], lineage_kind, _json(source["config"]), digest, fingerprint, now, now))
+                db.execute("INSERT INTO model_definition_revisions VALUES (?, 1, ?, ?, ?, ?)", (new_id, _json(source["config"]), digest, fingerprint, now))
+            except sqlite3.IntegrityError as exc:
+                if "model_definitions_name_idx" in str(exc) or "model_definitions.name" in str(exc):
+                    raise ValueError(f"Model definition name already exists: {duplicate_name}") from exc
+                raise
+        return self.model_definition(new_id)  # type: ignore[return-value]
+
+    @staticmethod
+    def _next_definition_duplicate_name(db: sqlite3.Connection, source_name: str) -> str:
+        """Choose the next free ``base V.N`` name for an automatic duplicate.
+
+        A copy of either ``baseline`` or ``baseline V.2`` belongs to the same
+        sequence.  We start at V.2 for a base definition and immediately after
+        a versioned source, then fill the next available number.  The caller
+        holds a write transaction, and the unique name index is the final
+        guard against collisions from another process.
+        """
+        match = re.fullmatch(r"(?P<base>.+?)\s+[Vv]\.(?P<version>[1-9]\d*)", source_name.strip())
+        base = match.group("base").strip() if match else source_name.strip()
+        version = int(match.group("version")) + 1 if match else 2
+        while True:
+            candidate = f"{base} V.{version}"
+            exists = db.execute(
+                "SELECT 1 FROM model_definitions WHERE name = ? COLLATE NOCASE LIMIT 1",
+                (candidate,),
+            ).fetchone()
+            if exists is None:
+                return candidate
+            version += 1
+
+    # Validated queue ---------------------------------------------------
+    # Definitions stay editable and versioned.  A queued run instead owns a
+    # sealed TOML and dataset pairing, so later edits cannot change queued
+    # science or execution behaviour.
+    @staticmethod
+    def _toml_safe(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {key: Orchestrator._toml_safe(item) for key, item in value.items() if item is not None}
+        if isinstance(value, list):
+            return [Orchestrator._toml_safe(item) for item in value if item is not None]
+        return value
+
+    def _definition_queue_config(self, definition: dict[str, Any], dataset: dict[str, Any]) -> dict[str, Any]:
+        """Bind trusted dataset facts before sealing a definition revision."""
+        config = deep_merge(definition["config"], {})
+        dataset_facts: dict[str, Any] = {}
+        task = str((config.get("run") or {}).get("task", "classification"))
+        if task in {"classification", "embedding"}:
+            try:
+                with sqlite3.connect(dataset["path"]) as dataset_db:
+                    count = int(dataset_db.execute("SELECT count(*) FROM classification_labels").fetchone()[0])
+            except sqlite3.DatabaseError as exc:
+                raise ValueError("Could not read class labels from the frozen dataset") from exc
+            if count < 1:
+                raise ValueError("Frozen classification dataset has no class labels")
+            dataset_facts["num_classes"] = count
+        # Keep the sealed TOML V2-only.  The training runtime translates this
+        # isolated input to internal builder aliases while resolving it.
+        return resolve_v2_config(config, dataset_facts=dataset_facts)
+
+    def queued_runs(self) -> list[dict[str, Any]]:
+        rows = self._many("SELECT * FROM queued_runs ORDER BY priority DESC, created_at")
+        for row in rows:
+            row["start_authorized"] = bool(row.get("start_authorized"))
+            definition = self.model_definition(str(row["definition_id"]), revision=int(row["definition_revision"]))
+            row["definition_name"] = definition.get("name") if definition else None
+            try:
+                row["batch_size"] = int(load_toml(row["resolved_toml_path"]).get("data", {}).get("batch_size"))
+            except (OSError, TypeError, ValueError):
+                row["batch_size"] = None
+        return rows
+
+    def queued_run(self, queued_run_id: str) -> dict[str, Any] | None:
+        with self._connection() as db:
+            row = _row(db.execute("SELECT * FROM queued_runs WHERE queued_run_id=?", (queued_run_id,)).fetchone())
+        if row is not None:
+            row["start_authorized"] = bool(row.get("start_authorized"))
+            try:
+                row["batch_size"] = int(load_toml(row["resolved_toml_path"]).get("data", {}).get("batch_size"))
+            except (OSError, TypeError, ValueError):
+                row["batch_size"] = None
+        return row
+
+    def validate_and_queue_model_definition(
+        self,
+        definition_id: str,
+        *,
+        name: str,
+        dataset_id: str,
+        endpoint_id: str,
+        revision: int | None = None,
+        description: str = "",
+        resources: dict[str, Any] | None = None,
+        initialization: dict[str, Any] | None = None,
+        batch_size_mode: str = "manual",
+        batch_size: int | None = None,
+        maximum_batch_size: int = 256,
+    ) -> dict[str, Any]:
+        if not name.strip():
+            raise ValueError("A queued run requires a name")
+        definition = self.model_definition(definition_id, revision=revision)
+        dataset = self.dataset(dataset_id)
+        if definition is None:
+            raise KeyError("Model definition was not found")
+        if dataset is None:
+            raise KeyError("Dataset was not found")
+        if dataset.get("lifecycle") != "frozen":
+            raise ValueError("Queued training requires a frozen registered dataset")
+        endpoint = self.compute_endpoint(endpoint_id)
+        if endpoint is None:
+            raise KeyError("Compute endpoint was not found")
+        requested_resources = dict(resources or {})
+        raw_gpu_ids = requested_resources.get("gpu_ids")
+        if raw_gpu_ids is not None:
+            if not isinstance(raw_gpu_ids, list) or any(not isinstance(item, (str, int)) or not str(item).strip() for item in raw_gpu_ids):
+                raise ValueError("GPU allocation must be a list of non-empty GPU IDs")
+            gpu_ids = [str(item).strip() for item in raw_gpu_ids]
+            if len(gpu_ids) != len(set(gpu_ids)):
+                raise ValueError("GPU allocation cannot contain the same GPU more than once")
+            if len(gpu_ids) > 1:
+                raise ValueError("Validated Queue currently allocates one GPU per training run")
+            gpu_count = requested_resources.get("gpu_count", len(gpu_ids))
+            if isinstance(gpu_count, bool) or not isinstance(gpu_count, int) or gpu_count != len(gpu_ids):
+                raise ValueError("gpu_count must equal the number of selected gpu_ids")
+            # Preserve an explicit empty allocation: it is an intentional CPU
+            # run, not an omitted legacy GPU request.
+            requested_resources["gpu_ids"] = gpu_ids
+            requested_resources["gpu_count"] = gpu_count
+        else:
+            gpu_count = requested_resources.get("gpu_count", 0)
+        if isinstance(gpu_count, bool) or not isinstance(gpu_count, int) or gpu_count < 0:
+            raise ValueError("GPU request must be a non-negative integer")
+        if batch_size_mode not in {"manual", "auto"}:
+            raise ValueError("batch_size_mode must be 'manual' or 'auto'")
+        if batch_size is not None and (isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1):
+            raise ValueError("batch_size must be a positive integer")
+        if isinstance(maximum_batch_size, bool) or not isinstance(maximum_batch_size, int) or maximum_batch_size < 1:
+            raise ValueError("maximum_batch_size must be a positive integer")
+        if batch_size_mode == "auto" and batch_size is not None:
+            raise ValueError("batch_size is only valid with manual batch_size_mode")
+        queue_id, experiment_id, specification_id, now = str(uuid.uuid4()), str(uuid.uuid4()), str(uuid.uuid4()), _now()
+        config = self._definition_queue_config(definition, dataset)
+        # Queue allocation owns physical-device choice.  The runtime sees just
+        # that selected device via CUDA_VISIBLE_DEVICES, so use one logical
+        # device rather than allowing the legacy automatic selector to choose
+        # another host GPU.
+        if "gpu_ids" in requested_resources:
+            distribution = config.setdefault("distribution", {})
+            distribution["strategy"] = "single" if requested_resources["gpu_ids"] else "cpu"
+            distribution["devices"] = []
+        if batch_size_mode == "manual":
+            resolved_batch_size = batch_size if batch_size is not None else int(config.get("data", {}).get("batch_size", 16))
+            config.setdefault("data", {})["batch_size"] = resolved_batch_size
+            batch_execution: dict[str, Any] = {"mode": "manual", "batch_size": resolved_batch_size}
+        else:
+            batch_execution = {"mode": "auto", "maximum_batch_size": maximum_batch_size, "safety_factor": 0.8}
+        queue_dir = self.artifact_root / "queued-runs" / queue_id
+        queue_dir.mkdir(parents=True, exist_ok=False)
+        config_path = queue_dir / "resolved.toml"
+        import tomli_w
+        config_path.write_text(tomli_w.dumps(self._toml_safe(config)), encoding="utf-8")
+        config_digest = hashlib.sha256(config_path.read_bytes()).hexdigest()
+        parameters = self._assign_output_path(
+            "train",
+            {
+                "config": str(config_path), "input": dataset["path"], "dataset_id": dataset_id,
+                "definition_id": definition_id, "definition_revision": int(definition["revision"]),
+                "initialization": dict(initialization or {}),
+                "queue_execution": batch_execution,
+            },
+            specification_id,
+        )
+        plan = {
+            "kind": "validated_queue", "queued_run_id": queue_id,
+            "definition_id": definition_id, "definition_revision": int(definition["revision"]),
+            "dataset_id": dataset_id, "dataset_fingerprint_sha256": dataset.get("fingerprint_sha256"),
+            "batch_execution": batch_execution,
         }
+        with self._connection() as db:
+            db.execute("INSERT INTO experiments VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", (
+                experiment_id, None, name.strip(), description, dataset_id, "queued", _json(plan), now, now,
+            ))
+            db.execute("INSERT INTO run_specifications VALUES (?, ?, 1, ?, 'train', ?, ?, ?, 'planned', NULL, ?, ?)", (
+                specification_id, experiment_id, name.strip(), _json(parameters), _json(requested_resources),
+                hashlib.sha256(_json({"parameters": parameters, "config_sha256": config_digest}).encode()).hexdigest(), now, now,
+            ))
+        # Both the orchestrator and compute host inspect the immutable inputs.
+        # A host-side preflight is advisory when telemetry is unavailable; its
+        # provenance stays attached to the queue row and is rechecked at launch.
+        report = self.preflight(specification_id, endpoint_id)
+        if report.get("ready") and batch_size_mode == "auto":
+            capable_workers = report.get("capable_workers") or []
+            idle_workers = [worker for worker in capable_workers if worker.get("status") == "idle"]
+            if not idle_workers:
+                states = sorted({str(worker.get("status") or "unknown") for worker in capable_workers})
+                report["ready"] = False
+                report.setdefault("reasons", []).append(
+                    "Batch-size auto-tuning requires an idle compute worker"
+                    + (f" (currently: {', '.join(states)})" if states else "")
+                    + ". Wait for the current training or calibration to finish, then retry."
+                )
+        if report.get("ready") and batch_size_mode == "auto":
+            try:
+                tune_report = self._request(endpoint["base_url"], "POST", "/compute/batch-size-tune", {
+                    "parameters": {
+                        "config": str(config_path), "input": dataset["path"],
+                        "minimum_batch_size": 1, "maximum_batch_size": maximum_batch_size,
+                        "safety_factor": 0.8,
+                    },
+                    "resources": requested_resources,
+                }, timeout_seconds=930)
+                report["batch_tune"] = tune_report
+                if tune_report.get("ready") and isinstance(tune_report.get("recommended_batch_size"), int):
+                    resolved_batch_size = int(tune_report["recommended_batch_size"])
+                    config.setdefault("data", {})["batch_size"] = resolved_batch_size
+                    batch_execution = {
+                        "mode": "auto", "batch_size": resolved_batch_size,
+                        "maximum_batch_size": maximum_batch_size,
+                        "probe_kind": tune_report.get("probe_kind"),
+                        "largest_verified_batch_size": tune_report.get("largest_verified_batch_size"),
+                        "safety_factor": tune_report.get("safety_factor"),
+                    }
+                    parameters["queue_execution"] = batch_execution
+                    plan["batch_execution"] = batch_execution
+                    import tomli_w
+                    config_path.write_text(tomli_w.dumps(self._toml_safe(config)), encoding="utf-8")
+                    config_digest = hashlib.sha256(config_path.read_bytes()).hexdigest()
+                    with self._connection() as db:
+                        db.execute(
+                            "UPDATE run_specifications SET parameters_json=?, config_hash=?, updated_at=? WHERE specification_id=?",
+                            (
+                                _json(parameters),
+                                hashlib.sha256(_json({"parameters": parameters, "config_sha256": config_digest}).encode()).hexdigest(),
+                                _now(), specification_id,
+                            ),
+                        )
+                        db.execute(
+                            "UPDATE experiments SET plan_json=?, updated_at=? WHERE experiment_id=?",
+                            (_json(plan), _now(), experiment_id),
+                        )
+                else:
+                    report["ready"] = False
+                    report.setdefault("reasons", []).extend(tune_report.get("reasons") or ["Batch-size auto-tuning did not produce a safe batch size"])
+            except RuntimeError as exc:
+                report["ready"] = False
+                report.setdefault("reasons", []).append(f"Batch-size auto-tuning unavailable: {exc}")
+        if report.get("ready"):
+            try:
+                compute_report = self._request(endpoint["base_url"], "POST", "/compute/preflight", {
+                    "action": "train", "parameters": parameters, "resources": requested_resources,
+                })
+                report["compute_preflight"] = compute_report
+                if not compute_report.get("ready"):
+                    report["ready"] = False
+                    report.setdefault("reasons", []).extend(compute_report.get("reasons") or ["Compute preflight failed"])
+            except RuntimeError as exc:
+                report["ready"] = False
+                report.setdefault("reasons", []).append(f"Compute preflight unavailable: {exc}")
+        status = "ready" if report.get("ready") else "needs_attention"
+        schema_fingerprint = self._definition_catalog_fingerprint()
+        with self._connection() as db:
+            db.execute("""INSERT INTO queued_runs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", (
+                queue_id, definition_id, int(definition["revision"]), dataset_id, dataset.get("fingerprint_sha256"),
+                name.strip(), description, specification_id, str(config_path), config_digest, schema_fingerprint,
+                _json(requested_resources), _json(initialization or {}), endpoint_id, "valid" if report.get("ready") else "invalid",
+                _json(report), status, 0, 0, "; ".join(report.get("reasons") or []) or None, now, now,
+            ))
+        return self.queued_run(queue_id)  # type: ignore[return-value]
+
+    def authorize_queued_runs(
+        self, *, queued_run_ids: list[str] | None, endpoint_id: str, all_ready: bool = False
+    ) -> dict[str, Any]:
+        endpoint = self.compute_endpoint(endpoint_id)
+        if endpoint is None:
+            raise KeyError("Compute endpoint was not found")
+        if all_ready:
+            selected = [
+                row["queued_run_id"] for row in self.queued_runs()
+                if row["status"] == "ready" and row.get("preflight_endpoint_id") == endpoint_id
+            ]
+        else:
+            selected = list(dict.fromkeys(str(item) for item in (queued_run_ids or []) if item))
+        if not selected:
+            raise ValueError("Select at least one ready queued run")
+        placeholders = ",".join("?" for _ in selected)
+        with self._connection() as db:
+            rows = db.execute(f"SELECT queued_run_id,status,preflight_endpoint_id FROM queued_runs WHERE queued_run_id IN ({placeholders})", selected).fetchall()
+            if len(rows) != len(selected):
+                raise KeyError("One or more queued runs were not found")
+            blocked = [
+                row["queued_run_id"] for row in rows
+                if row["status"] != "ready" or row["preflight_endpoint_id"] != endpoint_id
+            ]
+            if blocked:
+                raise ValueError("Only ready runs validated for this compute endpoint can be started")
+            db.execute(f"UPDATE queued_runs SET start_authorized=1, updated_at=? WHERE queued_run_id IN ({placeholders})", [_now(), *selected])
+        dispatched = self.schedule_queued_runs(endpoint_id)
+        return {"authorized_ids": selected, "dispatched": dispatched, "queued_runs": [self.queued_run(item) for item in selected]}
+
+    def schedule_queued_runs(self, endpoint_id: str) -> list[dict[str, Any]]:
+        """Dispatch at most one training run per endpoint in the initial policy."""
+        endpoint = self.compute_endpoint(endpoint_id)
+        if endpoint is None:
+            raise KeyError("Compute endpoint was not found")
+        active = [
+            job for job in self.jobs()
+            if job.get("oracle_serve_url", "").rstrip("/") == endpoint["base_url"].rstrip("/")
+            and job.get("status") in {"dispatching", "submitted", "queued", "running", "paused", "validating"}
+        ]
+        if active:
+            return []
+        with self._connection() as db:
+            row = _row(db.execute("""SELECT * FROM queued_runs
+                WHERE status='ready' AND start_authorized=1 AND preflight_endpoint_id=?
+                ORDER BY priority DESC, created_at LIMIT 1""", (endpoint_id,)).fetchone())
+        if row is None:
+            return []
+        # Capacity is volatile.  Re-run the compute-host admission check after
+        # the user authorizes this row and immediately before dispatching it.
+        # This intentionally remains an inventory-based VRAM check; the
+        # report records that provenance rather than promising a train-step
+        # memory guarantee we have not executed.
+        specification = self.specification(str(row["specification_id"]))
+        if specification is None:
+            raise KeyError("Queued run specification was not found")
+        try:
+            compute_report = self._request(endpoint["base_url"], "POST", "/compute/preflight", {
+                "action": specification["action"],
+                "parameters": specification["parameters"],
+                "resources": specification["resources"],
+            })
+        except RuntimeError as exc:
+            compute_report = {"ready": False, "reasons": [f"Compute preflight unavailable: {exc}"]}
+        if not compute_report.get("ready"):
+            reason = "; ".join(compute_report.get("reasons") or ["Compute capacity is no longer ready"])
+            with self._connection() as db:
+                db.execute(
+                    "UPDATE queued_runs SET status='waiting_for_resources', preflight_report_json=?, failure_reason=?, updated_at=? WHERE queued_run_id=?",
+                    (_json({"launch_preflight": compute_report}), reason, _now(), row["queued_run_id"]),
+                )
+            return []
+        try:
+            job = self.dispatch(str(row["specification_id"]), endpoint_id)
+        except (RuntimeError, ValueError) as exc:
+            with self._connection() as db:
+                db.execute("UPDATE queued_runs SET status='waiting_for_resources', failure_reason=?, updated_at=? WHERE queued_run_id=?", (str(exc), _now(), row["queued_run_id"]))
+            return []
+        with self._connection() as db:
+            db.execute("UPDATE jobs SET queued_run_id=? WHERE job_id=?", (row["queued_run_id"], job["job_id"]))
+            db.execute("UPDATE queued_runs SET status='submitted', updated_at=? WHERE queued_run_id=?", (_now(), row["queued_run_id"]))
+        return [job]
+
+    def cancel_queued_run(self, queued_run_id: str) -> dict[str, Any]:
+        queued = self.queued_run(queued_run_id)
+        if queued is None:
+            raise KeyError(queued_run_id)
+        if queued["status"] in {"submitted", "running"}:
+            raise ValueError("Cancel the active execution job before cancelling its queued run")
+        with self._connection() as db:
+            db.execute("UPDATE queued_runs SET status='cancelled', start_authorized=0, updated_at=? WHERE queued_run_id=?", (_now(), queued_run_id))
+        return self.queued_run(queued_run_id)  # type: ignore[return-value]
+
+    def control_job(self, job_id: str, action: str) -> dict[str, Any]:
+        """Proxy an explicit lifecycle control to the owning compute service.
+
+        The worker remains authoritative for the process, while the
+        orchestrator immediately records the observed lifecycle and a durable
+        audit event.  A cancellation may remain ``running`` briefly while the
+        worker drains the process; normal reconciliation records its terminal
+        state.
+        """
+        if action not in {"pause", "resume", "cancel"}:
+            raise ValueError("Unsupported job control")
+        local = self.job(job_id)
+        if local is None:
+            raise KeyError(job_id)
+        if local["status"] in {"indexed", "artifact_invalid", "failed", "cancelled"}:
+            raise ValueError("This job has already reached a terminal state")
+        remote = self._request(local["oracle_serve_url"], "POST", f"/compute/jobs/{job_id}/{action}")
+        remote_status = str(remote.get("status") or local.get("remote_status") or local["status"])
+        now = _now()
+        with self._connection() as db:
+            db.execute(
+                "UPDATE jobs SET status=?, remote_status=?, worker_id=?, error=?, updated_at=? WHERE job_id=?",
+                (remote_status, remote_status, remote.get("worker_id"), remote.get("error"), now, job_id),
+            )
+            if remote_status in {"paused", "running"}:
+                db.execute("UPDATE run_specifications SET status=?, updated_at=? WHERE specification_id=?", (remote_status, now, local["specification_id"]))
+            queued_run_id = local.get("queued_run_id")
+            if queued_run_id:
+                queue_status = {"paused": "paused", "running": "running", "queued": "submitted"}.get(remote_status, remote_status)
+                db.execute("UPDATE queued_runs SET status=?, updated_at=? WHERE queued_run_id=?", (queue_status, now, queued_run_id))
+        verb = {"pause": "paused", "resume": "resumed", "cancel": "cancellation requested"}[action]
+        self._record_event(job_id, action, f"Job {verb} by user", {"remote_status": remote_status})
+        return self.job(job_id)  # type: ignore[return-value]
+
+    def clear_queued_runs(self, *, endpoint_id: str | None = None) -> dict[str, Any]:
+        """Cancel only local, non-running queue entries.
+
+        This is intentionally not a bulk compute-job cancellation endpoint.
+        Jobs that have been submitted or are running remain untouched and must
+        be handled through their own execution controls.
+        """
+        query, params = "SELECT queued_run_id,status FROM queued_runs", []
+        if endpoint_id:
+            query += " WHERE preflight_endpoint_id=?"; params.append(endpoint_id)
+        with self._connection() as db:
+            rows = [dict(row) for row in db.execute(query, params).fetchall()]
+            cancellable = [row["queued_run_id"] for row in rows if row["status"] in {"ready", "needs_attention", "waiting_for_resources"}]
+            skipped = [{"queued_run_id": row["queued_run_id"], "status": row["status"]} for row in rows if row["queued_run_id"] not in cancellable and row["status"] != "cancelled"]
+            if cancellable:
+                db.execute(
+                    f"UPDATE queued_runs SET status='cancelled', start_authorized=0, updated_at=? WHERE queued_run_id IN ({','.join('?' for _ in cancellable)})",
+                    [_now(), *cancellable],
+                )
+        return {"cleared": cancellable, "skipped": skipped, "endpoint_id": endpoint_id}
 
     def model_preview(self, *, architecture: str, dataset_id: str, overrides: dict[str, Any] | None = None) -> dict[str, Any]:
         """Build a disposable model for an honest pre-run structural summary."""
@@ -275,9 +873,24 @@ class Orchestrator:
         capable = [worker for worker in workers if specification["action"] in (worker.get("capabilities") or {}).get("actions", [])]
         if endpoint["status"] == "ready" and not capable:
             reasons.append(f"No worker supports the {specification['action']} action")
-        requested_gpus = int((specification.get("resources") or {}).get("gpu_count") or 0)
+        requested_resources = specification.get("resources") or {}
+        requested_gpus = int(requested_resources.get("gpu_count") or 0)
         if capable and requested_gpus > max((len((worker.get("capabilities") or {}).get("gpus") or []) for worker in capable), default=0):
             reasons.append(f"Run requests {requested_gpus} GPU(s), but no capable worker advertises that capacity")
+        requested_gpu_ids = requested_resources.get("gpu_ids")
+        if isinstance(requested_gpu_ids, list) and requested_gpu_ids:
+            advertised_gpu_ids = {
+                str(gpu.get("id"))
+                for worker in capable
+                for gpu in ((worker.get("capabilities") or {}).get("gpus") or [])
+                if isinstance(gpu, dict) and gpu.get("id") is not None
+            }
+            missing_gpu_ids = [str(item) for item in requested_gpu_ids if str(item) not in advertised_gpu_ids]
+            if missing_gpu_ids:
+                reasons.append(
+                    "Selected GPU(s) are not advertised by a capable worker: "
+                    + ", ".join(missing_gpu_ids)
+                )
         queue = endpoint.get("queue") or {}
         if queue.get("capacity") is not None and queue.get("depth", 0) >= queue["capacity"]:
             reasons.append("Compute queue is full")
@@ -480,12 +1093,12 @@ class Orchestrator:
                     raise ValueError("artifact validation failed: " + "; ".join(validation.get("errors") or []))
                 now = _now()
                 model, dataset = manifest.get("model") or {}, manifest.get("dataset") or {}
+                facts = self._build_artifact_facts(manifest, manifest_path.parent)
                 values = (artifact_id, manifest.get("run_id"), manifest.get("artifact_type", "model_run"), manifest.get("name") or manifest_path.parent.name,
-                          model.get("task"), model.get("architecture"), model.get("variant"), manifest.get("status"), manifest.get("lifecycle"), dataset.get("dataset_id"), dataset.get("fingerprint_sha256"), manifest.get("fingerprint_sha256"), str(manifest_path.parent), _json(manifest), now, now)
+                          facts.get("task") or model.get("task"), facts.get("architecture") or model.get("architecture"), facts.get("variant") or model.get("variant"), manifest.get("status"), manifest.get("lifecycle"), dataset.get("dataset_id"), dataset.get("fingerprint_sha256"), manifest.get("fingerprint_sha256"), str(manifest_path.parent), _json(manifest), now, now)
                 with self._connection() as db:
                     db.execute("""INSERT INTO artifacts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                       ON CONFLICT(artifact_id) DO UPDATE SET run_id=excluded.run_id,artifact_type=excluded.artifact_type,name=excluded.name,task=excluded.task,architecture=excluded.architecture,variant=excluded.variant,status=excluded.status,lifecycle=excluded.lifecycle,dataset_id=excluded.dataset_id,dataset_fingerprint_sha256=excluded.dataset_fingerprint_sha256,fingerprint_sha256=excluded.fingerprint_sha256,path=excluded.path,manifest_json=excluded.manifest_json,updated_at=excluded.updated_at""", values)
-                    facts = self._build_artifact_facts(manifest, manifest_path.parent)
                     db.execute("""INSERT INTO artifact_facts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                         ON CONFLICT(artifact_id) DO UPDATE SET training_set=excluded.training_set,classifier_type=excluded.classifier_type,stem_size=excluded.stem_size,macro_f1=excluded.macro_f1,loss=excluded.loss,training_seconds=excluded.training_seconds,facts_json=excluded.facts_json,updated_at=excluded.updated_at""",
                         (artifact_id, facts.get("training_set"), facts.get("classifier_type"), facts.get("stem_size"), facts.get("macro_f1"), facts.get("loss"), facts.get("training_seconds"), _json(facts), now))
@@ -493,6 +1106,47 @@ class Orchestrator:
             except (OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
                 skipped.append({"path": str(manifest_path.parent), "reason": str(exc)})
         return {"root": str(root_path), "artifacts": discovered, "already_indexed": already_indexed, "skipped": skipped}
+
+    def reindex_artifact_catalog(self, artifact_ids: list[str] | None = None) -> dict[str, Any]:
+        """Refresh DB-owned catalog facts from registered artifacts only.
+
+        This intentionally reads the sealed run directory and writes only the
+        control-plane SQLite database. It never calls artifact update/seal APIs
+        and never changes a file within the artifact.
+        """
+        requested = list(dict.fromkeys(artifact_ids or []))
+        with self._connection() as db:
+            if requested:
+                rows = db.execute(f"SELECT * FROM artifacts WHERE artifact_id IN ({','.join('?' for _ in requested)})", requested).fetchall()
+            else:
+                rows = db.execute("SELECT * FROM artifacts ORDER BY artifact_id").fetchall()
+        found = {row["artifact_id"] for row in rows}
+        missing = [artifact_id for artifact_id in requested if artifact_id not in found]
+        refreshed: list[str] = []
+        skipped: list[dict[str, str]] = []
+        for row in rows:
+            artifact = _row(row)
+            assert artifact is not None
+            root = Path(artifact["path"]).resolve()
+            try:
+                # Registration only occurs from allow-listed browse roots; keep
+                # that invariant on later maintenance calls too.
+                self._require_browse_path(root)
+                manifest = artifact["manifest"]
+                if not isinstance(manifest, dict):
+                    raise ValueError("Registered artifact has no manifest")
+                facts = self._build_artifact_facts(manifest, root)
+                now = _now()
+                with self._connection() as db:
+                    db.execute("""UPDATE artifacts SET task=?,architecture=?,variant=?,updated_at=? WHERE artifact_id=?""",
+                        (facts.get("task") or artifact.get("task"), facts.get("architecture") or artifact.get("architecture"), facts.get("variant") or artifact.get("variant"), now, artifact["artifact_id"]))
+                    db.execute("""INSERT INTO artifact_facts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(artifact_id) DO UPDATE SET training_set=excluded.training_set,classifier_type=excluded.classifier_type,stem_size=excluded.stem_size,macro_f1=excluded.macro_f1,loss=excluded.loss,training_seconds=excluded.training_seconds,facts_json=excluded.facts_json,updated_at=excluded.updated_at""",
+                        (artifact["artifact_id"], facts.get("training_set"), facts.get("classifier_type"), facts.get("stem_size"), facts.get("macro_f1"), facts.get("loss"), facts.get("training_seconds"), _json(facts), now))
+                refreshed.append(artifact["artifact_id"])
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                skipped.append({"artifact_id": artifact["artifact_id"], "reason": str(exc)})
+        return {"requested": requested or None, "refreshed": refreshed, "missing": missing, "skipped": skipped, "artifact_files_changed": False}
 
     def reconcile_startup(self) -> dict[str, Any]:
         """Re-index durable local work without changing its source files.
@@ -550,13 +1204,22 @@ class Orchestrator:
         return current
 
     def _build_artifact_facts(self, manifest: dict[str, Any], root: Path) -> dict[str, Any]:
-        """Extract display/query facts while retaining the complete source map as JSON."""
+        """Extract catalog facts without ever changing an artifact.
+
+        The catalog is deliberately allowed to be more helpful than a legacy
+        manifest.  Every fallback is retained alongside its provenance so a
+        client never has to mistake an inferred display value for sealed
+        evaluation evidence.
+        """
         config = self._json_file(root / "config" / "resolved.json") or {}
         summary = manifest.get("summary") if isinstance(manifest.get("summary"), dict) else {}
-        evaluation = summary.get("evaluation") if isinstance(summary.get("evaluation"), dict) else {}
-        if not evaluation:
-            evaluation = self._json_file(root / "evaluation" / "evaluation_summary.json") or {}
+        manifest_evaluation = summary.get("evaluation") if isinstance(summary.get("evaluation"), dict) else {}
+        summary_evaluation = self._json_file(root / "evaluation" / "evaluation_summary.json") or {}
+        evaluation = manifest_evaluation or summary_evaluation
         runtime = self._json_file(root / "provenance" / "runtime.json") or {}
+        contract = self._json_file(root / "model" / "contract.json") or {}
+        history = self._evidence_csv(root / "metrics" / "history.csv", limit=2_000)
+        final_history = history[-1] if history else {}
         model = manifest.get("model") if isinstance(manifest.get("model"), dict) else {}
         dataset = manifest.get("dataset") if isinstance(manifest.get("dataset"), dict) else {}
         model_config = config.get("model") if isinstance(config.get("model"), dict) else {}
@@ -567,7 +1230,25 @@ class Orchestrator:
         metadata = config.get("metadata") if isinstance(config.get("metadata"), dict) else {}
         posthoc = config.get("posthoc") if isinstance(config.get("posthoc"), dict) else config.get("post_hoc") if isinstance(config.get("post_hoc"), dict) else {}
         training = config.get("training") if isinstance(config.get("training"), dict) else {}
-        seconds = runtime.get("training_seconds", runtime.get("duration_seconds")) if isinstance(runtime, dict) else None
+        sources: dict[str, dict[str, str]] = {}
+        availability: dict[str, str] = {}
+
+        def choose(field: str, *candidates: tuple[Any, str, str]) -> Any:
+            """Use the first meaningful source in explicit provenance order."""
+            for value, source, status in candidates:
+                if value is not None and value != "":
+                    sources[field] = {"source": source, "status": status}
+                    availability[field] = status
+                    return value
+            sources[field] = {"source": "unavailable", "status": "not_recorded"}
+            availability[field] = "not_recorded"
+            return None
+
+        seconds = choose(
+            "training_seconds",
+            (runtime.get("training_seconds") if isinstance(runtime, dict) else None, "runtime_provenance", "recorded"),
+            (runtime.get("duration_seconds") if isinstance(runtime, dict) else None, "runtime_provenance", "recorded"),
+        )
         try:
             artifact_size = sum(path.stat().st_size for path in root.rglob("*") if path.is_file())
             model_size = sum(path.stat().st_size for path in (root / "model").rglob("*") if path.is_file())
@@ -582,34 +1263,48 @@ class Orchestrator:
             match = re.search(rf"{label}\s*:\s*([\d,]+)", summary_text, flags=re.IGNORECASE)
             return int(match.group(1).replace(",", "")) if match else None
         metric_values = {key: value for key, value in evaluation.items() if isinstance(value, (int, float)) and not isinstance(value, bool)}
-        classifier_type = classifier.get("type") if isinstance(classifier, dict) else None
-        classifier_type = classifier_type or model_config.get("classifier_type") or model_config.get("classifier")
-        if not classifier_type and model.get("task") == "classification":
-            # V1 CNN artifacts used the standard final Dense logits layer.
-            classifier_type = "linear"
+        # A history value is operational evidence, not a substitute for a
+        # held-out evaluation; mark it inferred when it fills an old catalog.
+        for key, value in final_history.items():
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                metric_values.setdefault(key.removeprefix("val_"), value)
+        evaluation_source = "sealed_manifest" if manifest_evaluation else "evaluation_summary"
+        classifier_type = choose(
+            "classifier_type",
+            (classifier.get("type") if isinstance(classifier, dict) else None, "resolved_config", "recorded"),
+            (model_config.get("classifier_type") or model_config.get("classifier"), "resolved_config", "recorded"),
+            (self._nested(contract, "classifier", "type") or contract.get("classifier_type") if isinstance(contract, dict) else None, "model_contract", "inferred"),
+            ("linear" if model.get("task") == "classification" else None, "legacy_classification_default", "inferred"),
+        )
+        task = choose("task", (model.get("task"), "sealed_manifest", "recorded"), (config.get("task") if isinstance(config, dict) else None, "resolved_config", "recorded"), (contract.get("task") if isinstance(contract, dict) else None, "model_contract", "inferred"))
+        architecture = choose("architecture", (model.get("architecture"), "sealed_manifest", "recorded"), (model_config.get("architecture"), "resolved_config", "recorded"), (contract.get("architecture") if isinstance(contract, dict) else None, "model_contract", "inferred"))
+        variant = choose("variant", (model.get("variant"), "sealed_manifest", "recorded"), (model_config.get("variant"), "resolved_config", "recorded"), (contract.get("variant") if isinstance(contract, dict) else None, "model_contract", "inferred"))
+        epochs_from_history = max((int(row["epoch"]) + 1 for row in history if isinstance(row.get("epoch"), (int, float)) and not isinstance(row.get("epoch"), bool)), default=None)
         facts = {
-            "training_set": dataset.get("dataset_id") or dataset.get("name"),
+            "training_set": choose("training_set", (dataset.get("dataset_id") or dataset.get("name"), "sealed_manifest", "recorded"), (self._nested(config, "data", "dataset_id"), "resolved_config", "recorded")),
             "classifier_type": classifier_type,
-            "stem_size": stem.get("filters", stem.get("kernel_size", stem.get("size"))) if isinstance(stem, dict) else None,
-            "macro_f1": metric_values.get("macro_f1", metric_values.get("f1_macro")),
-            "loss": evaluation.get("loss", summary.get("loss")),
+            "stem_size": choose("stem_size", (stem.get("filters", stem.get("kernel_size", stem.get("size"))) if isinstance(stem, dict) else None, "resolved_config", "recorded"), (self._nested(contract, "stem", "filters") if isinstance(contract, dict) else None, "model_contract", "inferred")),
+            "macro_f1": choose("macro_f1", (manifest_evaluation.get("macro_f1", manifest_evaluation.get("f1_macro")), "sealed_manifest", "recorded"), (summary_evaluation.get("macro_f1", summary_evaluation.get("f1_macro")) if isinstance(summary_evaluation, dict) else None, "evaluation_summary", "recorded"), (final_history.get("val_macro_f1", final_history.get("macro_f1")), "training_history", "inferred")),
+            "loss": choose("loss", (manifest_evaluation.get("loss", summary.get("loss")), "sealed_manifest", "recorded"), (summary_evaluation.get("loss") if isinstance(summary_evaluation, dict) else None, "evaluation_summary", "recorded"), (final_history.get("val_loss", final_history.get("loss")), "training_history", "inferred")),
             "training_seconds": seconds,
-            "created_at": manifest.get("created_at"), "completed_at": manifest.get("completed_at"),
-            "modified_at": datetime.fromtimestamp(root.stat().st_mtime, timezone.utc).isoformat() if root.exists() else None,
-            "artifact_size_bytes": artifact_size, "model_size_bytes": model_size,
-            "epochs": training.get("epochs"), "seed": (config.get("run") or {}).get("seed") if isinstance(config.get("run"), dict) else None,
-            "parameter_count": summary_number("Total params"), "trainable_parameters": summary_number("Trainable params"),
-            "input_shape": (config.get("data") or {}).get("input_shape") if isinstance(config.get("data"), dict) else model.get("input", {}).get("shape"),
-            "num_classes": (config.get("data") or {}).get("num_classes") if isinstance(config.get("data"), dict) else outputs.get("class_count"),
-            "embedding_dim": (config.get("image_embedding") or {}).get("dimension") if isinstance(config.get("image_embedding"), dict) else model_config.get("embedding_dim", outputs.get("embedding_dimension")),
-            "pooling_type": pooling.get("type") if isinstance(pooling, dict) else model_config.get("pooling"),
-            "metadata_field_count": len(metadata.get("fields", metadata.get("features", []))) if isinstance(metadata.get("fields", metadata.get("features", [])), list) else 0,
-            "posthoc_type": posthoc.get("type") if isinstance(posthoc, dict) else None,
-            "architecture_version": (config.get("architecture") or {}).get("version", 1) if isinstance(config.get("architecture"), dict) else 1,
-            "architecture": model.get("architecture"), "variant": model.get("variant"),
-            "task": model.get("task"), "dataset_fingerprint": dataset.get("fingerprint_sha256"),
-            "metrics": metric_values, "config": config, "evaluation": evaluation, "runtime": runtime,
+            "created_at": choose("created_at", (manifest.get("created_at"), "sealed_manifest", "recorded")), "completed_at": choose("completed_at", (manifest.get("completed_at"), "sealed_manifest", "recorded")),
+            "modified_at": choose("modified_at", (datetime.fromtimestamp(root.stat().st_mtime, timezone.utc).isoformat() if root.exists() else None, "filesystem_metadata", "inferred")),
+            "artifact_size_bytes": choose("artifact_size_bytes", (artifact_size, "filesystem_metadata", "inferred")), "model_size_bytes": choose("model_size_bytes", (model_size, "filesystem_metadata", "inferred")),
+            "epochs": choose("epochs", (training.get("epochs"), "resolved_config", "recorded"), (epochs_from_history, "training_history", "inferred")), "seed": choose("seed", ((config.get("run") or {}).get("seed") if isinstance(config.get("run"), dict) else None, "resolved_config", "recorded")),
+            "parameter_count": choose("parameter_count", (summary_number("Total params"), "model_summary", "inferred")), "trainable_parameters": choose("trainable_parameters", (summary_number("Trainable params"), "model_summary", "inferred")),
+            "input_shape": choose("input_shape", ((config.get("data") or {}).get("input_shape") if isinstance(config.get("data"), dict) else None, "resolved_config", "recorded"), (model.get("input", {}).get("shape") if isinstance(model.get("input"), dict) else None, "sealed_manifest", "recorded"), (contract.get("input_shape") if isinstance(contract, dict) else None, "model_contract", "inferred")),
+            "num_classes": choose("num_classes", ((config.get("data") or {}).get("num_classes") if isinstance(config.get("data"), dict) else None, "resolved_config", "recorded"), (outputs.get("class_count"), "sealed_manifest", "recorded"), (contract.get("num_classes") if isinstance(contract, dict) else None, "model_contract", "inferred")),
+            "embedding_dim": choose("embedding_dim", ((config.get("image_embedding") or {}).get("dimension") if isinstance(config.get("image_embedding"), dict) else model_config.get("embedding_dim"), "resolved_config", "recorded"), (outputs.get("embedding_dimension"), "sealed_manifest", "recorded"), (contract.get("embedding_dim") if isinstance(contract, dict) else None, "model_contract", "inferred")),
+            "pooling_type": choose("pooling_type", (pooling.get("type") if isinstance(pooling, dict) else model_config.get("pooling"), "resolved_config", "recorded"), (contract.get("pooling") if isinstance(contract, dict) else None, "model_contract", "inferred")),
+            "metadata_field_count": choose("metadata_field_count", (len(metadata.get("fields", metadata.get("features", []))) if metadata and isinstance(metadata.get("fields", metadata.get("features", [])), list) else None, "resolved_config", "recorded")),
+            "posthoc_type": choose("posthoc_type", (posthoc.get("type") if isinstance(posthoc, dict) else None, "resolved_config", "recorded")),
+            "architecture_version": choose("architecture_version", ((config.get("architecture") or {}).get("version") if isinstance(config.get("architecture"), dict) else None, "resolved_config", "recorded")),
+            "architecture": architecture, "variant": variant, "task": task, "dataset_fingerprint": choose("dataset_fingerprint", (dataset.get("fingerprint_sha256"), "sealed_manifest", "recorded")),
+            "metrics": metric_values, "config": config, "evaluation": evaluation, "runtime": runtime, "field_sources": sources, "field_availability": availability,
         }
+        for name, value in metric_values.items():
+            # Evaluation values retain their source; history-only values are explicitly inferred.
+            choose(name, (manifest_evaluation.get(name), "sealed_manifest", "recorded"), (summary_evaluation.get(name) if isinstance(summary_evaluation, dict) else None, "evaluation_summary", "recorded"), (value, "training_history", "inferred"))
         facts.update(metric_values)
         for key in ("stem_size", "epochs", "seed", "parameter_count", "trainable_parameters", "num_classes", "embedding_dim", "metadata_field_count", "architecture_version"):
             if isinstance(facts[key], bool): facts[key] = None
@@ -1141,7 +1836,7 @@ class Orchestrator:
             "candidates": candidates, "comparison": self._comparison_check(comparable),
             "summary": {
                 "total": len(candidates), "planned": sum(candidate["status"] == "planned" for candidate in candidates),
-                "active": sum(candidate["status"] in {"dispatched", "queued", "running", "validating"} for candidate in candidates),
+                "active": sum(candidate["status"] in {"dispatched", "queued", "running", "paused", "validating"} for candidate in candidates),
                 "indexed": sum(candidate["artifact"] is not None for candidate in candidates),
                 "failed": sum(candidate["status"] in {"failed", "dispatch_failed", "artifact_invalid", "cancelled"} for candidate in candidates),
             },
@@ -1685,10 +2380,24 @@ class Orchestrator:
                     db.execute("UPDATE jobs SET status='artifact_invalid', validation_status='invalid', validation_report_json=?, error=?, updated_at=? WHERE job_id=?", (_json(report), error, _now(), job_id))
                     db.execute("UPDATE run_specifications SET status='artifact_invalid', updated_at=? WHERE specification_id=?", (_now(), local["specification_id"]))
                 self._record_event(job_id, "artifact_invalid", error, {"validation": report})
-        return self.job(job_id)  # type: ignore[return-value]
+        result_job = self.job(job_id)  # type: ignore[assignment]
+        queued_run_id = result_job.get("queued_run_id") if result_job else None
+        if queued_run_id:
+            queue_statuses = {
+                "dispatching": "starting", "submitted": "submitted", "queued": "submitted",
+                "running": "running", "paused": "paused", "validating": "validating_artifact", "indexed": "complete",
+                "succeeded": "complete", "failed": "failed", "cancelled": "cancelled",
+                "dispatch_failed": "waiting_for_resources", "artifact_invalid": "failed",
+            }
+            with self._connection() as db:
+                db.execute(
+                    "UPDATE queued_runs SET status=?, failure_reason=?, updated_at=? WHERE queued_run_id=?",
+                    (queue_statuses.get(str(result_job.get("status")), str(result_job.get("status"))), result_job.get("error"), _now(), queued_run_id),
+                )
+        return result_job  # type: ignore[return-value]
 
     def reconcile_active_jobs(self) -> list[dict[str, Any]]:
-        active = [job for job in self.jobs() if job["status"] in {"dispatching", "submitted", "queued", "running", "validating"}]
+        active = [job for job in self.jobs() if job["status"] in {"dispatching", "submitted", "queued", "running", "paused", "validating"}]
         results = []
         for job in active:
             try:
@@ -1696,6 +2405,52 @@ class Orchestrator:
             except RuntimeError:
                 results.append(job)
         return results
+
+    def reset_stuck_jobs(self, *, endpoint_id: str | None = None) -> dict[str, Any]:
+        """Reset only jobs proven absent from their compute endpoint.
+
+        A transient network failure is never treated as proof a job is gone.
+        The original dispatch record is retained as ``stale`` for audit, and a
+        linked validated queue row is returned to ``ready`` so the user must
+        explicitly authorize its next dispatch attempt.
+        """
+        active_states = {"dispatching", "submitted", "queued", "running", "paused", "validating"}
+        candidates = [job for job in self.jobs() if job.get("status") in active_states]
+        if endpoint_id:
+            endpoint = self.compute_endpoint(endpoint_id)
+            if endpoint is None:
+                raise KeyError("Compute endpoint was not found")
+            candidates = [job for job in candidates if job.get("oracle_serve_url", "").rstrip("/") == endpoint["base_url"].rstrip("/")]
+        reset: list[str] = []
+        still_active: list[str] = []
+        unavailable: list[dict[str, str]] = []
+        for job in candidates:
+            try:
+                remote = self._request(job["oracle_serve_url"], "GET", f"/compute/jobs/{job['job_id']}")
+            except RuntimeError as exc:
+                message = str(exc)
+                if "returned 404" not in message:
+                    unavailable.append({"job_id": job["job_id"], "reason": message})
+                    continue
+                now = _now()
+                reason = "Compute endpoint confirmed this dispatch no longer exists; reset for an explicit retry."
+                with self._connection() as db:
+                    db.execute("UPDATE jobs SET status='stale', remote_status='missing', error=?, completed_at=?, updated_at=? WHERE job_id=?", (reason, now, now, job["job_id"]))
+                    db.execute("UPDATE run_specifications SET status='planned', updated_at=? WHERE specification_id=?", (now, job["specification_id"]))
+                    queue = db.execute("SELECT queued_run_id,preflight_status FROM queued_runs WHERE specification_id=?", (job["specification_id"],)).fetchone()
+                    if queue is not None:
+                        next_status = "ready" if queue["preflight_status"] == "valid" else "needs_attention"
+                        db.execute("UPDATE queued_runs SET status=?, start_authorized=0, failure_reason=?, updated_at=? WHERE queued_run_id=?", (next_status, reason, now, queue["queued_run_id"]))
+                self._record_event(job["job_id"], "stale_reset", reason, {"remote_status": "missing"})
+                reset.append(job["job_id"])
+                continue
+            if remote.get("status") in active_states:
+                still_active.append(job["job_id"])
+            else:
+                # A completed remote record follows normal reconciliation;
+                # this endpoint is only a recovery tool for missing records.
+                self.reconcile_job(job["job_id"])
+        return {"reset": reset, "still_active": still_active, "unavailable": unavailable, "endpoint_id": endpoint_id}
 
     def _capture_job_events(self, job: dict[str, Any]) -> None:
         with self._connection() as db:
@@ -1756,13 +2511,20 @@ class Orchestrator:
             db.execute("INSERT INTO job_events VALUES (?, ?, ?, ?, ?, ?)", (job_id, sequence, _now(), event_type, message, _json(data)))
 
     @staticmethod
-    def _request(base: str, method: str, endpoint: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
+    def _request(
+        base: str,
+        method: str,
+        endpoint: str,
+        body: dict[str, Any] | None = None,
+        *,
+        timeout_seconds: float = 15,
+    ) -> dict[str, Any]:
         request = urllib.request.Request(base.rstrip("/") + endpoint, method=method)
         if body is not None:
             request.data = _json(body).encode()
             request.add_header("Content-Type", "application/json")
         try:
-            with urllib.request.urlopen(request, timeout=15) as response:
+            with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
                 return json.loads(response.read().decode())
         except urllib.error.HTTPError as exc:
             raise RuntimeError(f"oracle-serve returned {exc.code}: {exc.read().decode()}") from exc
@@ -1790,6 +2552,53 @@ class Orchestrator:
         with self._connection() as db:
             rows = db.execute("SELECT * FROM job_events WHERE job_id=? ORDER BY sequence", (job_id,)).fetchall()
         return [{**dict(row), "data": json.loads(row["data_json"])} for row in rows]
+
+    def job_training_status(self, job_id: str) -> dict[str, Any]:
+        """Return the worker's live training projection without exposing paths.
+
+        A live snapshot is intentionally best-effort: a job may be queued, run
+        on an older worker, or briefly lose contact with its compute service.
+        The web client can therefore render a useful, explicit unavailable
+        state instead of treating a transient worker failure as a failed job.
+        """
+        job = self.job(job_id)
+        if job is None:
+            raise KeyError(job_id)
+
+        fallback = {
+            "job_id": job_id,
+            "job_status": job["status"],
+            "controls": (
+                ["pause", "cancel"] if job["status"] == "running"
+                else ["resume", "cancel"] if job["status"] == "paused"
+                else ["cancel"] if job["status"] in {"dispatching", "submitted", "queued"}
+                else []
+            ),
+            "available": False,
+            "stale": True,
+            "phase": job.get("remote_status") or job["status"],
+            "message": "Live training status is not available yet.",
+        }
+        try:
+            remote = self._request(job["oracle_serve_url"], "GET", f"/compute/jobs/{job_id}/training-status")
+        except RuntimeError as exc:
+            return {**fallback, "message": f"Live training status is temporarily unavailable: {exc}"}
+
+        # A compute service controls the metric shape, but not the identity or
+        # lifecycle information returned to the browser.  This prevents a
+        # malformed/old worker response from making the local job ambiguous.
+        if not isinstance(remote, dict):
+            return {**fallback, "message": "Compute returned an invalid live training status response."}
+        available = bool(remote.get("available", True))
+        return {
+            **remote,
+            "job_id": job_id,
+            "job_status": job["status"],
+            "controls": fallback["controls"],
+            "available": available,
+            "stale": bool(remote.get("stale", not available)),
+            "message": remote.get("message") or (None if available else fallback["message"]),
+        }
     def comparisons(self) -> list[dict[str, Any]]: return self._many("SELECT * FROM comparisons ORDER BY created_at DESC")
     def comparison_groups(self) -> list[dict[str, Any]]:
         with self._connection() as db:

@@ -55,6 +55,12 @@ Start the local compute, orchestration, and web GUI stack together with:
 scripts/start_oracle_stack.sh
 ```
 
+The launcher detects Apple Silicon Metal and NVIDIA CUDA on Linux or WSL2,
+then synchronizes only the matching GPU extra. Set `ORACLE_ACCELERATOR=cpu`,
+`cuda`, or `metal` to override detection. Run it from WSL2—not a native Windows
+shell—for NVIDIA-backed Windows systems; a working `nvidia-smi` inside WSL is
+required. `CUDA_VISIBLE_DEVICES` is honored when already set.
+
 It creates a local `.oracle-runtime/` directory for the central SQLite
 database, GUI-upload staging, logs, and a persisted `Local` Oracle Serve
 endpoint used by dispatch preflight. Durable training products use `./runs/`

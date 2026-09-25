@@ -534,19 +534,34 @@ def make_tf_datasets(sqlite_path: str | Path, config: dict[str, Any]):
 def make_classification_metric_datasets(
     sqlite_path: str | Path, config: dict[str, Any]
 ):
-    """Build unshuffled, unaugmented train/validation datasets for epoch metrics."""
+    """Build an unshuffled, unaugmented validation dataset for epoch metrics."""
     if config.get("data", {}).get("streaming", {}).get("enabled", True):
         from oracle_builder.data.sqlite_stream import (
             SQLiteClassificationSource,
-            build_classification_index,
+            SQLiteSplitIndex,
+            build_classification_indices,
         )
 
-        source = SQLiteClassificationSource(sqlite_path, config)
-        datasets = {}
-        for split in ("train", "validation"):
-            index = build_classification_index(
-                sqlite_path, config, split, labeled_only=True
+        cache_indices = build_classification_indices(
+            sqlite_path, config, labeled_only=False
+        )
+        indices = {
+            split: SQLiteSplitIndex(
+                index.sqlite_path,
+                split,
+                [ref for ref in index.refs if ref.target is not None],
             )
+            for split, index in cache_indices.items()
+        }
+        source = SQLiteClassificationSource(sqlite_path, config)
+        from oracle_builder.data.materialization import materialized_classification_source
+
+        prepared = materialized_classification_source(config, cache_indices)
+        if prepared is not None:
+            source = prepared
+        datasets = {}
+        for split in ("validation",):
+            index = indices[split]
             if index.refs:
                 datasets[split] = source.training_dataset(
                     index, shuffle=False, augment=False
@@ -555,7 +570,7 @@ def make_classification_metric_datasets(
     import tensorflow as tf
 
     datasets = {}
-    for split in ("train", "validation"):
+    for split in ("validation",):
         try:
             inputs, targets, _ = load_arrays(sqlite_path, config, split=split)
         except ValueError as exc:

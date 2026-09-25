@@ -841,6 +841,8 @@ def train_stratified_models(
             display=str(config.get("training", {}).get("display", "rich")),
             training_log=training_log,
             run_id=run_id,
+            status_path=run_path / "training-status.json",
+            monitoring=config.get("monitoring") if isinstance(config.get("monitoring"), dict) else None,
         )
         interleaved_status.set_model(model)
         interleaved_status.set_params({"epochs": total_epochs, "steps": None})
@@ -923,6 +925,8 @@ def train_stratified_models(
                     display=str(config.get("training", {}).get("display", "rich")),
                     training_log=training_log,
                     run_id=run_id,
+                    status_path=run_path / "training-status.json",
+                    monitoring=config.get("monitoring") if isinstance(config.get("monitoring"), dict) else None,
                 )
                 while True:
                     source = SQLiteClassificationSource(sqlite_path, child)

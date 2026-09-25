@@ -14,9 +14,86 @@ LOG_DIR="$RUNTIME_DIR/logs"
 SERVE_PID=""
 ORCHESTRATOR_PID=""
 WEBGUI_PID=""
+ACCELERATOR_REQUEST="${ORACLE_ACCELERATOR:-auto}"
+ACCELERATOR="cpu"
+GPU_EXTRA=""
+KERNEL_NAME="$(uname -s)"
+NVIDIA_SMI="${ORACLE_NVIDIA_SMI:-nvidia-smi}"
 
 require_command() {
   command -v "$1" >/dev/null 2>&1 || { echo "Required command is unavailable: $1" >&2; exit 1; }
+}
+
+is_wsl() {
+  [[ "$KERNEL_NAME" == "Linux" ]] && {
+    [[ "$(uname -r)" == *[Mm]icrosoft* ]] || grep -qi microsoft /proc/sys/kernel/osrelease 2>/dev/null
+  }
+}
+
+has_nvidia_gpu() {
+  command -v "$NVIDIA_SMI" >/dev/null 2>&1 && "$NVIDIA_SMI" --query-gpu=index --format=csv,noheader >/dev/null 2>&1
+}
+
+configure_accelerator() {
+  case "$ACCELERATOR_REQUEST" in
+    auto|cpu|cuda|metal) ;;
+    *) echo "ORACLE_ACCELERATOR must be auto, cpu, cuda, or metal (got $ACCELERATOR_REQUEST)" >&2; exit 2 ;;
+  esac
+  case "$KERNEL_NAME" in
+    MINGW*|MSYS*|CYGWIN*)
+      echo "Native Windows shells are not supported for GPU training. Run this script from WSL2 instead." >&2
+      exit 2
+      ;;
+  esac
+
+  if [[ "$ACCELERATOR_REQUEST" == "cpu" ]]; then
+    ACCELERATOR="cpu"
+  elif [[ "$ACCELERATOR_REQUEST" == "metal" ]]; then
+    if [[ "$KERNEL_NAME" != "Darwin" || "$(uname -m)" != "arm64" ]]; then
+      echo "Metal acceleration requires Apple Silicon macOS." >&2
+      exit 2
+    fi
+    ACCELERATOR="metal"
+  elif [[ "$ACCELERATOR_REQUEST" == "cuda" ]]; then
+    if [[ "$KERNEL_NAME" != "Linux" ]]; then
+      echo "CUDA acceleration is supported by this launcher on Linux or WSL2." >&2
+      exit 2
+    fi
+    if ! has_nvidia_gpu; then
+      echo "CUDA was requested but nvidia-smi cannot query a usable GPU. Check the NVIDIA driver/WSL GPU passthrough." >&2
+      exit 2
+    fi
+    ACCELERATOR="cuda"
+  elif [[ "$KERNEL_NAME" == "Darwin" && "$(uname -m)" == "arm64" ]]; then
+    ACCELERATOR="metal"
+  elif [[ "$KERNEL_NAME" == "Linux" ]] && has_nvidia_gpu; then
+    ACCELERATOR="cuda"
+  fi
+
+  case "$ACCELERATOR" in
+    cuda)
+      GPU_EXTRA="gpu-wsl2"
+      if ! is_wsl; then GPU_EXTRA="gpu-linux"; fi
+      # Compute inventory intentionally honors CUDA_VISIBLE_DEVICES. Populate
+      # it from the host only when the user has not already constrained it.
+      if [[ -z "${CUDA_VISIBLE_DEVICES+x}" ]]; then
+        CUDA_VISIBLE_DEVICES="$($NVIDIA_SMI --query-gpu=index --format=csv,noheader | paste -sd, -)"
+        export CUDA_VISIBLE_DEVICES
+      fi
+      export ORACLE_ACCELERATOR_BACKEND="cuda"
+      ;;
+    metal)
+      GPU_EXTRA="gpu-macos"
+      export ORACLE_ACCELERATOR_BACKEND="metal"
+      ;;
+    cpu)
+      export ORACLE_ACCELERATOR_BACKEND="cpu"
+      # Make an explicit CPU request real on CUDA hosts.  Metal is selected by
+      # TensorFlow rather than this variable; queue-level CPU allocation still
+      # uses the runtime's CPU distribution strategy on macOS.
+      if [[ "$KERNEL_NAME" == "Linux" ]]; then export CUDA_VISIBLE_DEVICES="-1"; fi
+      ;;
+  esac
 }
 
 require_free_port() {
@@ -93,7 +170,15 @@ require_command uv
 require_command npm
 require_command curl
 require_command python3
+configure_accelerator
 mkdir -p "$LOG_DIR" "$RUNTIME_DIR/artifacts" "$ROOT_DIR/runs" "$ROOT_DIR/datasets"
+
+echo "Accelerator: $ACCELERATOR${GPU_EXTRA:+ (uv extra: $GPU_EXTRA)}"
+if [[ "$ACCELERATOR" == "cuda" ]]; then
+  echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
+elif [[ "$ACCELERATOR_REQUEST" == "auto" && "$ACCELERATOR" == "cpu" ]]; then
+  echo "No supported accelerator detected; using CPU. Set ORACLE_ACCELERATOR=cpu to make CPU selection explicit."
+fi
 
 # Reuse healthy development services. A port occupied by anything else remains
 # an error: it is unsafe to assume that an arbitrary process is Oracle Builder.
@@ -124,9 +209,18 @@ require_free_port "$WEBGUI_PORT"
 
 if [[ "${ORACLE_STACK_SKIP_SETUP:-0}" != "1" ]]; then
   echo "Synchronizing Python API dependencies…"
-  (cd "$ROOT_DIR" && uv sync --extra api --locked)
+  UV_SYNC_ARGS=(--extra api --locked)
+  if [[ -n "$GPU_EXTRA" ]]; then UV_SYNC_ARGS+=(--extra "$GPU_EXTRA"); fi
+  (cd "$ROOT_DIR" && uv sync "${UV_SYNC_ARGS[@]}")
   echo "Synchronizing web GUI dependencies…"
   (cd "$ROOT_DIR/webgui" && npm ci)
+fi
+
+if [[ "${ORACLE_STACK_SKIP_ACCELERATOR_CHECK:-0}" != "1" ]]; then
+  echo "Checking TensorFlow accelerator visibility…"
+  if ! (cd "$ROOT_DIR" && uv run python scripts/check_tensorflow_devices.py); then
+    echo "Accelerator verification failed; the stack will continue, but compute may fall back to CPU. See docs/operations-and-troubleshooting.md." >&2
+  fi
 fi
 
 if [[ "$SERVE_RUNNING" == "0" ]]; then
@@ -172,6 +266,7 @@ Oracle Builder stack is running.
   Orchestrator:  ${ORCHESTRATOR_URL}
   Compute API:   ${SERVE_URL}
   Runtime data:  ${RUNTIME_DIR}
+  Accelerator:   ${ACCELERATOR}
 
 Press Ctrl-C to stop the stack. Logs are in ${LOG_DIR}.
 EOF

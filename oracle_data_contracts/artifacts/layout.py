@@ -46,6 +46,11 @@ class RunLayout:
         return self.root / "protocol" / "splits.json"
 
     @property
+    def data_materialization(self) -> Path:
+        """Derived prepared-input cache report for this run, when requested."""
+        return self.root / "protocol" / "data_materialization.json"
+
+    @property
     def runtime(self) -> Path:
         return self.root / "provenance" / "runtime.json"
 

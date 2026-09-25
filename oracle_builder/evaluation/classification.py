@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 from typing import Any
 
@@ -604,7 +605,10 @@ def _binary_decision_metrics(targets: np.ndarray, predicted: np.ndarray) -> dict
     balanced_accuracy = 0.5 * (
         true_positive / positives + true_negative / negatives
     )
-    denominator = np.sqrt(
+    # Keep this in Python's floating-point arithmetic.  The product can exceed
+    # NumPy's fixed-width integer range even when each confusion count is
+    # modest (it grows approximately with the fourth power of sample count).
+    denominator = math.sqrt(
         (true_positive + false_positive)
         * (true_positive + false_negative)
         * (true_negative + false_positive)

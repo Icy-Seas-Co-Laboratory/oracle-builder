@@ -349,7 +349,9 @@ def run_grayscale_reconstruction_self_supervised(
                 epochs=epochs,
                 training_log=training_log,
                 run_id=run_id,
+                status_path=Path(run_dir) / "training-status.json",
                 display=_self_supervised_display(config, settings),
+                monitoring=config.get("monitoring") if isinstance(config.get("monitoring"), dict) else None,
             ),
         ],
     )
@@ -1118,7 +1120,9 @@ def run_self_supervised_training(
                 epochs=epochs,
                 training_log=training_log,
                 run_id=run_id,
+                status_path=Path(run_dir) / "training-status.json",
                 display=_self_supervised_display(config, settings),
+                monitoring=config.get("monitoring") if isinstance(config.get("monitoring"), dict) else None,
             ),
         ],
     )
