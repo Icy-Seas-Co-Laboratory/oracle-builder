@@ -4,6 +4,7 @@
 	import EmptyState from '$lib/EmptyState.svelte';
 
 	export let onuse: ((entry: RecordValue) => void) | undefined;
+	export let onchanged: ((message: string) => void | Promise<void>) | undefined;
 	export let onfailure: ((message: string) => void) | undefined;
 	type Bundle = { familyId: string; name: string; versions: RecordValue[] };
 	const asRecord = (value: unknown): RecordValue => value && typeof value === 'object' ? value as RecordValue : {};
@@ -45,7 +46,17 @@
 		catch (error) { unavailable = error instanceof Error ? error.message : 'The training-set catalog is unavailable.'; onfailure?.(unavailable); }
 		finally { loading = false; }
 	}
-	async function scan() { scanning = true; try { await api.scanTrainingCatalog({}); await load(); } catch (error) { unavailable = error instanceof Error ? error.message : 'Could not scan Oracle SQLite training sets.'; onfailure?.(unavailable); } finally { scanning = false; } }
+	async function scan() {
+		scanning = true;
+		try {
+			const report = await api.scanTrainingCatalog({});
+			const registration = asRecord(report.registration);
+			const added = asRecords(registration.registered).length, verified = asRecords(registration.already_registered).length;
+			await onchanged?.(added ? `${added} frozen training ${added === 1 ? 'set was' : 'sets were'} registered for Queue.` : verified ? 'Catalog scan complete; frozen training sets are registered and ready in Queue.' : 'Catalog scan complete; no frozen training sets were found.');
+			await load();
+		} catch (error) { unavailable = error instanceof Error ? error.message : 'Could not scan Oracle SQLite training sets.'; onfailure?.(unavailable); }
+		finally { scanning = false; }
+	}
 	async function select(id: string) {
 		selectedId = id; detail = null; previews = []; detailError = ''; page = 0; label = ''; showAllClasses = false; loadingDetail = true;
 		try { const [nextDetail, previewResult] = await Promise.all([api.trainingCatalogDetail(id), api.trainingCatalogPreviews(id, { limit: 18 })]); if (selectedId !== id) return; detail = nextDetail; previews = asRecords(previewResult.items); }

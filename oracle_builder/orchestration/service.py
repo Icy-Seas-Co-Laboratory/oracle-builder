@@ -1169,28 +1169,9 @@ class Orchestrator:
             result["artifacts"] = {"indexed": [], "refreshed": [], "skipped": [{"path": str(self.runs_root), "reason": str(exc)}]}
 
         dataset_report = self.scan_training_catalog()
-        imported, already_registered, skipped = [], [], []
-        for entry in dataset_report["entries"]:
-            if entry.get("source_type") != "oracle_sqlite":
-                continue
-            info = entry.get("dataset_info") if isinstance(entry.get("dataset_info"), dict) else {}
-            dataset_id = info.get("dataset_id")
-            if entry.get("status") != "frozen" or not isinstance(dataset_id, str):
-                skipped.append({"path": entry["path"], "reason": "Only frozen Oracle SQLite dataset revisions are registered"})
-                continue
-            if self.dataset(dataset_id) is not None:
-                already_registered.append(dataset_id)
-                continue
-            try:
-                self.ingest_dataset(entry["path"])
-                imported.append(dataset_id)
-            except (OSError, ValueError, sqlite3.DatabaseError) as exc:
-                skipped.append({"path": entry["path"], "reason": str(exc)})
         result["datasets"] = {
             "catalog_entries": len(dataset_report["entries"]),
-            "registered": imported,
-            "already_registered": already_registered,
-            "skipped": skipped,
+            **dataset_report["registration"],
         }
         return result
 
@@ -1315,6 +1296,31 @@ class Orchestrator:
     def training_catalog_roots_info(self) -> list[dict[str, str]]:
         return [{"root_id": root_id, "path": str(path)} for root_id, path in self.training_catalog_roots.items()]
 
+    def _register_frozen_catalog_entries(self, entries: list[dict[str, Any]]) -> dict[str, list[Any]]:
+        """Mirror discovered frozen datasets into Queue's durable registry.
+
+        Catalog entries are safe, allow-listed SQLite paths, while the
+        ``datasets`` table is the durable identity Queue pins into a run.  The
+        scan is therefore the single boundary that makes an already-frozen
+        revision usable for training; working revisions remain catalog-only.
+        """
+        registered, already_registered, skipped = [], [], []
+        for entry in entries:
+            if entry.get("source_type") != "oracle_sqlite" or entry.get("status") != "frozen":
+                continue
+            info = entry.get("dataset_info") if isinstance(entry.get("dataset_info"), dict) else {}
+            dataset_id = info.get("dataset_id")
+            if not isinstance(dataset_id, str) or not dataset_id:
+                skipped.append({"path": entry["path"], "reason": "Frozen catalog entry has no dataset identity"})
+                continue
+            try:
+                existed = self.dataset(dataset_id) is not None
+                self.ingest_dataset(entry["path"])
+                (already_registered if existed else registered).append(dataset_id)
+            except (OSError, ValueError, sqlite3.DatabaseError) as exc:
+                skipped.append({"path": entry["path"], "reason": str(exc)})
+        return {"registered": registered, "already_registered": already_registered, "skipped": skipped}
+
     def scan_training_catalog(self, root_id: str | None = None) -> dict[str, Any]:
         """Safely inspect an allow-listed source directory without importing it."""
         from oracle_builder.orchestration.training_catalog import scan_training_catalog
@@ -1341,6 +1347,7 @@ class Orchestrator:
             "root_id": root_id,
             "roots": [{"root_id": selected_root_id, "path": report["root"]} for selected_root_id, report in reports],
             "entries": entries,
+            "registration": self._register_frozen_catalog_entries(entries),
             "scanned_at": now,
         }
 

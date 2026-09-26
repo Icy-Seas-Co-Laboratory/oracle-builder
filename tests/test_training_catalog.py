@@ -68,6 +68,8 @@ def test_control_plane_catalog_serves_sqlite_previews_freezes_and_groups_revisio
 
     report = orchestrator.scan_training_catalog()
     working_entry = next(entry for entry in report["entries"] if entry["path"] == str(working))
+    assert len(report["registration"]["registered"]) == 1
+    assert [dataset["name"] for dataset in orchestrator.datasets()] == ["ISIISNet"]
     catalog_entry = next(entry for entry in orchestrator.training_catalog() if entry["catalog_id"] == working_entry["catalog_id"])
     assert catalog_entry["item_count"] == 4
     assert len(orchestrator.training_catalog_bundles()) == 1

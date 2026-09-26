@@ -84,7 +84,7 @@
 			{#if notice}<div class="banner notice" role="status"><strong>Updated</strong><span>{notice}</span><button aria-label="Dismiss" on:click={() => notice = ''}>×</button></div>{/if}
 			{#if activePage === 'models'}<ModelRunsView oncompare={compared} onfailure={(message) => failure = message} />
 			{:else if activePage === 'comparison'}<ModelComparisonView artifactIds={comparisonIds} onback={() => navigate('models')} onfailure={(message) => failure = message} />
-			{:else if activePage === 'datasets'}<TrainingSetCatalogView onuse={() => changed('Catalog sources are read-only. Register and freeze a revision before training.')} onfailure={(message) => failure = message} />
+			{:else if activePage === 'datasets'}<TrainingSetCatalogView onuse={() => { changed('Frozen revision is registered and ready in Queue.'); navigate('queue'); }} onchanged={changed} onfailure={(message) => failure = message} />
 			{:else if activePage === 'construction'}<ModelConstructionView onnotice={changed} onfailure={(message) => failure = message} ontrain={useDraft} />
 			{:else}<ValidatedQueueView {datasets} {computeEndpoints} onchanged={changed} onfailure={(message) => failure = message} />{/if}
 		</main>
