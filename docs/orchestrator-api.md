@@ -35,6 +35,37 @@ Clients inspect live endpoint, queue, and worker state with
 preflight is enforced by the dispatch endpoint, including action support, GPU
 capacity, endpoint readiness, and queue capacity.
 
+## Responsive operations and live updates
+
+Long-running control-plane work has a durable operation record rather than
+holding a browser request open. Schedule catalog scans, training-catalog scans,
+catalog reindexing, active-job reconciliation, or queue validation (including
+batch-size calibration) with the corresponding `.../schedule` endpoints. Each
+returns `202 Accepted` and an operation object
+whose `operation_id` is available from `GET /v1/operations/{operation_id}`;
+`GET /v1/operations` lists recent work. Operations retain `queued`, `running`,
+`completed`, and `failed` state, timestamps, result/error data, and ordered
+events across an orchestrator restart.
+
+`GET /v1/events?after=<cursor>` is a resumable server-sent-event stream over
+that durable event ledger. Events carry a globally ordered cursor in their SSE
+`id`; clients should reconnect using the last received ID and retain adaptive
+polling as a rolling-upgrade fallback. The orchestrator's single bounded
+operation runner periodically schedules active-job reconciliation, preventing
+every browser tab from multiplying remote compute calls.
+
+The local `oracle-serve` scheduler defaults to one execution slot, preserving
+existing behavior. Set `--compute-worker-slots N` (or
+`ORACLE_COMPUTE_WORKER_SLOTS`) to allow bounded parallel process launches,
+and optionally set `--compute-cpu-capacity N` (or
+`ORACLE_COMPUTE_CPU_CAPACITY`). The older
+`ORACLE_BUILDER_COMPUTE_WORKER_SLOTS` and
+`ORACLE_BUILDER_COMPUTE_CPU_CAPACITY` names remain supported for compatibility.
+`scripts/start_oracle_stack.sh` passes these settings through automatically.
+GPU allocations are
+leased before process launch, so explicit, automatic, and legacy unrestricted
+GPU work cannot silently overlap.
+
 For model-producing jobs, durable status progresses through `submitted`,
 `queued`, `running`, `validating`, and finally `indexed`. Compute failures use
 `failed`; valid process output that fails the artifact contract uses

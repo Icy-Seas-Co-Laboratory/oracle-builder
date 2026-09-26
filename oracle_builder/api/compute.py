@@ -63,6 +63,7 @@ class Job:
     exit_code: int | None = None
     error: str | None = None
     output_path: str | None = None
+    allocation: dict[str, Any] | None = None
     cancel_requested: bool = False
     process: subprocess.Popen[str] | None = field(default=None, repr=False)
     events: list[dict[str, Any]] = field(default_factory=list)
@@ -82,6 +83,7 @@ class Job:
             "exit_code": self.exit_code,
             "error": self.error,
             "cancel_requested": self.cancel_requested,
+            "allocation": self.allocation,
             "result": {
                 "output_path": self.output_path,
                 "exit_code": self.exit_code,
@@ -112,27 +114,64 @@ class ComputeService:
     records and can reconcile or resubmit jobs after a service restart.
     """
 
-    def __init__(self, *, max_queue_size: int = 128, worker_id: str = "local"):
+    def __init__(
+        self,
+        *,
+        max_queue_size: int = 128,
+        worker_id: str = "local",
+        worker_slots: int = 1,
+        max_workers: int | None = None,
+        cpu_capacity: int | None = None,
+    ):
+        """Create a local scheduler.
+
+        ``worker_slots=1`` deliberately preserves the historic one-process
+        behavior.  ``max_workers`` is accepted as a less ambiguous alias for
+        callers that already use that terminology.  CPU capacity is separate
+        from process slots: a job may request ``cpu_count`` (or legacy
+        ``cpu_cores``) and will wait until both kinds of capacity are free.
+        """
         if max_queue_size < 1:
             raise ValueError("max_queue_size must be positive")
+        if max_workers is not None:
+            if worker_slots != 1 and worker_slots != max_workers:
+                raise ValueError("worker_slots and max_workers disagree")
+            worker_slots = max_workers
+        if isinstance(worker_slots, bool) or not isinstance(worker_slots, int) or worker_slots < 1:
+            raise ValueError("worker_slots must be positive")
+        if cpu_capacity is None:
+            cpu_capacity = os.cpu_count() or 1
+        if isinstance(cpu_capacity, bool) or not isinstance(cpu_capacity, int) or cpu_capacity < 1:
+            raise ValueError("cpu_capacity must be positive")
         self._max_queue_size = max_queue_size
+        self._worker_slots = worker_slots
+        self._cpu_capacity = cpu_capacity
+        self._used_cpu = 0
+        self._leased_gpu_ids: set[str] = set()
         self._jobs: dict[str, Job] = {}
         self._queue: deque[str] = deque()
         self._lock = threading.RLock()
         self._condition = threading.Condition(self._lock)
         self._closed = False
         self._event_sequence = 0
-        self._worker = Worker(
-            worker_id=worker_id,
-            name=platform.node() or worker_id,
-            capabilities={
+        capabilities = {
                 "actions": ["train", "evaluate", "model_ingest", "run_validate", "run_pack"],
                 "platform": platform.platform(),
                 "python": platform.python_version(),
                 "cpu_count": os.cpu_count(),
                 "gpus": self._discover_gpus(),
-            },
-        )
+                "worker_slots": worker_slots,
+                "cpu_capacity": cpu_capacity,
+            }
+        self._workers = [Worker(
+            worker_id=worker_id if index == 0 else f"{worker_id}-{index + 1}",
+            name=platform.node() or worker_id,
+            capabilities=dict(capabilities),
+        ) for index in range(worker_slots)]
+        # Kept as a compatibility alias for integrations which inspect the
+        # original local worker directly.
+        self._worker = self._workers[0]
+        self._execution_threads: set[threading.Thread] = set()
         self._thread = threading.Thread(target=self._run, name="oracle-builder-compute", daemon=True)
         self._thread.start()
 
@@ -271,6 +310,12 @@ class ComputeService:
         command = self._command(action, parameters)
         gpus = self._discover_gpus()
         allocation, reasons = self._gpu_allocation(resources, gpus)
+        try:
+            cpu_count = self._cpu_request(resources)
+            if cpu_count > self._cpu_capacity:
+                reasons.append(f"Run requests {cpu_count} CPU(s), but this worker has {self._cpu_capacity}")
+        except ComputeRequestError as exc:
+            reasons.append(str(exc))
         allocated_ids = set(allocation["gpu_ids"])
         allocated_gpus = [gpu for gpu in gpus if str(gpu.get("id")) in allocated_ids]
         telemetry_available = not allocated_gpus or all(
@@ -314,13 +359,19 @@ class ComputeService:
         maximum = parameters.get("maximum_batch_size", 256)
         minimum = parameters.get("minimum_batch_size", 1)
         safety_factor = parameters.get("safety_factor", 0.8)
+        target_vram_min = parameters.get("target_vram_min", 0.30)
+        target_vram_max = parameters.get("target_vram_max", 0.80)
         if (isinstance(maximum, bool) or not isinstance(maximum, int) or maximum < 1
                 or isinstance(minimum, bool) or not isinstance(minimum, int) or minimum < 1
                 or minimum > maximum
                 or isinstance(safety_factor, bool) or not isinstance(safety_factor, (int, float))
-                or not 0 < float(safety_factor) <= 1):
+                or not 0 < float(safety_factor) <= 1
+                or isinstance(target_vram_min, bool) or not isinstance(target_vram_min, (int, float))
+                or isinstance(target_vram_max, bool) or not isinstance(target_vram_max, (int, float))
+                or not 0 < float(target_vram_min) <= float(target_vram_max) <= 1):
             raise ComputeRequestError("Invalid batch-size calibration bounds")
-        allocation, reasons = self._gpu_allocation(resources, self._discover_gpus())
+        gpus = self._discover_gpus()
+        allocation, reasons = self._gpu_allocation(resources, gpus)
         if reasons:
             raise ComputeRequestError("; ".join(reasons))
         environment = os.environ.copy()
@@ -328,17 +379,35 @@ class ComputeService:
             environment["CUDA_VISIBLE_DEVICES"] = ",".join(allocation["gpu_ids"])
         elif allocation["mode"] == "cpu":
             environment["CUDA_VISIBLE_DEVICES"] = "-1"
+        allocated = [gpu for gpu in gpus if str(gpu.get("id")) in set(allocation["gpu_ids"])]
+        vram_total_mib = min((int(gpu["total_memory_mib"]) for gpu in allocated if isinstance(gpu.get("total_memory_mib"), (int, float))), default=None)
         command = [
             sys.executable, "-m", "oracle_builder.training.batch_tune",
             "--config", config, "--input", input_path,
             "--minimum", str(minimum), "--maximum", str(maximum),
             "--safety-factor", str(float(safety_factor)),
+            "--target-vram-min", str(float(target_vram_min)),
+            "--target-vram-max", str(float(target_vram_max)),
         ]
+        if vram_total_mib:
+            command += ["--vram-total-mib", str(vram_total_mib)]
+        cpu_count = self._cpu_request(resources)
+        lease_gpu_ids = (
+            [str(gpu.get("id")) for gpu in gpus]
+            if allocation["mode"] == "unconstrained"
+            else allocation["gpu_ids"]
+        )
+        if cpu_count > self._cpu_capacity:
+            raise ComputeRequestError(f"Run requests {cpu_count} CPU(s), but this worker has {self._cpu_capacity}")
         with self._condition:
-            if self._worker.status != "idle" or self._queue:
-                raise ComputeRequestError("Compute worker is busy; wait before calibrating batch size")
-            self._worker.status = "calibrating"
-            self._worker.updated_at = time.time()
+            calibration_worker = self._available_worker()
+            if (calibration_worker is None or self._used_cpu + cpu_count > self._cpu_capacity
+                    or set(lease_gpu_ids) & self._leased_gpu_ids):
+                raise ComputeRequestError("Requested compute resources are busy; wait before calibrating batch size")
+            calibration_worker.status = "calibrating"
+            calibration_worker.updated_at = time.time()
+            self._used_cpu += cpu_count
+            self._leased_gpu_ids.update(lease_gpu_ids)
         try:
             completed = subprocess.run(
                 command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -369,8 +438,10 @@ class ComputeService:
             return {"ready": False, "reasons": ["Batch calibration exceeded its 15-minute limit"], "allocation": allocation}
         finally:
             with self._condition:
-                self._worker.status = "idle"
-                self._worker.updated_at = time.time()
+                self._used_cpu -= cpu_count
+                self._leased_gpu_ids.difference_update(lease_gpu_ids)
+                calibration_worker.status = "idle"
+                calibration_worker.updated_at = time.time()
                 self._condition.notify_all()
 
     def close(self) -> None:
@@ -384,10 +455,12 @@ class ComputeService:
                     job.process.terminate()
             self._condition.notify_all()
         self._thread.join(timeout=10)
+        for thread in list(self._execution_threads):
+            thread.join(timeout=10)
 
     def workers(self) -> list[dict[str, Any]]:
         with self._lock:
-            return [self._worker.to_dict()]
+            return [worker.to_dict() for worker in self._workers]
 
     def status(self) -> dict[str, Any]:
         with self._lock:
@@ -398,7 +471,13 @@ class ComputeService:
                 "status": "ready" if not self._closed else "stopping",
                 "queue": {"depth": len(self._queue), "capacity": self._max_queue_size},
                 "jobs": counts,
-                "workers": [self._worker.to_dict()],
+                "workers": [worker.to_dict() for worker in self._workers],
+                "resources": {
+                    "cpu_capacity": self._cpu_capacity,
+                    "cpu_in_use": self._used_cpu,
+                    "gpu_leases": sorted(self._leased_gpu_ids),
+                    "worker_slots": self._worker_slots,
+                },
             }
 
     def submit(self, *, job_id: str, action: JobAction, parameters: dict[str, Any], resources: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -410,6 +489,9 @@ class ComputeService:
         _allocation, reasons = self._gpu_allocation(resources, self._discover_gpus())
         if reasons:
             raise ComputeRequestError("; ".join(reasons))
+        cpu_count = self._cpu_request(resources)
+        if cpu_count > self._cpu_capacity:
+            raise ComputeRequestError(f"Run requests {cpu_count} CPU(s), but this worker has {self._cpu_capacity}")
         with self._condition:
             if job_id in self._jobs:
                 raise ComputeRequestError(f"job_id is already known: {job_id}")
@@ -508,8 +590,9 @@ class ComputeService:
                 raise ComputeRequestError("Pausing jobs is not supported on this compute host")
             job.process.send_signal(signal.SIGSTOP)
             job.status = "paused"
-            self._worker.status = "paused"
-            self._worker.updated_at = time.time()
+            worker = self._worker_for_job(job)
+            worker.status = "paused"
+            worker.updated_at = time.time()
             self._event(job, "paused", "Compute process paused")
             self._condition.notify_all()
             return job.to_dict()
@@ -526,8 +609,9 @@ class ComputeService:
                 raise ComputeRequestError("Resuming jobs is not supported on this compute host")
             job.process.send_signal(signal.SIGCONT)
             job.status = "running"
-            self._worker.status = "busy"
-            self._worker.updated_at = time.time()
+            worker = self._worker_for_job(job)
+            worker.status = "busy"
+            worker.updated_at = time.time()
             self._event(job, "resumed", "Compute process resumed")
             self._condition.notify_all()
             return job.to_dict()
@@ -537,6 +621,55 @@ class ComputeService:
             return self._jobs[job_id]
         except KeyError as exc:
             raise KeyError(job_id) from exc
+
+    def _worker_for_job(self, job: Job) -> Worker:
+        for worker in self._workers:
+            if worker.worker_id == job.worker_id:
+                return worker
+        # Compatibility for manually constructed jobs in callers/tests.
+        return self._worker
+
+    @staticmethod
+    def _cpu_request(resources: dict[str, Any] | None) -> int:
+        request = dict(resources or {})
+        value = request.get("cpu_count", request.get("cpu_cores", 1))
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ComputeRequestError("CPU request must be a positive integer")
+        return value
+
+    def _available_worker(self) -> Worker | None:
+        return next((worker for worker in self._workers if worker.status == "idle"), None)
+
+    def _schedule_allocation(self, job: Job) -> tuple[dict[str, Any] | None, str | None]:
+        """Return an allocation only when this job can start without sharing a GPU."""
+        cpu_count = self._cpu_request(job.resources)
+        if cpu_count > self._cpu_capacity:
+            return None, f"Run requests {cpu_count} CPU(s), but this worker has {self._cpu_capacity}"
+        if self._used_cpu + cpu_count > self._cpu_capacity:
+            return None, None
+        gpus = self._discover_gpus()
+        allocation, reasons = self._gpu_allocation(job.resources, gpus)
+        if reasons:
+            return None, "; ".join(reasons)
+        if allocation["mode"] == "unconstrained":
+            # Preserve legacy launch semantics (the child sees its ordinary
+            # CUDA visibility), while treating that as a lease of every
+            # advertised GPU so it cannot silently overlap an explicit job.
+            allocation = {**allocation, "gpu_ids": [str(gpu.get("id")) for gpu in gpus]}
+        if allocation["mode"] == "automatic" and allocation["gpu_count"]:
+            free_gpus = [gpu for gpu in gpus if str(gpu.get("id")) not in self._leased_gpu_ids]
+            if len(free_gpus) < allocation["gpu_count"]:
+                return None, None
+            # Automatic allocations are chosen from currently unleased GPUs,
+            # unlike a preflight report which intentionally describes only
+            # static inventory.
+            ranked = sorted(free_gpus, key=lambda gpu: int(gpu.get("free_memory_mib", -1)), reverse=True)
+            allocation = {**allocation, "gpu_ids": [str(gpu.get("id")) for gpu in ranked[:allocation["gpu_count"]]]}
+        selected = set(allocation["gpu_ids"])
+        if selected & self._leased_gpu_ids:
+            return None, None
+        allocation = {**allocation, "cpu_count": cpu_count}
+        return allocation, None
 
     def _event(self, job: Job, event_type: str, message: str, data: dict[str, Any] | None = None) -> None:
         self._event_sequence += 1
@@ -553,25 +686,67 @@ class ComputeService:
     def _run(self) -> None:
         while True:
             with self._condition:
-                while (not self._queue or self._worker.status != "idle") and not self._closed:
+                while not self._closed:
+                    candidate = self._next_runnable_job()
+                    if candidate is not None:
+                        break
                     self._condition.wait()
                 if self._closed:
                     return
-                job = self._jobs[self._queue.popleft()]
-                if job.status == "cancelled":
-                    continue
+                job, worker, allocation = candidate
                 job.status = "running"
                 job.started_at = time.time()
-                job.worker_id = self._worker.worker_id
-                self._worker.status = "busy"
-                self._worker.current_job_id = job.job_id
-                self._worker.updated_at = time.time()
-                self._event(job, "started", "Job started", {"worker_id": job.worker_id})
+                job.worker_id = worker.worker_id
+                job.allocation = allocation
+                worker.status = "busy"
+                worker.current_job_id = job.job_id
+                worker.updated_at = time.time()
+                self._used_cpu += allocation["cpu_count"]
+                self._leased_gpu_ids.update(allocation["gpu_ids"])
+                self._event(job, "started", "Job started", {"worker_id": job.worker_id, "allocation": allocation})
+                thread = threading.Thread(
+                    target=self._execute_and_release, args=(job, worker, allocation),
+                    name=f"oracle-builder-job-{job.job_id[:8]}", daemon=True,
+                )
+                self._execution_threads.add(thread)
+                thread.start()
+
+    def _next_runnable_job(self) -> tuple[Job, Worker, dict[str, Any]] | None:
+        """Pick the first fitting job, avoiding head-of-line blocking by GPUs."""
+        worker = self._available_worker()
+        if worker is None:
+            return None
+        for job_id in list(self._queue):
+            job = self._jobs[job_id]
+            if job.status == "cancelled":
+                self._queue.remove(job_id)
+                continue
+            allocation, impossible = self._schedule_allocation(job)
+            if impossible:
+                # This should normally be caught at submit time, but hardware
+                # inventory may legitimately change after acceptance.
+                self._queue.remove(job_id)
+                job.status = "failed"
+                job.finished_at = time.time()
+                job.error = impossible
+                self._event(job, "failed", impossible)
+                continue
+            if allocation is not None:
+                self._queue.remove(job_id)
+                return job, worker, allocation
+        return None
+
+    def _execute_and_release(self, job: Job, worker: Worker, allocation: dict[str, Any]) -> None:
+        try:
             self._execute(job)
+        finally:
             with self._condition:
-                self._worker.status = "idle"
-                self._worker.current_job_id = None
-                self._worker.updated_at = time.time()
+                self._used_cpu -= allocation["cpu_count"]
+                self._leased_gpu_ids.difference_update(allocation["gpu_ids"])
+                worker.status = "idle"
+                worker.current_job_id = None
+                worker.updated_at = time.time()
+                self._execution_threads.discard(threading.current_thread())
                 self._condition.notify_all()
 
     def _execute(self, job: Job) -> None:
@@ -580,9 +755,14 @@ class ComputeService:
             cwd = job.parameters.get("working_directory")
             if cwd is not None and not isinstance(cwd, str):
                 raise ComputeRequestError("working_directory must be a path string")
-            allocation, reasons = self._gpu_allocation(job.resources, self._discover_gpus())
-            if reasons:
-                raise ComputeRequestError("; ".join(reasons))
+            # The scheduler sealed this allocation under its resource lock.
+            # Do not rediscover and accidentally assign a GPU leased by a
+            # concurrently launched process.
+            allocation = job.allocation
+            if allocation is None:
+                allocation, reasons = self._gpu_allocation(job.resources, self._discover_gpus())
+                if reasons:
+                    raise ComputeRequestError("; ".join(reasons))
             environment = os.environ.copy()
             if allocation["mode"] in {"explicit", "automatic"} and os.environ.get("ORACLE_ACCELERATOR_BACKEND", "").lower() != "metal":
                 environment["CUDA_VISIBLE_DEVICES"] = ",".join(allocation["gpu_ids"])

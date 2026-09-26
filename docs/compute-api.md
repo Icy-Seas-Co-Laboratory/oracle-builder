@@ -17,15 +17,29 @@ it does not require a registered inference bundle:
 oracle-serve --host 127.0.0.1 --port 8100
 ```
 
-Use `--no-compute` for inference-only operation.  `--compute-queue-size` and
+Use `--no-compute` for inference-only operation. `--compute-queue-size` and
 `--worker-id` set the local queue bound and stable worker identifier.
+
+The worker uses one process slot by default. To run compatible jobs in
+parallel, configure both the process slots and, when useful, a CPU admission
+limit:
+
+```bash
+oracle-serve --compute-worker-slots 2 --compute-cpu-capacity 8
+```
+
+The equivalent environment settings are `ORACLE_COMPUTE_WORKER_SLOTS` and
+`ORACLE_COMPUTE_CPU_CAPACITY`; the legacy `ORACLE_BUILDER_COMPUTE_*` names are
+also accepted. The stack launcher forwards the unprefixed settings
+automatically. A slot does not bypass resource safety: each job's sealed CPU
+and GPU request must still fit, and a leased GPU cannot be assigned twice.
 
 ## Endpoints
 
 | Endpoint | Purpose |
 |---|---|
-| `GET /compute/workers` | Worker capabilities, active job, and status. |
-| `GET /compute/status` | Queue capacity, job counts, and worker readiness. |
+| `GET /compute/workers` | Per-slot worker capabilities, active job, and status. |
+| `GET /compute/status` | Queue capacity, job counts, per-slot state, configured CPU/slot capacity, CPU use, and GPU leases. |
 | `POST /compute/jobs` | Submit an immutable orchestrator-issued job. |
 | `GET /compute/jobs/{job_id}` | Inspect current execution state. |
 | `GET /compute/jobs/{job_id}/events?after=N` | Poll structured log/lifecycle events. |
@@ -53,8 +67,11 @@ Supported actions are `train`, `evaluate`, `model_ingest`, `run_validate`, and
 `run_pack`.  They map only to existing Oracle Builder commands; callers cannot
 submit arbitrary shell commands.  The `resources` object is retained and
 returned with the job so the orchestrator can state scheduling intent.  The
-single local worker currently advertises capabilities but does not yet perform
-multi-worker resource placement.
+local scheduler performs bounded multi-slot resource placement.
+
+`GET /compute/status` is the scheduler-facing capacity snapshot. Its
+`resources` object includes `worker_slots`, `cpu_capacity`, `cpu_in_use`, and
+`gpu_leases`; its `workers` list identifies each occupied or idle process slot.
 
 For a resumed training job, send `action: "train"` with `parameters.resume`.
 For a new training job, send `config`, `input`, and `output`; add `runs_dir` or

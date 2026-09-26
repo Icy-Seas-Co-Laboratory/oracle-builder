@@ -19,9 +19,21 @@ ACCELERATOR="cpu"
 GPU_EXTRA=""
 KERNEL_NAME="$(uname -s)"
 NVIDIA_SMI="${ORACLE_NVIDIA_SMI:-nvidia-smi}"
+# The unprefixed names are the launcher contract.  Keep the original Builder
+# names as a compatibility fallback for deployments that set them directly.
+COMPUTE_WORKER_SLOTS="${ORACLE_COMPUTE_WORKER_SLOTS:-${ORACLE_BUILDER_COMPUTE_WORKER_SLOTS:-1}}"
+COMPUTE_CPU_CAPACITY="${ORACLE_COMPUTE_CPU_CAPACITY:-${ORACLE_BUILDER_COMPUTE_CPU_CAPACITY:-}}"
 
 require_command() {
   command -v "$1" >/dev/null 2>&1 || { echo "Required command is unavailable: $1" >&2; exit 1; }
+}
+
+require_positive_integer() {
+  local name="$1" value="$2"
+  [[ "$value" =~ ^[1-9][0-9]*$ ]] || {
+    echo "$name must be a positive integer (got $value)" >&2
+    exit 2
+  }
 }
 
 is_wsl() {
@@ -170,10 +182,15 @@ require_command uv
 require_command npm
 require_command curl
 require_command python3
+require_positive_integer "ORACLE_COMPUTE_WORKER_SLOTS" "$COMPUTE_WORKER_SLOTS"
+if [[ -n "$COMPUTE_CPU_CAPACITY" ]]; then
+  require_positive_integer "ORACLE_COMPUTE_CPU_CAPACITY" "$COMPUTE_CPU_CAPACITY"
+fi
 configure_accelerator
 mkdir -p "$LOG_DIR" "$RUNTIME_DIR/artifacts" "$ROOT_DIR/runs" "$ROOT_DIR/datasets"
 
 echo "Accelerator: $ACCELERATOR${GPU_EXTRA:+ (uv extra: $GPU_EXTRA)}"
+echo "Compute capacity: ${COMPUTE_WORKER_SLOTS} process slot(s)${COMPUTE_CPU_CAPACITY:+, ${COMPUTE_CPU_CAPACITY} CPU core(s)}"
 if [[ "$ACCELERATOR" == "cuda" ]]; then
   echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
 elif [[ "$ACCELERATOR_REQUEST" == "auto" && "$ACCELERATOR" == "cpu" ]]; then
@@ -227,7 +244,11 @@ if [[ "$SERVE_RUNNING" == "0" ]]; then
   echo "Starting oracle-serve…"
   (
     cd "$ROOT_DIR"
-    exec uv run --extra api oracle-serve --host "$HOST" --port "$SERVE_PORT" --worker-id local
+    SERVE_COMPUTE_ARGS=(--compute-worker-slots "$COMPUTE_WORKER_SLOTS")
+    if [[ -n "$COMPUTE_CPU_CAPACITY" ]]; then
+      SERVE_COMPUTE_ARGS+=(--compute-cpu-capacity "$COMPUTE_CPU_CAPACITY")
+    fi
+    exec uv run --extra api oracle-serve --host "$HOST" --port "$SERVE_PORT" --worker-id local "${SERVE_COMPUTE_ARGS[@]}"
   ) >"$LOG_DIR/oracle-serve.log" 2>&1 &
   SERVE_PID=$!
   wait_for "oracle-serve" "$SERVE_URL/health/ready" "$SERVE_PID"

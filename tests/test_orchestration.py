@@ -9,6 +9,92 @@ from oracle_builder.orchestration.service import Orchestrator
 from oracle_builder.registry import MODEL_REGISTRY
 
 
+def test_durable_operation_ledger_records_progress_and_result(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    orchestrator = Orchestrator(tmp_path / "orchestrator.sqlite", workspace_root=workspace)
+    operation = orchestrator.create_operation("catalog_scan", {"root": str(workspace)})
+    assert operation["status"] == "queued"
+    assert orchestrator.run_next_operation() is True
+    completed = orchestrator.operation(operation["operation_id"])
+    assert completed is not None
+    assert completed["status"] == "completed"
+    assert completed["result"]["root"] == str(workspace)
+    # Operation detail carries the last durable stage, allowing the Web GUI to
+    # display progress without maintaining a second in-memory event cache.
+    assert completed["latest_event"]["event_type"] == "completed"
+    events = orchestrator.operation_events(operation_id=operation["operation_id"])
+    assert [event["event_type"] for event in events] == ["queued", "started", "completed"]
+    assert orchestrator.operation_events(after=events[0]["sequence"], operation_id=operation["operation_id"])[0]["event_type"] == "started"
+
+
+def test_scheduled_operation_api_returns_accepted_operation(tmp_path):
+    from fastapi.testclient import TestClient
+    from oracle_builder.orchestration.api import create_app
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    orchestrator = Orchestrator(tmp_path / "orchestrator.sqlite", workspace_root=workspace)
+    with TestClient(create_app(orchestrator)) as client:
+        response = client.post("/v1/catalog:scan/schedule", json={"root": str(workspace)})
+        assert response.status_code == 202
+        operation_id = response.json()["operation"]["operation_id"]
+        detail = client.get(f"/v1/operations/{operation_id}")
+        assert detail.status_code == 200
+        assert detail.json()["operation_id"] == operation_id
+
+
+def test_operation_runner_skips_reconciliation_when_no_job_is_active(tmp_path):
+    """Idle workspaces must not grow a no-op operation/event stream."""
+    import time
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    orchestrator = Orchestrator(tmp_path / "orchestrator.sqlite", workspace_root=workspace)
+    orchestrator.start_operation_runner(interval_seconds=0.005, reconciliation_seconds=0.0)
+    try:
+        time.sleep(0.03)
+    finally:
+        orchestrator.stop_operation_runner()
+    assert orchestrator.operations() == []
+
+
+def test_scheduled_validated_queue_returns_completed_queued_run(tmp_path, monkeypatch):
+    """Calibration work is accepted immediately and its queued run is durable output."""
+    import time
+    from fastapi.testclient import TestClient
+    from oracle_builder.orchestration.api import create_app
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    orchestrator = Orchestrator(tmp_path / "orchestrator.sqlite", workspace_root=workspace)
+    received = {}
+
+    def validate(definition_id, **kwargs):
+        received["definition_id"] = definition_id
+        received.update(kwargs)
+        kwargs["operation_progress"]("preflight", "Checking mocked endpoint", {})
+        kwargs["operation_progress"]("calibrating", "Calibrating mocked batch size", {})
+        return {"queued_run_id": "queued-123", "status": "ready"}
+
+    monkeypatch.setattr(orchestrator, "validate_and_queue_model_definition", validate)
+    payload = {"name": "scheduled", "dataset_id": "dataset-1", "endpoint_id": "endpoint-1", "batch_size_mode": "auto"}
+    with TestClient(create_app(orchestrator)) as client:
+        response = client.post("/v1/model-definitions/definition-1:validate-and-queue/schedule", json=payload)
+        assert response.status_code == 202
+        operation_id = response.json()["operation"]["operation_id"]
+        for _ in range(50):
+            detail = client.get(f"/v1/operations/{operation_id}").json()
+            if detail["status"] in {"completed", "failed"}:
+                break
+            time.sleep(0.02)
+        assert detail["status"] == "completed"
+        assert detail["result"]["queued_run_id"] == "queued-123"
+        assert received["definition_id"] == "definition-1"
+        event_types = [event["event_type"] for event in orchestrator.operation_events(operation_id=operation_id)]
+        assert event_types == ["queued", "started", "preflight", "calibrating", "completed"]
+
+
 def _create_sealed_product(path, source_config, *, artifact_type="model_product", metrics=None, dataset_fingerprint=None, task="classification", detailed_evidence=False):
     from oracle_builder.artifacts import (
         RunLayout, create_run_artifact, create_unavailable_split_manifest,
@@ -643,6 +729,17 @@ def test_first_class_ssl_and_mask_refinement_templates_are_strict_v2(tmp_path):
     assert ssl["config"]["self_supervised"]["method"] == "simclr"
     assert ssl["config"]["encoder"] == {"family": "resnet", "variant": "resnet18"}
 
+    for template_id, encoder in {
+        "ssl_embedding_resnet34": {"family": "resnet", "variant": "resnet34"},
+        "ssl_embedding_resnet50": {"family": "resnet", "variant": "resnet50"},
+        "ssl_embedding_densenet121": {"family": "densenet", "variant": "densenet121"},
+        "ssl_embedding_efficientnet_b0": {"family": "efficientnet", "variant": "efficientnet_b0"},
+    }.items():
+        assert templates[template_id]["task"] == "embedding"
+        assert templates[template_id]["model"] == encoder["family"]
+        assert templates[template_id]["variant"] == encoder["variant"]
+        assert templates[template_id]["config"]["self_supervised"]["enabled"] is True
+
     mask = templates["mask_refinement_unet"]
     assert mask["task"] == "segmentation"
     assert mask["config"]["encoder"] == {"family": "unet", "variant": "unet"}
@@ -731,6 +828,133 @@ def test_validated_queue_seals_definition_and_requires_explicit_start(tmp_path, 
     started = orchestrator.authorize_queued_runs(queued_run_ids=[queued["queued_run_id"]], endpoint_id=endpoint["endpoint_id"])
     assert started["dispatched"]
     assert any(route == "/compute/jobs" for _, _, route, _, _ in requests)
+
+    job_id = started["dispatched"][0]["job_id"]
+    with orchestrator._connection() as db:
+        db.execute("UPDATE jobs SET status='failed' WHERE job_id=?", (job_id,))
+        db.execute("UPDATE queued_runs SET status='failed' WHERE queued_run_id=?", (queued["queued_run_id"],))
+    orchestrator._record_event(job_id, "log", "ResourceExhaustedError: OOM during training", {})
+
+    cleared = orchestrator.archive_terminal_queued_run(queued["queued_run_id"])
+
+    assert cleared == {"queued_run_id": queued["queued_run_id"], "archived": True, "job_id": job_id}
+    assert queued["queued_run_id"] not in {item["queued_run_id"] for item in orchestrator.queued_runs()}
+    assert [event["event_type"] for event in orchestrator.job_events(job_id)][-2:] == ["log", "queue_cleared"]
+
+    with pytest.raises(ValueError, match="pinned"):
+        orchestrator.delete_model_definition(definition["definition_id"])
+    unused = orchestrator.create_model_definition(name="unused definition", template_id="resnet18")
+    assert orchestrator.delete_model_definition(unused["definition_id"])["deleted"] is True
+    assert orchestrator.model_definition(unused["definition_id"]) is None
+
+
+def _seed_scheduler_queue(orchestrator, endpoint_id, resources_list):
+    """Insert minimal sealed rows; scheduler tests do not need model building."""
+    import sqlite3
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc).isoformat()
+    # Foreign keys are exercised by the validation workflow tests above.  This
+    # focused scheduler fixture keeps the setup independent of config files.
+    with sqlite3.connect(orchestrator.database) as db:
+        for ordinal, resources in enumerate(resources_list):
+            queue_id, spec_id = f"scheduler-queue-{ordinal}", f"scheduler-spec-{ordinal}"
+            db.execute("""INSERT INTO queued_runs (
+                queued_run_id,definition_id,definition_revision,dataset_id,name,description,
+                specification_id,resolved_toml_path,resolved_toml_sha256,resources_json,
+                initialization_json,preflight_endpoint_id,preflight_status,preflight_report_json,
+                status,start_authorized,priority,created_at,updated_at
+            ) VALUES (?, 'definition', 1, 'dataset', ?, '', ?, 'sealed.toml', 'digest', ?, '{}', ?, 'valid', '{}', 'ready', 1, 0, ?, ?)""",
+                (queue_id, queue_id, spec_id, json.dumps(resources), endpoint_id, now, now),
+            )
+    return [f"scheduler-queue-{index}" for index in range(len(resources_list))]
+
+
+def _scheduler_endpoint(endpoint_id, *, workers=2, gpu_leases=None, cpu_capacity=8, cpu_in_use=0):
+    return {
+        "endpoint_id": endpoint_id, "base_url": "http://scheduler-serve", "enabled": True, "status": "ready",
+        "workers": [{"worker_id": f"w{index}", "status": "idle", "capabilities": {"actions": ["train"], "gpus": [{"id": "0"}, {"id": "1"}]}} for index in range(workers)],
+        "queue": {"resources": {"worker_slots": workers, "cpu_capacity": cpu_capacity, "cpu_in_use": cpu_in_use, "gpu_leases": gpu_leases or []}},
+    }
+
+
+def test_scheduler_fills_multiple_compatible_authorized_runs(tmp_path, monkeypatch):
+    orchestrator = Orchestrator(tmp_path / "scheduler.sqlite", workspace_root=tmp_path)
+    endpoint = orchestrator.register_compute_endpoint(name="scheduler", base_url="http://scheduler-serve")
+    queue_ids = _seed_scheduler_queue(orchestrator, endpoint["endpoint_id"], [{"gpu_count": 1, "gpu_ids": ["0"]}, {"gpu_count": 1, "gpu_ids": ["1"]}])
+    monkeypatch.setattr(orchestrator, "refresh_compute_endpoint", lambda _id: _scheduler_endpoint(endpoint["endpoint_id"]))
+    monkeypatch.setattr(orchestrator, "specification", lambda spec_id: {"specification_id": spec_id, "action": "train", "parameters": {}, "resources": {"gpu_count": 1, "gpu_ids": ["0"] if spec_id.endswith("0") else ["1"]}})
+    monkeypatch.setattr(orchestrator, "_request", lambda *_args, **_kwargs: {"ready": True, "reasons": []})
+    dispatched = []
+    def dispatch(spec_id, _endpoint_id):
+        job = {"job_id": f"job-{spec_id}", "specification_id": spec_id}
+        dispatched.append(job)
+        return job
+    monkeypatch.setattr(orchestrator, "dispatch", dispatch)
+
+    assert len(orchestrator.schedule_queued_runs(endpoint["endpoint_id"])) == 2
+    assert len(dispatched) == 2
+    assert {row["status"] for row in orchestrator.queued_runs() if row["queued_run_id"] in queue_ids} == {"submitted"}
+
+
+def test_scheduler_waits_for_conflicting_gpu_but_dispatches_compatible_run(tmp_path, monkeypatch):
+    orchestrator = Orchestrator(tmp_path / "scheduler.sqlite", workspace_root=tmp_path)
+    endpoint = orchestrator.register_compute_endpoint(name="scheduler", base_url="http://scheduler-serve")
+    blocked, compatible = _seed_scheduler_queue(orchestrator, endpoint["endpoint_id"], [{"gpu_count": 1, "gpu_ids": ["0"]}, {"gpu_count": 1, "gpu_ids": ["1"]}])
+    monkeypatch.setattr(orchestrator, "refresh_compute_endpoint", lambda _id: _scheduler_endpoint(endpoint["endpoint_id"], gpu_leases=["0"]))
+    monkeypatch.setattr(orchestrator, "specification", lambda spec_id: {"specification_id": spec_id, "action": "train", "parameters": {}, "resources": {"gpu_count": 1, "gpu_ids": ["1"]}})
+    monkeypatch.setattr(orchestrator, "_request", lambda *_args, **_kwargs: {"ready": True, "reasons": []})
+    monkeypatch.setattr(orchestrator, "dispatch", lambda spec_id, _endpoint_id: {"job_id": f"job-{spec_id}", "specification_id": spec_id})
+
+    result = orchestrator.schedule_queued_runs(endpoint["endpoint_id"])
+    assert [job["specification_id"] for job in result] == ["scheduler-spec-1"]
+    assert orchestrator.queued_run(blocked)["status"] == "waiting_for_resources"
+    assert "GPU" in orchestrator.queued_run(blocked)["failure_reason"]
+    assert orchestrator.queued_run(compatible)["status"] == "submitted"
+
+
+def test_scheduler_claim_prevents_duplicate_concurrent_dispatch(tmp_path, monkeypatch):
+    import threading
+    import time
+
+    orchestrator = Orchestrator(tmp_path / "scheduler.sqlite", workspace_root=tmp_path)
+    endpoint = orchestrator.register_compute_endpoint(name="scheduler", base_url="http://scheduler-serve")
+    _seed_scheduler_queue(orchestrator, endpoint["endpoint_id"], [
+        {"gpu_count": 1, "gpu_ids": ["0"]}, {"gpu_count": 1, "gpu_ids": ["1"]},
+    ])
+    monkeypatch.setattr(orchestrator, "refresh_compute_endpoint", lambda _id: _scheduler_endpoint(endpoint["endpoint_id"], workers=1))
+    monkeypatch.setattr(orchestrator, "specification", lambda spec_id: {"specification_id": spec_id, "action": "train", "parameters": {}, "resources": {"gpu_count": 1, "gpu_ids": ["0"] if spec_id.endswith("0") else ["1"]}})
+    monkeypatch.setattr(orchestrator, "_request", lambda *_args, **_kwargs: {"ready": True, "reasons": []})
+    submitted = []
+    def dispatch(spec_id, _endpoint_id):
+        submitted.append(spec_id)
+        time.sleep(0.1)
+        return {"job_id": f"job-{spec_id}", "specification_id": spec_id}
+    monkeypatch.setattr(orchestrator, "dispatch", dispatch)
+    threads = [threading.Thread(target=orchestrator.schedule_queued_runs, args=(endpoint["endpoint_id"],)) for _ in range(2)]
+    [thread.start() for thread in threads]
+    [thread.join() for thread in threads]
+    # Both ticks see two eligible rows, but the endpoint lease makes exactly
+    # one of them spend the single idle worker snapshot.
+    assert submitted == ["scheduler-spec-0"]
+
+
+def test_reconciliation_refills_affected_endpoint(tmp_path, monkeypatch):
+    import sqlite3
+    from datetime import datetime, timezone
+
+    orchestrator = Orchestrator(tmp_path / "scheduler.sqlite", workspace_root=tmp_path)
+    endpoint = orchestrator.register_compute_endpoint(name="scheduler", base_url="http://scheduler-serve")
+    now = datetime.now(timezone.utc).isoformat()
+    with sqlite3.connect(orchestrator.database) as db:
+        db.execute("""INSERT INTO jobs(job_id,specification_id,oracle_serve_url,action,parameters_json,
+            resources_json,status,submitted_at,updated_at) VALUES ('terminal-job', NULL, 'http://scheduler-serve',
+            'train', '{}', '{}', 'running', ?, ?)""", (now, now))
+    monkeypatch.setattr(orchestrator, "reconcile_job", lambda job_id: {"job_id": job_id, "oracle_serve_url": "http://scheduler-serve", "status": "failed"})
+    refills = []
+    monkeypatch.setattr(orchestrator, "schedule_queued_runs", lambda endpoint_id: refills.append(endpoint_id) or [])
+    orchestrator.reconcile_active_jobs()
+    assert refills == [endpoint["endpoint_id"]]
 
 
 def test_startup_reconciles_project_runs_and_frozen_datasets(tmp_path):

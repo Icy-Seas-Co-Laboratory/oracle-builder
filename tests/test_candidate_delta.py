@@ -48,6 +48,7 @@ def test_candidate_delta_target_and_reconstruction_are_exact(tmp_path):
 
     expected = np.logical_xor(candidate > 0, validated > 0)
     assert np.array_equal(y[0, ..., 0] > 0, expected)
+    assert records[0]["class_index"] is None
     assert np.array_equal(records[0]["candidate_mask"][..., 0] > 0, candidate > 0)
     assert np.array_equal(reconstruct_validated_mask(records[0]["candidate_mask"], y[0]) > 0, validated[..., None] > 0)
 

@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { api, type RecordValue } from '$lib/api';
+	import { OperationalRefreshCoordinator, type RefreshReason, publishOperationalRefresh } from '$lib/operational-refresh';
 	import ModelRunsView from '$lib/models/ModelRunsView.svelte';
 	import ModelComparisonView from '$lib/models/ModelComparisonView.svelte';
 	import TrainingSetCatalogView from '$lib/TrainingSetCatalogView.svelte';
@@ -35,14 +36,18 @@
 	const healthEndpoints = () => systemHealth?.compute_endpoints && typeof systemHealth.compute_endpoints === 'object' ? systemHealth.compute_endpoints as RecordValue : null;
 	const serviceReady = () => systemHealth?.database === 'ready' && (Number(healthEndpoints()?.ready ?? 0) > 0 || computeEndpoints.some((endpoint) => endpoint.status === 'ready'));
 
-	async function refresh(silent = false) {
+	let coordinator: OperationalRefreshCoordinator | undefined;
+	async function refresh(silent = false, signal?: AbortSignal, reason: RefreshReason = 'manual') {
 		if (!silent) loading = true;
 		try {
 			const [datasetResult, artifactResult, jobResult, queuedResult, endpointResult, healthResult] = await Promise.all([
-				api.datasets(), api.artifacts(), api.jobs(true), api.queuedRuns(), api.computeEndpoints(true), api.health()
+				api.datasets({ signal }), api.artifacts({ signal }), api.jobs(true, { signal }), api.queuedRuns({ signal }), api.computeEndpoints(true, { signal }), api.health({ signal })
 			]);
 			datasets = datasetResult.datasets; artifacts = artifactResult.artifacts; jobs = jobResult.jobs; queuedRuns = queuedResult.queued_runs; computeEndpoints = endpointResult.endpoints; systemHealth = healthResult;
-		} catch (error) { failure = error instanceof Error ? error.message : 'Could not reach the Oracle Builder control plane.'; }
+		publishOperationalRefresh(reason);
+		} catch (error) {
+			if (!(error instanceof DOMException && error.name === 'AbortError')) failure = error instanceof Error ? error.message : 'Could not reach the Oracle Builder control plane.';
+		}
 		finally { if (!silent) loading = false; }
 	}
 	function syncPageFromLocation() {
@@ -53,15 +58,19 @@
 	function navigate(page: Page) { activePage = page; if (typeof window !== 'undefined') window.history.replaceState(null, '', `#${page}`); }
 	function compared(ids: string[]) { comparisonIds = ids; navigate('comparison'); }
 	function useDraft(_definitionId: string) { navigate('queue'); }
-	function changed(message: string) { notice = message; failure = ''; void refresh(true); }
+	function changed(message: string) { notice = message; failure = ''; void coordinator?.trigger('mutation', true); }
 
 	onMount(() => {
 		syncPageFromLocation();
-		void refresh(); const timer = window.setInterval(() => void refresh(true), 10_000);
+		coordinator = new OperationalRefreshCoordinator(
+			(signal, reason) => refresh(reason === 'initial' || reason === 'manual', signal, reason),
+			() => activeJobCount > 0
+		);
+		coordinator.start();
 		window.addEventListener('hashchange', syncPageFromLocation);
 		window.addEventListener('popstate', syncPageFromLocation);
 		return () => {
-			window.clearInterval(timer);
+			coordinator?.stop(); coordinator = undefined;
 			window.removeEventListener('hashchange', syncPageFromLocation);
 			window.removeEventListener('popstate', syncPageFromLocation);
 		};
@@ -78,7 +87,7 @@
 		<div class="side-foot"><span class:offline={!serviceReady()} class="pulse"></span>{loading ? 'Updating workspace…' : serviceReady() ? 'Compute connected' : 'Plan offline; dispatch later'}</div>
 	</aside>
 	<div class="app-frame">
-		<header class="topbar"><div><p class="eyebrow">{pageMeta.find((page) => page.id === activePage)?.number} · {pageMeta.find((page) => page.id === activePage)?.title}</p><h1>{pageMeta.find((page) => page.id === activePage)?.detail}</h1></div><div class="topbar-actions"><span class:online={serviceReady()} class="system-pill"><i></i>{loading ? 'Connecting…' : serviceReady() ? 'Compute ready' : 'Compute unavailable'}</span><button class="quiet-button" on:click={() => refresh()} disabled={loading}>{loading ? 'Refreshing…' : 'Refresh'}</button></div></header>
+		<header class="topbar"><div><p class="eyebrow">{pageMeta.find((page) => page.id === activePage)?.number} · {pageMeta.find((page) => page.id === activePage)?.title}</p><h1>{pageMeta.find((page) => page.id === activePage)?.detail}</h1></div><div class="topbar-actions"><span class:online={serviceReady()} class="system-pill"><i></i>{loading ? 'Connecting…' : serviceReady() ? 'Compute ready' : 'Compute unavailable'}</span><button class="quiet-button" on:click={() => void coordinator?.trigger('manual', true)} disabled={loading}>{loading ? 'Refreshing…' : 'Refresh'}</button></div></header>
 		<main class="workspace">
 			{#if failure}<div class="banner error" role="alert"><strong>Action needed</strong><span>{failure}</span><button aria-label="Dismiss" on:click={() => failure = ''}>×</button></div>{/if}
 			{#if notice}<div class="banner notice" role="status"><strong>Updated</strong><span>{notice}</span><button aria-label="Dismiss" on:click={() => notice = ''}>×</button></div>{/if}

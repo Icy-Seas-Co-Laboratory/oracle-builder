@@ -3,10 +3,13 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 from typing import Any
 import uuid
+import asyncio
+import json
 
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
+from starlette.concurrency import run_in_threadpool
 
 from oracle_builder.orchestration.service import Orchestrator
 
@@ -190,8 +193,12 @@ class TrainingCatalogCompareRequest(BaseModel):
 def create_app(orchestrator: Orchestrator) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        app.state.startup_reconciliation = orchestrator.reconcile_startup()
+        # Recovery remains synchronous so the readiness report is meaningful;
+        # recurring remote reconciliation is subsequently durable/scheduled.
+        app.state.startup_reconciliation = await run_in_threadpool(orchestrator.reconcile_startup)
+        orchestrator.start_operation_runner()
         yield
+        orchestrator.stop_operation_runner()
 
     app = FastAPI(title="Oracle Builder Orchestrator API", version="0.1.0", lifespan=lifespan)
     app.state.orchestrator = orchestrator
@@ -209,6 +216,42 @@ def create_app(orchestrator: Orchestrator) -> FastAPI:
         endpoints = orchestrator.compute_endpoints()
         available = sum(endpoint["status"] == "ready" for endpoint in endpoints)
         return {"status": "ready" if available else "degraded", "database": "ready", "compute_endpoints": {"configured": len(endpoints), "ready": available}, "startup_reconciliation": getattr(app.state, "startup_reconciliation", None)}
+
+    @app.get("/v1/operations")
+    def operations(status: str | None = Query(default=None), limit: int = Query(default=100, ge=1, le=500)) -> dict[str, Any]:
+        return {"operations": orchestrator.operations(status=status, limit=limit)}
+
+    @app.get("/v1/operations/{operation_id}")
+    def operation(operation_id: str) -> dict[str, Any]:
+        return required(orchestrator.operation(operation_id), "Operation")
+
+    @app.post("/v1/jobs:reconcile/schedule", status_code=202)
+    async def schedule_job_reconciliation() -> dict[str, Any]:
+        return {"operation": await run_in_threadpool(orchestrator.create_operation, "active_job_reconciliation")}
+
+    @app.get("/v1/events")
+    async def operation_event_stream(request: Request, after: int | None = Query(default=None, ge=0), operation_id: str | None = Query(default=None)) -> StreamingResponse:
+        """Resumable SSE sourced entirely from the durable event ledger."""
+        # Native EventSource reconnects send Last-Event-ID, while non-browser
+        # clients may use the explicit query cursor.  Honor both forms.
+        try:
+            cursor = after if after is not None else max(0, int(request.headers.get("last-event-id", "0")))
+        except ValueError:
+            cursor = 0
+        async def stream():
+            nonlocal cursor
+            while not await request.is_disconnected():
+                events = await run_in_threadpool(
+                    orchestrator.operation_events, after=cursor, operation_id=operation_id
+                )
+                if events:
+                    for event in events:
+                        cursor = event["sequence"]
+                        yield f"id: {cursor}\nevent: {event['event_type']}\ndata: {json.dumps(event, separators=(',', ':'))}\n\n"
+                else:
+                    yield ": keepalive\n\n"
+                    await asyncio.sleep(1)
+        return StreamingResponse(stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
     @app.get("/v1/compute/endpoints")
     def compute_endpoints(refresh: bool = Query(default=False)) -> dict[str, Any]:
@@ -240,7 +283,9 @@ def create_app(orchestrator: Orchestrator) -> FastAPI:
                         written += len(chunk)
                         if written > orchestrator.upload_limit_bytes:
                             raise HTTPException(status_code=413, detail="Upload exceeds configured size limit")
-                        handle.write(chunk)
+                        # The request stream is asynchronous; keep potentially
+                        # slow filesystem writes out of its event loop too.
+                        await run_in_threadpool(handle.write, chunk)
                 temporary.replace(destination)
             except Exception:
                 temporary.unlink(missing_ok=True)
@@ -263,6 +308,11 @@ def create_app(orchestrator: Orchestrator) -> FastAPI:
         try: return orchestrator.scan_training_catalog(**body.model_dump())
         except KeyError as exc: raise HTTPException(status_code=404, detail=str(exc)) from exc
         except (OSError, ValueError) as exc: raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/v1/training-catalog:scan/schedule", status_code=202)
+    async def schedule_training_catalog_scan(body: TrainingCatalogScanRequest) -> dict[str, Any]:
+        try: return {"operation": await run_in_threadpool(orchestrator.create_operation, "training_catalog_scan", body.model_dump())}
+        except KeyError as exc: raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.post("/v1/training-catalog/{catalog_id}:freeze")
     def freeze_training_catalog_entry(catalog_id: str) -> dict[str, Any]:
@@ -340,6 +390,11 @@ def create_app(orchestrator: Orchestrator) -> FastAPI:
         try: return orchestrator.scan(body.root)
         except (OSError, ValueError) as exc: raise HTTPException(status_code=422, detail=str(exc)) from exc
 
+    @app.post("/v1/catalog:scan/schedule", status_code=202)
+    async def schedule_scan(body: ScanRequest) -> dict[str, Any]:
+        try: return {"operation": await run_in_threadpool(orchestrator.create_operation, "catalog_scan", body.model_dump())}
+        except (OSError, ValueError) as exc: raise HTTPException(status_code=422, detail=str(exc)) from exc
+
     @app.get("/v1/artifacts")
     def artifacts() -> dict[str, Any]: return {"artifacts": orchestrator.artifacts()}
 
@@ -365,6 +420,12 @@ def create_app(orchestrator: Orchestrator) -> FastAPI:
         # This route only refreshes database-owned catalog facts.  It accepts
         # IDs, never paths, so it cannot be used to inspect arbitrary files.
         return orchestrator.reindex_artifact_catalog(artifact_ids=body.artifact_ids if body else None)
+
+    @app.post("/v1/artifacts/catalog:reindex/schedule", status_code=202)
+    async def schedule_reindex_artifact_catalog(body: ArtifactCatalogReindexRequest | None = None) -> dict[str, Any]:
+        return {"operation": await run_in_threadpool(
+            orchestrator.create_operation, "artifact_reindex", {"artifact_ids": body.artifact_ids if body else None}
+        )}
 
     @app.get("/v1/tags")
     def tags() -> dict[str, Any]: return {"tags": orchestrator.tags()}
@@ -479,11 +540,25 @@ def create_app(orchestrator: Orchestrator) -> FastAPI:
         except KeyError as exc: raise HTTPException(status_code=404, detail="Model definition was not found") from exc
         except ValueError as exc: raise HTTPException(status_code=409 if "conflict" in str(exc).lower() else 422, detail=str(exc)) from exc
 
+    @app.delete("/v1/model-definitions/{definition_id}")
+    def delete_model_definition(definition_id: str) -> dict[str, Any]:
+        try: return orchestrator.delete_model_definition(definition_id)
+        except KeyError as exc: raise HTTPException(status_code=404, detail="Model definition was not found") from exc
+        except ValueError as exc: raise HTTPException(status_code=409, detail=str(exc)) from exc
+
     @app.post("/v1/model-definitions/{definition_id}:validate-and-queue", status_code=201)
     def validate_and_queue_model_definition(definition_id: str, body: ValidatedQueueRunRequest) -> dict[str, Any]:
         try: return orchestrator.validate_and_queue_model_definition(definition_id, **body.model_dump())
         except KeyError as exc: raise HTTPException(status_code=404, detail=str(exc)) from exc
         except (OSError, ValueError, RuntimeError) as exc: raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/v1/model-definitions/{definition_id}:validate-and-queue/schedule", status_code=202)
+    async def schedule_validated_queue_model_definition(definition_id: str, body: ValidatedQueueRunRequest) -> dict[str, Any]:
+        # This returns immediately: auto batch calibration can take minutes
+        # and its durable events are available from /v1/events.
+        parameters = {"definition_id": definition_id, **body.model_dump()}
+        try: return {"operation": await run_in_threadpool(orchestrator.create_operation, "validated_queue_validation", parameters)}
+        except ValueError as exc: raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.get("/v1/queued-runs")
     def queued_runs() -> dict[str, Any]:
@@ -498,6 +573,12 @@ def create_app(orchestrator: Orchestrator) -> FastAPI:
     @app.post("/v1/queued-runs/{queued_run_id}:cancel")
     def cancel_queued_run(queued_run_id: str) -> dict[str, Any]:
         try: return orchestrator.cancel_queued_run(queued_run_id)
+        except KeyError as exc: raise HTTPException(status_code=404, detail="Queued run was not found") from exc
+        except ValueError as exc: raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/v1/queued-runs/{queued_run_id}:clear")
+    def clear_terminal_queued_run(queued_run_id: str) -> dict[str, Any]:
+        try: return orchestrator.archive_terminal_queued_run(queued_run_id)
         except KeyError as exc: raise HTTPException(status_code=404, detail="Queued run was not found") from exc
         except ValueError as exc: raise HTTPException(status_code=422, detail=str(exc)) from exc
 

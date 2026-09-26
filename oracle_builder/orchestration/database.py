@@ -96,6 +96,13 @@ CREATE TABLE IF NOT EXISTS queued_runs (
   status TEXT NOT NULL,
   start_authorized INTEGER NOT NULL DEFAULT 0,
   priority INTEGER NOT NULL DEFAULT 0,
+  -- A dispatch claim is a short, durable lease held while the scheduler is
+  -- making the remote submission.  It prevents two scheduler ticks (or a
+  -- future second API process) from dispatching the same sealed run.
+  dispatch_claim_token TEXT,
+  dispatch_claim_owner TEXT,
+  dispatch_claimed_at TEXT,
+  dispatch_attempt INTEGER NOT NULL DEFAULT 0,
   failure_reason TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
@@ -141,11 +148,36 @@ CREATE TABLE IF NOT EXISTS job_events (
   message TEXT NOT NULL, data_json TEXT NOT NULL,
   PRIMARY KEY (job_id, sequence)
 );
+-- Durable control-plane work.  These rows deliberately survive API restarts;
+-- event sequence numbers provide a stable cursor for clients reconnecting to
+-- the event stream.
+CREATE TABLE IF NOT EXISTS operations (
+  operation_id TEXT PRIMARY KEY, operation_type TEXT NOT NULL,
+  status TEXT NOT NULL, parameters_json TEXT NOT NULL, result_json TEXT,
+  error TEXT, created_at TEXT NOT NULL, started_at TEXT, completed_at TEXT,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS operations_status_idx ON operations(status, created_at);
+CREATE TABLE IF NOT EXISTS operation_events (
+  sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+  operation_id TEXT NOT NULL REFERENCES operations(operation_id) ON DELETE CASCADE,
+  timestamp TEXT NOT NULL, event_type TEXT NOT NULL, message TEXT NOT NULL,
+  data_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS operation_events_operation_idx ON operation_events(operation_id, sequence);
 CREATE TABLE IF NOT EXISTS compute_endpoints (
   endpoint_id TEXT PRIMARY KEY, name TEXT NOT NULL, base_url TEXT NOT NULL UNIQUE,
   enabled INTEGER NOT NULL, status TEXT NOT NULL, last_checked_at TEXT,
   error TEXT, readiness_json TEXT, workers_json TEXT, queue_json TEXT,
   created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+-- Serialize capacity snapshots per endpoint.  Queue-row claims protect an
+-- individual dispatch; this lease additionally prevents two schedulers from
+-- independently spending the same idle worker snapshot.
+CREATE TABLE IF NOT EXISTS scheduler_leases (
+  endpoint_id TEXT PRIMARY KEY REFERENCES compute_endpoints(endpoint_id) ON DELETE CASCADE,
+  owner TEXT NOT NULL,
+  claimed_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS comparisons (
   comparison_id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT NOT NULL,
@@ -189,4 +221,15 @@ def connect(path: str | Path) -> sqlite3.Connection:
     for column, data_type in migrations.items():
         if column not in existing:
             connection.execute(f"ALTER TABLE jobs ADD COLUMN {column} {data_type}")
+    queued_columns = {row[1] for row in connection.execute("PRAGMA table_info(queued_runs)")}
+    queued_migrations = {
+        "dispatch_claim_token": "TEXT",
+        "dispatch_claim_owner": "TEXT",
+        "dispatch_claimed_at": "TEXT",
+        "dispatch_attempt": "INTEGER NOT NULL DEFAULT 0",
+    }
+    for column, data_type in queued_migrations.items():
+        if column not in queued_columns:
+            connection.execute(f"ALTER TABLE queued_runs ADD COLUMN {column} {data_type}")
+    connection.execute("CREATE INDEX IF NOT EXISTS queued_runs_claim_idx ON queued_runs(preflight_endpoint_id, dispatch_claimed_at)")
     return connection

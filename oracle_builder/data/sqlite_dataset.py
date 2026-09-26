@@ -197,7 +197,10 @@ def load_arrays(sqlite_path: str | Path, config: dict[str, Any], split: str | No
                 "uuid": row["uuid"],
                 "split": row.get("split") or "train",
                 "label_text": row.get("label_text"),
-                "class_index": int(y if y is not None else row.get("label_text")),
+                # Segmentation targets are masks, not scalar classes.  Keep
+                # the record contract aligned with ``load_prediction_arrays``
+                # and avoid coercing the decoded mask array to ``int``.
+                "class_index": int(y if y is not None else row.get("label_text")) if task == "classification" else None,
                 "sample_weight": row.get("sample_weight"),
                 "metadata": json.loads(row["metadata_json"]) if row.get("metadata_json") else {},
                 "original_shape": list(np.asarray(x).shape),

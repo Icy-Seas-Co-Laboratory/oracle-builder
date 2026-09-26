@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import uuid
 import json
+import threading
+import time
 
 from fastapi.testclient import TestClient
 
@@ -99,6 +101,36 @@ def test_compute_preflight_seals_explicit_gpu_ids_and_rejects_unknown_devices(mo
         compute.close()
 
 
+def test_batch_tune_passes_vram_inventory_and_target_band_to_isolated_probe(monkeypatch):
+    compute = ComputeService()
+    commands: list[list[str]] = []
+    monkeypatch.setattr(compute, "_discover_gpus", lambda: [
+        {"id": "1", "free_memory_mib": 8000, "total_memory_mib": 12288, "telemetry": "nvidia-smi"},
+    ])
+
+    class Completed:
+        returncode = 0
+        stdout = 'ORACLE_BATCH_TUNE_RESULT={"ready": true, "recommended_batch_size": 8}\n'
+
+    def run(command, **_kwargs):
+        commands.append(command)
+        return Completed()
+
+    monkeypatch.setattr("oracle_builder.api.compute.subprocess.run", run)
+    try:
+        result = compute.tune_batch_size(
+            parameters={"config": "/tmp/config.toml", "input": "/tmp/frozen.sqlite", "minimum_batch_size": 1, "maximum_batch_size": 64},
+            resources={"gpu_count": 1, "gpu_ids": ["1"]},
+        )
+        assert result["ready"] is True
+        assert "--vram-total-mib" in commands[0]
+        assert commands[0][commands[0].index("--vram-total-mib") + 1] == "12288"
+        assert commands[0][commands[0].index("--target-vram-min") + 1] == "0.3"
+        assert commands[0][commands[0].index("--target-vram-max") + 1] == "0.8"
+    finally:
+        compute.close()
+
+
 def test_compute_training_status_is_job_scoped_and_available_before_artifacts(tmp_path):
     compute = ComputeService()
     app = create_app(InferenceModelRegistry(), compute=compute, preload=False)
@@ -163,4 +195,74 @@ def test_compute_running_job_can_pause_resume_and_cancel_without_stranding_proce
         # Cancel wakes a paused process before terminating it.
         assert len(process.signals) == 4
     finally:
+        compute.close()
+
+
+def test_compute_scheduler_runs_multiple_slots_without_gpu_collisions(monkeypatch):
+    """Two slots can progress concurrently, but each receives a distinct GPU."""
+    compute = ComputeService(worker_slots=2, cpu_capacity=2)
+    started = threading.Event()
+    release = threading.Event()
+    executions: list[tuple[str, dict]] = []
+
+    monkeypatch.setattr(compute, "_discover_gpus", lambda: [
+        {"id": "0", "free_memory_mib": 10000},
+        {"id": "1", "free_memory_mib": 9000},
+    ])
+
+    def execute(job):
+        executions.append((job.job_id, job.allocation or {}))
+        if len(executions) == 2:
+            started.set()
+        release.wait(timeout=2)
+        job.status = "succeeded"
+        job.finished_at = time.time()
+
+    monkeypatch.setattr(compute, "_execute", execute)
+    ids = [str(uuid.uuid4()), str(uuid.uuid4())]
+    try:
+        for job_id in ids:
+            compute.submit(
+                job_id=job_id, action="run_validate", parameters={"run": "/tmp/run"},
+                resources={"gpu_count": 1, "cpu_count": 1},
+            )
+        assert started.wait(timeout=2)
+        assert {item[1]["gpu_ids"][0] for item in executions} == {"0", "1"}
+        status = compute.status()
+        assert status["queue"]["depth"] == 0
+        assert status["resources"]["cpu_in_use"] == 2
+        assert len(status["resources"]["gpu_leases"]) == 2
+    finally:
+        release.set()
+        compute.close()
+
+
+def test_compute_scheduler_keeps_conflicting_gpu_job_queued_and_can_cancel(monkeypatch):
+    compute = ComputeService(worker_slots=2, cpu_capacity=2)
+    release = threading.Event()
+    started = threading.Event()
+    monkeypatch.setattr(compute, "_discover_gpus", lambda: [{"id": "0"}])
+
+    def execute(job):
+        started.set()
+        release.wait(timeout=2)
+        job.status = "succeeded"
+        job.finished_at = time.time()
+
+    monkeypatch.setattr(compute, "_execute", execute)
+    first, second = str(uuid.uuid4()), str(uuid.uuid4())
+    try:
+        for job_id in (first, second):
+            compute.submit(
+                job_id=job_id, action="run_validate", parameters={"run": "/tmp/run"},
+                resources={"gpu_count": 1, "gpu_ids": ["0"]},
+            )
+        assert started.wait(timeout=2)
+        deadline = time.time() + 2
+        while compute.get(second)["status"] != "queued" and time.time() < deadline:
+            time.sleep(.01)
+        assert compute.get(second)["status"] == "queued"
+        assert compute.cancel(second)["status"] == "cancelled"
+    finally:
+        release.set()
         compute.close()

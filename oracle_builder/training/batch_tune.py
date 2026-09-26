@@ -25,6 +25,9 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--maximum", required=True, type=int)
     parser.add_argument("--minimum", type=int, default=1)
     parser.add_argument("--safety-factor", type=float, default=0.8)
+    parser.add_argument("--vram-total-mib", type=int)
+    parser.add_argument("--target-vram-min", type=float, default=0.30)
+    parser.add_argument("--target-vram-max", type=float, default=0.80)
     return parser.parse_args()
 
 
@@ -71,10 +74,25 @@ def _probe(config: dict[str, Any], input_path: str, batch_size: int) -> dict[str
     materialized = [tf.reduce_sum(gradient) for gradient in gradients if gradient is not None]
     if materialized:
         tf.add_n(materialized).numpy()
+    memory: dict[str, Any] | None = None
+    try:
+        # Peak allocator usage is available on supported TensorFlow GPU
+        # backends. Each probe runs in a fresh process, so this is scoped to
+        # the candidate rather than accumulated across earlier attempts.
+        allocator = tf.config.experimental.get_memory_info("GPU:0")
+        memory = {
+            "peak_bytes": int(allocator.get("peak", 0)),
+            "current_bytes": int(allocator.get("current", 0)),
+            "source": "tensorflow_allocator",
+        }
+    except Exception:
+        # Metal and older TensorFlow builds do not always expose allocator
+        # counters. The caller then falls back to OOM-bound calibration.
+        memory = None
     del model, datasets, batch, inputs, gradients, materialized, strategy
     tf.keras.backend.clear_session()
     gc.collect()
-    return {"status": "passed", "observed_batch_size": observed}
+    return {"status": "passed", "observed_batch_size": observed, **({"memory": memory} if memory else {})}
 
 
 def tune(
@@ -84,11 +102,18 @@ def tune(
     minimum: int = 1,
     maximum: int = 256,
     safety_factor: float = 0.8,
+    vram_total_mib: int | None = None,
+    target_vram_min: float = 0.30,
+    target_vram_max: float = 0.80,
 ) -> dict[str, Any]:
     if minimum < 1 or maximum < minimum:
         raise ValueError("Batch calibration bounds must be positive and ordered")
     if not 0 < safety_factor <= 1:
         raise ValueError("Batch calibration safety factor must be in (0, 1]")
+    if vram_total_mib is not None and vram_total_mib < 1:
+        raise ValueError("vram_total_mib must be positive when supplied")
+    if not 0 < target_vram_min <= target_vram_max <= 1:
+        raise ValueError("VRAM target bounds must be ordered fractions in (0, 1]")
     from oracle_builder.config import resolve_config
 
     # Resolution gives the probe exactly the V2 configuration that training
@@ -98,6 +123,11 @@ def tune(
     largest = 0
     candidate = minimum
     failure_ceiling: int | None = None
+    selected: int | None = None
+    selected_memory: dict[str, Any] | None = None
+    largest_under_target: int | None = None
+    largest_under_target_memory: dict[str, Any] | None = None
+    total_vram_bytes = vram_total_mib * 1024 * 1024 if vram_total_mib else None
     while candidate <= maximum:
         try:
             result = _probe(config, str(input_path), candidate)
@@ -111,10 +141,42 @@ def tune(
         largest = max(largest, int(result["observed_batch_size"]))
         if result["status"] == "dataset_limit":
             break
+        memory = result.get("memory") if isinstance(result.get("memory"), dict) else None
+        peak = memory.get("peak_bytes") if memory else None
+        if total_vram_bytes and isinstance(peak, int) and peak > 0:
+            fraction = peak / total_vram_bytes
+            attempts[-1]["vram_fraction"] = fraction
+            if fraction <= target_vram_max:
+                largest_under_target = candidate
+                largest_under_target_memory = memory
+            if target_vram_min <= fraction <= target_vram_max:
+                selected, selected_memory = candidate, memory
+                break
+            if fraction > target_vram_max:
+                # A power-of-two sequence can jump straight past the desired
+                # band.  Keep the highest previous candidate below the ceiling
+                # rather than reverting to a potentially unsafe OOM-bound
+                # result.  If even batch one exceeds it, it is the only
+                # verified choice and remains the conservative selection.
+                selected = largest_under_target or candidate
+                selected_memory = largest_under_target_memory or memory
+                break
         candidate *= 2
 
     if largest < 1:
         raise RuntimeError("No batch size completed a forward/backward probe")
+    if selected is not None:
+        return {
+            "ready": True,
+            "probe_kind": "representative_forward_backward",
+            "tuning_strategy": "vram_target_power_of_two",
+            "recommended_batch_size": selected,
+            "largest_verified_batch_size": largest,
+            "target_vram_fraction": {"minimum": target_vram_min, "maximum": target_vram_max},
+            "vram_total_mib": vram_total_mib,
+            "selected_peak_memory_mib": selected_memory["peak_bytes"] / (1024 * 1024) if selected_memory else None,
+            "attempts": attempts,
+        }
     if failure_ceiling is not None and largest + 1 < failure_ceiling:
         low, high = largest + 1, failure_ceiling - 1
         while low <= high:
@@ -146,6 +208,7 @@ def tune(
     return {
         "ready": True,
         "probe_kind": "representative_forward_backward",
+        "tuning_strategy": "oom_boundary_fallback",
         "recommended_batch_size": recommended,
         "largest_verified_batch_size": largest,
         "safety_factor": safety_factor,
@@ -160,6 +223,9 @@ def main() -> int:
             args.config, args.input,
             minimum=args.minimum, maximum=args.maximum,
             safety_factor=args.safety_factor,
+            vram_total_mib=args.vram_total_mib,
+            target_vram_min=args.target_vram_min,
+            target_vram_max=args.target_vram_max,
         )
     except Exception as error:
         result = {"ready": False, "reasons": [f"{type(error).__name__}: {error}"]}

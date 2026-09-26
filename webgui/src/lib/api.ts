@@ -1,4 +1,9 @@
 export type RecordValue = Record<string, unknown>;
+export type ApiRequestOptions = Pick<RequestInit, 'signal'>;
+
+export class ApiRequestError extends Error {
+	constructor(message: string, readonly status: number) { super(message); }
+}
 
 async function request<T>(path: string, options: RequestInit = {}, timeoutMs = 15_000): Promise<T> {
 	const controller = new AbortController();
@@ -7,7 +12,7 @@ async function request<T>(path: string, options: RequestInit = {}, timeoutMs = 1
 	try {
 		response = await fetch(`/api${path}`, {
 			...options,
-			signal: options.signal ?? controller.signal,
+			signal: options.signal ? AbortSignal.any([options.signal, controller.signal]) : controller.signal,
 			headers: { 'content-type': 'application/json', ...options.headers }
 		});
 	} catch (error) {
@@ -16,24 +21,27 @@ async function request<T>(path: string, options: RequestInit = {}, timeoutMs = 1
 	} finally { window.clearTimeout(timeout); }
 	if (!response.ok) {
 		const body = await response.json().catch(() => ({}));
-		throw new Error(String(body.detail ?? `${response.status} ${response.statusText}`));
+		throw new ApiRequestError(String(body.detail ?? `${response.status} ${response.statusText}`), response.status);
 	}
 	return response.json() as Promise<T>;
 }
 
 export const api = {
-	datasets: () => request<{ datasets: RecordValue[] }>('/v1/datasets'),
+	datasets: (options?: ApiRequestOptions) => request<{ datasets: RecordValue[] }>('/v1/datasets', options),
 	configurationSchema: () => request<RecordValue>('/v1/config-schema'),
 	modelDefinitionTemplates: () => request<{ templates: RecordValue[] }>('/v1/model-definition-templates'),
-	modelDefinitions: () => request<{ definitions: RecordValue[] }>('/v1/model-definitions'),
+	modelDefinitions: (options?: ApiRequestOptions) => request<{ definitions: RecordValue[] }>('/v1/model-definitions', options),
 	modelDefinition: (id: string, revision?: number) => request<RecordValue>(`/v1/model-definitions/${encodeURIComponent(id)}${revision ? `?revision=${revision}` : ''}`),
 	createModelDefinition: (body: RecordValue) => request<RecordValue>('/v1/model-definitions', { method: 'POST', body: JSON.stringify(body) }),
 	updateModelDefinition: (id: string, body: RecordValue) => request<RecordValue>(`/v1/model-definitions/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(body) }),
+	deleteModelDefinition: (id: string) => request<RecordValue>(`/v1/model-definitions/${encodeURIComponent(id)}`, { method: 'DELETE' }),
 	duplicateModelDefinition: (id: string, body: RecordValue = {}) => request<RecordValue>(`/v1/model-definitions/${encodeURIComponent(id)}:duplicate`, { method: 'POST', body: JSON.stringify(body) }),
 	validateAndQueueDefinition: (id: string, body: RecordValue) => request<RecordValue>(`/v1/model-definitions/${encodeURIComponent(id)}:validate-and-queue`, { method: 'POST', body: JSON.stringify(body) }, 960_000),
-	queuedRuns: () => request<{ queued_runs: RecordValue[] }>('/v1/queued-runs'),
+	validateAndQueueDefinitionSchedule: (id: string, body: RecordValue) => request<RecordValue>(`/v1/model-definitions/${encodeURIComponent(id)}:validate-and-queue/schedule`, { method: 'POST', body: JSON.stringify(body) }),
+	queuedRuns: (options?: ApiRequestOptions) => request<{ queued_runs: RecordValue[] }>('/v1/queued-runs', options),
 	startQueuedRuns: (body: RecordValue) => request<RecordValue>('/v1/queued-runs:start', { method: 'POST', body: JSON.stringify(body) }),
 	cancelQueuedRun: (id: string) => request<RecordValue>(`/v1/queued-runs/${encodeURIComponent(id)}:cancel`, { method: 'POST' }),
+	clearTerminalQueuedRun: (id: string) => request<RecordValue>(`/v1/queued-runs/${encodeURIComponent(id)}:clear`, { method: 'POST' }),
 	clearQueuedRuns: (endpointId?: string) => request<RecordValue>('/v1/queued-runs:clear', { method: 'POST', body: JSON.stringify(endpointId ? { endpoint_id: endpointId } : {}) }),
 	resetStuckJobs: (endpointId?: string) => request<RecordValue>('/v1/jobs:reset-stuck', { method: 'POST', body: JSON.stringify(endpointId ? { endpoint_id: endpointId } : {}) }),
 	modelSetup: (architecture: string) => request<RecordValue>(`/v1/model-setups/${encodeURIComponent(architecture)}`),
@@ -45,7 +53,7 @@ export const api = {
 		return request<RecordValue>(`/v1/datasets/${id}/previews?${search}`);
 	},
 	ingestDataset: (path: string) => request<RecordValue>('/v1/datasets:ingest', { method: 'POST', body: JSON.stringify({ path }) }),
-	artifacts: () => request<{ artifacts: RecordValue[] }>('/v1/artifacts'),
+	artifacts: (options?: ApiRequestOptions) => request<{ artifacts: RecordValue[] }>('/v1/artifacts', options),
 	artifactCatalog: () => request<{ artifacts: RecordValue[] }>('/v1/artifacts/catalog'),
 	artifactCatalogQuery: (body: RecordValue) => request<RecordValue>('/v1/artifacts/catalog/query', { method: 'POST', body: JSON.stringify(body) }),
 	artifactFilterSchema: () => request<RecordValue>('/v1/artifacts/filter-schema'),
@@ -63,9 +71,10 @@ export const api = {
 	comparisonGroups: () => request<{ comparison_groups: RecordValue[] }>('/v1/comparison-groups'),
 	comparisonGroup: (id: string) => request<RecordValue>(`/v1/comparison-groups/${id}`),
 	specifications: (experimentId?: string) => request<{ specifications: RecordValue[] }>(`/v1/specifications${experimentId ? `?experiment_id=${encodeURIComponent(experimentId)}` : ''}`),
-	jobs: (refresh = false) => request<{ jobs: RecordValue[] }>(`/v1/jobs${refresh ? '?refresh=true' : ''}`),
-	health: () => request<RecordValue>('/health/ready'),
-	computeEndpoints: (refresh = false) => request<{ endpoints: RecordValue[] }>(`/v1/compute/endpoints${refresh ? '?refresh=true' : ''}`),
+	jobs: (refresh = false, options?: ApiRequestOptions) => request<{ jobs: RecordValue[] }>(`/v1/jobs${refresh ? '?refresh=true' : ''}`, options),
+	operation: (id: string, options?: ApiRequestOptions) => request<RecordValue>(`/v1/operations/${encodeURIComponent(id)}`, options),
+	health: (options?: ApiRequestOptions) => request<RecordValue>('/health/ready', options),
+	computeEndpoints: (refresh = false, options?: ApiRequestOptions) => request<{ endpoints: RecordValue[] }>(`/v1/compute/endpoints${refresh ? '?refresh=true' : ''}`, options),
 	jobEvents: (id: string) => request<{ events: RecordValue[] }>(`/v1/jobs/${id}/events`),
 	jobTrainingStatus: (id: string) => request<RecordValue>(`/v1/jobs/${encodeURIComponent(id)}/training-status`),
 	pauseJob: (id: string) => request<RecordValue>(`/v1/jobs/${encodeURIComponent(id)}:pause`, { method: 'POST' }),

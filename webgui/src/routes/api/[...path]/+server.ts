@@ -8,7 +8,9 @@ const proxy: RequestHandler = async ({ request, params, url, fetch }) => {
 	target.search = url.search;
 	const headers = new Headers(request.headers);
 	headers.delete('host');
-	const body = ['GET', 'HEAD'].includes(request.method) ? undefined : await request.arrayBuffer();
+	// Preserve streaming bodies (notably multi-gigabyte dataset uploads) instead
+	// of materializing a second full copy in the SvelteKit process.
+	const body = ['GET', 'HEAD'].includes(request.method) ? undefined : request.body;
 	const response = await fetch(target, { method: request.method, headers, body });
 	return new Response(response.body, { status: response.status, headers: response.headers });
 };

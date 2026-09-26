@@ -11,6 +11,29 @@ from oracle_builder.api.compute import ComputeService
 from oracle_builder.api.registry import InferenceModelRegistry
 
 
+def _positive_int(value: str) -> int:
+    """Argparse type for bounded local scheduler capacity settings."""
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a positive integer") from exc
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
+def _environment_positive_int(parser: argparse.ArgumentParser, *names: str) -> int | None:
+    """Read the preferred setting first, retaining the older Builder prefix."""
+    for name in names:
+        value = os.environ.get(name)
+        if value is not None:
+            try:
+                return _positive_int(value)
+            except argparse.ArgumentTypeError as exc:
+                parser.error(f"{name} {exc}")
+    return None
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Serve Oracle Builder inference bundles and compute workers over HTTP.")
     parser.add_argument("--model", action="append", default=[], metavar="ALIAS=RUN_DIR")
@@ -31,6 +54,22 @@ def main() -> None:
     parser.add_argument("--no-preload", action="store_true")
     parser.add_argument("--no-compute", action="store_true", help="Disable the local compute worker API.")
     parser.add_argument("--compute-queue-size", type=int, default=128)
+    worker_slots = _environment_positive_int(
+        parser, "ORACLE_COMPUTE_WORKER_SLOTS", "ORACLE_BUILDER_COMPUTE_WORKER_SLOTS",
+    )
+    cpu_capacity = _environment_positive_int(
+        parser, "ORACLE_COMPUTE_CPU_CAPACITY", "ORACLE_BUILDER_COMPUTE_CPU_CAPACITY",
+    )
+    parser.add_argument(
+        "--compute-worker-slots", type=_positive_int,
+        default=worker_slots if worker_slots is not None else 1,
+        help="Concurrent local compute process slots; GPU and CPU resource leases still gate each launch.",
+    )
+    parser.add_argument(
+        "--compute-cpu-capacity", type=_positive_int,
+        default=cpu_capacity,
+        help="Total CPU cores available to queued local compute jobs (defaults to host capacity).",
+    )
     parser.add_argument("--worker-id", default=os.environ.get("ORACLE_BUILDER_WORKER_ID", "local"))
     parser.add_argument("--max-batch-size", type=int, default=256, help="Maximum combined inference items per model execution.")
     parser.add_argument("--max-wait-ms", type=int, default=8, help="Maximum queueing delay while forming a micro-batch.")
@@ -68,6 +107,8 @@ def main() -> None:
             compute=None if args.no_compute else ComputeService(
                 max_queue_size=args.compute_queue_size,
                 worker_id=args.worker_id,
+                worker_slots=args.compute_worker_slots,
+                cpu_capacity=args.compute_cpu_capacity,
             ),
             auth_token=os.environ.get("ORACLE_BUILDER_API_TOKEN"),
             preload=not args.no_preload,

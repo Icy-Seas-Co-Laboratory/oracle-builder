@@ -9,9 +9,10 @@ import sqlite3
 import urllib.error
 import urllib.request
 import uuid
-from datetime import datetime, timezone
+import threading
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 from PIL import Image
@@ -103,11 +104,138 @@ class Orchestrator:
                 self.browse_roots[f"catalog-{len(self.browse_roots) + 1}"] = location
         with connect(self.database):
             pass
+        self._operation_stop: threading.Event | None = None
+        self._operation_thread: threading.Thread | None = None
         for name, base_url in compute_endpoints or []:
             self.register_compute_endpoint(name=name, base_url=base_url)
 
     def _connection(self) -> sqlite3.Connection:
         return connect(self.database)
+
+    # Durable operations ------------------------------------------------
+    # Long-lived filesystem scans and remote reconciliation must not happen
+    # in a GET request or vanish with an API process.  The runner is deliberately
+    # single-slot for SQLite/local-filesystem deployments; a later distributed
+    # scheduler can claim the same queued rows.
+    def create_operation(self, operation_type: str, parameters: dict[str, Any] | None = None) -> dict[str, Any]:
+        if operation_type not in {"catalog_scan", "training_catalog_scan", "artifact_reindex", "active_job_reconciliation", "validated_queue_validation"}:
+            raise ValueError(f"Unsupported operation type: {operation_type}")
+        now, operation_id = _now(), str(uuid.uuid4())
+        with self._connection() as connection:
+            connection.execute("""INSERT INTO operations(operation_id,operation_type,status,parameters_json,created_at,updated_at)
+                VALUES(?,?, 'queued',?,?,?)""", (operation_id, operation_type, _json(parameters or {}), now, now))
+        self.emit_operation_event(operation_id, "queued", "Operation accepted", {"status": "queued"})
+        return self.operation(operation_id) or {}
+
+    def operation(self, operation_id: str) -> dict[str, Any] | None:
+        with self._connection() as connection:
+            row = connection.execute("SELECT * FROM operations WHERE operation_id=?", (operation_id,)).fetchone()
+            latest_event = connection.execute(
+                "SELECT * FROM operation_events WHERE operation_id=? ORDER BY sequence DESC LIMIT 1",
+                (operation_id,),
+            ).fetchone()
+        result = _row(row)
+        if result and result.get("result_json") is not None:
+            result["result"] = json.loads(result.pop("result_json"))
+        if result:
+            result.pop("result_json", None)
+            if latest_event is not None:
+                event = dict(latest_event)
+                event["data"] = json.loads(event.pop("data_json"))
+                result["latest_event"] = event
+        return result
+
+    def operations(self, *, status: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
+        limit = max(1, min(limit, 500))
+        with self._connection() as connection:
+            rows = connection.execute("SELECT * FROM operations " + ("WHERE status=? " if status else "") + "ORDER BY created_at DESC LIMIT ?", ((status, limit) if status else (limit,))).fetchall()
+        result = []
+        for row in rows:
+            item = self.operation(row["operation_id"])
+            if item: result.append(item)
+        return result
+
+    def operation_events(self, *, after: int = 0, operation_id: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
+        limit = max(1, min(limit, 500))
+        query = "SELECT * FROM operation_events WHERE sequence>?"
+        values: list[Any] = [after]
+        if operation_id:
+            query += " AND operation_id=?"; values.append(operation_id)
+        query += " ORDER BY sequence ASC LIMIT ?"; values.append(limit)
+        with self._connection() as connection: rows = connection.execute(query, values).fetchall()
+        return [{key: value for key, value in dict(row).items() if key != "data_json"} | {"data": json.loads(row["data_json"])} for row in rows]
+
+    def emit_operation_event(self, operation_id: str, event_type: str, message: str, data: dict[str, Any] | None = None) -> dict[str, Any]:
+        now = _now()
+        with self._connection() as connection:
+            cursor = connection.execute("""INSERT INTO operation_events(operation_id,timestamp,event_type,message,data_json)
+                VALUES(?,?,?,?,?)""", (operation_id, now, event_type, message, _json(data or {})))
+            connection.execute("UPDATE operations SET updated_at=? WHERE operation_id=?", (now, operation_id))
+            sequence = cursor.lastrowid
+        return {"sequence": sequence, "operation_id": operation_id, "timestamp": now, "event_type": event_type, "message": message, "data": data or {}}
+
+    def _run_operation(self, operation: dict[str, Any]) -> None:
+        operation_id, kind, parameters = operation["operation_id"], operation["operation_type"], operation["parameters"]
+        self.emit_operation_event(operation_id, "started", "Operation started", {"status": "running"})
+        try:
+            if kind == "catalog_scan": result = self.scan(parameters["root"])
+            elif kind == "training_catalog_scan": result = self.scan_training_catalog(parameters.get("root_id"))
+            elif kind == "artifact_reindex": result = self.reindex_artifact_catalog(parameters.get("artifact_ids"))
+            elif kind == "validated_queue_validation":
+                definition_id = parameters.pop("definition_id")
+                def progress(event_type: str, message: str, data: dict[str, Any] | None = None) -> None:
+                    self.emit_operation_event(operation_id, event_type, message, data)
+                queued_run = self.validate_and_queue_model_definition(definition_id, operation_progress=progress, **parameters)
+                result = {"queued_run": queued_run, "queued_run_id": queued_run["queued_run_id"]}
+            else: result = {"jobs": self.reconcile_active_jobs()}
+            now = _now()
+            with self._connection() as connection:
+                connection.execute("UPDATE operations SET status='completed',result_json=?,completed_at=?,updated_at=? WHERE operation_id=?", (_json(result), now, now, operation_id))
+            self.emit_operation_event(operation_id, "completed", "Operation completed", {"status": "completed"})
+        except Exception as exc:
+            now = _now()
+            with self._connection() as connection:
+                connection.execute("UPDATE operations SET status='failed',error=?,completed_at=?,updated_at=? WHERE operation_id=?", (str(exc), now, now, operation_id))
+            self.emit_operation_event(operation_id, "failed", "Operation failed", {"status": "failed", "error": str(exc)})
+
+    def run_next_operation(self) -> bool:
+        with self._connection() as connection:
+            row = connection.execute("SELECT * FROM operations WHERE status='queued' ORDER BY created_at LIMIT 1").fetchone()
+            if row is not None:
+                now = _now()
+                claimed = connection.execute("UPDATE operations SET status='running',started_at=?,updated_at=? WHERE operation_id=? AND status='queued'", (now, now, row["operation_id"])).rowcount
+        if row is None: return False
+        if claimed != 1: return False
+        operation = _row(row) or {}
+        self._run_operation(operation)
+        return True
+
+    def start_operation_runner(self, *, interval_seconds: float = 0.25, reconciliation_seconds: float = 15.0) -> None:
+        if self._operation_thread and self._operation_thread.is_alive(): return
+        self._operation_stop = threading.Event()
+        def loop() -> None:
+            last_reconciliation = 0.0
+            while not self._operation_stop.is_set():
+                # Coalesce periodic reconciliation so active remote jobs are
+                # refreshed without every browser read triggering network I/O.
+                import time
+                if time.monotonic() - last_reconciliation >= reconciliation_seconds:
+                    with self._connection() as connection:
+                        busy = connection.execute("SELECT 1 FROM operations WHERE operation_type='active_job_reconciliation' AND status IN ('queued','running') LIMIT 1").fetchone()
+                        active = connection.execute("SELECT 1 FROM jobs WHERE status IN ('dispatching','submitted','queued','running','paused','validating') LIMIT 1").fetchone()
+                    # Do not generate an endless stream of no-op operations
+                    # while the workspace is idle; that would defeat the UI's
+                    # adaptive refresh policy and grow the ledger forever.
+                    if busy is None and active is not None:
+                        self.create_operation("active_job_reconciliation")
+                    last_reconciliation = time.monotonic()
+                if not self.run_next_operation(): self._operation_stop.wait(interval_seconds)
+        self._operation_thread = threading.Thread(target=loop, name="oracle-operation-runner", daemon=True)
+        self._operation_thread.start()
+
+    def stop_operation_runner(self) -> None:
+        if self._operation_stop: self._operation_stop.set()
+        if self._operation_thread: self._operation_thread.join(timeout=5)
 
     @staticmethod
     def _architecture_config_path(architecture: str) -> Path:
@@ -289,13 +417,19 @@ class Orchestrator:
                 # A maintained file that is not V2 must never leak into the
                 # authoring catalog.  It remains visible on disk for migration.
                 continue
+            encoder = config.get("encoder") or {}
             templates.append({
                 "template_id": template_id,
                 "name": template_id.replace("_", " "),
                 "path": str(path),
                 "sha256": hashlib.sha256(raw).hexdigest(),
                 "task": (config.get("run") or {}).get("task"),
-                "architecture": {"family": (config.get("encoder") or {}).get("family"), "variant": (config.get("encoder") or {}).get("variant")},
+                # These are the user-facing creation dimensions.  ``model``
+                # deliberately aliases the V2 encoder family so clients do
+                # not need to understand source TOML filenames.
+                "model": encoder.get("family"),
+                "variant": encoder.get("variant"),
+                "architecture": {"family": encoder.get("family"), "variant": encoder.get("variant")},
                 "config": config,
             })
         return templates
@@ -395,6 +529,26 @@ class Orchestrator:
                 raise
         return self.model_definition(new_id)  # type: ignore[return-value]
 
+    def delete_model_definition(self, definition_id: str) -> dict[str, Any]:
+        """Delete an unused definition without breaking sealed run provenance."""
+        current = self.model_definition(definition_id)
+        if current is None:
+            raise KeyError(definition_id)
+        with self._connection() as db:
+            references = db.execute(
+                "SELECT queued_run_id,status FROM queued_runs WHERE definition_id=? ORDER BY created_at",
+                (definition_id,),
+            ).fetchall()
+            if references:
+                states = sorted({str(row["status"]) for row in references})
+                raise ValueError(
+                    "This definition is pinned by "
+                    f"{len(references)} queued or historical run{'s' if len(references) != 1 else ''} "
+                    f"({', '.join(states)}), so it cannot be deleted."
+                )
+            db.execute("DELETE FROM model_definitions WHERE definition_id=?", (definition_id,))
+        return {"definition_id": definition_id, "deleted": True, "name": current["name"]}
+
     @staticmethod
     def _next_definition_duplicate_name(db: sqlite3.Connection, source_name: str) -> str:
         """Choose the next free ``base V.N`` name for an automatic duplicate.
@@ -449,7 +603,7 @@ class Orchestrator:
         return resolve_v2_config(config, dataset_facts=dataset_facts)
 
     def queued_runs(self) -> list[dict[str, Any]]:
-        rows = self._many("SELECT * FROM queued_runs ORDER BY priority DESC, created_at")
+        rows = self._many("SELECT * FROM queued_runs WHERE status != 'archived' ORDER BY priority DESC, created_at")
         for row in rows:
             row["start_authorized"] = bool(row.get("start_authorized"))
             definition = self.model_definition(str(row["definition_id"]), revision=int(row["definition_revision"]))
@@ -485,7 +639,13 @@ class Orchestrator:
         batch_size_mode: str = "manual",
         batch_size: int | None = None,
         maximum_batch_size: int = 256,
+        operation_progress: Callable[[str, str, dict[str, Any] | None], None] | None = None,
     ) -> dict[str, Any]:
+        def progress(event_type: str, message: str, data: dict[str, Any] | None = None) -> None:
+            if operation_progress is not None:
+                operation_progress(event_type, message, data)
+
+        progress("validating", "Validating definition, frozen dataset, and requested resources")
         if not name.strip():
             raise ValueError("A queued run requires a name")
         definition = self.model_definition(definition_id, revision=revision)
@@ -543,7 +703,12 @@ class Orchestrator:
             config.setdefault("data", {})["batch_size"] = resolved_batch_size
             batch_execution: dict[str, Any] = {"mode": "manual", "batch_size": resolved_batch_size}
         else:
-            batch_execution = {"mode": "auto", "maximum_batch_size": maximum_batch_size, "safety_factor": 0.8}
+            probe_minimum = max(1, int(requested_resources.get("gpu_count", 0) or len(requested_resources.get("gpu_ids", [])) or 1))
+            batch_execution = {
+                "mode": "auto", "minimum_batch_size": probe_minimum,
+                "maximum_batch_size": maximum_batch_size,
+                "target_vram_fraction": {"minimum": 0.30, "maximum": 0.80},
+            }
         queue_dir = self.artifact_root / "queued-runs" / queue_id
         queue_dir.mkdir(parents=True, exist_ok=False)
         config_path = queue_dir / "resolved.toml"
@@ -577,6 +742,7 @@ class Orchestrator:
         # Both the orchestrator and compute host inspect the immutable inputs.
         # A host-side preflight is advisory when telemetry is unavailable; its
         # provenance stays attached to the queue row and is rechecked at launch.
+        progress("preflight", "Checking compute endpoint capacity and compatibility", {"endpoint_id": endpoint_id})
         report = self.preflight(specification_id, endpoint_id)
         if report.get("ready") and batch_size_mode == "auto":
             capable_workers = report.get("capable_workers") or []
@@ -591,11 +757,12 @@ class Orchestrator:
                 )
         if report.get("ready") and batch_size_mode == "auto":
             try:
+                progress("calibrating", "Calibrating a safe batch size on the selected compute resource", {"maximum_batch_size": maximum_batch_size})
                 tune_report = self._request(endpoint["base_url"], "POST", "/compute/batch-size-tune", {
                     "parameters": {
                         "config": str(config_path), "input": dataset["path"],
-                        "minimum_batch_size": 1, "maximum_batch_size": maximum_batch_size,
-                        "safety_factor": 0.8,
+                        "minimum_batch_size": probe_minimum, "maximum_batch_size": maximum_batch_size,
+                        "safety_factor": 0.8, "target_vram_min": 0.30, "target_vram_max": 0.80,
                     },
                     "resources": requested_resources,
                 }, timeout_seconds=930)
@@ -608,7 +775,10 @@ class Orchestrator:
                         "maximum_batch_size": maximum_batch_size,
                         "probe_kind": tune_report.get("probe_kind"),
                         "largest_verified_batch_size": tune_report.get("largest_verified_batch_size"),
-                        "safety_factor": tune_report.get("safety_factor"),
+                        "tuning_strategy": tune_report.get("tuning_strategy"),
+                        "target_vram_fraction": tune_report.get("target_vram_fraction"),
+                        "vram_total_mib": tune_report.get("vram_total_mib"),
+                        "selected_peak_memory_mib": tune_report.get("selected_peak_memory_mib"),
                     }
                     parameters["queue_execution"] = batch_execution
                     plan["batch_execution"] = batch_execution
@@ -636,6 +806,7 @@ class Orchestrator:
                 report.setdefault("reasons", []).append(f"Batch-size auto-tuning unavailable: {exc}")
         if report.get("ready"):
             try:
+                progress("compute_preflight", "Running final compute-host preflight", {"endpoint_id": endpoint_id})
                 compute_report = self._request(endpoint["base_url"], "POST", "/compute/preflight", {
                     "action": "train", "parameters": parameters, "resources": requested_resources,
                 })
@@ -649,12 +820,19 @@ class Orchestrator:
         status = "ready" if report.get("ready") else "needs_attention"
         schema_fingerprint = self._definition_catalog_fingerprint()
         with self._connection() as db:
-            db.execute("""INSERT INTO queued_runs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", (
+            db.execute("""INSERT INTO queued_runs (
+                queued_run_id,definition_id,definition_revision,dataset_id,dataset_fingerprint_sha256,
+                name,description,specification_id,resolved_toml_path,resolved_toml_sha256,
+                config_schema_fingerprint,resources_json,initialization_json,preflight_endpoint_id,
+                preflight_status,preflight_report_json,status,start_authorized,priority,failure_reason,
+                created_at,updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", (
                 queue_id, definition_id, int(definition["revision"]), dataset_id, dataset.get("fingerprint_sha256"),
                 name.strip(), description, specification_id, str(config_path), config_digest, schema_fingerprint,
                 _json(requested_resources), _json(initialization or {}), endpoint_id, "valid" if report.get("ready") else "invalid",
                 _json(report), status, 0, 0, "; ".join(report.get("reasons") or []) or None, now, now,
             ))
+        progress("queued_run_created", "Validated run was added to the queue", {"queued_run_id": queue_id, "status": status})
         return self.queued_run(queue_id)  # type: ignore[return-value]
 
     def authorize_queued_runs(
@@ -687,58 +865,203 @@ class Orchestrator:
         dispatched = self.schedule_queued_runs(endpoint_id)
         return {"authorized_ids": selected, "dispatched": dispatched, "queued_runs": [self.queued_run(item) for item in selected]}
 
+    def _release_expired_dispatch_claims(self, endpoint_id: str) -> None:
+        """Recover claims abandoned by a stopped scheduler process.
+
+        A claim is only held around synchronous preflight/submission, normally
+        a few seconds.  Five minutes is deliberately generous so a slow
+        endpoint cannot create a duplicate remote submission.
+        """
+        expires_at = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+        with self._connection() as db:
+            db.execute(
+                """UPDATE queued_runs
+                   SET status='waiting_for_resources', dispatch_claim_token=NULL,
+                       dispatch_claim_owner=NULL, dispatch_claimed_at=NULL,
+                       failure_reason=COALESCE(failure_reason, 'Dispatch claim expired; retrying automatically'),
+                       updated_at=?
+                   WHERE preflight_endpoint_id=? AND status='dispatching'
+                     AND dispatch_claimed_at IS NOT NULL AND dispatch_claimed_at < ?""",
+                (_now(), endpoint_id, expires_at),
+            )
+
+    @staticmethod
+    def _resource_request(resources: dict[str, Any] | None) -> tuple[int, list[str] | None]:
+        request = resources or {}
+        cpu = request.get("cpu_count", request.get("cpu_cores", 1))
+        cpu_count = int(cpu) if isinstance(cpu, int) and not isinstance(cpu, bool) and cpu > 0 else 1
+        explicit = request.get("gpu_ids")
+        if isinstance(explicit, list):
+            return cpu_count, [str(item) for item in explicit]
+        gpu_count = request.get("gpu_count", 0)
+        return cpu_count, None if isinstance(gpu_count, int) and gpu_count > 0 else []
+
+    def _scheduler_capacity(self, endpoint: dict[str, Any]) -> dict[str, Any]:
+        """Make a conservative local reservation view from Serve's snapshot."""
+        workers = endpoint.get("workers") or []
+        idle = [worker for worker in workers if worker.get("status") == "idle"]
+        gpu_ids = {
+            str(gpu.get("id")) for worker in workers
+            for gpu in ((worker.get("capabilities") or {}).get("gpus") or [])
+            if isinstance(gpu, dict) and gpu.get("id") is not None
+        }
+        resources = (endpoint.get("queue") or {}).get("resources") or {}
+        leased = {str(item) for item in resources.get("gpu_leases") or []}
+        cpu_capacity = resources.get("cpu_capacity")
+        cpu_in_use = resources.get("cpu_in_use", 0)
+        cpu_free = None
+        if isinstance(cpu_capacity, int) and isinstance(cpu_in_use, int):
+            cpu_free = max(0, cpu_capacity - cpu_in_use)
+        return {"slots": len(idle), "gpu_ids": gpu_ids, "leased_gpus": leased, "cpu_free": cpu_free}
+
+    def _claim_queued_run(self, endpoint_id: str, queued_run_id: str, owner: str) -> dict[str, Any] | None:
+        token, now = str(uuid.uuid4()), _now()
+        with self._connection() as db:
+            result = db.execute(
+                """UPDATE queued_runs SET status='dispatching', dispatch_claim_token=?,
+                       dispatch_claim_owner=?, dispatch_claimed_at=?, dispatch_attempt=dispatch_attempt+1,
+                       failure_reason=NULL, updated_at=?
+                   WHERE queued_run_id=? AND preflight_endpoint_id=? AND start_authorized=1
+                     AND status IN ('ready','waiting_for_resources') AND dispatch_claim_token IS NULL""",
+                (token, owner, now, now, queued_run_id, endpoint_id),
+            )
+            if result.rowcount != 1:
+                return None
+            return _row(db.execute("SELECT * FROM queued_runs WHERE queued_run_id=?", (queued_run_id,)).fetchone())
+
+    def _release_dispatch_claim(self, queued_run_id: str, *, reason: str, report: dict[str, Any] | None = None) -> None:
+        with self._connection() as db:
+            db.execute(
+                """UPDATE queued_runs SET status='waiting_for_resources', dispatch_claim_token=NULL,
+                   dispatch_claim_owner=NULL, dispatch_claimed_at=NULL, failure_reason=?,
+                   preflight_report_json=COALESCE(?, preflight_report_json), updated_at=?
+                   WHERE queued_run_id=? AND status='dispatching'""",
+                (reason, _json({"launch_preflight": report}) if report is not None else None, _now(), queued_run_id),
+            )
+
+    def _acquire_scheduler_lease(self, endpoint_id: str, owner: str) -> bool:
+        """Claim an endpoint-wide capacity snapshot for one scheduler tick."""
+        expires_at = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+        with self._connection() as db:
+            claimed = db.execute(
+                """INSERT INTO scheduler_leases(endpoint_id,owner,claimed_at) VALUES(?,?,?)
+                   ON CONFLICT(endpoint_id) DO UPDATE SET owner=excluded.owner, claimed_at=excluded.claimed_at
+                   WHERE scheduler_leases.claimed_at < ?""",
+                (endpoint_id, owner, _now(), expires_at),
+            ).rowcount
+        return claimed == 1
+
+    def _release_scheduler_lease(self, endpoint_id: str, owner: str) -> None:
+        with self._connection() as db:
+            db.execute("DELETE FROM scheduler_leases WHERE endpoint_id=? AND owner=?", (endpoint_id, owner))
+
     def schedule_queued_runs(self, endpoint_id: str) -> list[dict[str, Any]]:
-        """Dispatch at most one training run per endpoint in the initial policy."""
-        endpoint = self.compute_endpoint(endpoint_id)
+        """Fill capacity, serializing each endpoint's volatile snapshot."""
+        if self.compute_endpoint(endpoint_id) is None:
+            raise KeyError("Compute endpoint was not found")
+        owner = str(uuid.uuid4())
+        if not self._acquire_scheduler_lease(endpoint_id, owner):
+            return []
+        try:
+            return self._schedule_queued_runs_locked(endpoint_id, owner)
+        finally:
+            self._release_scheduler_lease(endpoint_id, owner)
+
+    def _schedule_queued_runs_locked(self, endpoint_id: str, owner: str) -> list[dict[str, Any]]:
+        """Fill currently advertised Serve capacity with authorized sealed runs.
+
+        The endpoint is refreshed once, then this invocation reserves slots,
+        CPU and GPU IDs locally while it submits.  Serve remains the final
+        resource authority; the durable claim prevents concurrent scheduler
+        invocations from submitting a queue row twice.
+        """
+        endpoint = self.refresh_compute_endpoint(endpoint_id)
         if endpoint is None:
             raise KeyError("Compute endpoint was not found")
-        active = [
-            job for job in self.jobs()
-            if job.get("oracle_serve_url", "").rstrip("/") == endpoint["base_url"].rstrip("/")
-            and job.get("status") in {"dispatching", "submitted", "queued", "running", "paused", "validating"}
-        ]
-        if active:
+        self._release_expired_dispatch_claims(endpoint_id)
+        if not endpoint.get("enabled") or endpoint.get("status") != "ready":
             return []
+        capacity = self._scheduler_capacity(endpoint)
+        if capacity["slots"] < 1:
+            return []
+        dispatched = []
+        # A bounded candidate snapshot means a malformed/high-priority row
+        # cannot starve a compatible one behind it.
         with self._connection() as db:
-            row = _row(db.execute("""SELECT * FROM queued_runs
-                WHERE status='ready' AND start_authorized=1 AND preflight_endpoint_id=?
-                ORDER BY priority DESC, created_at LIMIT 1""", (endpoint_id,)).fetchone())
-        if row is None:
-            return []
-        # Capacity is volatile.  Re-run the compute-host admission check after
-        # the user authorizes this row and immediately before dispatching it.
-        # This intentionally remains an inventory-based VRAM check; the
-        # report records that provenance rather than promising a train-step
-        # memory guarantee we have not executed.
-        specification = self.specification(str(row["specification_id"]))
-        if specification is None:
-            raise KeyError("Queued run specification was not found")
-        try:
-            compute_report = self._request(endpoint["base_url"], "POST", "/compute/preflight", {
-                "action": specification["action"],
-                "parameters": specification["parameters"],
-                "resources": specification["resources"],
-            })
-        except RuntimeError as exc:
-            compute_report = {"ready": False, "reasons": [f"Compute preflight unavailable: {exc}"]}
-        if not compute_report.get("ready"):
-            reason = "; ".join(compute_report.get("reasons") or ["Compute capacity is no longer ready"])
+            candidates = [_row(row) for row in db.execute(
+                """SELECT * FROM queued_runs WHERE preflight_endpoint_id=? AND start_authorized=1
+                   AND status IN ('ready','waiting_for_resources')
+                   ORDER BY priority DESC, created_at""", (endpoint_id,)
+            ).fetchall()]
+        for candidate in candidates:
+            if candidate is None or capacity["slots"] < 1:
+                break
+            resources = candidate.get("resources") or {}
+            cpu_count, explicit_gpu_ids = self._resource_request(resources)
+            requested_gpu_count = int(resources.get("gpu_count") or 0)
+            used_gpus = capacity["leased_gpus"]
+            if capacity["cpu_free"] is not None and cpu_count > capacity["cpu_free"]:
+                with self._connection() as db:
+                    db.execute("UPDATE queued_runs SET status='waiting_for_resources', failure_reason=?, updated_at=? WHERE queued_run_id=? AND status IN ('ready','waiting_for_resources')", ("Waiting for CPU capacity", _now(), candidate["queued_run_id"]))
+                continue
+            if explicit_gpu_ids is not None:
+                required_gpus = set(explicit_gpu_ids)
+                if required_gpus & used_gpus:
+                    # No claim is necessary to report a wait; a running
+                    # scheduler must not hold a lease while capacity is absent.
+                    with self._connection() as db:
+                        db.execute("UPDATE queued_runs SET status='waiting_for_resources', failure_reason=?, updated_at=? WHERE queued_run_id=? AND status IN ('ready','waiting_for_resources')", ("Waiting for selected GPU(s): " + ", ".join(sorted(required_gpus & used_gpus)), _now(), candidate["queued_run_id"]))
+                    continue
+                if required_gpus - capacity["gpu_ids"]:
+                    with self._connection() as db:
+                        db.execute("UPDATE queued_runs SET status='waiting_for_resources', failure_reason=?, updated_at=? WHERE queued_run_id=? AND status IN ('ready','waiting_for_resources')", ("Selected GPU(s) are unavailable: " + ", ".join(sorted(required_gpus - capacity["gpu_ids"])), _now(), candidate["queued_run_id"]))
+                    continue
+            elif requested_gpu_count:
+                free = capacity["gpu_ids"] - used_gpus
+                if len(free) < requested_gpu_count:
+                    with self._connection() as db:
+                        db.execute("UPDATE queued_runs SET status='waiting_for_resources', failure_reason=?, updated_at=? WHERE queued_run_id=? AND status IN ('ready','waiting_for_resources')", ("Waiting for GPU capacity", _now(), candidate["queued_run_id"]))
+                    continue
+                required_gpus = set(sorted(free)[:requested_gpu_count])
+            else:
+                # Serve preserves legacy unconstrained CUDA visibility by
+                # leasing every GPU; reserve the same set here.
+                required_gpus = set(capacity["gpu_ids"])
+                if required_gpus & used_gpus:
+                    continue
+            row = self._claim_queued_run(endpoint_id, candidate["queued_run_id"], owner)
+            if row is None:
+                continue
+            specification = self.specification(str(row["specification_id"]))
+            if specification is None:
+                self._release_dispatch_claim(row["queued_run_id"], reason="Queued run specification was not found")
+                continue
+            try:
+                compute_report = self._request(endpoint["base_url"], "POST", "/compute/preflight", {
+                    "action": specification["action"], "parameters": specification["parameters"],
+                    "resources": specification["resources"],
+                })
+            except RuntimeError as exc:
+                compute_report = {"ready": False, "reasons": [f"Compute preflight unavailable: {exc}"]}
+            if not compute_report.get("ready"):
+                self._release_dispatch_claim(row["queued_run_id"], reason="; ".join(compute_report.get("reasons") or ["Compute capacity is no longer ready"]), report=compute_report)
+                continue
+            try:
+                job = self.dispatch(str(row["specification_id"]), endpoint_id)
+            except (RuntimeError, ValueError) as exc:
+                self._release_dispatch_claim(row["queued_run_id"], reason=str(exc))
+                continue
             with self._connection() as db:
-                db.execute(
-                    "UPDATE queued_runs SET status='waiting_for_resources', preflight_report_json=?, failure_reason=?, updated_at=? WHERE queued_run_id=?",
-                    (_json({"launch_preflight": compute_report}), reason, _now(), row["queued_run_id"]),
-                )
-            return []
-        try:
-            job = self.dispatch(str(row["specification_id"]), endpoint_id)
-        except (RuntimeError, ValueError) as exc:
-            with self._connection() as db:
-                db.execute("UPDATE queued_runs SET status='waiting_for_resources', failure_reason=?, updated_at=? WHERE queued_run_id=?", (str(exc), _now(), row["queued_run_id"]))
-            return []
-        with self._connection() as db:
-            db.execute("UPDATE jobs SET queued_run_id=? WHERE job_id=?", (row["queued_run_id"], job["job_id"]))
-            db.execute("UPDATE queued_runs SET status='submitted', updated_at=? WHERE queued_run_id=?", (_now(), row["queued_run_id"]))
-        return [job]
+                db.execute("UPDATE jobs SET queued_run_id=? WHERE job_id=?", (row["queued_run_id"], job["job_id"]))
+                db.execute("""UPDATE queued_runs SET status='submitted', dispatch_claim_token=NULL,
+                    dispatch_claim_owner=NULL, dispatch_claimed_at=NULL, failure_reason=NULL, updated_at=?
+                    WHERE queued_run_id=? AND dispatch_claim_token=?""", (_now(), row["queued_run_id"], row["dispatch_claim_token"]))
+            dispatched.append(job)
+            capacity["slots"] -= 1
+            capacity["leased_gpus"].update(required_gpus)
+            if capacity["cpu_free"] is not None:
+                capacity["cpu_free"] -= cpu_count
+        return dispatched
 
     def cancel_queued_run(self, queued_run_id: str) -> dict[str, Any]:
         queued = self.queued_run(queued_run_id)
@@ -749,6 +1072,23 @@ class Orchestrator:
         with self._connection() as db:
             db.execute("UPDATE queued_runs SET status='cancelled', start_authorized=0, updated_at=? WHERE queued_run_id=?", (_now(), queued_run_id))
         return self.queued_run(queued_run_id)  # type: ignore[return-value]
+
+    def archive_terminal_queued_run(self, queued_run_id: str) -> dict[str, Any]:
+        """Clear a finished queue row while preserving the immutable job audit."""
+        queued = self.queued_run(queued_run_id)
+        if queued is None:
+            raise KeyError(queued_run_id)
+        with self._connection() as db:
+            job = _row(db.execute("SELECT job_id,status FROM jobs WHERE queued_run_id=? ORDER BY submitted_at DESC LIMIT 1", (queued_run_id,)).fetchone())
+            terminal = {"failed", "cancelled", "indexed", "artifact_invalid", "dispatch_failed", "succeeded"}
+            if job is not None and job["status"] not in terminal:
+                raise ValueError("Only a finished or failed run can be cleared from the queue")
+            if job is None and queued["status"] not in {"failed", "cancelled", "complete", "needs_attention", "waiting_for_resources"}:
+                raise ValueError("Only a non-running queue entry can be cleared")
+            db.execute("UPDATE queued_runs SET status='archived', start_authorized=0, updated_at=? WHERE queued_run_id=?", (_now(), queued_run_id))
+        if job is not None:
+            self._record_event(str(job["job_id"]), "queue_cleared", "Queue row cleared by user; execution logs remain retained", {"queued_run_id": queued_run_id})
+        return {"queued_run_id": queued_run_id, "archived": True, "job_id": job.get("job_id") if job else None}
 
     def control_job(self, job_id: str, action: str) -> dict[str, Any]:
         """Proxy an explicit lifecycle control to the owning compute service.
@@ -791,9 +1131,9 @@ class Orchestrator:
         Jobs that have been submitted or are running remain untouched and must
         be handled through their own execution controls.
         """
-        query, params = "SELECT queued_run_id,status FROM queued_runs", []
+        query, params = "SELECT queued_run_id,status FROM queued_runs WHERE status != 'archived'", []
         if endpoint_id:
-            query += " WHERE preflight_endpoint_id=?"; params.append(endpoint_id)
+            query += " AND preflight_endpoint_id=?"; params.append(endpoint_id)
         with self._connection() as db:
             rows = [dict(row) for row in db.execute(query, params).fetchall()]
             cancellable = [row["queued_run_id"] for row in rows if row["status"] in {"ready", "needs_attention", "waiting_for_resources"}]
@@ -847,7 +1187,10 @@ class Orchestrator:
             compute = self._request(endpoint["base_url"], "GET", "/compute/status")
             status = "ready" if readiness.get("status") == "ready" and compute.get("status") == "ready" else "degraded"
             error = None
-            workers, queue = compute.get("workers") or [], compute.get("queue") or {}
+            workers, queue = compute.get("workers") or [], dict(compute.get("queue") or {})
+            # Keep Serve's live capacity snapshot beside the existing queue
+            # payload for backward-compatible endpoint responses.
+            queue["resources"] = compute.get("resources") or {}
         except RuntimeError as exc:
             status, error, readiness, workers, queue = "unavailable", str(exc), None, [], {}
         with self._connection() as db:
@@ -2411,6 +2754,17 @@ class Orchestrator:
                 results.append(self.reconcile_job(job["job_id"]))
             except RuntimeError:
                 results.append(job)
+        # A terminal reconciliation releases a Serve slot.  Refill every
+        # affected endpoint now; claims make this safe if another tick races.
+        affected_urls = {str(job.get("oracle_serve_url") or "").rstrip("/") for job in results}
+        for endpoint in self.compute_endpoints():
+            if endpoint["base_url"].rstrip("/") in affected_urls:
+                try:
+                    self.schedule_queued_runs(str(endpoint["endpoint_id"]))
+                except RuntimeError:
+                    # Reconciliation remains best-effort when a compute host
+                    # goes away between observing a terminal job and refill.
+                    pass
         return results
 
     def reset_stuck_jobs(self, *, endpoint_id: str | None = None) -> dict[str, Any]:
@@ -2614,9 +2968,32 @@ class Orchestrator:
                 "SELECT comparison_group_id, COUNT(*) AS member_count FROM comparison_group_members GROUP BY comparison_group_id"
             ).fetchall()}
         return [{**group, "member_count": counts.get(group["comparison_group_id"], 0)} for group in groups if group]
+    def _endpoint_with_scheduler_capacity(self, endpoint: dict[str, Any]) -> dict[str, Any]:
+        """Expose the cached Serve resource snapshot in a UI-friendly shape."""
+        queue = endpoint.get("queue") or {}
+        resources = queue.get("resources") or {}
+        workers = endpoint.get("workers") or []
+        worker_slots = resources.get("worker_slots")
+        if not isinstance(worker_slots, int):
+            worker_slots = len(workers)
+        free_slots = sum(worker.get("status") == "idle" for worker in workers)
+        return {
+            **endpoint,
+            "resources": resources,
+            "capacity": {
+                "worker_slots": worker_slots,
+                "free_slots": free_slots,
+                "active_slots": max(0, worker_slots - free_slots),
+                "cpu_capacity": resources.get("cpu_capacity"),
+                "cpu_in_use": resources.get("cpu_in_use"),
+                "gpu_leases": resources.get("gpu_leases") or [],
+            },
+            "scheduler_resources": resources,
+        }
+
     def compute_endpoints(self, *, refresh: bool = False) -> list[dict[str, Any]]:
         endpoints = self._many("SELECT * FROM compute_endpoints WHERE enabled=1 ORDER BY name")
-        return [self.refresh_compute_endpoint(item["endpoint_id"]) for item in endpoints] if refresh else endpoints
+        return [self.refresh_compute_endpoint(item["endpoint_id"]) for item in endpoints] if refresh else [self._endpoint_with_scheduler_capacity(item) for item in endpoints]
     def _many(self, query: str) -> list[dict[str, Any]]:
         with self._connection() as db: return [_row(item) for item in db.execute(query).fetchall()]  # type: ignore[list-item]
     def dataset(self, value: str, *, connection: sqlite3.Connection | None = None) -> dict[str, Any] | None:
@@ -2642,7 +3019,8 @@ class Orchestrator:
                 WHERE jobs.job_id=?""", (value,)).fetchone())
     def compute_endpoint(self, value: str) -> dict[str, Any] | None:
         with self._connection() as db:
-            return _row(db.execute("SELECT * FROM compute_endpoints WHERE endpoint_id=?", (value,)).fetchone())
+            endpoint = _row(db.execute("SELECT * FROM compute_endpoints WHERE endpoint_id=?", (value,)).fetchone())
+        return self._endpoint_with_scheduler_capacity(endpoint) if endpoint is not None else None
     def comparison(self, value: str) -> dict[str, Any] | None:
         with self._connection() as db:
             return _row(db.execute("SELECT * FROM comparisons WHERE comparison_id=?", (value,)).fetchone())

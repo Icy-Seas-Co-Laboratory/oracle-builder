@@ -23,6 +23,13 @@ kept in focused components (`models/ModelRunsView.svelte`,
 `ModelConstructionView.svelte`, and `TrainingStudio.svelte`) while shared
 operational data is refreshed centrally without a global client-side store.
 
+Operational state is coordinated by one visibility-aware browser refresh loop:
+it consumes the orchestrator's resumable event stream when available, then
+falls back to polling every 5 seconds for active work, 20 seconds when idle,
+and 60 seconds while hidden. This prevents the queue and workspace shell from
+independently reconciling the same jobs. Older orchestrators remain supported
+through the polling fallback during a rolling upgrade.
+
 For local development, run `scripts/start_oracle_stack.sh` from the repository
 root. The GUI defaults to `http://127.0.0.1:5111`; Oracle Serve and the
 Orchestrator retain their defaults at ports `8100` and `8110`. The script checks

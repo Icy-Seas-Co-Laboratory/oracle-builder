@@ -39,6 +39,22 @@ class BatchTuneRequest(BaseModel):
     resources: dict[str, Any] = Field(default_factory=dict)
 
 
+def _positive_environment_int(*names: str) -> int | None:
+    """Return the first configured positive integer, preferring earlier names."""
+    for name in names:
+        value = os.environ.get(name)
+        if value is None:
+            continue
+        try:
+            parsed = int(value)
+        except ValueError as exc:
+            raise ValueError(f"{name} must be a positive integer") from exc
+        if parsed < 1:
+            raise ValueError(f"{name} must be a positive integer")
+        return parsed
+    return None
+
+
 def create_app(
     registry: InferenceModelRegistry,
     *,
@@ -296,6 +312,12 @@ def app_from_environment() -> FastAPI:
         compute=ComputeService(
             max_queue_size=int(os.environ.get("ORACLE_BUILDER_COMPUTE_QUEUE_SIZE", 128)),
             worker_id=os.environ.get("ORACLE_BUILDER_WORKER_ID", "local"),
+            worker_slots=_positive_environment_int(
+                "ORACLE_COMPUTE_WORKER_SLOTS", "ORACLE_BUILDER_COMPUTE_WORKER_SLOTS",
+            ) or 1,
+            cpu_capacity=_positive_environment_int(
+                "ORACLE_COMPUTE_CPU_CAPACITY", "ORACLE_BUILDER_COMPUTE_CPU_CAPACITY",
+            ),
         ) if os.environ.get("ORACLE_BUILDER_COMPUTE_ENABLED", "true").lower() not in {"0", "false", "no"} else None,
         auth_token=os.environ.get("ORACLE_BUILDER_API_TOKEN"),
         preload=os.environ.get("ORACLE_BUILDER_PRELOAD", "true").lower() not in {"0", "false", "no"},
