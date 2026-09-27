@@ -67,6 +67,14 @@ code, pre, .code { font-family: 'SFMono-Regular', Consolas, ui-monospace, monosp
 .sidebar-context dl div { display: flex; justify-content: space-between; padding: .35rem 0; color: #77949a; font-size: .73rem; }
 .sidebar-context dt { letter-spacing: 0; text-transform: none; }
 .sidebar-context dd { margin: 0; color: #b9cdcf; font-weight: 600; }
+.tensorflow-devices { margin-top: auto; padding: 1rem .5rem 0; }
+.tensorflow-devices .nav-label { padding: 0; }
+.tensorflow-device { display: grid; grid-template-columns: .5rem minmax(0, 1fr) auto; gap: .4rem; align-items: center; padding: .25rem 0; color: #b9cdcf; font: .68rem 'SFMono-Regular', Consolas, ui-monospace, monospace; }
+.tensorflow-device i { width: .45rem; height: .45rem; border-radius: 50%; background: #57cbb8; box-shadow: 0 0 0 3px rgba(87, 203, 184, .12); }
+.tensorflow-device i.busy { background: #e8ad62; box-shadow: 0 0 0 3px rgba(232, 173, 98, .12); }
+.tensorflow-device i.offline { background: #dc7479; box-shadow: none; }
+.tensorflow-device span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tensorflow-device small, .device-empty { color: #718e93; font: .61rem inherit; }
 .side-foot { margin-top: auto; padding: 1rem .5rem .2rem; color: #89a4a8; font-size: .71rem; line-height: 1.55; }
 .side-foot span { display: inline-block; width: .5rem; height: .5rem; margin-right: .35rem; border-radius: 50%; }
 .side-foot .pulse { background: #57cbb8; box-shadow: 0 0 0 4px rgba(87, 203, 184, .12); }

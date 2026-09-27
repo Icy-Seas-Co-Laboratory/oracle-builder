@@ -32,6 +32,7 @@
 	let batchSizeMode: 'manual' | 'auto' = 'manual';
 	let batchSize = 16;
 	let maximumBatchSize = 256;
+	let epochs = 10;
 	let batchDefinitionId = '';
 	let selected = new Set<string>();
 	let busy = false;
@@ -41,6 +42,8 @@
 	let logEvents: RecordValue[] = [];
 	let logsLoading = false;
 	let clearingQueuedRunId = '';
+	let batchOverrideQueuedRunId = '';
+	let batchOverrideValue = 1;
 	let loadController: AbortController | undefined;
 	let loadInFlight: Promise<void> | undefined;
 	let validationOperationId = '';
@@ -78,13 +81,15 @@
 	$: availableGpuIds = new Set(endpointGpus.map((gpu) => String(gpu.id)));
 	$: if (gpuIds.some((id) => !availableGpuIds.has(id))) gpuIds = gpuIds.filter((id) => availableGpuIds.has(id));
 	$: endpointReady = Boolean(selectedEndpoint && selectedEndpoint.status === 'ready');
-	$: canQueue = Boolean(definitionId && datasetId && endpointId && runName.trim());
+	$: validEpochs = Number.isInteger(epochs) && epochs >= 1;
+	$: canQueue = Boolean(definitionId && datasetId && endpointId && runName.trim() && validEpochs);
 	$: validationInProgress = ['queued', 'running', 'validating'].includes(String(validationOperation?.status));
 	$: queueRequirements = [
 		{ label: 'Definition revision', detail: selectedDefinition ? `${text(selectedDefinition.name)} · revision ${text(selectedDefinition.revision)} pinned` : 'Choose a versioned definition', state: selectedDefinition ? 'ready' : 'blocked' },
 		{ label: 'Frozen training set', detail: selectedDataset ? `${text(selectedDataset.name)} verified` : frozenDatasets.length ? 'Choose a frozen revision' : 'Freeze a training set first', state: selectedDataset ? 'ready' : 'blocked' },
 		{ label: 'Compute endpoint', detail: selectedEndpoint ? `${text(selectedEndpoint.name)} · ${endpointReady ? 'reachable' : text(selectedEndpoint.status)}` : 'Choose an endpoint', state: endpointReady ? 'ready' : selectedEndpoint ? 'advisory' : 'blocked' },
 		{ label: 'Allocation & telemetry', detail: endpointGpus.length ? (gpuIds.length ? `GPU ${gpuIds.join(', ')} selected` : 'CPU allocation selected') : selectedEndpoint ? 'CPU allocation; GPU telemetry unavailable' : 'Select an endpoint first', state: selectedEndpoint ? (endpointGpus.length ? 'ready' : 'advisory') : 'blocked' },
+		{ label: 'Training epochs', detail: validEpochs ? `${epochs} epoch${epochs === 1 ? '' : 's'} will be sealed with this run` : 'Enter a positive whole number', state: validEpochs ? 'ready' : 'blocked' },
 		{ label: 'Run name', detail: runName.trim() ? 'Name is ready to seal' : 'Enter a descriptive run name', state: runName.trim() ? 'ready' : 'blocked' },
 	];
 	$: missingRequirements = queueRequirements.filter((check) => check.state === 'blocked');
@@ -147,6 +152,13 @@
 		return current[key] ?? completed[key];
 	}
 	const supportsControl = (live: RecordValue | undefined, action: string) => Array.isArray(live?.controls) && live.controls.map(String).includes(action);
+	const canOverrideBatch = (item: RecordValue) => !item.start_authorized && ['ready', 'needs_attention', 'waiting_for_resources'].includes(String(item.status));
+	const batchOverrideDetail = (item: RecordValue) => {
+		const execution = record(item.batch_execution);
+		if (execution.mode !== 'manual_override') return '';
+		const tuned = number(execution.auto_tuned_batch_size);
+		return tuned != null ? `Auto-tuned ${tuned}; manually set to ${text(item.batch_size)}.` : 'Manual queue-level batch override.';
+	};
 	function toggleGpu(id: string) {
 		gpuIds = gpuIds.includes(id) ? [] : [id];
 	}
@@ -218,6 +230,7 @@
 			batch_size_mode: batchSizeMode,
 			batch_size: batchSizeMode === 'manual' ? batchSize : undefined,
 			maximum_batch_size: batchSizeMode === 'auto' ? maximumBatchSize : undefined,
+			epochs,
 		};
 		try {
 			try {
@@ -253,6 +266,22 @@
 	async function cancel(id: string) {
 		try { await api.cancelQueuedRun(id); await load(); await onchanged('Removed the queued run.'); }
 		catch (error) { onfailure(error instanceof Error ? error.message : 'Could not cancel this queued run.'); }
+	}
+	function editBatchSize(item: RecordValue) {
+		batchOverrideQueuedRunId = String(item.queued_run_id);
+		batchOverrideValue = number(item.batch_size) ?? 1;
+	}
+	async function saveBatchSize(item: RecordValue) {
+		const id = String(item.queued_run_id ?? '');
+		if (!id || !Number.isInteger(batchOverrideValue) || batchOverrideValue < 1) return;
+		busy = true;
+		try {
+			await api.updateQueuedRunBatchSize(id, batchOverrideValue);
+			batchOverrideQueuedRunId = '';
+			await load();
+			await onchanged(`Batch size set to ${batchOverrideValue} for this queued run. It remains unstarted and will be rechecked at launch.`);
+		} catch (error) { onfailure(error instanceof Error ? error.message : 'Could not update the queued batch size.'); }
+		finally { busy = false; }
 	}
 	async function showLogs(job: RecordValue) {
 		const id = String(job.job_id ?? job.id ?? '');
@@ -330,14 +359,15 @@
 	</section>
 {/if}
 
-<section class="panel training-form">
-	<div class="panel-head"><div><h2>Validate and queue a run</h2><p>Definitions carry the scientific and training settings. This step only selects frozen data and compute.</p></div></div>
+	<section class="panel training-form">
+	<div class="panel-head"><div><h2>Validate and queue a run</h2><p>Definitions carry reusable architecture and training protocol. This step sets the frozen data, compute, and run-specific epoch budget.</p></div></div>
 	<div class="editor-fields">
 		<label>Model definition<select bind:value={definitionId}>{#each definitions as definition}<option value={String(definition.definition_id)}>{text(definition.name)} · revision {text(definition.revision)}</option>{/each}</select></label>
 		<label>Frozen training set<select bind:value={datasetId}>{#each frozenDatasets as dataset}<option value={String(dataset.dataset_id)}>{text(dataset.name)} · {text(dataset.fingerprint_sha256).slice(0, 10)}</option>{/each}</select></label>
 		<label>Compute endpoint<select bind:value={endpointId}>{#each computeEndpoints as endpoint}<option value={String(endpoint.endpoint_id)}>{text(endpoint.name)} · {text(endpoint.status)}</option>{/each}</select></label>
 		<div class="gpu-allocation"><span>GPU allocation</span>{#if endpointGpus.length}<div class="gpu-chips"><button type="button" class:active={!gpuIds.length} on:click={() => gpuIds = []}>CPU</button>{#each endpointGpus as gpu}<button type="button" class:active={gpuIds.includes(String(gpu.id))} aria-pressed={gpuIds.includes(String(gpu.id))} on:click={() => toggleGpu(String(gpu.id))}>{gpuLabel(gpu)}</button>{/each}</div><small>Select one exact GPU. This allocation and its runtime device policy are sealed with the queued run.</small>{:else}<small>No GPU inventory is available for this endpoint. Queueing will use an explicit CPU allocation until GPU telemetry is visible.</small>{/if}</div>
 		<div class="batch-allocation"><span>Training batch size</span><div class="choice-tabs"><button type="button" class:active={batchSizeMode === 'manual'} on:click={() => batchSizeMode = 'manual'}>Manual</button><button type="button" class:active={batchSizeMode === 'auto'} on:click={() => batchSizeMode = 'auto'}>Auto-tune</button></div>{#if batchSizeMode === 'manual'}<label>Batch size<input type="number" min="1" bind:value={batchSize} /></label><small>Sealed for this run only; it does not change the model definition.</small>{:else}<label>Maximum to test<input type="number" min="1" bind:value={maximumBatchSize} /></label><small>Starts at one sample per allocated GPU and doubles by powers of two. When GPU allocator telemetry is available, it chooses the first 30–80% VRAM candidate; otherwise it falls back to an OOM-bound safety margin.</small>{/if}</div>
+		<label>Epochs per training phase<input type="number" min="1" bind:value={epochs} /></label>
 	</div>
 	<label>Queued run name<input bind:value={runName} placeholder="e.g. exp001-resnet-128 · frozen-v4" /></label>
 	<div class="queue-preflight" aria-live="polite"><div class="preflight-heading"><div><p class="eyebrow">LAUNCH READINESS</p><h3>{missingRequirements.length ? `${missingRequirements.length} item${missingRequirements.length === 1 ? '' : 's'} needed before validation` : endpointReady ? 'Ready to validate and queue' : 'Ready to validate; endpoint needs attention'}</h3></div><span class:ready={canQueue} class:advisory={!canQueue && Boolean(selectedEndpoint)} class="preflight-state">{canQueue ? 'FORM COMPLETE' : 'INCOMPLETE'}</span></div><div class="preflight-checks">{#each queueRequirements as check}<div class:ready={check.state === 'ready'} class:advisory={check.state === 'advisory'} class:blocked={check.state === 'blocked'} class="preflight-check"><span aria-hidden="true">{check.state === 'ready' ? '✓' : check.state === 'advisory' ? '!' : '○'}</span><div><strong>{check.label}</strong><small>{check.detail}</small></div></div>{/each}</div></div>
@@ -357,7 +387,7 @@
 </section>
 
 <section class="panel"><div class="panel-head"><div><h2>Run queue</h2><p>Select ready entries validated for the selected endpoint, then authorize automatic scheduling. Active runs publish progress and their latest training signal here.</p></div><div class="row-actions"><button class="secondary small" disabled={busy || !selected.size} on:click={() => start(false)}>Authorize selected</button><button class="small" disabled={busy || !queued.some((item) => item.status === 'ready' && item.preflight_endpoint_id === endpointId)} on:click={() => start(true)}>Authorize all ready here</button></div></div>
-	{#if queued.length}<div class="queue-table-wrap"><table><thead><tr><th></th><th>Run</th><th>Definition</th><th>Dataset</th><th>Preflight</th><th>Scheduling</th><th>Progress</th><th>Live signal</th><th></th></tr></thead><tbody>{#each queued as item}{@const job = jobFor(item)}{@const live = liveStatusByJob[String(job?.job_id ?? job?.id ?? '')]}{@const progress = queueProgress(live)}{@const schedulingDetail = dispatchDetail(item, job)}<tr class:attention={item.status === 'needs_attention'}><td><input type="checkbox" disabled={item.status !== 'ready' || item.preflight_endpoint_id !== endpointId} checked={selected.has(String(item.queued_run_id))} aria-label={`Select ${text(item.name)}`} on:change={() => toggle(String(item.queued_run_id))} /></td><td><strong>{text(item.name)}</strong><small>Allocation: {allocationLabel(item.resources as RecordValue | undefined)} · Batch: {text(item.batch_size)}</small></td><td>{text(item.definition_name)}<small>revision {text(item.definition_revision)}</small></td><td>{text(item.dataset_id)}<small>{text(item.dataset_fingerprint_sha256).slice(0, 10)}</small></td><td><span class:valid={item.preflight_status === 'valid'} class="status">{item.preflight_status === 'valid' ? 'Validated' : 'Needs attention'}</span>{#if item.failure_reason}<small>{text(item.failure_reason)}</small>{/if}</td><td class="queue-scheduling"><span class="status {text(item.status)}">{statusLabel(item, job)}</span>{#if schedulingDetail}<small>{schedulingDetail}</small>{/if}{#if item.dispatch_claimed_at}<small>Claimed {text(item.dispatch_claimed_at)}</small>{/if}</td><td class="queue-progress">{#if activeJob(job) && progress != null}<div class="queue-progress-label"><strong>{Math.round(progress)}%</strong><span>epoch {text(live?.epoch)} / {text(live?.total_epochs)}</span></div><div class="queue-progress-track" aria-label={`${Math.round(progress)}% through the current epoch`}><i style={`width:${progress}%`}></i></div><small>Batch {text(live?.batch)} / {text(live?.total_batches)} · ETA {formatDuration(live?.total_eta_seconds)}</small>{:else if activeJob(job)}<small>Awaiting worker telemetry…</small>{:else}<small>—</small>{/if}</td><td class="queue-live-signal">{#if activeJob(job) && live && Object.keys(live).length}<div><span>Loss <strong>{formatNumber(liveMetric(live, 'loss'))}</strong></span><span>Accuracy <strong>{formatNumber(liveMetric(live, 'accuracy'))}</strong></span><span>Macro F1 <strong>{formatNumber(liveMetric(live, 'macro_f1') ?? liveMetric(live, 'val_macro_f1'))}</strong></span></div>{#if liveMetric(live, 'val_macro_f1') != null}<small>Validated F1 {formatNumber(liveMetric(live, 'val_macro_f1'))}</small>{/if}{:else}<small>—</small>{/if}</td><td><div class="job-controls">{#if job}<button class="secondary small" on:click={() => showLogs(job)}>Logs</button>{/if}{#if job && activeJob(job)}{#if supportsControl(live, 'resume')}<button class="secondary small" disabled={Boolean(controllingJobId)} on:click={() => controlJob(job, 'resume')}>{controllingJobId === String(job.job_id) ? 'Working…' : 'Resume'}</button>{:else if supportsControl(live, 'pause')}<button class="secondary small" disabled={Boolean(controllingJobId)} on:click={() => controlJob(job, 'pause')}>{controllingJobId === String(job.job_id) ? 'Working…' : 'Pause'}</button>{/if}{#if supportsControl(live, 'cancel')}<button class="quiet-button small job-cancel" disabled={Boolean(controllingJobId)} on:click={() => controlJob(job, 'cancel')}>Cancel</button>{/if}<button class="secondary small" on:click={() => liveJob = job}>Live dashboard</button>{:else if clearableTerminal(item, job)}<button class="quiet-button small" disabled={Boolean(clearingQueuedRunId)} on:click={() => clearTerminal(item, job)}>{clearingQueuedRunId === String(item.queued_run_id) ? 'Clearing…' : 'Clear'}</button>{:else if ['ready', 'needs_attention', 'waiting_for_resources', 'dispatching'].includes(String(item.status))}<button class="secondary small" on:click={() => cancel(String(item.queued_run_id))}>Cancel</button>{/if}</div></td></tr>{/each}</tbody></table></div>{:else}<p class="empty">No validated runs yet. Select a model definition and frozen dataset above.</p>{/if}
+	{#if queued.length}<div class="queue-table-wrap"><table><thead><tr><th></th><th>Run</th><th>Definition</th><th>Dataset</th><th>Preflight</th><th>Scheduling</th><th>Progress</th><th>Live signal</th><th></th></tr></thead><tbody>{#each queued as item}{@const job = jobFor(item)}{@const live = liveStatusByJob[String(job?.job_id ?? job?.id ?? '')]}{@const progress = queueProgress(live)}{@const schedulingDetail = dispatchDetail(item, job)}{@const batchDetail = batchOverrideDetail(item)}<tr class:attention={item.status === 'needs_attention'}><td><input type="checkbox" disabled={item.status !== 'ready' || item.preflight_endpoint_id !== endpointId} checked={selected.has(String(item.queued_run_id))} aria-label={`Select ${text(item.name)}`} on:change={() => toggle(String(item.queued_run_id))} /></td><td><strong>{text(item.name)}</strong><small>Allocation: {allocationLabel(item.resources as RecordValue | undefined)} · Batch: {text(item.batch_size)} · Epochs: {text(item.epochs)}</small></td><td>{text(item.definition_name)}<small>revision {text(item.definition_revision)}</small></td><td>{text(item.dataset_id)}<small>{text(item.dataset_fingerprint_sha256).slice(0, 10)}</small></td><td><span class:valid={item.preflight_status === 'valid'} class="status">{item.preflight_status === 'valid' ? 'Validated' : 'Needs attention'}</span>{#if item.failure_reason}<small>{text(item.failure_reason)}</small>{/if}{#if batchDetail}<small>{batchDetail}</small>{/if}</td><td class="queue-scheduling"><span class="status {text(item.status)}">{statusLabel(item, job)}</span>{#if schedulingDetail}<small>{schedulingDetail}</small>{/if}{#if item.dispatch_claimed_at}<small>Claimed {text(item.dispatch_claimed_at)}</small>{/if}</td><td class="queue-progress">{#if activeJob(job) && progress != null}<div class="queue-progress-label"><strong>{Math.round(progress)}%</strong><span>epoch {text(live?.epoch)} / {text(live?.total_epochs)}</span></div><div class="queue-progress-track" aria-label={`${Math.round(progress)}% through the current epoch`}><i style={`width:${progress}%`}></i></div><small>Batch {text(live?.batch)} / {text(live?.total_batches)} · ETA {formatDuration(live?.total_eta_seconds)}</small>{:else if activeJob(job)}<small>Awaiting worker telemetry…</small>{:else}<small>—</small>{/if}</td><td class="queue-live-signal">{#if activeJob(job) && live && Object.keys(live).length}<div><span>Loss <strong>{formatNumber(liveMetric(live, 'loss'))}</strong></span><span>Accuracy <strong>{formatNumber(liveMetric(live, 'accuracy'))}</strong></span><span>Macro F1 <strong>{formatNumber(liveMetric(live, 'macro_f1') ?? liveMetric(live, 'val_macro_f1'))}</strong></span></div>{#if liveMetric(live, 'val_macro_f1') != null}<small>Validated F1 {formatNumber(liveMetric(live, 'val_macro_f1'))}</small>{/if}{:else}<small>—</small>{/if}</td><td><div class="job-controls">{#if job}<button class="secondary small" on:click={() => showLogs(job)}>Logs</button>{/if}{#if job && activeJob(job)}{#if supportsControl(live, 'resume')}<button class="secondary small" disabled={Boolean(controllingJobId)} on:click={() => controlJob(job, 'resume')}>{controllingJobId === String(job.job_id) ? 'Working…' : 'Resume'}</button>{:else if supportsControl(live, 'pause')}<button class="secondary small" disabled={Boolean(controllingJobId)} on:click={() => controlJob(job, 'pause')}>{controllingJobId === String(job.job_id) ? 'Working…' : 'Pause'}</button>{/if}{#if supportsControl(live, 'cancel')}<button class="quiet-button small job-cancel" disabled={Boolean(controllingJobId)} on:click={() => controlJob(job, 'cancel')}>Cancel</button>{/if}<button class="secondary small" on:click={() => liveJob = job}>Live dashboard</button>{:else if canOverrideBatch(item)}{#if batchOverrideQueuedRunId === String(item.queued_run_id)}<input class="queue-batch-override" type="number" min="1" bind:value={batchOverrideValue} aria-label={`Batch size for ${text(item.name)}`} /><button class="secondary small" disabled={busy || !Number.isInteger(batchOverrideValue) || batchOverrideValue < 1} on:click={() => saveBatchSize(item)}>Apply</button><button class="quiet-button small" disabled={busy} on:click={() => batchOverrideQueuedRunId = ''}>Cancel</button>{:else}<button class="secondary small" disabled={busy} on:click={() => editBatchSize(item)}>Adjust batch</button>{/if}<button class="quiet-button small" disabled={busy} on:click={() => cancel(String(item.queued_run_id))}>Cancel run</button>{:else if clearableTerminal(item, job)}<button class="quiet-button small" disabled={Boolean(clearingQueuedRunId)} on:click={() => clearTerminal(item, job)}>{clearingQueuedRunId === String(item.queued_run_id) ? 'Clearing…' : 'Clear'}</button>{:else if ['ready', 'needs_attention', 'waiting_for_resources', 'dispatching'].includes(String(item.status))}<button class="secondary small" on:click={() => cancel(String(item.queued_run_id))}>Cancel</button>{/if}</div></td></tr>{/each}</tbody></table></div>{:else}<p class="empty">No validated runs yet. Select a model definition and frozen dataset above.</p>{/if}
 </section>
 
 {#if liveJob}<TrainingStatusModal job={liveJob} runName={text(queued.find((item) => String(item.queued_run_id) === String(liveJob?.queued_run_id))?.name ?? liveJob.job_id)} onclose={() => liveJob = null} />{/if}

@@ -40,6 +40,7 @@ export const api = {
 	validateAndQueueDefinitionSchedule: (id: string, body: RecordValue) => request<RecordValue>(`/v1/model-definitions/${encodeURIComponent(id)}:validate-and-queue/schedule`, { method: 'POST', body: JSON.stringify(body) }),
 	queuedRuns: (options?: ApiRequestOptions) => request<{ queued_runs: RecordValue[] }>('/v1/queued-runs', options),
 	startQueuedRuns: (body: RecordValue) => request<RecordValue>('/v1/queued-runs:start', { method: 'POST', body: JSON.stringify(body) }),
+	updateQueuedRunBatchSize: (id: string, batchSize: number) => request<RecordValue>(`/v1/queued-runs/${encodeURIComponent(id)}/batch-size`, { method: 'PATCH', body: JSON.stringify({ batch_size: batchSize }) }),
 	cancelQueuedRun: (id: string) => request<RecordValue>(`/v1/queued-runs/${encodeURIComponent(id)}:cancel`, { method: 'POST' }),
 	clearTerminalQueuedRun: (id: string) => request<RecordValue>(`/v1/queued-runs/${encodeURIComponent(id)}:clear`, { method: 'POST' }),
 	clearQueuedRuns: (endpointId?: string) => request<RecordValue>('/v1/queued-runs:clear', { method: 'POST', body: JSON.stringify(endpointId ? { endpoint_id: endpointId } : {}) }),

@@ -161,12 +161,17 @@ class ValidatedQueueRunRequest(BaseModel):
     batch_size_mode: str = "manual"
     batch_size: int | None = Field(default=None, ge=1)
     maximum_batch_size: int = Field(default=256, ge=1)
+    epochs: int = Field(default=10, ge=1, description="Run-specific training epoch budget sealed with this queued run.")
 
 
 class QueueStartRequest(BaseModel):
     endpoint_id: str
     queued_run_ids: list[str] = Field(default_factory=list)
     all_ready: bool = False
+
+
+class QueuedRunBatchSizeRequest(BaseModel):
+    batch_size: int = Field(ge=1)
 
 
 class QueueMaintenanceRequest(BaseModel):
@@ -575,6 +580,12 @@ def create_app(orchestrator: Orchestrator) -> FastAPI:
         try: return orchestrator.cancel_queued_run(queued_run_id)
         except KeyError as exc: raise HTTPException(status_code=404, detail="Queued run was not found") from exc
         except ValueError as exc: raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.patch("/v1/queued-runs/{queued_run_id}/batch-size")
+    def update_queued_run_batch_size(queued_run_id: str, body: QueuedRunBatchSizeRequest) -> dict[str, Any]:
+        try: return orchestrator.update_queued_run_batch_size(queued_run_id, batch_size=body.batch_size)
+        except KeyError as exc: raise HTTPException(status_code=404, detail="Queued run was not found") from exc
+        except (FileNotFoundError, ValueError) as exc: raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.post("/v1/queued-runs/{queued_run_id}:clear")
     def clear_terminal_queued_run(queued_run_id: str) -> dict[str, Any]:

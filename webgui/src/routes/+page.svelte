@@ -29,12 +29,39 @@
 		{ id: 'queue', number: '05', title: 'Queue', detail: 'Validate & schedule' }
 	];
 	const activeStatuses = new Set(['preparing', 'queued', 'running', 'paused', 'submitted', 'dispatching', 'training', 'validating', 'sealing', 'indexing']);
+	const record = (value: unknown): RecordValue => value && typeof value === 'object' && !Array.isArray(value) ? value as RecordValue : {};
+	const records = (value: unknown): RecordValue[] => Array.isArray(value) ? value as RecordValue[] : [];
+	const strings = (value: unknown): string[] => Array.isArray(value) ? value.map(String) : [];
 	$: activeJobCount = new Set([
 		...jobs.filter((job) => activeStatuses.has(String(job.status))).map((job) => String(job.queued_run_id ?? job.job_id)),
 		...queuedRuns.filter((run) => activeStatuses.has(String(run.status))).map((run) => String(run.queued_run_id ?? run.job_id))
 	]).size;
 	const healthEndpoints = () => systemHealth?.compute_endpoints && typeof systemHealth.compute_endpoints === 'object' ? systemHealth.compute_endpoints as RecordValue : null;
 	const serviceReady = () => systemHealth?.database === 'ready' && (Number(healthEndpoints()?.ready ?? 0) > 0 || computeEndpoints.some((endpoint) => endpoint.status === 'ready'));
+	const tensorDevicesFor = (endpoints: RecordValue[]) => endpoints.flatMap((endpoint) => {
+		const queue = record(endpoint.queue);
+		const resources = record(endpoint.resources ?? queue.resources ?? endpoint.scheduler_resources);
+		const leases = new Set(strings(resources.gpu_leases));
+		const endpointName = String(endpoint.name ?? endpoint.base_url ?? 'Compute');
+		const gpus = Array.from(new Map(
+			records(endpoint.workers).flatMap((worker) => records(record(worker.capabilities).gpus))
+				.filter((gpu) => gpu.id !== undefined && gpu.id !== null)
+				.map((gpu) => [String(gpu.id), gpu])
+		).values());
+		if (gpus.length) return gpus.map((gpu) => ({
+			key: `${endpoint.endpoint_id}:${String(gpu.id)}`,
+			endpoint: endpointName,
+			label: gpu.backend === 'metal' ? 'GPU:0 · Metal' : `GPU:${String(gpu.id)} · CUDA`,
+			inUse: leases.has(String(gpu.id)),
+			available: endpoint.status === 'ready'
+		}));
+		if (endpoint.status !== 'ready') return [];
+		return [{
+			key: `${endpoint.endpoint_id}:cpu`, endpoint: endpointName, label: 'CPU:0',
+			inUse: Number(resources.cpu_in_use ?? 0) > 0, available: true
+		}];
+	});
+	$: tensorflowDevices = tensorDevicesFor(computeEndpoints);
 
 	let coordinator: OperationalRefreshCoordinator | undefined;
 	async function refresh(silent = false, signal?: AbortSignal, reason: RefreshReason = 'manual') {
@@ -84,7 +111,7 @@
 		<button class="brand" on:click={() => navigate('models')} aria-label="Oracle Builder home"><img class="brand-mark" src="/brand/oracle-builder-mark.webp" alt="" /><span><strong>Oracle Builder</strong><small>Scientific model workspace</small></span></button>
 		<div class="sidebar-group"><p class="nav-label">WORKSPACE</p><nav class="workflow-nav" aria-label="Primary navigation">{#each pageMeta as page}<button class:active={activePage === page.id} on:click={() => navigate(page.id)}><span class="nav-step">{page.number}</span><span><strong>{page.title}</strong><small>{page.detail}</small></span>{#if page.id === 'models' && artifacts.length}<i>{artifacts.length}</i>{:else if page.id === 'queue' && activeJobCount}<i>{activeJobCount}</i>{/if}</button>{/each}</nav></div>
 		<div class="sidebar-context"><p class="nav-label">SYSTEM</p><dl><div><dt>Models</dt><dd>{artifacts.length}</dd></div><div><dt>Frozen data</dt><dd>{datasets.filter((dataset) => dataset.lifecycle === 'frozen').length}</dd></div><div><dt>Active jobs</dt><dd>{activeJobCount}</dd></div></dl></div>
-		<div class="side-foot"><span class:offline={!serviceReady()} class="pulse"></span>{loading ? 'Updating workspace…' : serviceReady() ? 'Compute connected' : 'Plan offline; dispatch later'}</div>
+		<div class="sidebar-bottom"><section class="tensorflow-devices" aria-live="polite"><p class="nav-label">TENSORFLOW DEVICES</p>{#if tensorflowDevices.length}{#each tensorflowDevices as device}<div class="tensorflow-device" title={device.endpoint}><i class:busy={device.inUse} class:offline={!device.available}></i><span>{device.label}</span><small>{device.inUse ? 'In use' : 'Available'}</small></div>{/each}{:else}<small class="device-empty">No device telemetry available</small>{/if}</section><div class="side-foot"><span class:offline={!serviceReady()} class="pulse"></span>{loading ? 'Updating workspace…' : serviceReady() ? 'Compute connected' : 'Plan offline; dispatch later'}</div></div>
 	</aside>
 	<div class="app-frame">
 		<header class="topbar"><div><p class="eyebrow">{pageMeta.find((page) => page.id === activePage)?.number} · {pageMeta.find((page) => page.id === activePage)?.title}</p><h1>{pageMeta.find((page) => page.id === activePage)?.detail}</h1></div><div class="topbar-actions"><span class:online={serviceReady()} class="system-pill"><i></i>{loading ? 'Connecting…' : serviceReady() ? 'Compute ready' : 'Compute unavailable'}</span><button class="quiet-button" on:click={() => void coordinator?.trigger('manual', true)} disabled={loading}>{loading ? 'Refreshing…' : 'Refresh'}</button></div></header>

@@ -370,12 +370,22 @@ class Orchestrator:
         return schema.get("fingerprint") or schema.get("schema_fingerprint")
 
     def _definition_config(self, config: dict[str, Any]) -> dict[str, Any]:
-        """Resolve and enforce the only user-authorable configuration dialect."""
+        """Resolve the reusable model portion of a V2 configuration.
+
+        Training duration is intentionally excluded from a model definition.
+        It is an execution decision made when a frozen definition is paired
+        with a dataset in the validated queue.
+        """
         # Definition records are public V2 documents.  Runtime-only aliases
         # (run.model/model/pretraining) are created only by resolve_config at
         # execution time and never leak back through this API.
         validate_v2_config(config)
-        return resolve_v2_config(config)
+        resolved = resolve_v2_config(config)
+        if isinstance(resolved.get("training"), dict):
+            resolved["training"].pop("epochs", None)
+        if isinstance(resolved.get("self_supervised"), dict):
+            resolved["self_supervised"].pop("epochs", None)
+        return resolved
 
     def _template_path(self, template_id: str) -> Path:
         if not isinstance(template_id, str) or not template_id or "/" in template_id or "\\" in template_id:
@@ -609,9 +619,14 @@ class Orchestrator:
             definition = self.model_definition(str(row["definition_id"]), revision=int(row["definition_revision"]))
             row["definition_name"] = definition.get("name") if definition else None
             try:
-                row["batch_size"] = int(load_toml(row["resolved_toml_path"]).get("data", {}).get("batch_size"))
+                sealed = load_toml(row["resolved_toml_path"])
+                row["batch_size"] = int(sealed.get("data", {}).get("batch_size"))
+                row["epochs"] = int(sealed.get("training", {}).get("epochs"))
             except (OSError, TypeError, ValueError):
                 row["batch_size"] = None
+                row["epochs"] = None
+            specification = self.specification(str(row["specification_id"])) if row.get("specification_id") else None
+            row["batch_execution"] = (specification or {}).get("parameters", {}).get("queue_execution")
         return rows
 
     def queued_run(self, queued_run_id: str) -> dict[str, Any] | None:
@@ -620,9 +635,14 @@ class Orchestrator:
         if row is not None:
             row["start_authorized"] = bool(row.get("start_authorized"))
             try:
-                row["batch_size"] = int(load_toml(row["resolved_toml_path"]).get("data", {}).get("batch_size"))
+                sealed = load_toml(row["resolved_toml_path"])
+                row["batch_size"] = int(sealed.get("data", {}).get("batch_size"))
+                row["epochs"] = int(sealed.get("training", {}).get("epochs"))
             except (OSError, TypeError, ValueError):
                 row["batch_size"] = None
+                row["epochs"] = None
+            specification = self.specification(str(row["specification_id"])) if row.get("specification_id") else None
+            row["batch_execution"] = (specification or {}).get("parameters", {}).get("queue_execution")
         return row
 
     def validate_and_queue_model_definition(
@@ -639,6 +659,7 @@ class Orchestrator:
         batch_size_mode: str = "manual",
         batch_size: int | None = None,
         maximum_batch_size: int = 256,
+        epochs: int = 10,
         operation_progress: Callable[[str, str, dict[str, Any] | None], None] | None = None,
     ) -> dict[str, Any]:
         def progress(event_type: str, message: str, data: dict[str, Any] | None = None) -> None:
@@ -686,10 +707,18 @@ class Orchestrator:
             raise ValueError("batch_size must be a positive integer")
         if isinstance(maximum_batch_size, bool) or not isinstance(maximum_batch_size, int) or maximum_batch_size < 1:
             raise ValueError("maximum_batch_size must be a positive integer")
+        if isinstance(epochs, bool) or not isinstance(epochs, int) or epochs < 1:
+            raise ValueError("epochs must be a positive integer")
         if batch_size_mode == "auto" and batch_size is not None:
             raise ValueError("batch_size is only valid with manual batch_size_mode")
         queue_id, experiment_id, specification_id, now = str(uuid.uuid4()), str(uuid.uuid4()), str(uuid.uuid4()), _now()
         config = self._definition_queue_config(definition, dataset)
+        # Run length belongs to this sealed dataset/definition pairing, not to
+        # the reusable model definition.  The resolved TOML remains the audit
+        # record of the exact epoch budget that was executed.
+        config.setdefault("training", {})["epochs"] = epochs
+        if (config.get("self_supervised") or {}).get("enabled"):
+            config.setdefault("self_supervised", {})["epochs"] = epochs
         # Queue allocation owns physical-device choice.  The runtime sees just
         # that selected device via CUDA_VISIBLE_DEVICES, so use one logical
         # device rather than allowing the legacy automatic selector to choose
@@ -721,7 +750,7 @@ class Orchestrator:
                 "config": str(config_path), "input": dataset["path"], "dataset_id": dataset_id,
                 "definition_id": definition_id, "definition_revision": int(definition["revision"]),
                 "initialization": dict(initialization or {}),
-                "queue_execution": batch_execution,
+                "queue_execution": {**batch_execution, "epochs": epochs},
             },
             specification_id,
         )
@@ -729,7 +758,7 @@ class Orchestrator:
             "kind": "validated_queue", "queued_run_id": queue_id,
             "definition_id": definition_id, "definition_revision": int(definition["revision"]),
             "dataset_id": dataset_id, "dataset_fingerprint_sha256": dataset.get("fingerprint_sha256"),
-            "batch_execution": batch_execution,
+            "batch_execution": {**batch_execution, "epochs": epochs},
         }
         with self._connection() as db:
             db.execute("INSERT INTO experiments VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", (
@@ -780,8 +809,8 @@ class Orchestrator:
                         "vram_total_mib": tune_report.get("vram_total_mib"),
                         "selected_peak_memory_mib": tune_report.get("selected_peak_memory_mib"),
                     }
-                    parameters["queue_execution"] = batch_execution
-                    plan["batch_execution"] = batch_execution
+                    parameters["queue_execution"] = {**batch_execution, "epochs": epochs}
+                    plan["batch_execution"] = {**batch_execution, "epochs": epochs}
                     import tomli_w
                     config_path.write_text(tomli_w.dumps(self._toml_safe(config)), encoding="utf-8")
                     config_digest = hashlib.sha256(config_path.read_bytes()).hexdigest()
@@ -1071,6 +1100,65 @@ class Orchestrator:
             raise ValueError("Cancel the active execution job before cancelling its queued run")
         with self._connection() as db:
             db.execute("UPDATE queued_runs SET status='cancelled', start_authorized=0, updated_at=? WHERE queued_run_id=?", (_now(), queued_run_id))
+        return self.queued_run(queued_run_id)  # type: ignore[return-value]
+
+    def update_queued_run_batch_size(self, queued_run_id: str, *, batch_size: int) -> dict[str, Any]:
+        """Replace an unstarted run's batch size without changing its definition.
+
+        This is intentionally a queue-level amendment: the sealed TOML,
+        dispatch specification, and experiment plan change together while the
+        reusable model-definition revision stays untouched.  Once authorized,
+        a queue row is immutable because a scheduler may claim it at any time.
+        """
+        if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
+            raise ValueError("batch_size must be a positive integer")
+        queued = self.queued_run(queued_run_id)
+        if queued is None:
+            raise KeyError(queued_run_id)
+        if queued.get("start_authorized") or queued["status"] not in {"ready", "needs_attention", "waiting_for_resources"}:
+            raise ValueError("Batch size can only be changed before the run is authorized")
+        config_path = Path(str(queued["resolved_toml_path"])).resolve()
+        if not config_path.is_file():
+            raise FileNotFoundError("The sealed queued-run configuration is unavailable")
+        config = load_toml(config_path)
+        prior_batch_size = config.get("data", {}).get("batch_size")
+        config.setdefault("data", {})["batch_size"] = batch_size
+        import tomli_w
+        config_path.write_text(tomli_w.dumps(self._toml_safe(config)), encoding="utf-8")
+        config_digest = hashlib.sha256(config_path.read_bytes()).hexdigest()
+        with self._connection() as db:
+            specification = self.specification(str(queued["specification_id"]), connection=db)
+            if specification is None:
+                raise KeyError("Queued run specification was not found")
+            parameters = dict(specification["parameters"])
+            previous_execution = dict(parameters.get("queue_execution") or {})
+            execution = {
+                **previous_execution,
+                "mode": "manual_override",
+                "batch_size": batch_size,
+                "auto_tuned_batch_size": previous_execution.get("batch_size") if previous_execution.get("mode") == "auto" else None,
+            }
+            parameters["queue_execution"] = execution
+            experiment = _row(db.execute("SELECT plan_json FROM experiments WHERE experiment_id=?", (specification["experiment_id"],)).fetchone())
+            if experiment is not None:
+                plan = dict(experiment.get("plan") or {})
+                plan["batch_execution"] = execution
+                db.execute("UPDATE experiments SET plan_json=?, updated_at=? WHERE experiment_id=?", (_json(plan), _now(), specification["experiment_id"]))
+            report = dict(queued.get("preflight_report") or {})
+            report["batch_size_override"] = {
+                "previous_batch_size": prior_batch_size,
+                "batch_size": batch_size,
+                "message": "Manual override selected after queue validation; launch preflight will recheck compute compatibility.",
+            }
+            now = _now()
+            db.execute(
+                "UPDATE run_specifications SET parameters_json=?, config_hash=?, updated_at=? WHERE specification_id=?",
+                (_json(parameters), hashlib.sha256(_json({"parameters": parameters, "config_sha256": config_digest}).encode()).hexdigest(), now, specification["specification_id"]),
+            )
+            db.execute(
+                "UPDATE queued_runs SET resolved_toml_sha256=?, preflight_report_json=?, failure_reason=NULL, updated_at=? WHERE queued_run_id=?",
+                (config_digest, _json(report), now, queued_run_id),
+            )
         return self.queued_run(queued_run_id)  # type: ignore[return-value]
 
     def archive_terminal_queued_run(self, queued_run_id: str) -> dict[str, Any]:

@@ -785,6 +785,8 @@ def test_validated_queue_seals_definition_and_requires_explicit_start(tmp_path, 
     dataset = orchestrator.ingest_dataset(dataset_path)
     endpoint = orchestrator.register_compute_endpoint(name="local", base_url="http://oracle-serve:8100")
     definition = orchestrator.create_model_definition(name="exp001-resnet-128", template_id="resnet18")
+    assert "epochs" not in definition["config"]["training"]
+    assert "epochs" not in definition["config"]["self_supervised"]
     requests = []
 
     def request(base, method, route, body=None, *, timeout_seconds=15):
@@ -809,11 +811,12 @@ def test_validated_queue_seals_definition_and_requires_explicit_start(tmp_path, 
 
     monkeypatch.setattr(orchestrator, "_request", request)
     queued = orchestrator.validate_and_queue_model_definition(
-        definition["definition_id"], name="exp001 on frozen", dataset_id=dataset["dataset_id"], endpoint_id=endpoint["endpoint_id"], resources={"gpu_count": 1, "gpu_ids": ["0"]}, batch_size_mode="auto", maximum_batch_size=64,
+        definition["definition_id"], name="exp001 on frozen", dataset_id=dataset["dataset_id"], endpoint_id=endpoint["endpoint_id"], resources={"gpu_count": 1, "gpu_ids": ["0"]}, batch_size_mode="auto", maximum_batch_size=64, epochs=7,
     )
     assert queued["status"] == "ready"
     assert queued["start_authorized"] is False
     assert queued["batch_size"] == 24
+    assert queued["epochs"] == 7
     assert queued["resources"] == {"gpu_count": 1, "gpu_ids": ["0"]}
     batch_tune_requests = [item for item in requests if item[2] == "/compute/batch-size-tune"]
     assert batch_tune_requests[0][4] == 930
@@ -823,11 +826,21 @@ def test_validated_queue_seals_definition_and_requires_explicit_start(tmp_path, 
     assert Path(queued["resolved_toml_path"]).is_file()
     sealed = load_toml(queued["resolved_toml_path"])
     assert sealed["data"]["batch_size"] == 24
+    assert sealed["training"]["epochs"] == 7
     assert sealed["distribution"]["strategy"] == "single"
+
+    overridden = orchestrator.update_queued_run_batch_size(queued["queued_run_id"], batch_size=12)
+    assert overridden["batch_size"] == 12
+    assert overridden["batch_execution"]["mode"] == "manual_override"
+    assert overridden["batch_execution"]["auto_tuned_batch_size"] == 24
+    assert load_toml(queued["resolved_toml_path"])["data"]["batch_size"] == 12
+    assert "epochs" not in orchestrator.model_definition(definition["definition_id"])["config"]["training"]
 
     started = orchestrator.authorize_queued_runs(queued_run_ids=[queued["queued_run_id"]], endpoint_id=endpoint["endpoint_id"])
     assert started["dispatched"]
     assert any(route == "/compute/jobs" for _, _, route, _, _ in requests)
+    with pytest.raises(ValueError, match="before the run is authorized"):
+        orchestrator.update_queued_run_batch_size(queued["queued_run_id"], batch_size=8)
 
     job_id = started["dispatched"][0]["job_id"]
     with orchestrator._connection() as db:
