@@ -290,7 +290,7 @@
 
 		{#if loading && !status}<div class="dashboard-message" aria-live="polite">Connecting to the live training status…</div>
 		{:else if error && !status}<div class="dashboard-message error" role="alert"><strong>Live status unavailable</strong><span>{error}</span></div>
-		{:else if status?.available === false}<div class="dashboard-message error" role="status"><strong>Live training status is not available</strong><span>{text(status.message, 'The worker has not published a training snapshot yet.')}</span></div>
+		{:else if status?.available === false}<div class="dashboard-message error" role="status"><strong>{status?.recovery_action === 'reconcile_stuck_jobs' ? 'Compute worker no longer has this job' : 'Live training status is not available'}</strong><span>{text(status.message, 'The worker has not published a training snapshot yet.')}</span>{#if record(status?.snapshot).updated_at}<section class="last-known-status"><strong>Last persisted training progress</strong><span>Epoch {text(record(status?.snapshot).epoch)} / {text(record(status?.snapshot).total_epochs)} · batch {text(record(status?.snapshot).batch)} / {text(record(status?.snapshot).total_batches)}</span><span>Recorded {text(record(status?.snapshot).updated_at)}</span></section>{/if}{#if status?.recovery_action === 'reconcile_stuck_jobs'}<span class="recovery-guidance">Open Queue and choose <strong>Reconcile stuck jobs</strong> to record this missing dispatch safely before deciding whether to retry or resume from its recovery snapshot.</span>{/if}</div>
 		{:else if status}
 			<div class="stage-rail" aria-label={`Current stage: ${currentStage}`}>
 				{#each stages as stage, index}<div class:done={stageDone(index)} class:current={stageActive(index)}><i></i><span>{stage}</span></div>{/each}
@@ -371,4 +371,6 @@
 	.danger { color: #b91c1c; border-color: #fecaca; }
 	.danger:hover:not(:disabled) { color: #991b1b; background: #fef2f2; }
 	@media (max-width: 460px) { .modal-actions { justify-content: flex-start; } }
+	.last-known-status { display: grid; gap: .28rem; max-width: 36rem; margin: 1rem auto; padding: .8rem; border: 1px solid #fecaca; border-radius: 8px; background: #fff7ed; color: #7f1d1d; text-align: left; font-size: .76rem; }
+	.recovery-guidance { max-width: 42rem; margin: 0 auto; color: #7f1d1d; font-size: .76rem; line-height: 1.45; }
 </style>

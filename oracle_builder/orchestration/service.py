@@ -2922,8 +2922,8 @@ class Orchestrator:
         remote_status, now = remote["status"], _now()
         result = remote.get("result") or {}
         output_path = result.get("output_path") or self._expected_output_path(local)
+        local_status = "validating" if remote_status == "succeeded" and local["action"] in {"train", "model_ingest"} else remote_status
         with self._connection() as db:
-            local_status = "validating" if remote_status == "succeeded" and local["action"] in {"train", "model_ingest"} else remote_status
             db.execute("""UPDATE jobs SET status=?, remote_status=?, worker_id=?, error=?,
                 updated_at=?, completed_at=?, started_at=?, output_path=? WHERE job_id=?""",
                 (local_status, remote_status, remote.get("worker_id"), remote.get("error"), now,
@@ -2934,6 +2934,20 @@ class Orchestrator:
                 db.execute("UPDATE run_specifications SET status='validating', updated_at=? WHERE specification_id=?", (now, local["specification_id"]))
             elif remote_status == "succeeded":
                 db.execute("UPDATE run_specifications SET status='succeeded', updated_at=? WHERE specification_id=?", (now, local["specification_id"]))
+        if local_status != local.get("status") or remote_status != local.get("remote_status"):
+            self._record_event(
+                job_id,
+                "status_changed",
+                f"Oracle Serve status changed to {remote_status}.",
+                {
+                    "source": "oracle-serve",
+                    "previous_status": local.get("status"),
+                    "previous_remote_status": local.get("remote_status"),
+                    "status": local_status,
+                    "remote_status": remote_status,
+                    "worker_id": remote.get("worker_id"),
+                },
+            )
         if remote_status == "succeeded" and local["action"] in {"train", "model_ingest"}:
             self._record_event(job_id, "validating", "Compute completed; validating the produced artifact", {"output_path": output_path})
             try:
@@ -2972,7 +2986,8 @@ class Orchestrator:
         for job in active:
             try:
                 results.append(self.reconcile_job(job["job_id"]))
-            except RuntimeError:
+            except RuntimeError as exc:
+                self._record_remote_job_unavailable(job, exc)
                 results.append(job)
         # A terminal reconciliation releases a Serve slot.  Refill every
         # affected endpoint now; claims make this safe if another tick races.
@@ -2986,6 +3001,24 @@ class Orchestrator:
                     # goes away between observing a terminal job and refill.
                     pass
         return results
+
+    def _record_remote_job_unavailable(self, job: dict[str, Any], error: RuntimeError) -> None:
+        """Persist an endpoint-confirmed missing job once, without resetting it.
+
+        A 404 proves this Serve process no longer owns the dispatch, but state
+        reset remains an explicit user action.  Recording that fact is safe,
+        makes the UI honest immediately, and retains the recovery decision.
+        """
+        message = str(error)
+        if "returned 404" not in message or job.get("remote_status") == "missing":
+            return
+        reason = "Compute endpoint no longer has this job; it may have restarted or the process was interrupted."
+        with self._connection() as db:
+            db.execute(
+                "UPDATE jobs SET remote_status='missing', error=?, updated_at=? WHERE job_id=?",
+                (reason, _now(), job["job_id"]),
+            )
+        self._record_event(job["job_id"], "remote_missing", reason, {"source": "oracle-serve", "error": message})
 
     def reset_stuck_jobs(self, *, endpoint_id: str | None = None) -> dict[str, Any]:
         """Reset only jobs proven absent from their compute endpoint.
@@ -3035,11 +3068,24 @@ class Orchestrator:
 
     def _capture_job_events(self, job: dict[str, Any]) -> None:
         with self._connection() as db:
-            last = db.execute("SELECT COALESCE(MAX(sequence), 0) FROM job_events WHERE job_id=?", (job["job_id"],)).fetchone()[0]
-        payload = self._request(job["oracle_serve_url"], "GET", f"/compute/jobs/{job['job_id']}/events?after={last}")
+            cursor = db.execute("SELECT remote_sequence FROM job_remote_event_cursors WHERE job_id=?", (job["job_id"],)).fetchone()
+            remote_after = int(cursor["remote_sequence"]) if cursor is not None else 0
+        payload = self._request(job["oracle_serve_url"], "GET", f"/compute/jobs/{job['job_id']}/events?after={remote_after}")
         with self._connection() as db:
+            remote_cursor = remote_after
             for event in payload.get("events", []):
-                db.execute("INSERT OR IGNORE INTO job_events VALUES (?, ?, ?, ?, ?, ?)", (job["job_id"], event["sequence"], event["timestamp"], event["type"], event["message"], _json(event.get("data") or {})))
+                remote_sequence = event.get("sequence")
+                if not isinstance(remote_sequence, int) or remote_sequence <= remote_cursor:
+                    continue
+                sequence = db.execute("SELECT COALESCE(MAX(sequence), 0) + 1 FROM job_events WHERE job_id=?", (job["job_id"],)).fetchone()[0]
+                data = {**(event.get("data") or {}), "source": "oracle-serve", "remote_sequence": remote_sequence}
+                db.execute("INSERT INTO job_events VALUES (?, ?, ?, ?, ?, ?)", (job["job_id"], sequence, event.get("timestamp") or _now(), event.get("type") or "log", event.get("message") or "", _json(data)))
+                remote_cursor = remote_sequence
+            db.execute(
+                """INSERT INTO job_remote_event_cursors(job_id,remote_sequence,updated_at) VALUES(?,?,?)
+                   ON CONFLICT(job_id) DO UPDATE SET remote_sequence=excluded.remote_sequence, updated_at=excluded.updated_at""",
+                (job["job_id"], remote_cursor, _now()),
+            )
 
     @staticmethod
     def _expected_output_path(job: dict[str, Any]) -> str | None:
@@ -3134,6 +3180,33 @@ class Orchestrator:
             rows = db.execute("SELECT * FROM job_events WHERE job_id=? ORDER BY sequence", (job_id,)).fetchall()
         return [{**dict(row), "data": json.loads(row["data_json"])} for row in rows]
 
+    def _last_persisted_training_snapshot(self, job: dict[str, Any]) -> dict[str, Any] | None:
+        """Return safe, last-known progress when a local worker has forgotten a job.
+
+        The live worker owns process state, but a training run records a
+        status document in its sealed output.  It is valuable recovery context
+        after a worker restart; keep the response deliberately path-free and
+        bounded to fields useful in the UI.
+        """
+        output = job.get("output_path") or self._expected_output_path(job)
+        if not isinstance(output, str):
+            return None
+        run_path = Path(output).expanduser().resolve()
+        if not run_path.is_relative_to(self.runs_root):
+            return None
+        try:
+            snapshot = json.loads((run_path / "training-status.json").read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        if not isinstance(snapshot, dict):
+            return None
+        allowed = {
+            "state", "phase", "epoch", "total_epochs", "batch", "total_batches", "updated_at",
+            "message", "progress", "timing", "metrics", "latest_metrics", "history", "learning_rate",
+            "batches_per_second", "samples_per_second", "total_eta_seconds",
+        }
+        return {key: value for key, value in snapshot.items() if key in allowed}
+
     def job_training_status(self, job_id: str) -> dict[str, Any]:
         """Return the worker's live training projection without exposing paths.
 
@@ -3163,6 +3236,15 @@ class Orchestrator:
         try:
             remote = self._request(job["oracle_serve_url"], "GET", f"/compute/jobs/{job_id}/training-status")
         except RuntimeError as exc:
+            if "returned 404" in str(exc):
+                snapshot = self._last_persisted_training_snapshot(job)
+                return {
+                    **fallback,
+                    "snapshot": snapshot,
+                    "last_known": snapshot is not None,
+                    "recovery_action": "reconcile_stuck_jobs",
+                    "message": "The compute worker no longer has this job. It was interrupted or the worker restarted; use Reconcile stuck jobs before retrying.",
+                }
             return {**fallback, "message": f"Live training status is temporarily unavailable: {exc}"}
 
         # A compute service controls the metric shape, but not the identity or

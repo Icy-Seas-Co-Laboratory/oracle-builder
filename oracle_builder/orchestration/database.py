@@ -148,6 +148,15 @@ CREATE TABLE IF NOT EXISTS job_events (
   message TEXT NOT NULL, data_json TEXT NOT NULL,
   PRIMARY KEY (job_id, sequence)
 );
+-- Remote event cursors are intentionally separate from the locally ordered
+-- job-event sequence.  The orchestrator adds its own diagnostics/events, so
+-- using a local sequence as Serve's ``after`` cursor could silently skip a
+-- worker log line after a local status update.
+CREATE TABLE IF NOT EXISTS job_remote_event_cursors (
+  job_id TEXT PRIMARY KEY REFERENCES jobs(job_id) ON DELETE CASCADE,
+  remote_sequence INTEGER NOT NULL DEFAULT 0,
+  updated_at TEXT NOT NULL
+);
 -- Durable control-plane work.  These rows deliberately survive API restarts;
 -- event sequence numbers provide a stable cursor for clients reconnecting to
 -- the event stream.

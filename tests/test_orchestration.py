@@ -237,7 +237,44 @@ def test_job_training_status_proxies_live_snapshot_and_degrades_gracefully(tmp_p
     assert status["available"] is False
     assert status["stale"] is True
     assert status["job_status"] == "submitted"
-    assert "temporarily unavailable" in status["message"]
+    assert "no longer has this job" in status["message"]
+
+
+def test_job_training_status_exposes_last_persisted_progress_for_missing_worker_job(tmp_path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    runs = workspace / "runs"
+    runs.mkdir()
+    orchestrator = Orchestrator(tmp_path / "orchestrator.sqlite", workspace_root=workspace, runs_root=runs)
+    endpoint = orchestrator.register_compute_endpoint(name="local", base_url="http://oracle-serve:8100")
+    with orchestrator._connection() as db:
+        now = "2026-09-27T00:00:00+00:00"
+        db.execute("""INSERT INTO experiments(experiment_id,name,description,status,plan_json,created_at,updated_at)
+            VALUES('experiment', 'test', '', 'planned', '{}', ?, ?)""", (now, now))
+        db.execute("""INSERT INTO run_specifications(specification_id,experiment_id,ordinal,name,action,parameters_json,resources_json,status,created_at,updated_at)
+            VALUES('spec', 'experiment', 0, 'run', 'train', ?, '{}', 'dispatched', ?, ?)""", (json.dumps({"output": "recovery-run", "runs_dir": str(runs)}), now, now))
+        db.execute("""INSERT INTO jobs(job_id,specification_id,oracle_serve_url,action,parameters_json,resources_json,status,submitted_at,updated_at,output_path)
+            VALUES('missing-job', 'spec', 'http://oracle-serve:8100', 'train', ?, '{}', 'running', ?, ?, ?)""", (json.dumps({"output": "recovery-run", "runs_dir": str(runs)}), now, now, str(runs / "recovery-run")))
+    run = runs / "recovery-run"
+    run.mkdir()
+    (run / "training-status.json").write_text(json.dumps({
+        "state": "running", "epoch": 3, "total_epochs": 50, "batch": 42, "total_batches": 100,
+        "updated_at": "2026-09-26T12:00:00Z", "input_path": "/not-disclosed",
+    }), encoding="utf-8")
+    monkeypatch.setattr(orchestrator, "_request", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("oracle-serve returned 404: missing")))
+
+    status = orchestrator.job_training_status("missing-job")
+
+    assert status["available"] is False
+    assert status["last_known"] is True
+    assert status["recovery_action"] == "reconcile_stuck_jobs"
+    assert status["snapshot"] == {"state": "running", "epoch": 3, "total_epochs": 50, "batch": 42, "total_batches": 100, "updated_at": "2026-09-26T12:00:00Z"}
+    assert "no longer has this job" in status["message"]
+
+    orchestrator._record_remote_job_unavailable(orchestrator.job("missing-job"), RuntimeError("oracle-serve returned 404: missing"))
+    orchestrator._record_remote_job_unavailable(orchestrator.job("missing-job"), RuntimeError("oracle-serve returned 404: missing"))
+    assert orchestrator.job("missing-job")["remote_status"] == "missing"
+    assert [event["event_type"] for event in orchestrator.job_events("missing-job")] == ["remote_missing"]
 
 
 def test_orchestrator_api_creates_a_model_import_specification(tmp_path):
@@ -308,7 +345,7 @@ def test_successful_compute_is_validated_indexed_and_linked(tmp_path, monkeypatc
     assert completed["artifact_path"] == specification["parameters"]["output"]
     assert orchestrator.specification(specification["specification_id"])["status"] == "indexed"
     assert [event["event_type"] for event in orchestrator.job_events(job["job_id"])] == [
-        "completed", "validating", "artifact_indexed",
+        "completed", "status_changed", "validating", "artifact_indexed",
     ]
 
 
