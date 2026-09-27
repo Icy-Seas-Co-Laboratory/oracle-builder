@@ -3229,9 +3229,13 @@ class Orchestrator:
                 else []
             ),
             "available": False,
-            "stale": True,
-            "phase": job.get("remote_status") or job["status"],
-            "message": "Live training status is not available yet.",
+            # A process can be running normally while it creates its split,
+            # imports TensorFlow, or compiles its first graph.  That is an
+            # initializing state, not a stale/lost worker.  ``stale`` remains
+            # reserved for the confirmed-404 recovery path below.
+            "stale": False,
+            "phase": "initializing" if job["status"] == "running" else (job.get("remote_status") or job["status"]),
+            "message": "Training is starting; the first live metrics snapshot is not available yet.",
         }
         try:
             remote = self._request(job["oracle_serve_url"], "GET", f"/compute/jobs/{job_id}/training-status")
@@ -3240,6 +3244,7 @@ class Orchestrator:
                 snapshot = self._last_persisted_training_snapshot(job)
                 return {
                     **fallback,
+                    "stale": True,
                     "snapshot": snapshot,
                     "last_known": snapshot is not None,
                     "recovery_action": "reconcile_stuck_jobs",
@@ -3259,7 +3264,10 @@ class Orchestrator:
             "job_status": job["status"],
             "controls": fallback["controls"],
             "available": available,
-            "stale": bool(remote.get("stale", not available)),
+            # Older/newer Serve instances may omit ``stale`` while they are
+            # still starting their first snapshot.  Missing telemetry alone
+            # is not evidence that a running worker was lost.
+            "stale": bool(remote.get("stale", False)),
             "message": remote.get("message") or (None if available else fallback["message"]),
         }
     def comparisons(self) -> list[dict[str, Any]]: return self._many("SELECT * FROM comparisons ORDER BY created_at DESC")

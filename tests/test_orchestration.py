@@ -239,6 +239,17 @@ def test_job_training_status_proxies_live_snapshot_and_degrades_gracefully(tmp_p
     assert status["job_status"] == "submitted"
     assert "no longer has this job" in status["message"]
 
+    def starting_request(base, method, route, body=None):
+        if route.endswith("/training-status"):
+            return {"available": False, "message": "Training is starting."}
+        return live_request(base, method, route, body)
+
+    monkeypatch.setattr(orchestrator, "_request", starting_request)
+    status = orchestrator.job_training_status(job["job_id"])
+    assert status["available"] is False
+    assert status["stale"] is False
+    assert status["message"] == "Training is starting."
+
 
 def test_job_training_status_exposes_last_persisted_progress_for_missing_worker_job(tmp_path, monkeypatch):
     workspace = tmp_path / "workspace"

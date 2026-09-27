@@ -11,7 +11,12 @@ const proxy: RequestHandler = async ({ request, params, url, fetch }) => {
 	// Preserve streaming bodies (notably multi-gigabyte dataset uploads) instead
 	// of materializing a second full copy in the SvelteKit process.
 	const body = ['GET', 'HEAD'].includes(request.method) ? undefined : request.body;
-	const response = await fetch(target, { method: request.method, headers, body });
+	// Node's Undici implementation requires an explicit duplex mode whenever a
+	// ReadableStream is forwarded. Without it every POST/PATCH is rejected by
+	// the development proxy before the orchestrator can return useful feedback.
+	const options: RequestInit & { duplex?: 'half' } = { method: request.method, headers, body };
+	if (body) options.duplex = 'half';
+	const response = await fetch(target, options);
 	return new Response(response.body, { status: response.status, headers: response.headers });
 };
 

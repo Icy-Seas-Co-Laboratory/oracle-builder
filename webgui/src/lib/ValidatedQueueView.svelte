@@ -149,7 +149,14 @@
 		const total = number(live?.total_batches ?? progress.total_batches ?? progress.batches_per_epoch);
 		return batch != null && total ? Math.max(0, Math.min(100, batch / total * 100)) : null;
 	}
-	const workerUnavailable = (live: RecordValue | undefined) => Boolean(live) && (live?.available === false || live?.stale === true);
+	// A new job may legitimately have no snapshot while its process starts.
+	// Reserve the interruption treatment for a confirmed stale/missing worker
+	// record; otherwise the queue would invite a harmful reconciliation during
+	// normal startup.
+	const workerUnavailable = (live: RecordValue | undefined) => {
+		const message = String(live?.message ?? '');
+		return Boolean(live) && (live?.recovery_action === 'reconcile_stuck_jobs' || /returned 404|no longer has this job/i.test(message));
+	};
 	const workerUnavailableDetail = (live: RecordValue | undefined) => String(live?.message || 'The compute worker is not publishing a live status for this run.');
 	const lastKnownUpdate = (live: RecordValue | undefined) => text(live?.updated_at ?? live?.last_updated_at);
 	function liveMetric(live: RecordValue | undefined, key: string) {
