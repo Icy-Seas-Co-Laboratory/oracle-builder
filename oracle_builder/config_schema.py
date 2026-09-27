@@ -26,10 +26,9 @@ from oracle_builder.config import (
 
 
 # Bump whenever clients need to understand a new catalog contract attribute.
-# Version 3 removes the public V1 compatibility surface and adds explicit UI
-# control semantics.  Clients must treat this as an authoring contract, not a
-# dump of internal runtime defaults.
-SCHEMA_VERSION = 4
+# Version 5 adds the maximum Gaussian-blur augmentation setting. Clients must
+# treat this as an authoring contract, not a dump of internal runtime defaults.
+SCHEMA_VERSION = 5
 
 EXPOSURES: tuple[dict[str, Any], ...] = (
     {
@@ -282,6 +281,13 @@ _OVERRIDES: dict[str, dict[str, Any]] = {
     "metadata.augmentation.gaussian_variance": {"minimum": 0, "applies_to": ("classification",), "advanced": True},
     "metadata.augmentation.probability": {"minimum": 0, "maximum": 1, "advanced": True},
     "metadata.augmentation.apply_to": {"choices": ("continuous",), "advanced": True},
+    "augmentation.gaussian_blur_max_sigma": {
+        "minimum": 0,
+        "maximum": 32,
+        "step": 0.1,
+        "advanced": True,
+        "help": "Maximum Gaussian blur σ in input pixels. Training samples a value uniformly from 0 to this maximum for each batch; 0 disables blur.",
+    },
     # These are the ordinary experiment controls.  Their maintained choices
     # originate in config.py, so guided clients cannot silently drift from the
     # configuration accepted by the training runtime.

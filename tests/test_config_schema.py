@@ -74,6 +74,8 @@ def test_catalog_covers_every_runtime_default_and_exposes_v2_metadata():
     assert fields["training.metrics"]["allowed_values_path"] == "run.task"
     assert fields["augmentation.enabled"]["exposure"] == "standard"
     assert fields["augmentation.enabled"]["control"] == "toggle"
+    assert fields["augmentation.gaussian_blur_max_sigma"]["default"] == 1.0
+    assert fields["augmentation.gaussian_blur_max_sigma"]["minimum"] == 0
     assert fields["distribution.strategy"]["exposure"] == "standard"
     assert fields["distribution.strategy"]["control"] == "select"
     assert fields["distribution.strategy"]["choices"] == list(STANDARD_DISTRIBUTION_STRATEGIES)

@@ -4,6 +4,7 @@ import numpy as np
 import tensorflow as tf
 
 from oracle_builder.training.augmentation import (
+    apply_gaussian_blur,
     augment_batch,
     input_mask_channels,
     photometric_channels,
@@ -75,6 +76,33 @@ def test_classification_augmentation_keeps_label_dtype_and_shape():
     assert augmented_y.dtype == tf.int64
     assert np.array_equal(augmented_y.numpy(), y)
     assert np.allclose(augmented_x.numpy(), 0.8)
+
+
+def test_gaussian_blur_is_optical_and_does_not_modify_mask_channels():
+    tf.random.set_seed(17)
+    config = {
+        "run": {"task": "segmentation"},
+        "data": {"input_shape": [9, 9, 2]},
+        "augmentation": {
+            "enabled": True,
+            "gaussian_blur_max_sigma": 1.0,
+            "photometric_channels": [0],
+            "mask_input_channels": [1],
+        },
+    }
+    x = np.zeros((1, 9, 9, 2), dtype="float32")
+    x[:, 4, 4, 0] = 1.0
+    x[:, 2:7, 2:7, 1] = 1.0
+    y = np.zeros((1, 9, 9, 1), dtype="float32")
+
+    blurred = apply_gaussian_blur(tf.constant(x[..., :1]), tf.constant(1.0), radius=3)
+    augmented_x, augmented_y = augment_batch(tf.constant(x), tf.constant(y), config)
+
+    assert augmented_x.shape == x.shape
+    assert 0 < blurred.numpy()[0, 4, 4, 0] < 1
+    assert blurred.numpy()[0, 4, 3, 0] > 0
+    assert np.array_equal(augmented_x.numpy()[..., 1], x[..., 1])
+    assert np.array_equal(augmented_y.numpy(), y)
 
 
 def test_classification_augmentation_preserves_auxiliary_metadata_input():

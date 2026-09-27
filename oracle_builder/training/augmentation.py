@@ -380,11 +380,53 @@ def apply_photometric_augmentation(x, config: dict[str, Any], augmentation: dict
         factor = tf.random.uniform([tf.shape(selected)[0], 1, 1, 1], max(0.0, 1.0 - contrast), 1.0 + contrast)
         mean = tf.reduce_mean(selected, axis=[1, 2], keepdims=True)
         selected = (selected - mean) * factor + mean
+    maximum_blur_sigma = float(augmentation.get("gaussian_blur_max_sigma", 1.0))
+    if maximum_blur_sigma > 0:
+        # Blur is deliberately applied before additive noise: it models an
+        # optical/focus perturbation rather than blurring synthetic sensor
+        # noise.  Restrict it to photometric channels so masks and signed
+        # distance fields retain their semantic values.
+        selected = apply_random_gaussian_blur(selected, maximum_blur_sigma)
     noise = float(augmentation.get("gaussian_noise", 0.0))
     if noise:
         selected = selected + tf.random.normal(tf.shape(selected), stddev=noise)
     selected = tf.clip_by_value(selected, 0.0, 1.0)
     return replace_channels(values, channels, selected)
+
+
+def apply_random_gaussian_blur(images, maximum_sigma: float):
+    """Blur a batch with a Gaussian sigma uniformly sampled in ``[0, max]``.
+
+    One sigma is sampled per batch, which keeps the operation a single
+    depthwise convolution on CPU, CUDA, and Metal instead of a costly Python
+    loop over images.  Successive shuffled batches still provide a continuous
+    range of focus perturbations to every training image.
+    """
+    maximum_sigma = float(maximum_sigma)
+    if maximum_sigma <= 0:
+        return images
+    radius = max(1, int(math.ceil(3.0 * maximum_sigma)))
+    sigma = tf.random.uniform((), 0.0, maximum_sigma, dtype=images.dtype)
+
+    def blur():
+        return apply_gaussian_blur(images, sigma, radius=radius)
+
+    # Keep a true identity path for the lower endpoint, avoiding division by
+    # zero and preserving unblurred views when the sampled sigma is tiny.
+    return tf.cond(sigma > tf.cast(1e-6, images.dtype), blur, lambda: images)
+
+
+def apply_gaussian_blur(images, sigma, *, radius: int):
+    """Apply one sigma-controlled, channel-independent Gaussian blur."""
+    coordinates = tf.cast(tf.range(-radius, radius + 1), images.dtype)
+    kernel_1d = tf.exp(-0.5 * tf.square(coordinates / tf.cast(sigma, images.dtype)))
+    kernel_1d /= tf.reduce_sum(kernel_1d)
+    kernel_2d = kernel_1d[:, tf.newaxis] * kernel_1d[tf.newaxis, :]
+    kernel = kernel_2d[:, :, tf.newaxis, tf.newaxis]
+    kernel = tf.tile(kernel, [1, 1, tf.shape(images)[-1], 1])
+    # Symmetric padding prevents a dark artificial border around ROIs.
+    padded = tf.pad(images, [[0, 0], [radius, radius], [radius, radius], [0, 0]], mode="SYMMETRIC")
+    return tf.nn.depthwise_conv2d(padded, kernel, strides=[1, 1, 1, 1], padding="VALID")
 
 
 def gather_channels(x, channels: list[int]):

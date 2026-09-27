@@ -363,6 +363,7 @@ flip_vertical = true
 brightness = 0.20
 contrast = 0.20
 gaussian_noise = 0.05
+gaussian_blur_max_sigma = 1.0 # Maximum optical blur σ in input pixels; sampled uniformly from 0 to this value per batch.
 fill_value = 0.0
 mask_fill_value = 0.0
 # signed_distance_fill_value = -1.0 # Segmentation signed-distance channel.

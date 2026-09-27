@@ -266,6 +266,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "brightness": 0.0,
         "contrast": 0.0,
         "gaussian_noise": 0.0,
+        # The maximum optical blur sigma in input pixels.  A value is sampled
+        # uniformly from [0, maximum] for each training batch.
+        "gaussian_blur_max_sigma": 1.0,
         "fill_value": 0.0,
         "mask_fill_value": 0.0,
     },
@@ -623,6 +626,9 @@ def validate_config(config: dict[str, Any]) -> None:
         value = augmentation.get(axis)
         if value is not None and not 0 <= float(value) <= 0.95:
             raise ValueError(f"augmentation.{axis} must be in [0, 0.95]")
+    blur_sigma = float(augmentation.get("gaussian_blur_max_sigma", 1.0))
+    if not np.isfinite(blur_sigma) or blur_sigma < 0:
+        raise ValueError("augmentation.gaussian_blur_max_sigma must be finite and non-negative")
     metadata_settings = config.get("metadata", {})
     if not isinstance(metadata_settings, dict):
         raise ValueError("metadata must be a table/object")
