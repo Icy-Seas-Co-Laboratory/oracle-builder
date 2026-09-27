@@ -79,6 +79,33 @@ code, pre, .code { font-family: 'SFMono-Regular', Consolas, ui-monospace, monosp
 .side-foot span { display: inline-block; width: .5rem; height: .5rem; margin-right: .35rem; border-radius: 50%; }
 .side-foot .pulse { background: #57cbb8; box-shadow: 0 0 0 4px rgba(87, 203, 184, .12); }
 .side-foot .offline { background: #dc7479; }
+.server-logs-button { display: block; width: 100%; margin-top: .6rem; padding: .35rem .45rem; color: #b9cdcf; border: 1px solid #33565e; background: transparent; font-size: .65rem; text-align: left; }
+.server-logs-button:hover:not(:disabled) { color: white; border-color: #5cbcae; background: var(--navy-soft); }
+.server-logs-backdrop { position: fixed; z-index: 60; inset: 0; display: grid; place-items: center; padding: 1rem; background: rgba(8, 29, 35, .62); backdrop-filter: blur(3px); }
+.server-logs-modal { width: min(1250px, 96vw); max-height: 92vh; overflow: auto; padding: 1.25rem; border: 1px solid #cbd5e1; border-radius: 12px; background: #fff; color: var(--ink); box-shadow: 0 26px 70px rgba(0, 0, 0, .3); }
+.server-logs-modal > header { display: flex; justify-content: space-between; gap: 1rem; padding-bottom: 1rem; border-bottom: 1px solid var(--line); }
+.server-logs-modal > header h2 { margin: .1rem 0 .3rem; }
+.server-logs-modal > header p { margin: 0; color: var(--muted); font-size: .76rem; }
+.server-logs-modal > header > div:last-child { display: flex; align-items: start; gap: .45rem; }
+.scheduler-diagnostics { margin-top: 1rem; padding: .9rem; border: 1px solid #b9dfd8; border-radius: 8px; background: #f2fbf8; }
+.scheduler-diagnostics > h3 { margin: 0 0 .55rem; color: #17675d; font-size: .82rem; }
+.scheduler-findings { margin-bottom: .65rem; padding: .1rem .65rem; border-left: 3px solid #d69b4d; background: #fff8e9; color: #7a4b15; font-size: .73rem; }
+.scheduler-findings p { margin: .45rem 0; }
+.scheduler-diagnostic-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: .65rem; }
+.scheduler-diagnostic-grid article { padding: .65rem .75rem; border: 1px solid #cfe7e1; border-radius: 6px; background: white; }
+.scheduler-diagnostic-grid h4 { margin: 0; font-size: .76rem; }
+.scheduler-diagnostic-grid small { display: block; margin-top: .25rem; color: var(--muted); font-size: .65rem; }
+.scheduler-diagnostic-grid p { margin: .4rem 0 0; color: #43556b; font-size: .71rem; line-height: 1.45; }
+.server-log-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: .8rem; margin-top: 1rem; }
+.server-log-grid article { min-width: 0; overflow: hidden; border: 1px solid var(--line); border-radius: 8px; background: #f8fafc; }
+.server-log-grid article > header { display: flex; justify-content: space-between; gap: .5rem; padding: .75rem; border-bottom: 1px solid var(--line); }
+.server-log-grid h3 { margin: 0; font-size: .82rem; }
+.server-log-grid small { display: block; margin-top: .15rem; color: var(--muted); font-size: .63rem; }
+.server-log-grid header > span { height: fit-content; padding: .2rem .4rem; border-radius: 99px; color: #9a5a12; background: #fef3c7; font-size: .61rem; font-weight: 700; text-transform: uppercase; }
+.server-log-grid header > span.available { color: #17675d; background: #dff1ec; }
+.server-log-grid pre { min-height: 260px; max-height: 55vh; margin: 0; overflow: auto; padding: .75rem; color: #dceced; background: #102a35; font: .66rem/1.45 'SFMono-Regular', Consolas, ui-monospace, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+.server-log-grid article > p, .server-logs-error { padding: .8rem; color: #9a5a12; font-size: .75rem; }
+.server-logs-error { margin: 1rem 0 0; color: #b42318; background: #fef2f2; border: 1px solid #fecaca; border-radius: 7px; }
 .app-frame { min-width: 0; }
 .topbar { min-height: 112px; display: flex; align-items: center; justify-content: space-between; gap: 1rem; padding: 1.65rem clamp(1.2rem, 3.5vw, 3.5rem); background: rgba(255,255,255,.88); border-bottom: 1px solid var(--line); backdrop-filter: blur(12px); }
 .topbar .eyebrow { margin-bottom: .35rem; }
@@ -389,6 +416,7 @@ tr.attention { background: #fff6f6; }
 	.workflow-nav button { grid-template-columns: auto 1fr; padding: .65rem .55rem; }
 	.workflow-nav button.active { box-shadow: inset 0 -3px #43b9a9; }
 	.workflow-nav small, .workflow-nav i { display: none; }
+	.server-log-grid { grid-template-columns: 1fr; }
 	.topbar { min-height: 92px; }
 	.welcome-panel { grid-template-columns: 1fr; }
 	.workflow-map { grid-template-columns: repeat(4, 1fr); }

@@ -20,6 +20,12 @@
 	let loading = true;
 	let notice = '';
 	let failure = '';
+	let serverLogsOpen = false;
+	let serverLogs: RecordValue[] = [];
+	let schedulerDiagnostics: RecordValue[] = [];
+	let schedulerFindings: string[] = [];
+	let serverLogsLoading = false;
+	let serverLogsError = '';
 
 	const pageMeta: { id: Page; number: string; title: string; detail: string }[] = [
 		{ id: 'models', number: '01', title: 'Model Runs', detail: 'Catalog & inspect' },
@@ -86,6 +92,17 @@
 	function compared(ids: string[]) { comparisonIds = ids; navigate('comparison'); }
 	function useDraft(_definitionId: string) { navigate('queue'); }
 	function changed(message: string) { notice = message; failure = ''; void coordinator?.trigger('mutation', true); }
+	async function loadServerLogs() {
+		serverLogsLoading = true; serverLogsError = '';
+		try {
+			const result = await api.serverLogs();
+			serverLogs = records(result.logs);
+			schedulerDiagnostics = records(record(result.scheduler).endpoints);
+			schedulerFindings = strings(record(result.scheduler).findings);
+		} catch (error) { serverLogsError = error instanceof Error ? error.message : 'Could not load server diagnostics.'; }
+		finally { serverLogsLoading = false; }
+	}
+	function openServerLogs() { serverLogsOpen = true; void loadServerLogs(); }
 
 	onMount(() => {
 		syncPageFromLocation();
@@ -111,7 +128,7 @@
 		<button class="brand" on:click={() => navigate('models')} aria-label="Oracle Builder home"><img class="brand-mark" src="/brand/oracle-builder-mark.webp" alt="" /><span><strong>Oracle Builder</strong><small>Scientific model workspace</small></span></button>
 		<div class="sidebar-group"><p class="nav-label">WORKSPACE</p><nav class="workflow-nav" aria-label="Primary navigation">{#each pageMeta as page}<button class:active={activePage === page.id} on:click={() => navigate(page.id)}><span class="nav-step">{page.number}</span><span><strong>{page.title}</strong><small>{page.detail}</small></span>{#if page.id === 'models' && artifacts.length}<i>{artifacts.length}</i>{:else if page.id === 'queue' && activeJobCount}<i>{activeJobCount}</i>{/if}</button>{/each}</nav></div>
 		<div class="sidebar-context"><p class="nav-label">SYSTEM</p><dl><div><dt>Models</dt><dd>{artifacts.length}</dd></div><div><dt>Frozen data</dt><dd>{datasets.filter((dataset) => dataset.lifecycle === 'frozen').length}</dd></div><div><dt>Active jobs</dt><dd>{activeJobCount}</dd></div></dl></div>
-		<div class="sidebar-bottom"><section class="tensorflow-devices" aria-live="polite"><p class="nav-label">TENSORFLOW DEVICES</p>{#if tensorflowDevices.length}{#each tensorflowDevices as device}<div class="tensorflow-device" title={device.endpoint}><i class:busy={device.inUse} class:offline={!device.available}></i><span>{device.label}</span><small>{device.inUse ? 'In use' : 'Available'}</small></div>{/each}{:else}<small class="device-empty">No device telemetry available</small>{/if}</section><div class="side-foot"><span class:offline={!serviceReady()} class="pulse"></span>{loading ? 'Updating workspace…' : serviceReady() ? 'Compute connected' : 'Plan offline; dispatch later'}</div></div>
+		<div class="sidebar-bottom"><section class="tensorflow-devices" aria-live="polite"><p class="nav-label">TENSORFLOW DEVICES</p>{#if tensorflowDevices.length}{#each tensorflowDevices as device}<div class="tensorflow-device" title={device.endpoint}><i class:busy={device.inUse} class:offline={!device.available}></i><span>{device.label}</span><small>{device.inUse ? 'In use' : 'Available'}</small></div>{/each}{:else}<small class="device-empty">No device telemetry available</small>{/if}</section><div class="side-foot"><span class:offline={!serviceReady()} class="pulse"></span>{loading ? 'Updating workspace…' : serviceReady() ? 'Compute connected' : 'Plan offline; dispatch later'}<button class="server-logs-button" on:click={openServerLogs}>Server health & logs</button></div></div>
 	</aside>
 	<div class="app-frame">
 		<header class="topbar"><div><p class="eyebrow">{pageMeta.find((page) => page.id === activePage)?.number} · {pageMeta.find((page) => page.id === activePage)?.title}</p><h1>{pageMeta.find((page) => page.id === activePage)?.detail}</h1></div><div class="topbar-actions"><span class:online={serviceReady()} class="system-pill"><i></i>{loading ? 'Connecting…' : serviceReady() ? 'Compute ready' : 'Compute unavailable'}</span><button class="quiet-button" on:click={() => void coordinator?.trigger('manual', true)} disabled={loading}>{loading ? 'Refreshing…' : 'Refresh'}</button></div></header>
@@ -126,3 +143,5 @@
 		</main>
 	</div>
 </div>
+
+{#if serverLogsOpen}<div class="server-logs-backdrop" role="presentation" on:click={(event) => event.target === event.currentTarget && (serverLogsOpen = false)}><div class="server-logs-modal" role="dialog" aria-modal="true" aria-labelledby="server-logs-title" tabindex="-1"><header><div><p class="eyebrow">SERVER HEALTH</p><h2 id="server-logs-title">Oracle Builder service logs</h2><p>Scheduler diagnosis and bounded tails from the local Orchestrator, Serve, and Web GUI processes.</p></div><div><button class="secondary small" disabled={serverLogsLoading} on:click={loadServerLogs}>{serverLogsLoading ? 'Refreshing…' : 'Refresh'}</button><button class="icon-button" aria-label="Close server logs" on:click={() => serverLogsOpen = false}>×</button></div></header>{#if serverLogsLoading && !serverLogs.length}<p class="empty">Loading service diagnostics…</p>{:else if serverLogsError}<p class="server-logs-error">{serverLogsError}</p>{:else}{#if schedulerDiagnostics.length}<section class="scheduler-diagnostics" aria-label="Scheduler diagnosis"><h3>Scheduler diagnosis</h3>{#if schedulerFindings.length}<div class="scheduler-findings">{#each schedulerFindings as finding}<p>{finding}</p>{/each}</div>{/if}<div class="scheduler-diagnostic-grid">{#each schedulerDiagnostics as endpoint}<article><h4>{String(endpoint.name ?? endpoint.endpoint_id ?? 'Compute endpoint')}</h4><small>{String(endpoint.idle_workers ?? 0)} idle / {String(endpoint.worker_slots ?? 0)} worker slots · {String(endpoint.authorized_runs ?? 0)} authorized waiting</small><p>{String(endpoint.diagnosis ?? '')}</p></article>{/each}</div></section>{/if}<div class="server-log-grid">{#each serverLogs as log}<article><header><div><h3>{String(log.name ?? log.service ?? 'Service')}</h3><small>{log.available ? `${String(log.line_count ?? 0)} recent lines · ${String(log.updated_at ?? 'timestamp unavailable')}` : 'Unavailable'}</small></div><span class:available={Boolean(log.available)}>{log.available ? 'Available' : 'Unavailable'}</span></header>{#if log.available}<pre>{String(log.text ?? '') || 'No log output yet.'}</pre>{:else}<p>{String(log.message ?? 'No log file was found for this service.')}</p>{/if}</article>{/each}</div>{/if}</div></div>{/if}

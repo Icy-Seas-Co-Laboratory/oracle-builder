@@ -63,7 +63,10 @@
 	}
 	$: selectedDataset = frozenDatasets.find((item) => String(item.dataset_id) === datasetId);
 	$: selectedEndpoint = computeEndpoints.find((item) => String(item.endpoint_id) === endpointId);
-	$: endpointResources = record(selectedEndpoint?.resources ?? selectedEndpoint?.capacity ?? selectedEndpoint?.scheduler_resources);
+	// Serve's raw resources and the orchestrator's derived capacity each carry
+	// useful fields.  Merge them so a raw resources object cannot hide live
+	// worker-slot telemetry from the Queue screen.
+	$: endpointResources = { ...record(selectedEndpoint?.resources ?? selectedEndpoint?.scheduler_resources), ...record(selectedEndpoint?.capacity) };
 	$: endpointQueue = record(selectedEndpoint?.queue);
 	$: endpointWorkerSlots = number(endpointResources.worker_slots ?? endpointResources.slots ?? endpointResources.total_slots ?? selectedEndpoint?.worker_slots);
 	$: endpointActiveSlots = number(endpointResources.active_slots ?? endpointResources.slots_in_use ?? endpointResources.running_slots ?? selectedEndpoint?.active_slots);

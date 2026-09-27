@@ -262,6 +262,7 @@ if [[ "$ORCHESTRATOR_RUNNING" == "0" ]]; then
       --database "$RUNTIME_DIR/orchestrator.sqlite" \
       --workspace-root "$ROOT_DIR" \
       --artifact-root "$RUNTIME_DIR/artifacts" \
+      --log-root "$LOG_DIR" \
       --runs-root "$ROOT_DIR/runs" \
       --datasets-root "$ROOT_DIR/datasets" \
       --oracle-serve "Local=${SERVE_URL}" \

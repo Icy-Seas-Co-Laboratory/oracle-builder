@@ -63,11 +63,16 @@ class Orchestrator:
         datasets_root: str | Path | None = None,
         browse_roots: list[str | Path] | None = None,
         training_catalog_roots: list[str | Path] | None = None,
+        log_root: str | Path | None = None,
         upload_limit_bytes: int = 10 * 1024 * 1024 * 1024,
         workspace_root: str | Path | None = None,
         compute_endpoints: list[tuple[str, str]] | None = None,
     ):
         self.database = Path(database).expanduser().resolve()
+        # The stack launcher writes only these service logs beneath the
+        # runtime directory.  Keep this a fixed allow-list rather than a
+        # general file browser so diagnostics cannot disclose arbitrary files.
+        self.log_root = (Path(log_root).expanduser().resolve() if log_root else self.database.parent / "logs")
         self.artifact_root = Path(artifact_root).expanduser().resolve() if artifact_root else self.database.parent / "oracle-artifacts"
         self.artifact_root.mkdir(parents=True, exist_ok=True)
         if upload_limit_bytes < 1:
@@ -112,6 +117,93 @@ class Orchestrator:
     def _connection(self) -> sqlite3.Connection:
         return connect(self.database)
 
+    def server_logs(self, *, tail_lines: int = 400) -> dict[str, Any]:
+        """Return bounded service tails plus the scheduler's cached diagnosis.
+
+        Reading logs must stay cheap and local: the modal must not itself
+        create a burst of requests to Serve.  The scheduler summary therefore
+        uses the most recently persisted endpoint snapshot, which is also the
+        snapshot used by the Queue page between refreshes.
+        """
+        lines = max(1, min(int(tail_lines), 2_000))
+        services = {
+            "orchestrator": ("Oracle Orchestrator", "orchestrator.log"),
+            "serve": ("Oracle Serve", "oracle-serve.log"),
+            "webgui": ("Web GUI", "webgui.log"),
+        }
+        logs: list[dict[str, Any]] = []
+        for service_id, (name, filename) in services.items():
+            path = (self.log_root / filename).resolve()
+            if not path.is_relative_to(self.log_root) or not path.is_file():
+                logs.append({"service": service_id, "name": name, "available": False, "message": "Log file is not available."})
+                continue
+            try:
+                # Tails are capped before decoding to keep a noisy process
+                # from turning a health-modal request into a large response.
+                with path.open("rb") as handle:
+                    handle.seek(0, 2)
+                    handle.seek(max(0, handle.tell() - 512 * 1024))
+                    tail = handle.read().decode("utf-8", errors="replace").splitlines()[-lines:]
+                logs.append({
+                    "service": service_id, "name": name, "available": True,
+                    "updated_at": datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat(),
+                    "line_count": len(tail), "text": "\n".join(tail),
+                })
+            except OSError as exc:
+                logs.append({"service": service_id, "name": name, "available": False, "message": f"Could not read log: {exc}"})
+        endpoint_diagnostics: list[dict[str, Any]] = []
+        findings: list[str] = []
+        with self._connection() as connection:
+            queue_counts_by_endpoint: dict[str, dict[str, int]] = {}
+            for row in connection.execute(
+                """SELECT preflight_endpoint_id, status, COUNT(*) AS count FROM queued_runs
+                   WHERE start_authorized=1
+                     AND status IN ('ready', 'waiting_for_resources')
+                     AND preflight_endpoint_id IS NOT NULL
+                   GROUP BY preflight_endpoint_id, status"""
+            ).fetchall():
+                endpoint_counts = queue_counts_by_endpoint.setdefault(str(row["preflight_endpoint_id"]), {})
+                endpoint_counts[str(row["status"])] = int(row["count"])
+        for endpoint in self.compute_endpoints():
+            endpoint_id = str(endpoint["endpoint_id"])
+            workers = endpoint.get("workers") or []
+            worker_states: dict[str, int] = {}
+            for worker in workers:
+                state = str(worker.get("status") or "unknown")
+                worker_states[state] = worker_states.get(state, 0) + 1
+            idle_workers = worker_states.get("idle", 0)
+            queue_counts = queue_counts_by_endpoint.get(endpoint_id, {})
+            authorized = sum(queue_counts.values())
+            status = str(endpoint.get("status") or "unknown")
+            diagnosis = "No authorized runs are waiting for this endpoint."
+            if status != "ready":
+                diagnosis = f"Endpoint is {status}; scheduling requires a ready endpoint."
+            elif authorized and not workers:
+                diagnosis = "Serve has not reported any workers. The scheduler dispatches only to workers explicitly reported as idle."
+            elif authorized and not idle_workers:
+                states = ", ".join(f"{count} {state}" for state, count in sorted(worker_states.items())) or "no worker telemetry"
+                diagnosis = f"{authorized} authorized run(s) are blocked: Serve reports no idle worker slot ({states})."
+            elif authorized:
+                diagnosis = f"{authorized} authorized run(s) can be considered on the next scheduler retry."
+            if authorized and (status != "ready" or not idle_workers):
+                findings.append(f"{endpoint.get('name') or endpoint_id}: {diagnosis}")
+            endpoint_diagnostics.append({
+                "endpoint_id": endpoint_id,
+                "name": endpoint.get("name") or endpoint_id,
+                "status": status,
+                "worker_slots": (endpoint.get("capacity") or {}).get("worker_slots", len(workers)),
+                "idle_workers": idle_workers,
+                "worker_states": worker_states,
+                "authorized_runs": authorized,
+                "waiting_runs": int(queue_counts.get("waiting_for_resources", 0)),
+                "diagnosis": diagnosis,
+            })
+        return {
+            "log_root_configured": self.log_root.is_dir(),
+            "logs": logs,
+            "scheduler": {"endpoints": endpoint_diagnostics, "findings": findings},
+        }
+
     # Durable operations ------------------------------------------------
     # Long-lived filesystem scans and remote reconciliation must not happen
     # in a GET request or vanish with an API process.  The runner is deliberately
@@ -124,7 +216,12 @@ class Orchestrator:
         with self._connection() as connection:
             connection.execute("""INSERT INTO operations(operation_id,operation_type,status,parameters_json,created_at,updated_at)
                 VALUES(?,?, 'queued',?,?,?)""", (operation_id, operation_type, _json(parameters or {}), now, now))
-        self.emit_operation_event(operation_id, "queued", "Operation accepted", {"status": "queued"})
+            # Commit the durable operation and its first event together.  A
+            # runner can otherwise claim a just-inserted row between these
+            # two writes, making the observable event stream begin at
+            # ``started`` rather than ``queued``.
+            connection.execute("""INSERT INTO operation_events(operation_id,timestamp,event_type,message,data_json)
+                VALUES(?,?,?,?,?)""", (operation_id, now, "queued", "Operation accepted", _json({"status": "queued"})))
         return self.operation(operation_id) or {}
 
     def operation(self, operation_id: str) -> dict[str, Any] | None:
@@ -215,6 +312,7 @@ class Orchestrator:
         self._operation_stop = threading.Event()
         def loop() -> None:
             last_reconciliation = 0.0
+            last_scheduling = 0.0
             while not self._operation_stop.is_set():
                 # Coalesce periodic reconciliation so active remote jobs are
                 # refreshed without every browser read triggering network I/O.
@@ -229,6 +327,27 @@ class Orchestrator:
                     if busy is None and active is not None:
                         self.create_operation("active_job_reconciliation")
                     last_reconciliation = time.monotonic()
+                # Authorized runs can be waiting while a remote worker changes
+                # from busy to idle.  Revisit only endpoints with such runs so
+                # an idle workspace remains silent, while recovered capacity is
+                # filled without requiring a browser refresh or re-authorization.
+                if time.monotonic() - last_scheduling >= reconciliation_seconds:
+                    with self._connection() as connection:
+                        pending_endpoints = [str(row["preflight_endpoint_id"]) for row in connection.execute(
+                            """SELECT DISTINCT preflight_endpoint_id FROM queued_runs
+                               WHERE start_authorized=1
+                                 AND status IN ('ready', 'waiting_for_resources')
+                                 AND preflight_endpoint_id IS NOT NULL"""
+                        ).fetchall()]
+                    for endpoint_id in pending_endpoints:
+                        try:
+                            self.schedule_queued_runs(endpoint_id)
+                        except (KeyError, RuntimeError):
+                            # The queued row retains the detailed reason from
+                            # a later explicit refresh; one failing endpoint
+                            # must not stop capacity retries for another.
+                            continue
+                    last_scheduling = time.monotonic()
                 if not self.run_next_operation(): self._operation_stop.wait(interval_seconds)
         self._operation_thread = threading.Thread(target=loop, name="oracle-operation-runner", daemon=True)
         self._operation_thread.start()
@@ -1012,6 +1131,19 @@ class Orchestrator:
             return []
         capacity = self._scheduler_capacity(endpoint)
         if capacity["slots"] < 1:
+            states: dict[str, int] = {}
+            for worker in endpoint.get("workers") or []:
+                state = str(worker.get("status") or "unknown")
+                states[state] = states.get(state, 0) + 1
+            telemetry = ", ".join(f"{count} {state}" for state, count in sorted(states.items())) or "no worker telemetry"
+            reason = f"Waiting for an idle compute worker slot ({telemetry})"
+            with self._connection() as db:
+                db.execute(
+                    """UPDATE queued_runs SET status='waiting_for_resources', failure_reason=?, updated_at=?
+                       WHERE preflight_endpoint_id=? AND start_authorized=1
+                         AND status IN ('ready', 'waiting_for_resources')""",
+                    (reason, _now(), endpoint_id),
+                )
             return []
         dispatched = []
         # A bounded candidate snapshot means a malformed/high-priority row

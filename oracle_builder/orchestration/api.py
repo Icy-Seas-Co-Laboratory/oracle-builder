@@ -230,6 +230,10 @@ def create_app(orchestrator: Orchestrator) -> FastAPI:
     def operation(operation_id: str) -> dict[str, Any]:
         return required(orchestrator.operation(operation_id), "Operation")
 
+    @app.get("/v1/system/logs")
+    async def server_logs(tail_lines: int = Query(default=400, ge=1, le=2_000)) -> dict[str, Any]:
+        return await run_in_threadpool(orchestrator.server_logs, tail_lines=tail_lines)
+
     @app.post("/v1/jobs:reconcile/schedule", status_code=202)
     async def schedule_job_reconciliation() -> dict[str, Any]:
         return {"operation": await run_in_threadpool(orchestrator.create_operation, "active_job_reconciliation")}

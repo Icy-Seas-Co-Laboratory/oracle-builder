@@ -28,6 +28,22 @@ def test_durable_operation_ledger_records_progress_and_result(tmp_path):
     assert orchestrator.operation_events(after=events[0]["sequence"], operation_id=operation["operation_id"])[0]["event_type"] == "started"
 
 
+def test_server_logs_are_bounded_to_allow_listed_stack_files(tmp_path):
+    log_root = tmp_path / "logs"
+    log_root.mkdir()
+    (log_root / "orchestrator.log").write_text("old\nnew\n", encoding="utf-8")
+    (log_root / "oracle-serve.log").write_text("serve\n", encoding="utf-8")
+    orchestrator = Orchestrator(tmp_path / "orchestrator.sqlite", workspace_root=tmp_path, log_root=log_root)
+
+    result = orchestrator.server_logs(tail_lines=1)
+
+    logs = {entry["service"]: entry for entry in result["logs"]}
+    assert logs["orchestrator"]["text"] == "new"
+    assert logs["serve"]["text"] == "serve"
+    assert logs["webgui"] == {"service": "webgui", "name": "Web GUI", "available": False, "message": "Log file is not available."}
+    assert result["scheduler"] == {"endpoints": [], "findings": []}
+
+
 def test_scheduled_operation_api_returns_accepted_operation(tmp_path):
     from fastapi.testclient import TestClient
     from oracle_builder.orchestration.api import create_app
@@ -924,6 +940,42 @@ def test_scheduler_waits_for_conflicting_gpu_but_dispatches_compatible_run(tmp_p
     assert orchestrator.queued_run(blocked)["status"] == "waiting_for_resources"
     assert "GPU" in orchestrator.queued_run(blocked)["failure_reason"]
     assert orchestrator.queued_run(compatible)["status"] == "submitted"
+
+
+def test_scheduler_explains_when_serve_has_no_idle_worker_slot(tmp_path, monkeypatch):
+    orchestrator = Orchestrator(tmp_path / "scheduler.sqlite", workspace_root=tmp_path)
+    endpoint = orchestrator.register_compute_endpoint(name="scheduler", base_url="http://scheduler-serve")
+    [queued_run_id] = _seed_scheduler_queue(orchestrator, endpoint["endpoint_id"], [{"gpu_count": 0}])
+    busy_endpoint = _scheduler_endpoint(endpoint["endpoint_id"], workers=1)
+    busy_endpoint["workers"][0]["status"] = "running"
+    monkeypatch.setattr(orchestrator, "refresh_compute_endpoint", lambda _id: busy_endpoint)
+
+    assert orchestrator.schedule_queued_runs(endpoint["endpoint_id"]) == []
+    queued = orchestrator.queued_run(queued_run_id)
+    assert queued["status"] == "waiting_for_resources"
+    assert queued["failure_reason"] == "Waiting for an idle compute worker slot (1 running)"
+
+
+def test_server_log_diagnostics_identify_authorized_run_without_idle_worker(tmp_path):
+    orchestrator = Orchestrator(tmp_path / "scheduler.sqlite", workspace_root=tmp_path)
+    endpoint = orchestrator.register_compute_endpoint(name="diagnostic serve", base_url="http://scheduler-serve")
+    _seed_scheduler_queue(orchestrator, endpoint["endpoint_id"], [{"gpu_count": 0}])
+    busy_endpoint = _scheduler_endpoint(endpoint["endpoint_id"], workers=1)
+    busy_endpoint["workers"][0]["status"] = "running"
+    with orchestrator._connection() as db:
+        db.execute(
+            "UPDATE compute_endpoints SET status='ready', workers_json=?, queue_json=? WHERE endpoint_id=?",
+            (json.dumps(busy_endpoint["workers"]), json.dumps(busy_endpoint["queue"]), endpoint["endpoint_id"]),
+        )
+
+    diagnostics = orchestrator.server_logs()["scheduler"]
+
+    assert diagnostics["endpoints"][0]["idle_workers"] == 0
+    assert diagnostics["endpoints"][0]["authorized_runs"] == 1
+    assert "no idle worker slot" in diagnostics["endpoints"][0]["diagnosis"]
+    assert diagnostics["findings"] == [
+        "diagnostic serve: 1 authorized run(s) are blocked: Serve reports no idle worker slot (1 running)."
+    ]
 
 
 def test_scheduler_claim_prevents_duplicate_concurrent_dispatch(tmp_path, monkeypatch):

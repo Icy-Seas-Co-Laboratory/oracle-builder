@@ -74,6 +74,7 @@ export const api = {
 	specifications: (experimentId?: string) => request<{ specifications: RecordValue[] }>(`/v1/specifications${experimentId ? `?experiment_id=${encodeURIComponent(experimentId)}` : ''}`),
 	jobs: (refresh = false, options?: ApiRequestOptions) => request<{ jobs: RecordValue[] }>(`/v1/jobs${refresh ? '?refresh=true' : ''}`, options),
 	operation: (id: string, options?: ApiRequestOptions) => request<RecordValue>(`/v1/operations/${encodeURIComponent(id)}`, options),
+	serverLogs: (tailLines = 400) => request<RecordValue>(`/v1/system/logs?tail_lines=${Math.max(1, Math.min(2000, tailLines))}`),
 	health: (options?: ApiRequestOptions) => request<RecordValue>('/health/ready', options),
 	computeEndpoints: (refresh = false, options?: ApiRequestOptions) => request<{ endpoints: RecordValue[] }>(`/v1/compute/endpoints${refresh ? '?refresh=true' : ''}`, options),
 	jobEvents: (id: string) => request<{ events: RecordValue[] }>(`/v1/jobs/${id}/events`),
