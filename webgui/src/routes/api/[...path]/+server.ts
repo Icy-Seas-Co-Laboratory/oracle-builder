@@ -8,6 +8,10 @@ const proxy: RequestHandler = async ({ request, params, url, fetch }) => {
 	target.search = url.search;
 	const headers = new Headers(request.headers);
 	headers.delete('host');
+	// The browser never receives an operator token. The UI proxy owns the
+	// server-side credential and refuses caller-supplied Authorization values.
+	headers.delete('authorization');
+	if (env.ORCHESTRATOR_OPERATOR_TOKEN) headers.set('authorization', `Bearer ${env.ORCHESTRATOR_OPERATOR_TOKEN}`);
 	// Preserve streaming bodies (notably multi-gigabyte dataset uploads) instead
 	// of materializing a second full copy in the SvelteKit process.
 	const body = ['GET', 'HEAD'].includes(request.method) ? undefined : request.body;
@@ -24,3 +28,4 @@ export const GET = proxy;
 export const POST = proxy;
 export const PATCH = proxy;
 export const PUT = proxy;
+export const DELETE = proxy;

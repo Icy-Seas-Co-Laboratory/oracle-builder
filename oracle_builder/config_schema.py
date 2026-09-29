@@ -26,9 +26,9 @@ from oracle_builder.config import (
 
 
 # Bump whenever clients need to understand a new catalog contract attribute.
-# Version 5 adds the maximum Gaussian-blur augmentation setting. Clients must
+# Version 7 adds explicit split-policy and coverage configuration. Clients must
 # treat this as an authoring contract, not a dump of internal runtime defaults.
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 7
 
 EXPOSURES: tuple[dict[str, Any], ...] = (
     {
@@ -257,7 +257,19 @@ def _leaves(value: Any, prefix: str = "") -> Iterable[tuple[str, Any]]:
 # API drafts, and GUI select controls.
 _OVERRIDES: dict[str, dict[str, Any]] = {
     "architecture.version": {"choices": (2,), "editable": False, "help": "Architecture V2 is the supported authoring contract."},
-    "data.split_strategy": {"choices": ("auto", "random", "source_partitions")},
+    "data.split_strategy": {
+        "choices": (
+            "auto", "class_stratified", "stratified_group", "group_only",
+            "random", "source_partitions",
+        ),
+        "help": "Auto preserves complete imported partitions; otherwise it stratifies effective classification labels.",
+    },
+    "data.split_minimum_per_class": {"minimum": 0, "advanced": True},
+    "data.split_group_metadata_key": {
+        "value_type": "string_or_null",
+        "advanced": True,
+        "visible_when": {"data.split_strategy": ("stratified_group", "group_only")},
+    },
     "data.candidate_distance": {"choices": ("none", "euclidean_sdf", "geodesic"), "advanced": True, "applies_to": ("segmentation",)},
     "data.streaming.reader_workers": {"minimum": 1, "advanced": True},
     "data.streaming.prefetch_batches": {"minimum": 1, "advanced": True},
@@ -317,8 +329,21 @@ _OVERRIDES: dict[str, dict[str, Any]] = {
         "help": "Metrics reported for each training and validation epoch.",
     },
     "training.display": {"choices": ("rich", "text", "off")},
+    "training.step_cursor_policy": {
+        "choices": ("epoch", "ordered_batches_v1"),
+        "advanced": True,
+        "help": "Checkpoint boundary policy. Ordered batches is CPU-only and requires deterministic, non-streaming inputs.",
+    },
+    "training.work_unit_steps": {
+        "minimum": 0,
+        "maximum": 1000000,
+        "step": 1,
+        "advanced": True,
+        "help": "Maximum deterministic batches per scheduled unit; 0 uses epoch or shared-cycle units.",
+    },
     "training.weight_decay": {"minimum": 0, "advanced": True},
-    "training.class_weights.mode": {"choices": ("explicit", "inverse_frequency", "effective_number"), "applies_to": ("classification",)},
+    "training.class_weights.mode": {"choices": ("explicit", "inverse_frequency", "effective_number", "power_law"), "applies_to": ("classification",)},
+    "training.class_weights.alpha": {"minimum": 0, "maximum": 1, "step": 0.01, "applies_to": ("classification",), "help": "Power-law exponent for p_i^-alpha class weighting."},
     "monitoring.primary_metric": {"help": "Metric used for the dashboard health summary. Use auto to prefer validation macro F1, then validation accuracy or loss."},
     "monitoring.target_metric": {"help": "Exact emitted metric name to watch, for example val_macro_f1 or val_loss."},
     "monitoring.target_value": {"help": "Target is satisfied when higher-is-better metrics meet it, or lower-is-better metrics are at or below it."},
@@ -608,7 +633,7 @@ def classification_preset_defaults() -> dict[str, Any]:
         "fusion": {"type": "concat"},
         "classifier": {"type": "linear"},
         "model": {"embedding_dim": 256, "normalize_embeddings": True, "dropout": 0.0},
-        "training": {"epochs": 50, "optimizer": "adam", "learning_rate": 0.001, "loss": "weighted_sparse_categorical_crossentropy", "metrics": ["accuracy", "macro_f1"], "class_weights": {"mode": "effective_number", "beta": 0.999, "normalize": True}},
+        "training": {"epochs": 50, "optimizer": "adam", "learning_rate": 0.001, "loss": "weighted_sparse_categorical_crossentropy", "metrics": ["accuracy", "macro_f1"], "class_weights": {"mode": "effective_number", "beta": 0.999, "alpha": 0.5, "normalize": True}},
         "callbacks": {"early_stopping": True, "early_stopping_patience": 18, "reduce_lr_on_plateau": True, "checkpoint_monitor": "val_loss"},
         "augmentation": {"enabled": True, "repeats_per_epoch": 1, "invert": False, "rotation": 0.5, "zoom": 0.20, "translation": [0.15, 0.15], "skew": 0.20, "flip_horizontal": True, "flip_vertical": True, "brightness": 0.20, "contrast": 0.20, "gaussian_noise": 0.05, "fill_value": 0.0},
         "distribution": {"strategy": "single", "devices": [], "cross_device_ops": "auto", "fallback_to_single": True, "memory_growth": True, "gpu_selection": "unused_first", "require_unused_gpu": False, "allow_busy_fallback": False, "gpu_light_share_memory_mb": 1024, "gpu_light_share_utilization_percent": 15},

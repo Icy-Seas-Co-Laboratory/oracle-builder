@@ -5,6 +5,12 @@ preprocessing, a neural-network core, deterministic postprocessing, and a
 versioned input/output contract. Training augmentation is part of the training
 recipe and is not executed by the inference bundle.
 
+This document describes a storage-neutral library contract. It is not a
+network API and does not authorize a user-facing worker endpoint. The former
+`oracle-serve` API is retired; operational batch inference is an
+Orchestrator-owned `infer` WorkUnit and must be
+submitted through the Orchestrator as an explicit leased WorkUnit.
+
 ## Ownership and persistence
 
 The system providing an operational input remains its authoritative owner.

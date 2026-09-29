@@ -8,6 +8,8 @@ entry points. Domain code should not import repository-root scripts.
 | Package | Responsibility |
 |---|---|
 | `oracle_data_contracts` | Dependency-light Dataset V1 schema/lifecycle/workspace plus model-run artifact layout, manifests, split protocol, fingerprints, repositories, and deterministic transfer. |
+| `oracle_data_contracts.work_units` | Versioned, path-free execution attempt contracts shared by the orchestrator and workers. |
+| `oracle_tools.roi` | Dependency-light ROI image, mask morphology, thresholding, and validation primitives. It has no Builder, orchestration, training, SQLite-workspace, or GUI dependency. |
 | `oracle_builder.datasets`, `oracle_builder.artifacts` | Backward-compatible imports and Oracle Builder CLI integration for the shared contracts. |
 | `oracle_builder.data` | Backend-neutral decoding, preprocessing, splitting, tiling, and TensorFlow input adapters. |
 | `oracle_builder.models` | Built-in architecture definitions. |
@@ -15,12 +17,15 @@ entry points. Domain code should not import repository-root scripts.
 | `oracle_builder.evaluation` | Predictions, thresholds, evidence, and reports. |
 | `oracle_builder.classification` | Classification feature and evidence semantics. |
 | `oracle_builder.inference` | Storage-neutral inference bundles, contracts, connectors, and sinks. |
-| `oracle_builder.masking` | Mask editing, validation, API loading, and mask-refinement workflows. |
+| `oracle_builder.worker` | Stateless registered pull-worker runtime with fixed `train`, `infer`, and `package` executors plus disk-backed, resumable output publication. |
+| `oracle_builder.orchestration` | Durable catalog, worker-pool admission, lease, artifact-store, and staged-publication authority. |
+| `oracle_builder.masking` | Mask editing, API loading, SQLite workspace, and mask-refinement workflows. |
 | `oracle_builder.saving` | Portable model serialization and load tests. |
 
 The top-level `model_training.py`, `model_inference.py`, `model_evaluate.py`, and
-`mask_builder.py` files are application entry points. New reusable behavior
-belongs in the package domains above.
+`mask_builder.py` files are local/developer application adapters. Normal users
+enter the system through the Orchestrator via the Web GUI, `oracle` CLI, or its
+HTTP API; new reusable behavior belongs in the package domains above.
 
 ## Dependency direction
 
@@ -75,3 +80,21 @@ persistence is selected through an explicit sink.
 
 The stable V1 contracts are documented in
 [`inference-contract-v1.md`](inference-contract-v1.md).
+
+Batch inference is an Orchestrator-owned WorkUnit: callers create and start an
+inference run through the Orchestrator, and an admitted worker executes the
+fixed `infer` action. There is no supported direct-worker or `oracle-serve`
+inference endpoint.
+
+## Control-plane migration boundary
+
+The Orchestrator owns durable work-unit construction and is the designated
+artifact-store publication authority. `WorkUnit V1` contains portable artifact
+references and a job-scoped staging reference; it never serializes host paths
+or storage credentials. Workers materialize granted artifacts into disposable
+scratch space and publish only staged output through a disk-backed resumable
+transfer session. The Orchestrator alone validates, seals, and promotes the
+result. This same worker protocol works over loopback or HTTPS to a remote
+worker; S3-compatible stores remain an Orchestrator-owned replica/persistence
+boundary rather than a credentialed worker write path. See
+[`work-unit-v1.md`](work-unit-v1.md).

@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from oracle_builder.config import validate_config
-from oracle_builder.training.distribution import select_distribution_strategy
+from oracle_builder.training.distribution import _GPU_LEASES, gpu_lease_scope, select_distribution_strategy
 
 
 def base_config():
@@ -23,8 +23,19 @@ def base_config():
     }
 
 
-def test_auto_strategy_reports_global_and_per_replica_batch_sizes():
-    strategy, info = select_distribution_strategy(base_config())
+def test_auto_strategy_reports_global_and_per_replica_batch_sizes(monkeypatch):
+    # This assertion exercises batch accounting, not a machine's current
+    # GPU availability. Keep it independent of leases held by other tests.
+    monkeypatch.setattr(
+        "oracle_builder.training.distribution.tf.config.list_physical_devices",
+        lambda _kind: [],
+    )
+    monkeypatch.setattr(
+        "oracle_builder.training.distribution.tf.config.list_logical_devices",
+        lambda _kind: [],
+    )
+    with gpu_lease_scope():
+        strategy, info = select_distribution_strategy(base_config())
 
     assert info.replicas == strategy.num_replicas_in_sync
     assert info.global_batch_size == 8
@@ -36,7 +47,8 @@ def test_cpu_strategy_can_be_requested_explicitly():
     config = base_config()
     config["distribution"]["strategy"] = "cpu"
 
-    strategy, info = select_distribution_strategy(config)
+    with gpu_lease_scope():
+        strategy, info = select_distribution_strategy(config)
 
     assert strategy.num_replicas_in_sync == 1
     assert info.resolved_strategy == "cpu"
@@ -69,14 +81,17 @@ def test_auto_uses_one_unused_gpu_for_multiple_gpus(monkeypatch, tmp_path):
     config = base_config()
     config["distribution"]["gpu_lease_directory"] = str(tmp_path)
 
-    strategy, info = select_distribution_strategy(config)
+    with gpu_lease_scope():
+        strategy, info = select_distribution_strategy(config)
 
-    assert strategy is fake_strategy
-    assert info.resolved_strategy == "single"
-    assert info.replicas == 1
-    assert info.per_replica_batch_size == 8
-    assert one_device_calls == ["/GPU:1"]
-    assert info.gpu_lease_path is not None
+        assert strategy is fake_strategy
+        assert info.resolved_strategy == "single"
+        assert info.replicas == 1
+        assert info.per_replica_batch_size == 8
+        assert one_device_calls == ["/GPU:1"]
+        assert info.gpu_lease_path is not None
+        assert info.gpu_lease_path in _GPU_LEASES
+    assert info.gpu_lease_path not in _GPU_LEASES
 
 
 def test_global_batch_must_be_divisible_by_replica_count(monkeypatch):
@@ -104,8 +119,9 @@ def test_global_batch_must_be_divisible_by_replica_count(monkeypatch):
         lambda **_kwargs: fake_strategy,
     )
 
-    with pytest.raises(ValueError, match="must be divisible"):
-        select_distribution_strategy(config)
+    with gpu_lease_scope():
+        with pytest.raises(ValueError, match="must be divisible"):
+            select_distribution_strategy(config)
 
 
 @pytest.mark.parametrize("strategy", ["many_gpus", "distributed"])

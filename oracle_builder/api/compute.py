@@ -21,6 +21,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
+from oracle_data_contracts.work_units import WorkUnit, WorkUnitError
+
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _TRAINING_STATUS_FILENAME = "training-status.json"
 _MAX_TRAINING_STATUS_BYTES = 1_000_000
@@ -55,6 +57,7 @@ class Job:
     action: JobAction
     parameters: dict[str, Any]
     resources: dict[str, Any]
+    work_unit: dict[str, Any] | None = None
     submitted_at: float = field(default_factory=time.time)
     status: JobStatus = "queued"
     worker_id: str | None = None
@@ -75,6 +78,7 @@ class Job:
             "action": self.action,
             "parameters": self.parameters,
             "resources": self.resources,
+            "work_unit": self.work_unit,
             "status": self.status,
             "worker_id": self.worker_id,
             "submitted_at": _timestamp(self.submitted_at),
@@ -480,11 +484,31 @@ class ComputeService:
                 },
             }
 
-    def submit(self, *, job_id: str, action: JobAction, parameters: dict[str, Any], resources: dict[str, Any] | None = None) -> dict[str, Any]:
+    def submit(
+        self,
+        *,
+        job_id: str,
+        action: JobAction,
+        parameters: dict[str, Any],
+        resources: dict[str, Any] | None = None,
+        work_unit: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         try:
             uuid.UUID(job_id)
         except (ValueError, AttributeError) as exc:
             raise ComputeRequestError("job_id must be a UUID supplied by the orchestrator") from exc
+        if work_unit is not None:
+            try:
+                validated_work_unit = WorkUnit.from_dict(work_unit)
+            except WorkUnitError as exc:
+                raise ComputeRequestError(str(exc)) from exc
+            if validated_work_unit.work_unit_id != job_id:
+                raise ComputeRequestError("work_unit_id must match job_id")
+            if validated_work_unit.action != action:
+                raise ComputeRequestError("work_unit action must match action")
+            if validated_work_unit.resources != dict(resources or {}):
+                raise ComputeRequestError("work_unit resources must match resources")
+            work_unit = validated_work_unit.to_dict()
         self._command(action, parameters)  # validate before accepting work
         _allocation, reasons = self._gpu_allocation(resources, self._discover_gpus())
         if reasons:
@@ -502,6 +526,7 @@ class ComputeService:
                 action=action,
                 parameters=dict(parameters),
                 resources=dict(resources or {}),
+                work_unit=work_unit,
                 output_path=self._expected_output(action, parameters),
             )
             self._jobs[job_id] = job

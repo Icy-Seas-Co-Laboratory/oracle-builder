@@ -1,0 +1,22 @@
+[Unit]
+Description=Oracle Builder Orchestrator
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=oracle-builder
+Group=oracle-builder
+EnvironmentFile=/etc/oracle-builder/orchestrator.env
+WorkingDirectory=/opt/oracle-builder
+ExecStart=/opt/oracle-builder/.venv/bin/oracle-orchestrator --database /var/lib/oracle-builder/control/orchestrator.sqlite --workspace-root /var/lib/oracle-builder/workspace --artifact-root /var/lib/oracle-builder/artifacts --runs-root /var/lib/oracle-builder/runs --datasets-root /var/lib/oracle-builder/datasets --log-root /var/log/oracle-builder --host 127.0.0.1 --port 8110 --upload-limit-mib 10240 --s3-bucket ${ORACLE_ARTIFACT_S3_BUCKET} --s3-prefix ${ORACLE_ARTIFACT_S3_PREFIX} --s3-endpoint-url ${ORACLE_ARTIFACT_S3_ENDPOINT_URL} --s3-region ${ORACLE_ARTIFACT_S3_REGION} --worker-deployment-profiles ${ORACLE_WORKER_DEPLOYMENT_PROFILES}
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ReadWritePaths=/var/lib/oracle-builder /var/log/oracle-builder /run/oracle-builder
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

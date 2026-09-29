@@ -2,7 +2,15 @@ from pathlib import Path
 
 import pytest
 
-from oracle_builder.config import DEFAULT_CONFIG, deep_merge, load_toml, validate_config
+from oracle_builder.config import (
+    DEFAULT_CONFIG,
+    deep_merge,
+    load_toml,
+    normalize_component_config,
+    normalize_self_supervised_config,
+    resolve_v2_config,
+    validate_config,
+)
 from oracle_builder.registry import MODEL_REGISTRY
 
 
@@ -51,15 +59,24 @@ def classification_config_paths():
     return paths
 
 
-def validate_dataset_independent_recipe(user_config):
-    """Validate a recipe after substituting facts normally resolved from its dataset."""
-    resolved = deep_merge(DEFAULT_CONFIG, user_config)
+def resolve_dataset_independent_recipe(user_config):
+    """Resolve V2 authoring input through the same component bridge as runtime.
+
+    Generated recipes intentionally omit V1 ``run.model`` and ``model``
+    aliases.  The resolver validates their V2 shape first, then the runtime
+    bridge derives those legacy builder fields from ``encoder``.
+    """
+    authoring = resolve_v2_config(user_config, dataset_facts={"num_classes": 3})
+    resolved = deep_merge(DEFAULT_CONFIG, authoring)
+    normalize_self_supervised_config(resolved, user_config)
+    normalize_component_config(resolved, user_config)
     resolved["data"]["num_classes"] = 3
     # ``auto`` polarity is intentionally resolved from frozen dataset metadata
     # by the training planner; use a deterministic stand-in for static tests.
     if resolved.get("preprocessing", {}).get("invert") == "auto":
         resolved["preprocessing"]["invert"] = False
     validate_config(resolved)
+    return authoring, resolved
 
 
 def test_documented_default_exists_for_every_classification_preset():
@@ -70,7 +87,9 @@ def test_documented_default_exists_for_every_classification_preset():
 def test_documented_classification_presets_are_explicit_v2_and_dataset_independent(preset):
     user_config = load_toml(CONFIG_DIR / f"{preset}.toml")
 
-    assert user_config["run"]["model"] in MODEL_REGISTRY
+    # V2 authoring intentionally has no legacy builder aliases.
+    assert "model" not in user_config["run"]
+    assert "model" not in user_config
     assert user_config["architecture"]["version"] == 2
     for section in ("input", "encoder", "normalization", "pooling", "image_embedding", "metadata", "fusion", "classifier"):
         assert section in user_config
@@ -90,7 +109,11 @@ def test_documented_classification_presets_are_explicit_v2_and_dataset_independe
     assert distribution["memory_growth"] is True
     assert "num_classes" not in user_config["data"]
 
-    validate_dataset_independent_recipe(user_config)
+    authoring, runtime = resolve_dataset_independent_recipe(user_config)
+    assert authoring["data"]["num_classes"] == 3
+    assert runtime["run"]["model"] == user_config["encoder"]["family"]
+    assert runtime["run"]["model"] in MODEL_REGISTRY
+    assert runtime["model"]["variant"] == user_config["encoder"]["variant"]
 
 
 def test_classification_presets_have_a_safe_explicit_augmentation_policy():
@@ -106,18 +129,16 @@ def test_resnet_default_preserves_roi_detail_and_uses_raw_classifier_embeddings(
     config = load_toml(CONFIG_DIR / "resnet.toml")
 
     assert config["data"]["input_shape"] == [128, 128]
-    assert config["model"]["variant"] == "resnet18"
-    assert config["model"]["stem_kernel_size"] == 3
-    assert config["model"]["stem_stride"] == 1
-    assert config["model"]["stem_pool"] is False
-    assert config["model"]["normalize_embeddings"] is False
+    assert config["encoder"] == {"family": "resnet", "variant": "resnet18"}
+    assert config["stem"] == {"type": "native", "kernel_size": 3, "stride": 1, "pool": "none"}
+    assert config["image_embedding"]["projection"]["l2_normalize"] is False
 
 
 def test_resnet_like_default_uses_roi_input_and_raw_classifier_embeddings():
     config = load_toml(CONFIG_DIR / "resnet_like.toml")
 
     assert config["data"]["input_shape"] == [128, 128]
-    assert config["model"]["normalize_embeddings"] is False
+    assert config["image_embedding"]["projection"]["l2_normalize"] is False
 
 
 @pytest.mark.parametrize("family", sorted(BASELINE_PRESETS))
@@ -174,4 +195,5 @@ def test_all_classification_examples_share_high_level_defaults(path):
     # recipes. Older top-level examples intentionally preserve their historic
     # preprocessing/SSL demonstrations and are covered by their own tests.
     if path.parent == CONFIG_DIR:
-        validate_dataset_independent_recipe(user_config)
+        _authoring, runtime = resolve_dataset_independent_recipe(user_config)
+        assert runtime["run"]["model"] in MODEL_REGISTRY

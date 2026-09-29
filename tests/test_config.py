@@ -45,6 +45,35 @@ loss = "sparse_categorical_crossentropy"
     assert config["paths"]["run_dir"] == str(run_dir.resolve())
 
 
+def test_resolve_config_accepts_power_law_class_weights(tmp_path: Path):
+    config_path = tmp_path / "power-law.toml"
+    input_path = tmp_path / "data.sqlite"
+    config_path.write_text(
+        """
+[run]
+task = "classification"
+model = "simple_cnn"
+
+[data]
+input_shape = [16, 16, 1]
+
+[training]
+loss = "weighted_sparse_categorical_crossentropy"
+
+[training.class_weights]
+mode = "power_law"
+alpha = 0.75
+"""
+    )
+    create_synthetic_classification(input_path, n=4, shape=(16, 16, 1), classes=2)
+    freeze(input_path)
+
+    config = resolve_config(config_path, input_path, tmp_path / "runs" / "power-law")
+
+    assert config["training"]["class_weights"]["mode"] == "power_law"
+    assert config["training"]["class_weights"]["alpha"] == 0.75
+
+
 def test_v2_center_roi_pad_geometry_resolves_to_center_pad(tmp_path: Path):
     config_path = tmp_path / "config.toml"
     input_path = tmp_path / "data.sqlite"

@@ -1,8 +1,14 @@
 # Oracle Builder
 
-Oracle Builder builds, curates, trains, evaluates, preserves, and deploys
-portable image-model products using local SQLite datasets and TensorFlow/Keras.
-It supports image classification and ROI mask refinement.
+Oracle Builder is a durable control plane for portable image-model work. The
+Orchestrator owns plans, artifact storage, worker admission, leases, and
+published outputs; stateless `oracle-worker` processes pull sealed WorkUnits.
+
+For normal users, the Orchestrator is the single system entry point: use the
+Web GUI, the `oracle` CLI, or the Orchestrator HTTP API. All three operate on
+the same control-plane records; none communicates directly with a worker.
+See [Using Oracle Builder](docs/user-entrypoints.md) for supported workflows
+and the current inference boundary.
 
 The durable dataset and annotation-workspace contracts are also available in
 the dependency-light `oracle_data_contracts` Python package within this source
@@ -14,24 +20,29 @@ tree, so other applications can share the same SQLite schema and lifecycle APIs.
 uv sync
 ```
 
-Run project commands through uv so they always use the synchronized environment,
-for example `uv run oracle-dataset --help` or `uv run python model_training.py --help`.
+Run supported control-plane commands through uv: `uv run oracle --help`,
+`uv run oracle-orchestrator --help`, and `uv run oracle-worker --help`.
 
-For the development/test environment with the optional GUI and API features, run
-`uv sync --extra gui --extra api`, then run `uv run pytest`. Choose a GPU extra
-for your platform separately; do not install every GPU extra at once.
+For the development/test environment with the optional GUI, run
+`uv sync --extra gui`, then run `uv run pytest`. The Orchestrator API and
+Uvicorn are base dependencies. Choose a GPU extra for your platform separately;
+do not install every GPU extra at once.
+For an S3/MinIO-compatible immutable artifact replica, add `--extra storage-s3`
+and configure `oracle-orchestrator --s3-bucket ...`; the normal folder tree
+remains the primary, human-readable artifact store.
+
+For a containerized single-host demo (Caddy, production-built Web GUI,
+Orchestrator, and Orchestrator-managed Docker workers), see the
+[Docker demo deployment guide](deploy/docker/README.md).
 
 Choose the guide that matches what you want to do:
 
-- [Getting started](docs/getting-started.md) — install, verify hardware, and run a small training job.
-- [Building training-set databases](docs/training-dataset-guide.md) — plan, import, validate, and freeze classification or mask-refinement datasets.
-- [Classification workflow](docs/classification-workflow.md) — import a folder library, train, evaluate, infer, and compare classifier families.
-- [Mask-refinement workflow](docs/mask-refinement-workflow.md) — build/edit an ROI mask dataset, train U-Net-family models, tile large ROIs, and visualize results.
-- [External model products](docs/model-products.md) — ingest and promote existing Keras models.
-- [Training, evaluation, and recovery](docs/training-and-evaluation.md) — configs, augmentation, streaming, multi-GPU, metrics, and resume behavior.
-- [Pipeline options reference](docs/pipeline-options-reference.md) — detailed training, inference, and Oracle Serve options with considerations and examples.
-- [Operations and troubleshooting](docs/operations-and-troubleshooting.md) — validation, packages, common problems, and analysis helpers.
-- [Inference API](docs/inference-api.md) — serve resident model bundles to Pelagia and other operational callers.
+- [Oracle control CLI](docs/oracle-cli.md) — upload data and queue portable work.
+- [Oracle worker](docs/oracle-worker.md) — deploy stateless pull workers.
+- [Orchestrator API](docs/orchestrator-api.md) — control-plane protocol.
+- [Using Oracle Builder](docs/user-entrypoints.md) — choose the supported GUI,
+  CLI, or API entry point.
+- [WorkUnit V1](docs/work-unit-v1.md) — portable execution contract.
 
 ## Reference
 
@@ -49,7 +60,7 @@ The SvelteKit orchestration interface lives in [`webgui/`](webgui/). It talks
 to the `oracle-orchestrator` service through a same-origin proxy; see its
 [setup guide](webgui/README.md) and the [Orchestrator API](docs/orchestrator-api.md).
 
-Start the local compute, orchestration, and web GUI stack together with:
+Start the local orchestration and web GUI stack together with:
 
 ```bash
 scripts/start_oracle_stack.sh
@@ -62,13 +73,9 @@ shell—for NVIDIA-backed Windows systems; a working `nvidia-smi` inside WSL is
 required. `CUDA_VISIBLE_DEVICES` is honored when already set.
 
 It creates a local `.oracle-runtime/` directory for the central SQLite
-database, GUI-upload staging, logs, and a persisted `Local` Oracle Serve
-endpoint used by dispatch preflight. Durable training products use `./runs/`
-and training sources use `./datasets/`, consistent with command-line Oracle
-Builder workflows. At startup the control plane safely indexes sealed runs and
-registers frozen SQLite datasets that are not yet in its runtime database. Set
-`ORACLE_RUNTIME_DIR`, `ORACLE_HOST`, or the `ORACLE_*_PORT` variables to
-override its defaults.
+database, artifact storage, GUI-upload staging, and logs. Workers are separate
+processes that connect outward to the control plane. Set `ORACLE_RUNTIME_DIR`,
+`ORACLE_HOST`, or the `ORACLE_*_PORT` variables to override local defaults.
 
 The reference documents are authoritative for on-disk contracts. Workflow guides
 intentionally repeat the commands and decisions needed for a single task.

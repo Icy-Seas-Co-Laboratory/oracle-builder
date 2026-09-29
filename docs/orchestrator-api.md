@@ -6,6 +6,17 @@ run specifications, and orchestration job state.  It does not replace Oracle
 Builder artifact contracts: datasets and artifacts remain the scientific source
 of truth and may be re-ingested after recovery.
 
+It is the sole supported system API boundary. The Web GUI, `oracle` CLI, and
+programmatic clients communicate with this service—not with `oracle-worker`.
+Workers are lease-authenticated execution clients and expose no user-facing
+control or inference API. See [Using Oracle Builder](user-entrypoints.md) for
+the supported training and batch-inference workflows.
+
+For normal interactive operation, prefer the thin [`oracle` control
+CLI](oracle-cli.md). It maps common dataset, definition, queue, artifact, and
+worker-pool actions to these API endpoints without taking execution or output
+path ownership.
+
 ```bash
 oracle-orchestrator --database /oracle/control/orchestrator.sqlite \
   --workspace-root /oracle/workspace \
@@ -13,34 +24,125 @@ oracle-orchestrator --database /oracle/control/orchestrator.sqlite \
   --runs-root /oracle/workspace/runs \
   --datasets-root /oracle/workspace/datasets \
   --training-catalog-root /oracle/training-sources \
-  --oracle-serve Local=http://127.0.0.1:8100 --port 8110
+  --role-tokens-sha256 '{"operator":"sha256:OPERATOR_TOKEN_SHA256"}' --port 8110
 ```
+
+### Artifact storage
+
+The default artifact store is an ordinary local folder tree.  That is the
+authoritative workflow surface: sealed datasets and runs remain easy to
+inspect, copy, snapshot, and restore without a proprietary database.  For
+off-host durability, install `oracle-builder[storage-s3]` and add
+`--s3-bucket BUCKET` (plus `--s3-endpoint-url` for MinIO or another compatible
+service).  Each locally published artifact is replicated under
+`{prefix}/{kind}/{artifact-id}/{revision}`; a content-hash manifest marker is
+written last, so a backup process can ignore incomplete uploads.
+
+Replica progress is durable in the control-plane database (`pending`,
+`replicated`, or `failed`). Operators can inspect it with `GET
+/v1/artifact-replicas` and enqueue retries, verification, or a restore of a
+missing *canonical* local artifact through the corresponding
+`:retry`, `:verify`, and `:restore` endpoints. Those operations accept only
+location-free `ArtifactRef` values, run through the operation runner, and
+never overwrite an existing local folder. A restore validates every downloaded
+object against the remote completion marker before its atomic local publish.
+
+The local folder is intentionally retained as the online authority in this
+release.  It keeps atomic publication, catalog scanning, and grant delivery
+simple, while S3-compatible storage provides a reliable immutable replica.
 
 ## Core workflow
 
 1. Register a frozen SQLite dataset with `POST /v1/datasets:ingest`.
 2. Register a validated TOML training recipe with `POST /v1/recipes`.
-3. Create a typed training experiment at `POST /v1/experiments:train` with a
-   dataset, recipe IDs, and explicit seeds.
-4. Dispatch an immutable specification to a chosen `oracle-serve` endpoint at
-   `POST /v1/specifications/{id}:dispatch`.
-5. Reconcile transient compute state with `POST /v1/jobs/{id}:reconcile`. A
-   completed training or import job is validated and indexed automatically.
+3. Create or update a typed model definition at `POST /v1/model-definitions`.
+4. Queue it to an admitted worker pool with
+   `POST /v1/model-definitions/{id}:queue`, supplying a frozen dataset and
+   `worker_pool_id`. It returns `pending_verification` and creates no worker job.
+5. Verify selected entries through `POST /v1/queued-runs:verify` with
+   `queued_run_ids` and optional `start_after_verification` (default `false`).
+   The worker resolves configuration/data, probes model execution, and determines
+   the automatic batch size when requested. This is a verification-only job.
+6. After successful verification, start `ready` entries through
+   `POST /v1/queued-runs:start` with `queued_run_ids` and `worker_pool_id`.
+   Training uses the verified batch size on the same worker execution instance. With explicit
+   `start_after_verification: true`, successful verification creates the training
+   job atomically; failed verification never starts training.
+7. Create batch inference with `POST /v1/inference-runs`, using a sealed model
+   artifact, frozen dataset, split, and admitted pool; authorize it with
+   `POST /v1/inference-runs/{id}:start` and retrieve its sealed result through
+   `GET /v1/inference-runs/{id}:download`.
 
-Compute endpoints are configured by operators with repeatable
-`--oracle-serve NAME=URL` arguments and persisted in the Orchestrator database.
-Clients inspect live endpoint, queue, and worker state with
-`GET /v1/compute/endpoints?refresh=true`. Before dispatch they call
-`GET /v1/specifications/{id}/preflight?endpoint_id={endpoint-id}`. The same
-preflight is enforced by the dispatch endpoint, including action support, GPU
-capacity, endpoint readiness, and queue capacity.
+There is no push-dispatch or compute-endpoint control plane. The Orchestrator
+is the durable scheduling authority; workers are pull-only clients.
+
+## Access policy
+
+`GET`, `HEAD`, and `OPTIONS` requests are intentionally anonymous and
+rate-limited per source address, so simple scripts can retrieve public catalog,
+job, and artifact metadata without managing a login. The deployment proxy is
+responsible for distributed rate limiting and client-address forwarding.
+
+All writes require a configured bearer role token. `analyst` may submit the
+explicit analytical queries; `operator` may queue, cancel, upload, and change
+catalog state; `admin` is reserved for operational administration. Configure
+only SHA-256 token digests through `--role-tokens-sha256` or
+`ORACLE_ORCHESTRATOR_ROLE_TOKENS_SHA256`; the raw token is supplied by CLI
+clients as `ORACLE_ORCHESTRATOR_TOKEN`. Worker registration and lease APIs use
+separate pool and worker credentials. The local stack permits unauthenticated
+mutations only when bound to loopback, and does so explicitly.
+
+## Registered pull workers
+
+An operator creates a worker pool with its allowed WorkUnit actions, receiving
+a pool join token once.
+A worker registers with that token, then receives its own bearer credential
+once. It polls `POST /v1/workers/{worker_id}:lease`; an idle poll returns
+`204`, while a successful poll returns an opaque lease token and a sealed,
+path-free WorkUnit. Renewal and release are scoped to that lease token.
+
+The durable pool/worker/lease records are inspectable through
+`/v1/worker-pools`, `/v1/workers`, and `/v1/worker-leases`. Tokens are never
+returned by list/detail endpoints or saved in plaintext. A browser or the
+`oracle` CLI queues a definition only through
+`POST /v1/model-definitions/{id}:queue`; the Orchestrator pins portable input
+artifacts before verification. The old `:validate-and-queue` URL is a compatibility
+alias for queue intake and now also returns an unverified entry. The
+lower-level `enqueue_work_unit_for_pool` boundary stays internal, so a browser
+or worker cannot choose an output location, inject a command, or construct
+work for another pool.
+
+`oracle-worker` registers once and continuously acknowledges leases,
+requests/downloads one-use input grants, emits idempotent progress events,
+uploads a staging archive, and completes the lease. Downloads require the
+worker bearer, lease token, and grant token. Output publication uses a
+lease-bound resumable session: create it with `POST
+/v1/worker-leases/{lease_id}/output-uploads`, send authenticated fixed parts
+to `PUT /v1/worker-output-uploads/{upload_id}/parts/{part_number}` with an
+exact `Content-Range` and part SHA-256, then call `POST
+/v1/worker-output-uploads/{upload_id}:finalize`. The control plane persists
+accepted part hashes, so a worker may resend a part or resume after a dropped
+connection without repeating execution. It validates the assembled archive
+SHA-256 and stages it before normal lease completion publishes the artifact.
+No worker receives an artifact-store path or object-store credential. A
+`train` completion is validated as a model-run artifact and indexed
+automatically.
+
+The same HTTPS transfer protocol is used for local and remote workers. When
+`--s3-bucket` is configured, the Orchestrator retains ownership of the S3 or
+S3-compatible endpoint: sealed artifacts replicate there after local atomic
+publication, with a content manifest marker written last. This keeps worker
+credentials and artifact-store mutation authority out of remote deployments
+while still supporting MinIO and other S3-compatible endpoints.
 
 ## Responsive operations and live updates
 
 Long-running control-plane work has a durable operation record rather than
 holding a browser request open. Schedule catalog scans, training-catalog scans,
-catalog reindexing, active-job reconciliation, or queue validation (including
-batch-size calibration) with the corresponding `.../schedule` endpoints. Each
+catalog reindexing, worker reconciliation, replica maintenance, or legacy queue
+intake with the corresponding `.../schedule` endpoints. Training preflight and
+batch calibration run as worker jobs created by `POST /v1/queued-runs:verify`,
+not as control-plane operations. Each
 returns `202 Accepted` and an operation object
 whose `operation_id` is available from `GET /v1/operations/{operation_id}`;
 `GET /v1/operations` lists recent work. Operations retain `queued`, `running`,
@@ -51,31 +153,25 @@ events across an orchestrator restart.
 that durable event ledger. Events carry a globally ordered cursor in their SSE
 `id`; clients should reconnect using the last received ID and retain adaptive
 polling as a rolling-upgrade fallback. The orchestrator's single bounded
-operation runner periodically schedules active-job reconciliation, preventing
-every browser tab from multiplying remote compute calls.
+operation runner periodically reconciles pull-worker liveness and staged
+publication, without contacting a remote compute service.
 
-The local `oracle-serve` scheduler defaults to one execution slot, preserving
-existing behavior. Set `--compute-worker-slots N` (or
-`ORACLE_COMPUTE_WORKER_SLOTS`) to allow bounded parallel process launches,
-and optionally set `--compute-cpu-capacity N` (or
-`ORACLE_COMPUTE_CPU_CAPACITY`). The older
-`ORACLE_BUILDER_COMPUTE_WORKER_SLOTS` and
-`ORACLE_BUILDER_COMPUTE_CPU_CAPACITY` names remain supported for compatibility.
-`scripts/start_oracle_stack.sh` passes these settings through automatically.
-GPU allocations are
-leased before process launch, so explicit, automatic, and legacy unrestricted
-GPU work cannot silently overlap.
+Worker-pool admission and leases enforce declared action and resource
+compatibility before a worker can materialize a WorkUnit. The supplied local
+pull-worker provider can start and stop only fixed `oracle-worker` argument
+vectors from a typed deployment declaration; it reads a bootstrap token from a
+permission-checked secret file rather than a command line. Container, VM, and
+Kubernetes providers should map that same declaration to native deployment
+primitives. The Orchestrator never opens an SSH or arbitrary-command channel
+to workers.
 
-For model-producing jobs, durable status progresses through `submitted`,
-`queued`, `running`, `validating`, and finally `indexed`. Compute failures use
+For model-producing jobs, durable status progresses through `queued`,
+`leased`, `running`, `validating`, and finally `indexed`. Worker failures use
 `failed`; valid process output that fails the artifact contract uses
-`artifact_invalid`. `GET /v1/jobs` returns the resolved output path, worker and
-timing fields, structured validation report, and linked artifact summary.
-
-To import an external model, first stage or browse to a `.keras`, `.h5`, or
-`.hdf5` file and a TOML file containing a `[product]` section. Create the
-immutable import specification with `POST /v1/model-imports`, then dispatch it
-through the same review gate. An optional registered dataset records provenance.
+`artifact_invalid`. `GET /v1/jobs` returns worker and timing fields, structured
+validation/reporting state, and linked artifact summary. The historical
+path-based model-import endpoint and remote-job refresh behavior return `410
+Gone`; model products enter the system only as sealed artifacts.
 
 The orchestrator owns output locations. For training it assigns
 `{runs-root}/{specification-id}` through `runs_dir` and `output`; for
@@ -90,9 +186,27 @@ catalog roots for frozen Oracle SQLite revisions. Missing database records are
 registered; existing records are left intact. The resulting reconciliation
 summary is available from `GET /health/ready`.
 
-Training experiments create one immutable specification per selected recipe and
-seed. Every specification has a UUID, ordinal, generated configuration snapshot,
-configuration hash, and exact compute request.
+Queue intake pins the definition revision, dataset and baseline configuration.
+Verification produces a separate sealed WorkUnit with `queue_execution.phase`
+set to `verify`. A successful report records the selected batch size, worker,
+checks, and timestamp in `preflight_report`; the final training WorkUnit uses
+`queue_execution.mode: verified`. Its worker-local configuration applies that
+batch size without changing the baseline artifact or recalibrating at start.
+
+Queue statuses are `pending_verification` → `verifying` → `ready` → `queued`.
+Verification failure becomes `needs_attention` and may be retried. Reverification
+of an unstarted ready entry can select a different compatible worker. Start
+requests reject unverified rows and duplicate starts. Selection validation and
+job creation commit atomically within each request.
+
+Deploy the updated Orchestrator and restart training workers together. Workers
+advertise `training_verification_v1` on registration and authenticated lease
+polls, including when reusing saved credentials. A fresh worker boot identifier and
+capability digest bind verification to its environment. Restarting or changing
+the worker invalidates unstarted verified work and requires reverification.
+Older workers cannot claim
+verification or verified-training units. Existing unstarted legacy entries must
+be verified before starting; already running jobs are not migrated.
 
 ## Model workspace and training-source catalog
 
@@ -162,7 +276,21 @@ relative to a selected root and requests that escape it are rejected.
 roots. It validates and indexes standard `artifact.json` manifests, reports
 skipped directories with reasons, and never rewrites the artifact itself.
 
-`POST /v1/uploads/{kind}/{filename}` stages raw uploaded bytes only in the
-owned artifact root. Supported kinds are `datasets` (`.sqlite`), `configs`
-(`.toml`), and `models` (`.keras`, `.h5`, or `.hdf5`). Existing files
-are never overwritten. Use `--upload-limit-mib` to set the service limit.
+The web GUI uses a resumable transfer protocol for files of any supported
+size: create a session with `POST /v1/uploads/sessions`, send fixed 16 MiB
+`PUT /v1/uploads/sessions/{id}/part` ranges with `Content-Range`, then atomically
+publish it with `POST /v1/uploads/sessions/{id}:complete`. The session ledger
+records received ranges, so selecting the same file and retrying after a
+network interruption continues rather than restarts the upload. Partial paths
+are never returned or eligible for registration.
+
+`GET /v1/datasets/{id}:download` streams a registered SQLite training set.
+`GET /v1/artifacts/{id}:download` streams a portable `.tar.gz` model-artifact
+archive. Neither endpoint exposes a storage path. Supported upload kinds are
+`datasets` (`.sqlite`), `configs` (`.toml`), and `models` (`.keras`, `.h5`, or
+`.hdf5`); existing files are never overwritten. Use `--upload-limit-mib` to
+set the service limit.
+
+`POST /v1/uploads/{kind}/{filename}` remains as a streaming one-request
+compatibility endpoint for the CLI and simple integrations; new browser work
+should use resumable sessions.

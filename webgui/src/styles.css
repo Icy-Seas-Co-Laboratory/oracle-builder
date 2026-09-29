@@ -228,6 +228,8 @@ textarea { resize: vertical; }
 .upload-panel { display: grid; grid-template-columns: minmax(250px, .9fr) minmax(420px, 1.1fr); gap: 1.5rem; align-items: end; }
 .upload-panel p { margin-bottom: 0; }
 .upload-controls { display: grid; grid-template-columns: minmax(150px, .8fr) minmax(180px, 1fr) auto; gap: .65rem; align-items: end; }
+.upload-progress { display: grid; grid-column: 1 / -1; gap: .3rem; color: #5f767b; font-size: .72rem; }
+.upload-progress progress { width: 100%; height: .55rem; accent-color: var(--teal); }
 .file-input { position: relative; overflow: hidden; }
 .file-input input { position: absolute; inset: 0; opacity: 0; cursor: pointer; }
 .file-input span { display: block; overflow: hidden; min-height: 2.55rem; padding: .65rem .72rem; border: 1px dashed #9db7b2; border-radius: 7px; color: #647b81; background: #f8fbfa; text-overflow: ellipsis; white-space: nowrap; }
@@ -235,6 +237,8 @@ textarea { resize: vertical; }
 .path-control input, .path-control textarea { min-width: 0; }
 .cards { display: grid; gap: .65rem; }
 .asset-card { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: .85rem; padding: .9rem; border: 1px solid var(--line); border-radius: 9px; background: var(--surface-soft); }
+.asset-actions { display: flex; align-items: center; justify-content: flex-end; gap: .4rem; }
+.asset-actions a, td a.secondary { text-decoration: none; }
 .asset-card p { margin: .22rem 0; font-size: .8rem; }
 .asset-card small { display: block; overflow-wrap: anywhere; color: #77898e; font: .68rem 'SFMono-Regular', Consolas, monospace; }
 .asset-icon { display: grid; place-items: center; width: 2.35rem; height: 2.35rem; border-radius: 8px; color: var(--teal); background: var(--teal-soft); }
@@ -752,3 +756,10 @@ tbody tr.selected { background: #eff6ff; }
 .asset-icon, .count, .row-icon { color: #1d4ed8; background: #eff6ff; }
 .status.succeeded, .status.complete, .status.indexed, .status.ready { color: #047857; background: #ecfdf5; }
 .selection-box, .dynamic-fields input[type="checkbox"], .option-grid input[type="checkbox"] { accent-color: #2563eb; }
+
+/* Keep the compact navigation within narrow dashboard viewports. */
+@media (max-width: 680px) {
+    .workflow-nav button { grid-template-columns: minmax(0, 1fr); }
+    .workflow-nav button > span { min-width: 0; max-width: 100%; }
+    .workflow-nav strong { overflow-wrap: anywhere; }
+}

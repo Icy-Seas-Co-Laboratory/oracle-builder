@@ -1,0 +1,40 @@
+# The default is convenient for local development. Set ORACLE_PUBLIC_HOST to a
+# real DNS name for Caddy-managed public TLS, and put edge rate limiting/WAF in
+# front of this service for Internet exposure.
+{$ORACLE_PUBLIC_HOST:localhost} {
+	encode zstd gzip
+
+	request_body {
+		max_size 11GB
+	}
+
+	@control path /v1/* /health/* /docs /openapi.json
+	handle @control {
+		reverse_proxy orchestrator:8110 {
+			transport http {
+				read_timeout 15m
+				write_timeout 15m
+			}
+		}
+	}
+
+	# The GUI's /api proxy adds its server-only operator token for mutations.
+	handle {
+		reverse_proxy webgui:3000 {
+			transport http {
+				read_timeout 15m
+				write_timeout 15m
+			}
+		}
+	}
+
+	log {
+		output stdout
+		format filter {
+			wrap json
+			fields {
+				request>headers>Authorization delete
+			}
+		}
+	}
+}

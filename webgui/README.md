@@ -10,32 +10,50 @@ npm install
 npm run dev
 ```
 
-Set `ORCHESTRATOR_URL` to the running `oracle-orchestrator` backend. The main
-workspace has five connected pages: **Model Runs** (catalog, tags, inspector),
-**Comparison**, **Training Sets** (read-only source catalog and previews),
-**Construction** (versioned V2 model drafts), and **Training** (immutable plan
-creation). It also supports asset upload and registration, dispatch preflight,
-and the full compute-to-catalog job lifecycle.
+Set `ORCHESTRATOR_URL` to the running `oracle-orchestrator` backend. Set
+`ORCHESTRATOR_OPERATOR_TOKEN` when its mutation API is protected: SvelteKit
+keeps this token server-side, strips browser-supplied authorization, and adds
+it only when proxying to the control plane. Anonymous direct `GET` requests
+remain available for lightweight retrieval scripts.
 
-The root route is a thin workspace controller. Page-level feature state is
-kept in focused components (`models/ModelRunsView.svelte`,
-`models/ModelComparisonView.svelte`, `TrainingSetCatalogView.svelte`,
-`ModelConstructionView.svelte`, and `TrainingStudio.svelte`) while shared
-operational data is refreshed centrally without a global client-side store.
+The GUI is one of three supported client surfaces—the others are `oracle` and
+the Orchestrator HTTP API. All communicate only with the Orchestrator;
+`oracle-worker` is not browser- or user-addressable.
+
+The main workspace focuses on worker pools, sealed definition queueing,
+durable leases, and published output references. Dataset/config/model uploads
+use resumable 16 MiB chunks (a retry resumes the same selected file), and the
+asset library can download frozen datasets or complete portable model-artifact
+archives without connecting the browser to worker storage.
+
+The Queue page separates **Add to queue → Verify selected → Start selected**.
+Select one or more entries; the optional **Start training after successful
+verification** checkbox is unchecked by default. Worker preflight checks the
+configuration, dataset and model, and calibrates automatic batch sizes. Passing
+entries wait for Start unless the checkbox was selected; failures remain
+inspectable and can be verified again. Restart updated workers to advertise
+verification support. Training uses the same worker instance and selected batch
+size; a worker restart or capability change requires reverification.
+
+The Workers page creates pool admission boundaries and shows fleet state. It
+never connects to worker hosts or reads artifact storage. Pool join tokens are shown once after creation; use them with
+`oracle-worker` outside the browser.
+
+The root route is a thin workspace controller. Worker-fleet state is kept in
+`WorkerFleetView.svelte`; the browser does not own scheduling or artifact
+state.
 
 Operational state is coordinated by one visibility-aware browser refresh loop:
 it consumes the orchestrator's resumable event stream when available, then
 falls back to polling every 5 seconds for active work, 20 seconds when idle,
 and 60 seconds while hidden. This prevents the queue and workspace shell from
-independently reconciling the same jobs. Older orchestrators remain supported
-through the polling fallback during a rolling upgrade.
+independently reconciling the same jobs.
 
 For local development, run `scripts/start_oracle_stack.sh` from the repository
-root. The GUI defaults to `http://127.0.0.1:5111`; Oracle Serve and the
-Orchestrator retain their defaults at ports `8100` and `8110`. The script checks
-their health endpoints first and reuses either service when it is already
-healthy. Override any bind port with `ORACLE_WEBGUI_PORT`, `ORACLE_SERVE_PORT`,
-or `ORACLE_ORCHESTRATOR_PORT`.
+root. The GUI defaults to `http://127.0.0.1:5111` and the Orchestrator defaults
+to port `8110`. Override bind ports with `ORACLE_WEBGUI_PORT` or
+`ORACLE_ORCHESTRATOR_PORT`. Workers are deployed independently and pull work
+from the Orchestrator; the browser never needs their addresses.
 
 The stack keeps transient control-plane state under `.oracle-runtime/`, while
 durable runs and training datasets use the repository's `runs/` and `datasets/`
@@ -50,3 +68,17 @@ SQLite image assets.
 detail, segmentation evidence, and a gallery for sealed figures, overlays, and
 activation or saliency products. The application shell follows the scientific
 study workflow: **Prepare → Design → Run → Review**.
+
+The Live Dashboard shares the workspace refresh coordinator, supports run
+selection, batch/epoch charts, and metric, timing, fleet, queue, and publication
+detail dialogs. Charts expose sampled values and individual point tooltips.
+Updates can be paused; refresh failures retain the last snapshot with a visible
+stale-data notice. Native dialogs support Escape and restore focus on close.
+
+For resumable work units, the selected-run panel also shows the run/unit/attempt
+cursor, latest committed checkpoint, and worker heartbeat. Its controls submit
+durable `pause`, `yield`, `restart`, `resume`, or `stop now` requests; they show
+the command's received/accepted/applied state and do not claim completion when
+the request is merely delivered. Safe pause and yield appear only for jobs that
+advertise an execution segment. Queue verification details include the frozen
+split policy and class-by-split coverage report when available.

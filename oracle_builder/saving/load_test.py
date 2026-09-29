@@ -8,12 +8,18 @@ import tensorflow as tf
 from tensorflow import keras
 
 from oracle_builder.classification.features import L2Normalization, build_embedding_model
+from oracle_builder.models.components import CosineClassifier, GeMPooling2D, L2Normalize, ZeroLike
 from oracle_builder.products.ingest import (
     ConvertChannels,
     InvertIntensity,
     ProbabilityToLogits,
 )
-from oracle_builder.training.losses import WeightedSparseCategoricalCrossentropy
+from oracle_builder.training.losses import (
+    BinaryCrossentropySoftDice,
+    BinaryCrossentropySoftTversky,
+    WeightedSparseCategoricalCrossentropy,
+)
+from oracle_builder.training.metrics import BinaryDice, SparseCategoricalMacroF1
 from oracle_builder.training.train import build_and_compile_model
 
 
@@ -28,15 +34,39 @@ def _synthetic_input(config: dict[str, Any]) -> np.ndarray | dict[str, np.ndarra
     return image
 
 
-def _load_keras_model(path: str | Path):
+def _load_keras_model(path: str | Path, *, compile: bool = False):
+    """Load a trusted project artifact with every registered custom component.
+
+    Checkpoint recovery must work in a fresh worker process, where decorator
+    registration has not happened incidentally through model construction.
+    This explicit, allowlisted registry keeps Keras safe deserialization on;
+    it does not accept arbitrary user-defined code.
+    """
     return keras.models.load_model(
         path,
-        compile=False,
+        compile=compile,
+        safe_mode=True,
         custom_objects={
+			"L2Normalize": L2Normalize,
+			"oracle_builder>L2Normalize": L2Normalize,
+			"ZeroLike": ZeroLike,
+			"oracle_builder>ZeroLike": ZeroLike,
+			"GeMPooling2D": GeMPooling2D,
+			"oracle_builder>GeMPooling2D": GeMPooling2D,
+			"CosineClassifier": CosineClassifier,
+			"oracle_builder>CosineClassifier": CosineClassifier,
             "L2Normalization": L2Normalization,
             "oracle_builder>L2Normalization": L2Normalization,
             "WeightedSparseCategoricalCrossentropy": WeightedSparseCategoricalCrossentropy,
             "oracle_builder>WeightedSparseCategoricalCrossentropy": WeightedSparseCategoricalCrossentropy,
+			"BinaryCrossentropySoftDice": BinaryCrossentropySoftDice,
+			"oracle_builder>BinaryCrossentropySoftDice": BinaryCrossentropySoftDice,
+			"BinaryCrossentropySoftTversky": BinaryCrossentropySoftTversky,
+			"oracle_builder>BinaryCrossentropySoftTversky": BinaryCrossentropySoftTversky,
+			"BinaryDice": BinaryDice,
+			"oracle_builder>BinaryDice": BinaryDice,
+			"SparseCategoricalMacroF1": SparseCategoricalMacroF1,
+			"oracle_builder>SparseCategoricalMacroF1": SparseCategoricalMacroF1,
             "ProbabilityToLogits": ProbabilityToLogits,
             "oracle_builder>ProbabilityToLogits": ProbabilityToLogits,
             "InvertIntensity": InvertIntensity,

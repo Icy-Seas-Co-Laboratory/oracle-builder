@@ -95,9 +95,10 @@ loss = "weighted_sparse_categorical_crossentropy"
 metrics = ["accuracy", "macro_f1"]
 
 [training.class_weights]
-# Effective-number weighting is less volatile than inverse-frequency weighting.
+# Effective-number is the default; power_law uses p_i^-alpha to temper rare-class weighting.
 mode = "effective_number"
 beta = 0.999
+alpha = 0.5
 normalize = true
 
 [callbacks]

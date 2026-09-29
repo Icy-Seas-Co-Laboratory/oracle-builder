@@ -107,7 +107,7 @@ def _section_comments(recipe: Recipe, section: str) -> tuple[str, ...]:
         "stem": ("# Explicit native stem. Smaller stride/pool preserves fine detail at higher cost.",),
         "image_embedding.projection": ("# The fixed-size image representation consumed by fusion and the classifier.",),
         "metadata.augmentation": ("# Gaussian metadata noise is training-only; leave zero unless regularization is intended.",),
-        "training.class_weights": ("# Effective-number weighting is less volatile than inverse-frequency weighting.",),
+        "training.class_weights": ("# Effective-number is the default; power_law uses p_i^-alpha to temper rare-class weighting.",),
         "augmentation": ("# Online augmentation remains stochastic even when deterministic prepared-input caching is enabled.",),
         "distribution": ("# single uses one selected GPU; select mirrored only for intentional multi-GPU training.",),
         "evidence": ("# Retain embeddings, prototypes, and nearest-neighbor evidence with predictions.",),

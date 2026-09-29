@@ -213,7 +213,7 @@ def test_tiny_end_to_end_run_persists_both_children(tmp_path):
     state = validate_recovery_state(
         run_dir, config, artifact_id="artifact-1", run_id="run-1"
     )
-    assert state["shared"]["model_path"] == "model/recovery/latest.keras"
+    assert state["shared"]["model_path"].startswith("model/recovery/generations/")
     assert (run_dir / state["shared"]["model_path"]).exists()
 
     # A process can be interrupted after its final rolling snapshot but before

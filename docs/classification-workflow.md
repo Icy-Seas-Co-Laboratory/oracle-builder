@@ -59,9 +59,15 @@ training-library/
 Those directory names are retained as `source_partition` provenance for each
 item. They do not become dataset-level split state. A training run with the
 default `data.split_strategy = "auto"` uses a complete source-partition layout;
-otherwise it creates its own deterministic assignments. Set
-`split_strategy = "random"` to ignore source partitions, or
-`"source_partitions"` to require them.
+otherwise it creates deterministic class-stratified assignments. Every class
+must have at least one member in each enabled split by default, so a rare class
+that cannot populate the requested splits stops verification with a useful
+report instead of silently disappearing from validation or test. Set
+`split_strategy = "random"` to ignore source partitions and label coverage,
+`"class_stratified"` to deliberately replace imported partitions, or
+`"source_partitions"` to require them. `stratified_group` is available only
+when a reliable item metadata key is explicitly declared as
+`data.split_group_metadata_key`; groups are never inferred from filenames.
 
 Original encoded image bytes are the default and recommended storage form.
 `--storage-mode materialized` is for a deliberately fixed, preprocessed image

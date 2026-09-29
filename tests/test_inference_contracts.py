@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 import uuid
 
 import numpy as np
@@ -15,6 +17,16 @@ from oracle_builder.inference import (
     SourceReference,
     run_connector,
 )
+
+
+def test_prediction_contract_import_does_not_eagerly_import_the_workflow():
+    # Training imports prediction serialization, which imports ArrayPayload.
+    # That low-level contracts path must not recursively import the workflow.
+    result = subprocess.run(
+        [sys.executable, "-c", "import oracle_builder.evaluation.predictions"],
+        capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def model_reference(task: str = "classification") -> ModelReference:

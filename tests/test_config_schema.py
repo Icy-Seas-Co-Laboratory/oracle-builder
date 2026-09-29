@@ -67,6 +67,12 @@ def test_catalog_covers_every_runtime_default_and_exposes_v2_metadata():
         key: list(values) for key, values in STANDARD_TRAINING_LOSSES_BY_TASK.items()
     }
     assert fields["training.loss"]["allowed_values_path"] == "run.task"
+    assert fields["training.class_weights.mode"]["choices"] == [
+        "explicit", "inverse_frequency", "effective_number", "power_law"
+    ]
+    assert fields["training.class_weights.alpha"]["default"] == 0.5
+    assert fields["training.class_weights.alpha"]["minimum"] == 0
+    assert fields["training.class_weights.alpha"]["maximum"] == 1
     assert fields["training.metrics"]["control"] == "multi_select"
     assert fields["training.metrics"]["allowed_values_by"] == {
         key: list(values) for key, values in STANDARD_TRAINING_METRICS_BY_TASK.items()

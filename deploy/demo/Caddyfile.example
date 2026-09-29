@@ -1,0 +1,44 @@
+# Replace demo.example.com and certificate settings before use.
+# Caddy terminates TLS. Keep both backend listeners bound to 127.0.0.1.
+demo.example.com {
+	encode zstd gzip
+
+	# Large resumable uploads are 16 MiB chunks, but the entire request must be
+	# allowed. Match this to --upload-limit-mib with deployment headroom.
+	request_body {
+		max_size 11GB
+	}
+
+	@control path /v1/* /health/* /docs /openapi.json
+	handle @control {
+		reverse_proxy 127.0.0.1:8110 {
+			transport http {
+				read_timeout 15m
+				write_timeout 15m
+			}
+		}
+	}
+
+	# /api/* reaches the Web GUI's server-side proxy. Its operator token is
+	# never sent to the browser. All other UI routes use the same Web GUI host.
+	handle {
+		reverse_proxy 127.0.0.1:5111 {
+			transport http {
+				read_timeout 15m
+				write_timeout 15m
+			}
+		}
+	}
+
+	log {
+		output file /var/log/caddy/oracle-builder-access.json
+		# Caddy's JSON logs otherwise include request headers. Never retain bearer
+		# credentials in the access log.
+		format filter {
+			wrap json
+			fields {
+				request>headers>Authorization delete
+			}
+		}
+	}
+}

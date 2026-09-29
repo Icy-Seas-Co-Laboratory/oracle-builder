@@ -49,10 +49,16 @@ def resolve_class_weights(
         if not 0.0 <= beta < 1.0:
             raise ValueError("training.class_weights.beta must be in [0, 1)")
         weights = (1.0 - beta) / (1.0 - np.power(beta, counts))
+    elif mode == "power_law":
+        alpha = float(settings.get("alpha", 0.5))
+        if not 0.0 <= alpha <= 1.0:
+            raise ValueError("training.class_weights.alpha must be in [0, 1]")
+        probabilities = counts / counts.sum()
+        weights = np.power(probabilities, -alpha)
     else:
         raise ValueError(
             "training.class_weights.mode must be explicit, inverse_frequency, "
-            "or effective_number"
+            "effective_number, or power_law"
         )
     if np.any(~np.isfinite(weights)) or np.any(weights <= 0):
         raise ValueError("Resolved class weights must be finite and positive")
@@ -66,6 +72,9 @@ def resolve_class_weights(
             float(settings.get("beta", 0.999))
             if mode == "effective_number"
             else None
+        ),
+        "alpha": (
+            float(settings.get("alpha", 0.5)) if mode == "power_law" else None
         ),
         "normalize": bool(settings.get("normalize", True)),
         "counts": [int(value) for value in counts],

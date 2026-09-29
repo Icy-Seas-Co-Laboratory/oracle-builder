@@ -92,9 +92,11 @@ loss = "weighted_sparse_categorical_crossentropy"
 metrics = ["accuracy", "macro_f1"]
 
 [training.class_weights]
-# effective_number is gentler than inverse_frequency; explicit accepts a list.
+# effective_number is gentler than inverse_frequency. Set mode = "power_law"
+# and alpha = 0.5 or 0.75 for p_i^-alpha weighting; explicit accepts a list.
 mode = "effective_number"
 beta = 0.999
+alpha = 0.5
 normalize = true
 
 [callbacks]

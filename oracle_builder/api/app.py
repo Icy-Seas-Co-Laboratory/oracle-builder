@@ -11,6 +11,7 @@ from starlette.concurrency import run_in_threadpool
 
 from oracle_builder.api.registry import InferenceModelRegistry, ModelNotFoundError
 from oracle_builder.api.compute import ComputeRequestError, ComputeService, JobAction
+from oracle_data_contracts.work_units import WorkUnit, WorkUnitError
 from oracle_builder.inference.transport import (
     InferenceTransportError,
     NPZ_MEDIA_TYPE,
@@ -26,6 +27,10 @@ class ComputeJobRequest(BaseModel):
     action: JobAction
     parameters: dict[str, Any] = Field(default_factory=dict)
     resources: dict[str, Any] = Field(default_factory=dict)
+    # The legacy parameters remain a local materialization adapter during the
+    # migration.  Workers validate the sealed, path-free work unit whenever it
+    # is supplied, rather than silently ignoring it as an unknown JSON field.
+    work_unit: dict[str, Any] | None = None
 
 
 class ComputePreflightRequest(BaseModel):
@@ -159,13 +164,23 @@ def create_app(
     ) -> dict[str, Any]:
         authorize(authorization)
         try:
+            work_unit = None
+            if body.work_unit is not None:
+                work_unit = WorkUnit.from_dict(body.work_unit)
+                if work_unit.work_unit_id != body.job_id:
+                    raise ComputeRequestError("work_unit_id must match job_id")
+                if work_unit.action != body.action:
+                    raise ComputeRequestError("work_unit action must match action")
+                if work_unit.resources != body.resources:
+                    raise ComputeRequestError("work_unit resources must match resources")
             return require_compute().submit(
                 job_id=body.job_id,
                 action=body.action,
                 parameters=body.parameters,
                 resources=body.resources,
+                work_unit=work_unit.to_dict() if work_unit is not None else None,
             )
-        except ComputeRequestError as exc:
+        except (ComputeRequestError, WorkUnitError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.get("/compute/jobs/{job_id}")

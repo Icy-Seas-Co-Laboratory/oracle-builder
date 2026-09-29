@@ -307,6 +307,9 @@ epochs = 1
 loss = "sparse_categorical_crossentropy"
 metrics = ["accuracy"]
 
+[distribution]
+strategy = "cpu"
+
 [augmentation]
 enabled = false
 

@@ -73,3 +73,19 @@ def test_auto_tune_keeps_previous_power_of_two_when_next_probe_exceeds_vram_ceil
     assert report["recommended_batch_size"] == 2
     assert report["attempts"][-1]["batch_size"] == 4
     assert report["attempts"][-1]["vram_fraction"] > 0.80
+
+
+def test_auto_tune_preserves_replica_batch_multiple(monkeypatch):
+    monkeypatch.setattr('oracle_builder.config.resolve_config', lambda *args: {})
+    seen = []
+    def probe(config, input_path, batch_size):
+        assert batch_size % 4 == 0
+        seen.append(batch_size)
+        if batch_size > 20:
+            raise RuntimeError('OOM')
+        return {'status': 'passed', 'observed_batch_size': batch_size}
+    monkeypatch.setattr(batch_tune, '_probe', probe)
+    report = batch_tune.tune('config.toml', 'data.sqlite', minimum=4, maximum=64)
+    assert report['recommended_batch_size'] == 16
+    assert report['largest_verified_batch_size'] == 20
+    assert seen[-1] == 16

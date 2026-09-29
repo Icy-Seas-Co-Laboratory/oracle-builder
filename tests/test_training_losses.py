@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 import tensorflow as tf
 from tensorflow import keras
 
@@ -95,6 +96,23 @@ def test_inverse_frequency_weights_have_unit_observed_mean():
         3 * resolved["values"][0] + resolved["values"][1]
     ) / 4
     assert np.isclose(observed, 1.0)
+
+
+def test_power_law_weights_follow_class_frequency_exponent():
+    resolved = resolve_class_weights(
+        [0, 0, 0, 1],
+        2,
+        {"mode": "power_law", "alpha": 0.5, "normalize": False},
+    )
+
+    assert resolved["alpha"] == 0.5
+    assert resolved["beta"] is None
+    assert np.allclose(resolved["values"], [np.sqrt(4 / 3), 2.0])
+
+
+def test_power_law_alpha_must_be_in_unit_interval():
+    with pytest.raises(ValueError, match="class_weights.alpha must be in \\[0, 1\\]"):
+        resolve_class_weights([0, 1], 2, {"mode": "power_law", "alpha": 1.1})
 
 
 def test_classification_model_trains_with_weighted_cross_entropy():

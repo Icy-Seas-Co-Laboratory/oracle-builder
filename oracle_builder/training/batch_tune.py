@@ -46,6 +46,12 @@ def _first_tensor(value: Any):
 
 
 def _probe(config: dict[str, Any], input_path: str, batch_size: int) -> dict[str, Any]:
+    from oracle_builder.training.distribution import gpu_lease_scope
+    with gpu_lease_scope():
+        return _probe_batch(config, input_path, batch_size)
+
+
+def _probe_batch(config: dict[str, Any], input_path: str, batch_size: int) -> dict[str, Any]:
     """Run one genuine forward/backward pass without updating model weights."""
     import tensorflow as tf
 
@@ -60,8 +66,6 @@ def _probe(config: dict[str, Any], input_path: str, batch_size: int) -> dict[str
     inputs = batch[0] if isinstance(batch, tuple) else batch
     first_input = _first_tensor(inputs)
     observed = int(tf.shape(first_input)[0].numpy())
-    if observed < batch_size:
-        return {"status": "dataset_limit", "observed_batch_size": observed}
     strategy, _distribution = select_distribution_strategy(candidate)
     with strategy.scope():
         model = get_model_builder(candidate["run"]["model"])(candidate)
@@ -92,7 +96,7 @@ def _probe(config: dict[str, Any], input_path: str, batch_size: int) -> dict[str
     del model, datasets, batch, inputs, gradients, materialized, strategy
     tf.keras.backend.clear_session()
     gc.collect()
-    return {"status": "passed", "observed_batch_size": observed, **({"memory": memory} if memory else {})}
+    return {"status": "dataset_limit" if observed < batch_size else "passed", "observed_batch_size": observed, **({"memory": memory} if memory else {})}
 
 
 def tune(
@@ -177,23 +181,23 @@ def tune(
             "selected_peak_memory_mib": selected_memory["peak_bytes"] / (1024 * 1024) if selected_memory else None,
             "attempts": attempts,
         }
-    if failure_ceiling is not None and largest + 1 < failure_ceiling:
-        low, high = largest + 1, failure_ceiling - 1
+    if failure_ceiling is not None and largest + minimum < failure_ceiling:
+        low, high = largest + minimum, failure_ceiling - minimum
         while low <= high:
-            candidate = (low + high) // 2
+            candidate = ((low + high) // 2 // minimum) * minimum
             try:
                 result = _probe(config, str(input_path), candidate)
             except Exception as error:
                 if not _is_memory_error(error):
                     raise RuntimeError(f"Batch probe failed before memory admission: {type(error).__name__}: {error}") from error
                 attempts.append({"batch_size": candidate, "status": "out_of_memory"})
-                high = candidate - 1
+                high = candidate - minimum
                 continue
             attempts.append({"batch_size": candidate, **result})
             largest = max(largest, int(result["observed_batch_size"]))
-            low = candidate + 1
+            low = candidate + minimum
 
-    recommended = max(minimum, min(largest, int(largest * safety_factor)))
+    recommended = max(minimum, min(largest, (int(largest * safety_factor) // minimum) * minimum))
     if recommended != largest:
         # Verify the conservative value too; the evidence must cover the batch
         # size we actually seal, not only a larger neighbouring candidate.

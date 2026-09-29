@@ -1,0 +1,19 @@
+{
+  "profiles": [
+    {
+      "profile_id": "docker-cpu",
+      "provider": "docker",
+      "orchestrator_url": "http://orchestrator:8110",
+      "credentials_root": "REPLACE_WITH_ABSOLUTE_HOST_DATA_ROOT/worker-identities",
+      "scratch_root": "REPLACE_WITH_ABSOLUTE_HOST_DATA_ROOT/worker-scratch",
+      "registration_token_file": "REPLACE_WITH_ABSOLUTE_HOST_DATA_ROOT/worker-bootstrap/pool-token",
+      "executors": ["train", "infer"],
+      "capabilities": {"cpu_capacity": "4"},
+      "docker": {
+        "image": "oracle-builder/worker:demo",
+        "network": "oracle-builder",
+        "resource_args": ["--cpus=4", "--memory=8g"]
+      }
+    }
+  ]
+}

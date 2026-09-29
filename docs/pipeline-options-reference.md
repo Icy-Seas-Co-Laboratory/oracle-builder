@@ -31,8 +31,10 @@ interrupted non-embedding run with a valid recovery snapshot.
 | `data.input_shape` | required | `[height, width]` or `[height, width, channels]` for classification/embedding; segmentation requires channels. Larger images improve detail but sharply increase memory. |
 | `data.batch_size` | `16` | Global batch size. With multi-GPU training it must divide evenly across replicas. |
 | `shuffle_buffer` | `512` | Number of streaming examples used to randomize order; larger improves mixing and consumes host memory. |
-| `validation_split`, `test_split` | `0.2`, `0.1` | Fractions for a deterministic random split when source partitions are not used. Test data is reserved for final evaluation. |
-| `split_strategy` | `auto` | `auto` honors a complete imported `train`/`validation`/`test` layout, otherwise randomizes; `random` always randomizes; `source_partitions` requires a complete source layout. |
+| `validation_split`, `test_split` | `0.2`, `0.1` | Target fractions for a deterministic split. Test data is reserved for final evaluation. |
+| `split_strategy` | `auto` | `auto` preserves complete imported `train`/`validation`/`test` partitions, otherwise class-stratifies effective classification labels. `class_stratified` always makes a new label-aware split; `stratified_group` keeps a declared metadata group together while enforcing label coverage; `group_only` only keeps declared groups together. `random` is an explicit legacy random policy; `source_partitions` requires a complete imported layout. |
+| `split_minimum_per_class` | `1` | Minimum examples of every effective class in every enabled split. Coverage takes precedence over exact fractions. A feasibility error explains when a rare class cannot populate the requested splits. Set `0` only for a deliberately sparse imported benchmark. |
+| `split_group_metadata_key` | unset | Required only for `stratified_group` and `group_only`. This explicit item metadata key defines groups that must remain together. Oracle Builder never infers groups from file names or `source_key`. |
 | `data.streaming.*` | enabled; 4 workers; 2 prefetch batches; deterministic; 65536 KiB cache | Classification/embedding loader controls. Turn `deterministic` off only when throughput matters more than repeatable ordering. Tune workers/prefetch for slow storage; both must be positive. |
 | `distribution.strategy` | `auto` | `auto` leases one suitable visible GPU; `single`/`none` use the first requested or visible device; `mirrored` requires distributed execution; `cpu` forces CPU. `devices`, `cross_device_ops` (`auto`, `nccl`, `hierarchical_copy`), `fallback_to_single`, and `memory_growth` refine it. |
 | GPU selection controls | `unused_first`; safe fallbacks off | `require_unused_gpu`, `allow_busy_fallback`, `gpu_light_share_memory_mb`, `gpu_light_share_utilization_percent`, and `gpu_lease_directory` avoid stealing a busy GPU. Favor the defaults in shared environments. |
@@ -207,8 +209,10 @@ combined with self-supervised pretraining.
 Use `sparse_categorical_crossentropy` for balanced labels or
 `weighted_sparse_categorical_crossentropy` for imbalance. Weighted loss uses
 `training.class_weights.mode` (`explicit`, `inverse_frequency`,
-`effective_number`), `beta`, `normalize`, and `values`; weights are calculated
-from the training split only. Metrics normally include `accuracy` and
+`effective_number`, `power_law`), `beta`, `alpha`, `normalize`, and `values`;
+`power_law` uses \(w_i = p_i^{-\alpha}\), where \(p_i\) is the class's
+training-split frequency and `alpha` is in `[0, 1]` (commonly `0.5` or `0.75`).
+Weights are calculated from the training split only. Metrics normally include `accuracy` and
 epoch-wide `macro_f1`. `[evidence] enabled` and `knn_k` retain embeddings,
 prototypes, and KNN context for predictions; turn off if storage/privacy costs
 outweigh explanation value.
@@ -311,46 +315,8 @@ python model_inference.py --run runs/fish-v3 --input data/new.sqlite \
   --output predictions/fish-v3.sqlite --split all --prediction-set survey-2026-09
 ```
 
-## 3. Oracle Serve
+## 3. Retired Oracle Serve runtime
 
-Oracle Serve is the HTTP process for resident inference bundles and optional
-local compute work. It does not persist operational inputs/outputs; callers
-own them. Start it with `uv run oracle-serve`.
-
-| CLI option | Default | Use and consideration |
-|---|---:|---|
-| `--model ALIAS=RUN_DIR` | repeatable | Register selected sealed artifact(s) under a stable, path-safe operational selector. |
-| `--models-root DIRECTORY` | repeatable | Recursively discover sealed model runs/products; malformed, active, and duplicate artifacts are skipped and reported. |
-| `--host`, `--port` | `127.0.0.1`, `8100` | Bind address/port. Do not expose a non-local host without authentication/TLS controls. |
-| `--root-path` | `ORACLE_BUILDER_ROOT_PATH` or empty | External prefix behind a reverse proxy, e.g. `/oracle-builder-api`; keeps OpenAPI URLs correct. |
-| `--no-preload` | false | Lazy-load models. Useful during development; production should preload so readiness reflects actual availability. |
-| `--max-batch-size` | 256 | Maximum combined items for one model execution. Startup warmup can lower a model's active limit if memory cannot fit it. |
-| `--max-wait-ms` | 8 | Queueing window used to form a micro-batch. Larger improves throughput but adds latency. |
-| `--queue-capacity` | 1024 | Pending requests per model. Bound it to prevent memory exhaustion and provide backpressure. |
-| `--no-compute` | false | Inference-only mode; requires at least one registered model. |
-| `--compute-queue-size` | 128 | Maximum queued compute jobs. |
-| `--worker-id` | `local` or `ORACLE_BUILDER_WORKER_ID` | Stable identifier reported to an orchestrator. |
-
-For ASGI/environment deployment, `ORACLE_BUILDER_MODELS_ROOT` accepts one or
-more roots (platform path separator), while `ORACLE_BUILDER_MODELS` accepts
-comma-separated `alias=/path` registrations. `ORACLE_BUILDER_PRELOAD`,
-`ORACLE_BUILDER_MAX_PAYLOAD_BYTES`, `ORACLE_BUILDER_SERVING_MAX_BATCH_SIZE`,
-`ORACLE_BUILDER_SERVING_MAX_WAIT_MS`, `ORACLE_BUILDER_SERVING_QUEUE_CAPACITY`,
-`ORACLE_BUILDER_COMPUTE_ENABLED`, `ORACLE_BUILDER_COMPUTE_QUEUE_SIZE`, and
-`ORACLE_BUILDER_WORKER_ID` supply the corresponding application settings.
-`ORACLE_BUILDER_API_TOKEN` requires `Authorization: Bearer TOKEN` on model and
-compute routes.
-
-The service exposes `GET /health/live`, `GET /health/ready`, `GET /v1/models`
-(optional `?task=segmentation`), `GET /v1/models/{selector}/evidence/{item_id}`,
-and `POST /v1/models/{selector}:predict`. Inference request/response bodies
-use `application/vnd.oracle-builder.inference+npz`: a JSON manifest plus typed
-arrays, decoded without pickle. The resident worker batches concurrent requests
-while preserving each caller's correlation and result set; catalog diagnostics
-report whether a model is GPU-accelerated and its micro-batch limits.
-
-With compute enabled, the protected `/compute/*` API provides workers, status,
-submission, job inspection/events, and cooperative cancellation. Permitted
-actions are `train`, `evaluate`, `model_ingest`, `run_validate`, and `run_pack`;
-requests contain immutable parameters and a retained `resources` scheduling
-intent. It is deliberately not an arbitrary shell-command service.
+The `oracle-serve` process and `/compute/*` push protocol are retired.  Use the
+Orchestrator plus registered `oracle-worker` pull workers for execution; see
+[Oracle worker](oracle-worker.md) and [Orchestrator API](orchestrator-api.md).

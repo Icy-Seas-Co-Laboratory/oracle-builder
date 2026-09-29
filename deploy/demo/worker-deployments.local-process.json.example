@@ -1,0 +1,16 @@
+{
+  "profiles": [
+    {
+      "profile_id": "demo-local-train",
+      "provider": "local-process",
+      "orchestrator_url": "http://127.0.0.1:8110",
+      "credentials_root": "/var/lib/oracle-builder/worker-identities",
+      "scratch_root": "/var/lib/oracle-builder/worker-scratch",
+      "registration_token_file": "/run/oracle-builder/demo-pool-token",
+      "executors": ["train", "infer"],
+      "capabilities": {
+        "cpu_capacity": "4"
+      }
+    }
+  ]
+}

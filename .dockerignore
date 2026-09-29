@@ -1,0 +1,15 @@
+.git
+.venv
+.pytest_cache
+__pycache__
+*.py[cod]
+*.egg-info
+build
+dist
+.oracle-runtime
+runs
+datasets
+webgui/node_modules
+webgui/.svelte-kit
+deploy/docker/.env
+deploy/docker/runtime

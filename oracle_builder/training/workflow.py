@@ -1,0 +1,1020 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import json
+import shutil
+import sys
+import uuid
+from pathlib import Path
+from types import SimpleNamespace
+
+from oracle_builder.artifacts import (
+    RunLayout,
+    attach_split_manifest,
+    create_run_artifact,
+    create_split_manifest,
+    read_run_config,
+    read_run_manifest,
+    read_run_runtime,
+    read_split_manifest,
+    reopen_run_artifact,
+    seal_run_artifact,
+    update_run_artifact,
+    validate_run_artifact,
+    write_run_config,
+)
+from oracle_builder.config import resolve_config, self_supervised_settings
+from oracle_builder.environment import write_environment
+from oracle_builder.paths import create_run_dir
+from oracle_builder.training.api import TrainingRequest
+
+
+def plot_history(history, run_dir: Path) -> None:
+    import matplotlib.pyplot as plt
+
+    figures = run_dir / "figures"
+    figures.mkdir(exist_ok=True)
+    history_dict = history.history
+    for metric, filename in (
+        ("loss", "loss_curve.png"),
+        ("accuracy", "accuracy_curve.png"),
+        ("dice", "dice_curve.png"),
+    ):
+        if metric not in history_dict and f"val_{metric}" not in history_dict:
+            continue
+        fig, ax = plt.subplots(figsize=(7, 4))
+        if metric in history_dict:
+            ax.plot(history_dict[metric], label=metric)
+        if f"val_{metric}" in history_dict:
+            ax.plot(history_dict[f"val_{metric}"], label=f"val_{metric}")
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel(metric)
+        ax.legend()
+        fig.tight_layout()
+        fig.savefig(figures / filename, dpi=150)
+        plt.close(fig)
+    # Classification has richer epoch-wide metrics than Keras exposes in its
+    # History object (top-k, weighted, and per-class values).  Render those
+    # standard curves alongside the generic training figures when present.
+    from oracle_builder.evaluation.classification import (
+        plot_classification_training_metrics,
+    )
+
+    plot_classification_training_metrics(history_dict, run_dir)
+
+
+def run_training(request: TrainingRequest) -> int:
+    """Run one workflow with GPU reservations bounded to this request."""
+    from oracle_builder.training.distribution import gpu_lease_scope
+    with gpu_lease_scope():
+        return _run_training(request)
+
+
+def _run_training(request: TrainingRequest) -> int:
+    """Execute a training request without reading command-line state."""
+    if not isinstance(request, TrainingRequest):
+        raise TypeError("request must be a TrainingRequest")
+    # This local mutable view keeps the established workflow stable without
+    # coupling it to argparse or process-global command-line state. Resume
+    # resolution intentionally updates its input/output values below.
+    args = SimpleNamespace(
+        config=request.config,
+        input=request.input,
+        output=request.output,
+        runs_dir=request.runs_dir,
+        overwrite=request.overwrite,
+        resume=request.resume,
+        dry_run=request.dry_run,
+        preflight=request.preflight,
+        debug=request.debug,
+        segment_start_epoch=request.segment_start_epoch,
+        segment_stop_epoch=request.segment_stop_epoch,
+        finalize_only=request.finalize_only,
+        control_file=request.control_file,
+        segment_result_path=request.segment_result_path,
+        split_manifest=request.split_manifest,
+        segment_max_steps=request.segment_max_steps,
+        segment_start_step=request.segment_start_step,
+    )
+    resume_state = None
+    is_resume = bool(args.resume)
+    is_segment = bool(
+        args.finalize_only
+        or args.segment_start_epoch is not None
+        or args.segment_stop_epoch is not None
+        or args.control_file
+        or args.segment_result_path
+        or args.segment_max_steps is not None
+        or args.segment_start_step is not None
+    )
+    if is_resume:
+        if args.dry_run or args.preflight:
+            raise ValueError("--dry-run and --preflight cannot be combined with --resume")
+        if args.config or args.output or args.overwrite:
+            raise ValueError("--resume uses the existing artifact; do not pass --config, --output, or --overwrite")
+        run_dir = Path(args.resume).expanduser().resolve()
+        manifest = read_run_manifest(run_dir)
+        if manifest["status"] == "complete":
+            raise ValueError("Completed runs cannot be resumed; start a new run instead")
+        report = validate_run_artifact(run_dir)
+        if not report["valid"]:
+            raise ValueError("Cannot resume an invalid run artifact: " + "; ".join(report["errors"]))
+        config = read_run_config(run_dir)
+        runtime = read_run_runtime(run_dir)
+        input_path = args.input or runtime.get("paths", {}).get("input_path")
+        if not input_path:
+            raise ValueError("The run has no recorded input path; provide --input DATASET.sqlite")
+        args.input = str(Path(input_path).expanduser().resolve())
+        args.output = str(manifest["name"])
+        config["paths"] = {
+            **runtime.get("paths", {}),
+            "input_path": args.input,
+            "run_dir": str(run_dir),
+        }
+        config["run"]["run_id"] = manifest["run_id"]
+        config["run"]["run_name"] = manifest["name"]
+        config["artifact"] = {
+            "artifact_id": manifest["artifact_id"],
+            "schema_name": manifest["artifact_schema"]["name"],
+            "schema_version": manifest["artifact_schema"]["version"],
+        }
+        if config.get("run", {}).get("task") == "embedding":
+            raise ValueError(
+                "Embedding runs currently restart from their sealed training record; "
+                "use oracle-embed with a new output"
+            )
+        split_manifest = read_split_manifest(run_dir)
+        attach_split_manifest(config, split_manifest)
+        from oracle_builder.artifacts.splits import split_manifest_matches_dataset
+        from oracle_builder.training.recovery import validate_recovery_state
+
+        if not split_manifest_matches_dataset(config, args.input):
+            raise ValueError("The supplied dataset does not exactly match this run's split manifest")
+        if config.get("classification", {}).get("stratification", {}).get("enabled", False):
+            from oracle_builder.classification.stratified_training import (
+                validate_recovery_state as validate_stratified_recovery_state,
+            )
+
+            resume_state = validate_stratified_recovery_state(
+                run_dir, config, artifact_id=manifest["artifact_id"], run_id=manifest["run_id"]
+            )
+        else:
+            resume_state = validate_recovery_state(
+                run_dir,
+                config,
+                artifact_id=manifest["artifact_id"],
+                run_id=manifest["run_id"],
+            )
+        if args.segment_start_epoch is not None:
+            recovered_epoch = (
+                min(
+                    int(child.get("completed_epochs", 0))
+                    for child in resume_state.get("children", {}).values()
+                )
+                if config.get("classification", {}).get("stratification", {}).get("enabled", False)
+                else int(resume_state["completed_epoch"])
+            )
+            if recovered_epoch != int(args.segment_start_epoch):
+                raise ValueError(
+                    "Segment start cursor does not match the committed checkpoint "
+                    f"({args.segment_start_epoch} requested, {recovered_epoch} committed)"
+                )
+        if manifest["lifecycle"] == "sealed":
+            reopen_run_artifact(run_dir, reason="resume from validated recovery snapshot")
+        update_run_artifact(run_dir, status="running")
+        if config.get("classification", {}).get("stratification", {}).get("enabled", False):
+            print(f"Resuming stratified run {run_dir.name}", flush=True)
+        else:
+            print(
+                f"Resuming {run_dir.name} at supervised epoch "
+                f"{int(resume_state['completed_epoch']) + 1}",
+                flush=True,
+            )
+    else:
+        if not args.config or not args.input or not args.output:
+            raise ValueError("New training requires --config, --input, and --output")
+        run_dir = Path(args.runs_dir) / args.output
+        print(
+            "[startup] Resolving configuration and verifying frozen dataset identity...",
+            flush=True,
+        )
+        config = resolve_config(args.config, args.input, run_dir)
+        if args.segment_start_epoch not in (None, 0):
+            raise ValueError("The first training segment must start at epoch 0")
+    if not args.preflight and not args.dry_run and config["dataset"]["lifecycle"] != "frozen":
+        raise ValueError(
+            "Model training requires a frozen dataset checkpoint. Run "
+            f"`oracle-dataset checkpoint {args.input}` and train from the resulting file."
+        )
+    config["debug"] = bool(args.debug)
+    total_epochs = int(config.get("training", {}).get("epochs", 10))
+    finalize_stopped_early = False
+    if is_segment and self_supervised_settings(config).get("enabled", False):
+        raise ValueError(
+            "Segmented execution is unsupported for self-supervised training; "
+            "run it as a whole phase because its continuation state is not yet portable"
+        )
+    if args.finalize_only:
+        if resume_state is None:
+            raise ValueError("finalize_only requires a completed training checkpoint")
+        if config.get("classification", {}).get("stratification", {}).get("enabled", False):
+            completed = min(
+                (int(item.get("completed_epochs", 0)) for item in resume_state.get("children", {}).values()),
+                default=0,
+            )
+        else:
+            completed = int(resume_state.get("completed_epoch", 0))
+        if config.get("classification", {}).get("stratification", {}).get("enabled", False):
+            stopped_early = bool(resume_state.get("cycle_scheduler", {}).get("stopped_early"))
+        else:
+            from oracle_builder.training.recovery import read_recovery_callback_state
+            stopped_early = bool(
+                read_recovery_callback_state(run_dir, resume_state)
+                .get("early_stopping", {})
+                .get("stopped_epoch", 0)
+            )
+        finalize_stopped_early = stopped_early
+        if completed < total_epochs and not stopped_early:
+            raise ValueError("finalize_only requires all configured training epochs to be checkpointed")
+    if args.preflight:
+        if config["run"]["task"] != "segmentation":
+            print("--preflight currently validates segmentation datasets only.")
+            return 0
+        from oracle_builder.masking.unet_dataset import validate_unet_dataset
+
+        report = validate_unet_dataset(
+            args.input,
+            target_input_shape=config["data"].get("input_shape"),
+            target_output_shape=config["data"].get("output_shape"),
+            require_candidate_mask=config["training"].get("segmentation_target") == "candidate_delta",
+        )
+        print(json.dumps(report, indent=2, sort_keys=True, default=str))
+        return 0 if report["valid"] else 2
+    if args.dry_run:
+        print(json.dumps({"run_dir": str(run_dir), "resolved_config": config}, indent=2))
+        return 0
+    if not is_resume and config["run"]["task"] == "embedding":
+        from oracle_builder.embedding.training import train_embedding_run
+
+        result = train_embedding_run(
+            args.config,
+            args.input,
+            run_dir,
+            overwrite=args.overwrite,
+        )
+        print(json.dumps(result, indent=2, sort_keys=True, default=str))
+        return 0
+    if args.overwrite and run_dir.exists() and not is_resume:
+        shutil.rmtree(run_dir)
+    if not is_resume:
+        print("[startup] Creating versioned run artifact...", flush=True)
+        run_dir = create_run_dir(args.runs_dir, args.output)
+        run_id = str(uuid.uuid4())
+        config["run"]["run_id"] = run_id
+        config["run"]["run_name"] = args.output
+        manifest = create_run_artifact(
+            run_dir,
+            run_id=run_id,
+            name=args.output,
+            config=config,
+            source_config=args.config,
+        )
+        print(
+            "[startup] Creating immutable train/validation/test split manifest...",
+            flush=True,
+        )
+        if args.split_manifest:
+            source_manifest = Path(args.split_manifest).expanduser().resolve()
+            if not source_manifest.is_file() or source_manifest.is_symlink():
+                raise ValueError("split_manifest must be a regular, non-symlink JSON file")
+            # The verifier owns this supplied immutable split assignment. Copy
+            # it into the new run before reading it so the run artifact—not a
+            # worker-local path—is the only continuation authority.
+            shutil.copyfile(source_manifest, RunLayout(run_dir).split_manifest)
+            split_manifest = read_split_manifest(run_dir)
+            from oracle_builder.artifacts.splits import split_manifest_matches_dataset
+            attach_split_manifest(config, split_manifest)
+            if not split_manifest_matches_dataset(config, args.input):
+                raise ValueError("The supplied split manifest does not match the frozen input dataset")
+        else:
+            split_manifest = create_split_manifest(
+                run_dir,
+                args.input,
+                config,
+                verified_dataset_fingerprint=config["dataset"]["fingerprint_sha256"],
+            )
+        attach_split_manifest(config, split_manifest)
+        config["artifact"] = {
+            "artifact_id": manifest["artifact_id"],
+            "schema_name": manifest["artifact_schema"]["name"],
+            "schema_version": manifest["artifact_schema"]["version"],
+        }
+        write_run_config(run_dir, config)
+    else:
+        run_id = config["run"]["run_id"]
+    layout = RunLayout(run_dir)
+    # Portable checkpoint archives intentionally omit empty directories.  A
+    # resumed finalize unit still needs the canonical layout before it writes
+    # histories, figures, or reports.
+    layout.create_directories()
+    print("[startup] Inspecting TensorFlow environment and available devices...", flush=True)
+    environment = write_environment(run_dir)
+    devices = environment.get("gpus", [])
+    print(
+        "[startup] TensorFlow ready: "
+        + (f"GPU device(s): {', '.join(devices)}" if devices else "no GPU devices detected"),
+        flush=True,
+    )
+    training_log = layout.training_log
+    from oracle_builder.training.logging_callbacks import init_training_log, log_event, mark_run_complete
+
+    init_training_log(
+        training_log,
+        run_id,
+        args.output,
+        config,
+        environment,
+        resume=is_resume,
+    )
+    if is_resume:
+        resumed_payload = (
+            {"stratified": True, "children": resume_state.get("children", {})}
+            if config.get("classification", {}).get("stratification", {}).get("enabled", False)
+            else {"completed_epoch": int(resume_state["completed_epoch"])}
+        )
+        log_event(
+            training_log,
+            run_id,
+            "INFO",
+            "Resumed from validated rolling recovery snapshot",
+            resumed_payload,
+        )
+
+    try:
+        print("[startup] Loading training components and preparing datasets...", flush=True)
+        from oracle_builder.data.sqlite_dataset import load_arrays, load_prediction_arrays, make_tf_datasets
+        from oracle_builder.evaluation.predictions import write_predictions_db
+        from oracle_builder.evaluation.reports import evaluate_run_model
+        from oracle_builder.evaluation.thresholds import analyze_validation_threshold
+        from oracle_builder.saving.load_test import run_load_tests
+        from oracle_builder.saving.save_model import save_model_artifacts, write_load_test_report
+        from oracle_builder.training.train import train_model
+
+        streaming_bundle = None
+        if (
+            config["run"]["task"] == "classification"
+            and config.get("data", {}).get("streaming", {}).get("enabled", True)
+        ):
+            print("[startup] Building streaming dataset indexes...", flush=True)
+            from oracle_builder.data.sqlite_stream import (
+                build_classification_index,
+                make_streaming_classification_bundle,
+            )
+
+            materialization_mode = str(
+                config.get("data", {}).get("materialization", {}).get("mode", "off")
+            ).lower()
+            if materialization_mode != "off":
+                print(
+                    "[startup] Preparing or reusing immutable training-input cache...",
+                    flush=True,
+                )
+            streaming_bundle = make_streaming_classification_bundle(args.input, config)
+            datasets = streaming_bundle.datasets
+            records_by_split = {
+                split: list(index.iter_records())
+                for split, index in streaming_bundle.indices.items()
+            }
+            if streaming_bundle.materialization is not None:
+                layout.data_materialization.write_text(
+                    json.dumps(streaming_bundle.materialization, indent=2, sort_keys=True, default=str)
+                    + "\n",
+                    encoding="utf-8",
+                )
+                log_event(
+                    training_log,
+                    run_id,
+                    "INFO",
+                    "Prepared-input cache ready",
+                    {
+                        key: streaming_bundle.materialization.get(key)
+                        for key in ("status", "cache_id", "path", "source")
+                    },
+                )
+                print(
+                    "[startup] Prepared-input cache "
+                    f"{streaming_bundle.materialization['status']}: "
+                    f"{streaming_bundle.materialization['path']}",
+                    flush=True,
+                )
+        else:
+            datasets, records_by_split = make_tf_datasets(args.input, config)
+        log_event(training_log, run_id, "INFO", "Datasets loaded", {"splits": list(datasets)})
+        from oracle_builder.classification.stratification import (
+            enabled as stratification_enabled,
+            summarize_records,
+        )
+        if stratification_enabled(config):
+            summaries = {
+                split: summarize_records(records, config, split=split, epoch=0)
+                for split, records in records_by_split.items()
+            }
+            log_event(
+                training_log,
+                run_id,
+                "INFO",
+                "Stratification preflight counts",
+                {"status": "preflight", "splits": summaries},
+            )
+            print(
+                "Stratification configured; canonical and epoch-0 routed counts:\n"
+                + json.dumps(summaries, indent=2, sort_keys=True),
+                flush=True,
+            )
+        if (
+            config["run"]["task"] == "classification"
+            and config.get("output", {}).get("intermediate_artifacts", {}).get("enabled", True)
+        ):
+            from oracle_builder.training.class_weights import (
+                resolve_class_weights,
+                uses_weighted_cross_entropy,
+            )
+
+            if uses_weighted_cross_entropy(config):
+                weight_index = (
+                    streaming_bundle.indices["train"]
+                    if streaming_bundle is not None
+                    else None
+                )
+                if weight_index is None:
+                    from oracle_builder.data.sqlite_stream import build_classification_index
+
+                    weight_index = build_classification_index(
+                        args.input,
+                        config,
+                        "train",
+                        labeled_only=True,
+                    )
+                resolved_weights = resolve_class_weights(
+                    [ref.target for ref in weight_index.refs],
+                    int(config["data"]["num_classes"]),
+                    config["training"].get("class_weights", {}),
+                )
+                config["training"]["class_weights"] = resolved_weights
+                write_run_config(run_dir, config)
+                log_event(
+                    training_log,
+                    run_id,
+                    "INFO",
+                    "Resolved weighted cross entropy class weights",
+                    resolved_weights,
+                )
+        if stratification_enabled(config):
+            # The controller owns the parent epoch loop so its seeded routing
+            # can reassign training examples between child resolutions.
+            from oracle_builder.classification.stratified_data import (
+                add_stratum_dimension_input,
+                child_config,
+            )
+            from oracle_builder.classification.stratified_training import (
+                build_indices,
+                make_canonical_bundle,
+                shared_model_config,
+                train_stratified_models,
+                write_stratified_metric_artifacts,
+            )
+            from oracle_builder.classification.stratification import dimensions
+            from oracle_builder.saving.save_model import save_model_artifacts
+            from oracle_builder.classification.evidence import build_evidence_index_streaming
+            from oracle_builder.evaluation.classification import evaluate_classification_streaming
+
+            segment_control = None
+            if is_segment:
+                from oracle_builder.training.control import FileSegmentControl
+                segment_control = FileSegmentControl(args.control_file)
+            stratified = train_stratified_models(
+                config, args.input, run_dir, training_log, run_id, resume_state=resume_state,
+                segment_stop_epoch=args.segment_stop_epoch,
+                segment_control=segment_control,
+            )
+            if is_segment and not args.finalize_only:
+                from oracle_builder.classification.stratified_training import read_recovery_state
+                from oracle_builder.training.control import FileSegmentControl, write_segment_result
+
+                state = read_recovery_state(run_dir)
+                completed = min(
+                    (int(item.get("completed_epochs", 0)) for item in state.get("children", {}).values()),
+                    default=0,
+                )
+                decision = FileSegmentControl(args.control_file).poll()
+                result = {
+                    "schema": "oracle_builder_training_segment_result/v1",
+                    "phase": "train",
+                    "cursor": {"completed_epoch": completed},
+                    "checkpoint": str(stratified.recovery_path.relative_to(run_dir)),
+                    "next_phase": (
+                        "finalize"
+                        if completed >= total_epochs or state.get("cycle_scheduler", {}).get("stopped_early")
+                        else "train"
+                    ),
+                    "stopped_early": bool(state.get("cycle_scheduler", {}).get("stopped_early")),
+                    "interrupted": decision.command in {"pause", "yield", "stop", "restart"},
+                    "command": decision.command,
+                }
+                write_segment_result(args.segment_result_path or (run_dir / "segment-result.json"), result)
+                # A checkpoint handoff is a resumable, sealed artifact.  The
+                # next attempt reopens it only after validating this complete
+                # inventory; leaving it ``running`` makes transport sealing
+                # fail and permits accidental mutation of a published unit.
+                mark_run_complete(training_log, run_id, "interrupted")
+                update_run_artifact(run_dir, status="interrupted", summary={"segment": result})
+                seal_run_artifact(run_dir)
+                return 0
+            base_indices = build_indices(args.input, config)
+            child_reports = {}
+            class_names = {
+                int(row["class_index"]): str(row.get("name") or row["class_index"])
+                for row in config.get("dataset", {}).get("labels", [])
+            }
+            # One dynamic-spatial model is saved at the standard run location.
+            # Per-stratum folders retain only their routed evidence, evaluation,
+            # histories, and identical architecture summaries.
+            shared_model = stratified.load_model(dimensions(config)[0])
+            shared_save_report = save_model_artifacts(
+                shared_model, run_dir, shared_model_config(config)
+            )
+            for dimension in dimensions(config):
+                child = child_config(config, dimension)
+                child_dir = run_dir / "model" / "strata" / str(dimension)
+                canonical = make_canonical_bundle(
+                    args.input, config, dimension, indices=base_indices
+                )
+                evidence = None
+                if config.get("evidence", {}).get("enabled", True) and "train" in canonical.indices:
+                    train_index = canonical.indices["train"]
+                    evidence = build_evidence_index_streaming(
+                        shared_model,
+                        add_stratum_dimension_input(
+                            canonical.source.indexed_image_dataset(
+                                train_index,
+                                batch_size=int(child["data"]["batch_size"]),
+                            ),
+                            dimension,
+                            config,
+                        ),
+                        train_index,
+                        child_dir / "classification_evidence",
+                        progress=bool(config.get("inference", {}).get("progress", True)),
+                    )
+                evaluation = None
+                evaluation_split = "test" if "test" in canonical.indices else "validation"
+                if evaluation_split in canonical.indices:
+                    evaluation_index = canonical.indices[evaluation_split]
+                    evaluation = evaluate_classification_streaming(
+                        shared_model,
+                        add_stratum_dimension_input(
+                            canonical.source.indexed_image_dataset(
+                                evaluation_index,
+                                batch_size=int(child["data"]["batch_size"]),
+                            ),
+                            dimension,
+                            config,
+                        ),
+                        evaluation_index,
+                        child_dir,
+                        class_names=class_names,
+                        progress=bool(config.get("inference", {}).get("progress", True)),
+                        evaluation_settings=config.get("evaluation", {}),
+                        evaluation_context={"split": evaluation_split, "stratum_dimension": dimension},
+                    )
+                child_reports[str(dimension)] = {
+                    "shared_model": "model/final.keras",
+                    "save": shared_save_report,
+                    "evaluation": evaluation.get("summary") if evaluation else None,
+                    "evidence_references": len(canonical.indices.get("train", [])) if evidence is not None else 0,
+                }
+                log_event(training_log, run_id, "INFO", "Finalized resolution stratum", {"dimension": dimension, **child_reports[str(dimension)]})
+            metric_artifacts = write_stratified_metric_artifacts(
+                run_dir, run_id, config, stratified
+            )
+            load_report = run_load_tests(run_dir, config, shared_save_report)
+            write_load_test_report(run_dir, load_report)
+            log_event(
+                training_log,
+                run_id,
+                "INFO",
+                "Wrote shared stratified model load-test and history artifacts",
+                {"load_test": load_report, **metric_artifacts},
+            )
+            del shared_model
+            config.setdefault("classification", {}).setdefault("stratification", {})["training_report"] = child_reports
+            write_run_config(run_dir, config)
+            from oracle_builder.artifacts import write_model_contract
+
+            write_model_contract(
+                run_dir,
+                {
+                    "task": "classification",
+                    "architecture": config["run"]["model"],
+                    "inputs": {
+                        "image": {
+                            "dtype": "float32",
+                            "routing": "canonical_max_original_dimension",
+                            "strata": dimensions(config),
+                            "preprocessing": config.get("preprocessing", {}),
+                        }
+                    },
+                    "outputs": {"logits": True, "probabilities": True, "identity_embedding": True},
+                    "stratification_manifest": "model/stratification_manifest.json",
+                },
+            )
+            from oracle_builder.classification.stratified_training import clear_recovery_state
+            clear_recovery_state(run_dir)
+            mark_run_complete(training_log, run_id, "complete")
+            update_run_artifact(run_dir, status="complete", summary={"stratification": child_reports})
+            seal_run_artifact(run_dir)
+            print(f"Stratified training run complete: {run_dir}", flush=True)
+            return 0
+        self_supervised_dataset = None
+        self_supervised = self_supervised_settings(config)
+        if self_supervised.get("enabled", False) and resume_state is None:
+            if str(self_supervised.get("method", "byol")).lower() == "grayscale_reconstruction":
+                from oracle_builder.training.student_teacher import load_grayscale_self_supervised_dataset
+                source_database = self_supervised.get("database", args.input)
+                self_supervised_dataset = load_grayscale_self_supervised_dataset(source_database, config)
+                self_supervised_count = "database"
+            elif streaming_bundle is not None:
+                pretraining_index = build_classification_index(
+                    args.input,
+                    config,
+                    "train",
+                    labeled_only=False,
+                )
+                pretraining_source = streaming_bundle.source
+                if hasattr(pretraining_source, "supports_index") and not pretraining_source.supports_index(pretraining_index):
+                    # Retain SQLite as a safe fallback for an index that is not
+                    # represented by this immutable prepared-input cache.
+                    from oracle_builder.data.sqlite_stream import SQLiteClassificationSource
+
+                    pretraining_source = SQLiteClassificationSource(args.input, config)
+                self_supervised_dataset = pretraining_source.image_dataset(
+                    pretraining_index,
+                    shuffle=True,
+                )
+                self_supervised_count = len(pretraining_index)
+            else:
+                from oracle_builder.training.student_teacher import make_self_supervised_dataset
+
+                self_supervised_x, _, self_supervised_records = load_prediction_arrays(
+                    args.input,
+                    config,
+                    split="train",
+                )
+                self_supervised_dataset = make_self_supervised_dataset(self_supervised_x, config)
+                self_supervised_count = len(self_supervised_records)
+            log_event(
+                training_log,
+                run_id,
+                "INFO",
+        "Loaded self-supervised training inputs",
+                {"samples": self_supervised_count, "split": "train"},
+            )
+        classification_metric_datasets = None
+        if config["run"]["task"] == "classification":
+            from oracle_builder.data.sqlite_dataset import (
+                make_classification_metric_datasets,
+            )
+
+            classification_metric_datasets = make_classification_metric_datasets(
+                args.input, config
+            )
+        segment_control = None
+        if is_segment:
+            from oracle_builder.training.control import FileSegmentControl
+            segment_control = FileSegmentControl(args.control_file)
+        model, history = train_model(
+            config,
+            datasets,
+            run_dir,
+            training_log,
+            run_id,
+            pretraining_dataset=self_supervised_dataset,
+            resume_state=resume_state,
+            classification_metric_datasets=classification_metric_datasets,
+            segment_stop_epoch=(
+                int(resume_state["completed_epoch"])
+                if args.finalize_only and finalize_stopped_early and resume_state is not None
+                else args.segment_stop_epoch
+            ),
+            segment_control=segment_control,
+            require_recovery=is_segment and not args.finalize_only,
+            segment_max_steps=args.segment_max_steps,
+            segment_start_step=args.segment_start_step,
+        )
+        if is_segment and not args.finalize_only:
+            from oracle_builder.training.control import FileSegmentControl, write_segment_result
+            from oracle_builder.training.recovery import (
+                read_recovery_callback_state,
+                validate_recovery_state,
+            )
+
+            state = validate_recovery_state(
+                run_dir, config,
+                artifact_id=config["artifact"]["artifact_id"], run_id=run_id,
+            )
+            decision = FileSegmentControl(args.control_file).poll()
+            completed = int(state["completed_epoch"])
+            callback_state = read_recovery_callback_state(run_dir, state)
+            stopped_early = bool(
+                callback_state.get("early_stopping", {}).get("stopped_epoch", 0)
+            )
+            result = {
+                "schema": "oracle_builder_training_segment_result/v1",
+                "phase": "train",
+                "cursor": {"completed_epoch": completed},
+                "checkpoint": "model/recovery/recovery.json",
+                "next_phase": "finalize" if completed >= total_epochs or stopped_early else "train",
+                "stopped_early": stopped_early,
+                "interrupted": decision.command in {"pause", "yield", "stop", "restart"},
+                "command": decision.command,
+            }
+            if isinstance(state.get("cursor"), dict):
+                result["cursor"].update({
+                    key: value for key, value in state["cursor"].items()
+                    if key in {"kind", "epoch", "batch_offset", "global_step"}
+                })
+                result["partial_metrics"] = state.get("partial_metrics", {})
+            write_segment_result(args.segment_result_path or (run_dir / "segment-result.json"), result)
+            mark_run_complete(training_log, run_id, "interrupted")
+            update_run_artifact(run_dir, status="interrupted", summary={"segment": result})
+            seal_run_artifact(run_dir)
+            return 0
+        if streaming_bundle is not None and hasattr(streaming_bundle.source, "statistics"):
+            log_event(
+                training_log,
+                run_id,
+                "INFO",
+                "Input pipeline statistics",
+                streaming_bundle.source.statistics(),
+            )
+        from oracle_builder.inference.batching import (
+            resolve_inference_batch_size,
+        )
+        from oracle_builder.progress import PostTrainingProgress
+
+        post_stage_count = 6
+        if config["run"]["task"] == "classification" and config.get(
+            "evidence", {}
+        ).get("enabled", True):
+            post_stage_count += 1
+        if config["run"]["task"] == "segmentation" and "validation" in datasets:
+            post_stage_count += 1
+        if config.get("output", {}).get("save_predictions", True):
+            post_stage_count += 1
+        post_progress = PostTrainingProgress(post_stage_count)
+
+        with post_progress.stage("Rendering training-history figures"):
+            plot_history(history, run_dir)
+        with post_progress.stage("Selecting a safe inference batch size"):
+            inference_batch_plan = resolve_inference_batch_size(model, config)
+            inference_batch_size = inference_batch_plan.batch_size
+            log_event(
+                training_log,
+                run_id,
+                "INFO",
+                "Resolved inference batch size",
+                inference_batch_plan.to_dict(),
+            )
+        evidence_index = None
+        if (
+            config["run"]["task"] == "classification"
+            and config.get("evidence", {}).get("enabled", True)
+        ):
+            with post_progress.stage(
+                "Building prototype and nearest-neighbor evidence"
+            ):
+                if streaming_bundle is not None:
+                    from oracle_builder.classification.evidence import (
+                        build_evidence_index_streaming,
+                    )
+
+                    evidence_sample_index = streaming_bundle.indices["train"]
+                    evidence_index = build_evidence_index_streaming(
+                        model,
+                        streaming_bundle.source.indexed_image_dataset(
+                            evidence_sample_index,
+                            batch_size=inference_batch_size,
+                        ),
+                        evidence_sample_index,
+                        run_dir / "model" / "classification_evidence",
+                        progress=bool(
+                            config.get("inference", {}).get("progress", True)
+                        ),
+                    )
+                    evidence_reference_count = len(evidence_sample_index)
+                else:
+                    from oracle_builder.classification.evidence import (
+                        build_evidence_index,
+                    )
+
+                    evidence_x, evidence_y, evidence_records = load_arrays(
+                        args.input,
+                        config,
+                        split="train",
+                    )
+                    evidence_index = build_evidence_index(
+                        model,
+                        evidence_x,
+                        evidence_y,
+                        evidence_records,
+                        run_dir / "model" / "classification_evidence",
+                    )
+                    evidence_reference_count = len(evidence_records)
+            log_event(
+                training_log,
+                run_id,
+                "INFO",
+                "Built classification prototype and KNN evidence index",
+                {
+                    "reference_count": evidence_reference_count,
+                    "classes": [int(value) for value in evidence_index.prototype_labels],
+                },
+            )
+        threshold_analysis = None
+        if config["run"]["task"] == "segmentation" and "validation" in datasets:
+            with post_progress.stage(
+                "Optimizing the segmentation threshold on validation data"
+            ):
+                validation_x, validation_y, validation_records = load_arrays(
+                    args.input, config, split="validation"
+                )
+                threshold_analysis = analyze_validation_threshold(
+                    model,
+                    validation_x,
+                    validation_y,
+                    run_dir,
+                    config=config,
+                    records=validation_records,
+                )
+                config.setdefault("evaluation", {})[
+                    "segmentation_threshold"
+                ] = threshold_analysis["best_threshold"]
+                write_run_config(run_dir, config)
+            log_event(
+                training_log,
+                run_id,
+                "INFO",
+                "Optimized segmentation probability threshold on validation data",
+                threshold_analysis,
+            )
+        with post_progress.stage("Saving portable model formats and manifests"):
+            save_report = save_model_artifacts(model, run_dir, config)
+        representation_artifacts = None
+        if config["run"]["task"] == "classification":
+            with post_progress.stage("Writing memory-bounded representation artifacts"):
+                from oracle_builder.artifacts.representations import (
+                    write_representation_artifacts,
+                )
+                from oracle_builder.data.sqlite_stream import (
+                    SQLiteClassificationSource,
+                    build_classification_index,
+                )
+
+                artifact_settings = config.get("output", {}).get(
+                    "intermediate_artifacts", {}
+                )
+                requested_split = str(artifact_settings.get("split", "test"))
+                cache_index = build_classification_index(
+                    args.input, config, requested_split, labeled_only=False
+                )
+                if not cache_index.refs:
+                    # Small datasets can lack a test split; retain a useful,
+                    # explicit fallback rather than silently writing nothing.
+                    cache_index = build_classification_index(
+                        args.input, config, "validation", labeled_only=False
+                    )
+                if not cache_index.refs:
+                    cache_index = build_classification_index(
+                        args.input, config, "train", labeled_only=False
+                    )
+                if cache_index.refs:
+                    source = SQLiteClassificationSource(args.input, config)
+                    representation_artifacts = write_representation_artifacts(
+                        model,
+                        source.indexed_image_dataset(
+                            cache_index,
+                            batch_size=int(artifact_settings.get("batch_size", 256)),
+                        ),
+                        cache_index,
+                        config,
+                        run_dir,
+                    )
+                    log_event(
+                        training_log,
+                        run_id,
+                        "INFO",
+                        "Wrote representation artifacts",
+                        representation_artifacts,
+                    )
+        with post_progress.stage("Reloading and testing saved model formats"):
+            load_report = run_load_tests(run_dir, config, save_report)
+            write_load_test_report(run_dir, load_report)
+        with post_progress.stage("Evaluating the held-out test split"):
+            evaluation = evaluate_run_model(
+                model,
+                config,
+                args.input,
+                run_dir,
+                split="test",
+                inference_batch_size=inference_batch_size,
+            )
+        if config["run"]["task"] == "classification":
+            from oracle_builder.evaluation.classification import (
+                plot_classification_roi_size_metrics,
+            )
+
+            plot_classification_roi_size_metrics(run_dir)
+        if config.get("output", {}).get("save_predictions", True):
+            with post_progress.stage(
+                "Generating and storing predictions for every dataset split"
+            ):
+                predictions_path = (
+                    run_dir / "predictions" / "predictions.sqlite"
+                )
+                if streaming_bundle is not None:
+                    from oracle_builder.data.sqlite_stream import (
+                        build_all_classification_index,
+                    )
+                    from oracle_builder.evaluation.predictions import (
+                        write_classification_predictions_streaming,
+                    )
+
+                    prediction_index = build_all_classification_index(
+                        args.input,
+                        config,
+                        labeled_only=False,
+                    )
+                    write_classification_predictions_streaming(
+                        model,
+                        streaming_bundle.source.indexed_image_dataset(
+                            prediction_index,
+                            batch_size=inference_batch_size,
+                        ),
+                        prediction_index,
+                        config,
+                        predictions_path,
+                        source_sqlite=args.input,
+                        prediction_set=args.output,
+                        evidence_index=evidence_index,
+                        progress=bool(
+                            config.get("inference", {}).get("progress", True)
+                        ),
+                    )
+                else:
+                    x, targets, records = load_prediction_arrays(
+                        args.input, config
+                    )
+                    write_predictions_db(
+                        model,
+                        x,
+                        targets,
+                        records,
+                        config,
+                        predictions_path,
+                        source_sqlite=args.input,
+                        prediction_set=args.output,
+                        evidence_index=evidence_index,
+                        inference_batch_size=inference_batch_size,
+                    )
+        summary = {
+            "evaluation": evaluation.get("summary"),
+            "inference_batching": inference_batch_plan.to_dict(),
+        }
+        if representation_artifacts is not None:
+            summary["representation_artifacts"] = representation_artifacts
+        if threshold_analysis is not None:
+            summary["validation_threshold_analysis"] = {
+                key: value for key, value in threshold_analysis.items() if key != "curve"
+            }
+        with post_progress.stage("Finalizing and sealing the run artifact"):
+            from oracle_builder.training.recovery import clear_recovery_snapshot
+
+            clear_recovery_snapshot(run_dir)
+            mark_run_complete(training_log, run_id, "complete")
+            update_run_artifact(run_dir, status="complete", summary=summary)
+            seal_run_artifact(run_dir)
+        print(f"Training run complete: {run_dir}", flush=True)
+        return 0
+    except KeyboardInterrupt:
+        log_event(training_log, run_id, "WARNING", "Training interrupted", {})
+        mark_run_complete(training_log, run_id, "interrupted")
+        update_run_artifact(run_dir, status="interrupted", error="Interrupted by user")
+        seal_run_artifact(run_dir)
+        print(f"Training interrupted; resume with --resume {run_dir}", file=sys.stderr)
+        return 130
+    except Exception as exc:
+        log_event(training_log, run_id, "ERROR", "Training run failed", {"error": str(exc)})
+        mark_run_complete(training_log, run_id, "failed")
+        update_run_artifact(run_dir, status="failed", error=str(exc))
+        seal_run_artifact(run_dir)
+        raise

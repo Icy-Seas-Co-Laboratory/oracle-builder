@@ -1,19 +1,18 @@
 #!/usr/bin/env bash
-# Start the local Oracle Builder compute, orchestration, and web UI stack.
+# Start the local Oracle Builder pull-worker, orchestration, and web UI stack.
 set -Eeuo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RUNTIME_DIR="${ORACLE_RUNTIME_DIR:-$ROOT_DIR/.oracle-runtime}"
 HOST="${ORACLE_HOST:-127.0.0.1}"
-SERVE_PORT="${ORACLE_SERVE_PORT:-8100}"
 ORCHESTRATOR_PORT="${ORACLE_ORCHESTRATOR_PORT:-8110}"
 WEBGUI_PORT="${ORACLE_WEBGUI_PORT:-5111}"
-SERVE_URL="http://${HOST}:${SERVE_PORT}"
 ORCHESTRATOR_URL="http://${HOST}:${ORCHESTRATOR_PORT}"
 LOG_DIR="$RUNTIME_DIR/logs"
-SERVE_PID=""
+WORKER_PID=""
 ORCHESTRATOR_PID=""
 WEBGUI_PID=""
+LOCAL_JOIN_TOKEN_FILE=""
 ACCELERATOR_REQUEST="${ORACLE_ACCELERATOR:-auto}"
 ACCELERATOR="cpu"
 GPU_EXTRA=""
@@ -21,8 +20,14 @@ KERNEL_NAME="$(uname -s)"
 NVIDIA_SMI="${ORACLE_NVIDIA_SMI:-nvidia-smi}"
 # The unprefixed names are the launcher contract.  Keep the original Builder
 # names as a compatibility fallback for deployments that set them directly.
-COMPUTE_WORKER_SLOTS="${ORACLE_COMPUTE_WORKER_SLOTS:-${ORACLE_BUILDER_COMPUTE_WORKER_SLOTS:-1}}"
-COMPUTE_CPU_CAPACITY="${ORACLE_COMPUTE_CPU_CAPACITY:-${ORACLE_BUILDER_COMPUTE_CPU_CAPACITY:-}}"
+LOCAL_WORKER_SLOTS="${ORACLE_LOCAL_WORKER_SLOTS:-1}"
+LOCAL_WORKER_CPU_CAPACITY="${ORACLE_LOCAL_WORKER_CPU_CAPACITY:-}"
+WORKER_ARTIFACT_TIMEOUT_SECONDS="${ORACLE_WORKER_ARTIFACT_TIMEOUT_SECONDS:-900}"
+ARTIFACT_S3_BUCKET="${ORACLE_ARTIFACT_S3_BUCKET:-}"
+ARTIFACT_S3_PREFIX="${ORACLE_ARTIFACT_S3_PREFIX:-oracle-builder}"
+ARTIFACT_S3_ENDPOINT_URL="${ORACLE_ARTIFACT_S3_ENDPOINT_URL:-}"
+ARTIFACT_S3_REGION="${ORACLE_ARTIFACT_S3_REGION:-}"
+WORKER_DEPLOYMENT_PROFILES="${ORACLE_WORKER_DEPLOYMENT_PROFILES:-}"
 
 require_command() {
   command -v "$1" >/dev/null 2>&1 || { echo "Required command is unavailable: $1" >&2; exit 1; }
@@ -172,7 +177,8 @@ cleanup() {
   trap - EXIT INT TERM
   stop_process "$WEBGUI_PID"
   stop_process "$ORCHESTRATOR_PID"
-  stop_process "$SERVE_PID"
+  stop_process "$WORKER_PID"
+  if [[ -n "$LOCAL_JOIN_TOKEN_FILE" && -f "$LOCAL_JOIN_TOKEN_FILE" ]]; then rm -f "$LOCAL_JOIN_TOKEN_FILE"; fi
   exit "$exit_code"
 }
 
@@ -182,15 +188,17 @@ require_command uv
 require_command npm
 require_command curl
 require_command python3
-require_positive_integer "ORACLE_COMPUTE_WORKER_SLOTS" "$COMPUTE_WORKER_SLOTS"
-if [[ -n "$COMPUTE_CPU_CAPACITY" ]]; then
-  require_positive_integer "ORACLE_COMPUTE_CPU_CAPACITY" "$COMPUTE_CPU_CAPACITY"
+require_positive_integer "ORACLE_LOCAL_WORKER_SLOTS" "$LOCAL_WORKER_SLOTS"
+require_positive_integer "ORACLE_WORKER_ARTIFACT_TIMEOUT_SECONDS" "$WORKER_ARTIFACT_TIMEOUT_SECONDS"
+if [[ -n "$LOCAL_WORKER_CPU_CAPACITY" ]]; then
+  require_positive_integer "ORACLE_LOCAL_WORKER_CPU_CAPACITY" "$LOCAL_WORKER_CPU_CAPACITY"
 fi
 configure_accelerator
 mkdir -p "$LOG_DIR" "$RUNTIME_DIR/artifacts" "$ROOT_DIR/runs" "$ROOT_DIR/datasets"
 
 echo "Accelerator: $ACCELERATOR${GPU_EXTRA:+ (uv extra: $GPU_EXTRA)}"
-echo "Compute capacity: ${COMPUTE_WORKER_SLOTS} process slot(s)${COMPUTE_CPU_CAPACITY:+, ${COMPUTE_CPU_CAPACITY} CPU core(s)}"
+echo "Local worker capacity: ${LOCAL_WORKER_SLOTS} process slot(s)${LOCAL_WORKER_CPU_CAPACITY:+, ${LOCAL_WORKER_CPU_CAPACITY} CPU core(s)}"
+echo "Worker artifact-transfer timeout: ${WORKER_ARTIFACT_TIMEOUT_SECONDS}s"
 if [[ "$ACCELERATOR" == "cuda" ]]; then
   echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
 elif [[ "$ACCELERATOR_REQUEST" == "auto" && "$ACCELERATOR" == "cpu" ]]; then
@@ -199,19 +207,9 @@ fi
 
 # Reuse healthy development services. A port occupied by anything else remains
 # an error: it is unsafe to assume that an arbitrary process is Oracle Builder.
-SERVE_RUNNING=0
 ORCHESTRATOR_RUNNING=0
-if is_online "$SERVE_URL/health/ready"; then
-  SERVE_RUNNING=1
-  echo "Reusing oracle-serve at $SERVE_URL"
-else
-  require_free_port "$SERVE_PORT"
-fi
 if is_online "$ORCHESTRATOR_URL/health/live"; then
-  # A live endpoint alone is not enough: the GUI relies on the model setup
-  # schema for architecture defaults and previews. Do not silently reuse an
-  # older process that predates that API.
-  if is_online "$ORCHESTRATOR_URL/v1/model-setups/simple_cnn" && has_startup_reconciliation; then
+  if has_startup_reconciliation; then
     ORCHESTRATOR_RUNNING=1
     echo "Reusing oracle-orchestrator at $ORCHESTRATOR_URL"
   else
@@ -227,6 +225,7 @@ require_free_port "$WEBGUI_PORT"
 if [[ "${ORACLE_STACK_SKIP_SETUP:-0}" != "1" ]]; then
   echo "Synchronizing Python API dependencies…"
   UV_SYNC_ARGS=(--extra api --locked)
+  if [[ -n "$ARTIFACT_S3_BUCKET" ]]; then UV_SYNC_ARGS+=(--extra storage-s3); fi
   if [[ -n "$GPU_EXTRA" ]]; then UV_SYNC_ARGS+=(--extra "$GPU_EXTRA"); fi
   (cd "$ROOT_DIR" && uv sync "${UV_SYNC_ARGS[@]}")
   echo "Synchronizing web GUI dependencies…"
@@ -240,42 +239,131 @@ if [[ "${ORACLE_STACK_SKIP_ACCELERATOR_CHECK:-0}" != "1" ]]; then
   fi
 fi
 
-if [[ "$SERVE_RUNNING" == "0" ]]; then
-  echo "Starting oracle-serve…"
-  (
-    cd "$ROOT_DIR"
-    SERVE_COMPUTE_ARGS=(--compute-worker-slots "$COMPUTE_WORKER_SLOTS")
-    if [[ -n "$COMPUTE_CPU_CAPACITY" ]]; then
-      SERVE_COMPUTE_ARGS+=(--compute-cpu-capacity "$COMPUTE_CPU_CAPACITY")
-    fi
-    exec uv run --extra api oracle-serve --host "$HOST" --port "$SERVE_PORT" --worker-id local "${SERVE_COMPUTE_ARGS[@]}"
-  ) >"$LOG_DIR/oracle-serve.log" 2>&1 &
-  SERVE_PID=$!
-  wait_for "oracle-serve" "$SERVE_URL/health/ready" "$SERVE_PID"
-fi
-
 if [[ "$ORCHESTRATOR_RUNNING" == "0" ]]; then
   echo "Starting oracle-orchestrator…"
+  # Keep one non-empty argv array. Bash 3 with `set -u` treats an empty
+  # indexed array expansion as unset, which broke the no-S3/no-profile local
+  # startup path on macOS.
+  ORCHESTRATOR_ARGS=(
+    --database "$RUNTIME_DIR/orchestrator.sqlite"
+    --workspace-root "$ROOT_DIR"
+    --artifact-root "$RUNTIME_DIR/artifacts"
+    --log-root "$LOG_DIR"
+    --runs-root "$ROOT_DIR/runs"
+    --datasets-root "$ROOT_DIR/datasets"
+    --host "$HOST"
+    --port "$ORCHESTRATOR_PORT"
+  )
+  if [[ -n "$ARTIFACT_S3_BUCKET" ]]; then
+    ORCHESTRATOR_ARGS+=(--s3-bucket "$ARTIFACT_S3_BUCKET" --s3-prefix "$ARTIFACT_S3_PREFIX")
+    if [[ -n "$ARTIFACT_S3_ENDPOINT_URL" ]]; then ORCHESTRATOR_ARGS+=(--s3-endpoint-url "$ARTIFACT_S3_ENDPOINT_URL"); fi
+    if [[ -n "$ARTIFACT_S3_REGION" ]]; then ORCHESTRATOR_ARGS+=(--s3-region "$ARTIFACT_S3_REGION"); fi
+  fi
+  if [[ -n "$WORKER_DEPLOYMENT_PROFILES" ]]; then
+    ORCHESTRATOR_ARGS+=(--worker-deployment-profiles "$WORKER_DEPLOYMENT_PROFILES")
+  fi
+  if [[ -n "${ORACLE_ORCHESTRATOR_ROLE_TOKENS_SHA256:-}" ]]; then
+    ORCHESTRATOR_ARGS+=(--role-tokens-sha256 "$ORACLE_ORCHESTRATOR_ROLE_TOKENS_SHA256")
+  elif [[ "$HOST" == "127.0.0.1" || "$HOST" == "localhost" || "$HOST" == "::1" ]]; then
+    # This launcher is a single-user local-development convenience. Remote
+    # deployments must provide hashed role tokens instead of this bypass.
+    ORCHESTRATOR_ARGS+=(--allow-unauthenticated-mutations)
+  else
+    echo "ORACLE_ORCHESTRATOR_ROLE_TOKENS_SHA256 is required when binding the stack remotely." >&2
+    exit 2
+  fi
   (
     cd "$ROOT_DIR"
-    exec uv run --extra api oracle-orchestrator \
-      --database "$RUNTIME_DIR/orchestrator.sqlite" \
-      --workspace-root "$ROOT_DIR" \
-      --artifact-root "$RUNTIME_DIR/artifacts" \
-      --log-root "$LOG_DIR" \
-      --runs-root "$ROOT_DIR/runs" \
-      --datasets-root "$ROOT_DIR/datasets" \
-      --oracle-serve "Local=${SERVE_URL}" \
-      --host "$HOST" --port "$ORCHESTRATOR_PORT"
+    ORCHESTRATOR_EXTRAS=(--extra api)
+    if [[ -n "$ARTIFACT_S3_BUCKET" ]]; then ORCHESTRATOR_EXTRAS+=(--extra storage-s3); fi
+    exec uv run "${ORCHESTRATOR_EXTRAS[@]}" oracle-orchestrator "${ORCHESTRATOR_ARGS[@]}"
   ) >"$LOG_DIR/orchestrator.log" 2>&1 &
   ORCHESTRATOR_PID=$!
   wait_for "orchestrator" "$ORCHESTRATOR_URL/health/live" "$ORCHESTRATOR_PID"
 fi
 
+# A local stack proves the production boundary: create an admission pool, then
+# run a registered pull worker. The one-time token never reaches the GUI or a
+# WorkUnit. A new pool per launcher invocation also avoids accidentally
+# reusing a token that was intentionally only returned at creation time.
+LOCAL_POOL_NAME="local-$(date +%s)-$$"
+ORCHESTRATOR_CURL_ARGS=(-H 'Content-Type: application/json')
+if [[ -n "${ORACLE_ORCHESTRATOR_ROLE_TOKENS_SHA256:-}" ]]; then
+  if [[ -z "${ORACLE_ORCHESTRATOR_TOKEN:-}" ]]; then
+    echo "ORACLE_ORCHESTRATOR_TOKEN is required when role-token security is configured." >&2
+    exit 2
+  fi
+  ORCHESTRATOR_CURL_ARGS+=(-H "Authorization: Bearer ${ORACLE_ORCHESTRATOR_TOKEN}")
+fi
+POOL_RESPONSE="$(curl --fail --silent --show-error \
+  "${ORCHESTRATOR_CURL_ARGS[@]}" \
+  -d "{\"name\":\"${LOCAL_POOL_NAME}\",\"allowed_actions\":[\"train\",\"infer\"]}" \
+  "${ORCHESTRATOR_URL}/v1/worker-pools")"
+read -r LOCAL_POOL_ID LOCAL_JOIN_TOKEN < <(python3 -c '
+import json, sys
+value = json.load(sys.stdin)
+print(value["pool_id"], value["registration_token"])
+' <<<"$POOL_RESPONSE")
+# Keep the one-time join secret off the process command line. The worker gets
+# it from its environment only for the initial registration, then persists its
+# server-issued identity in the owner-only credentials file.
+umask 077
+mkdir -p "$RUNTIME_DIR/worker-secrets"
+LOCAL_JOIN_TOKEN_FILE="$RUNTIME_DIR/worker-secrets/${LOCAL_POOL_ID}.join-token"
+printf '%s\n' "$LOCAL_JOIN_TOKEN" >"$LOCAL_JOIN_TOKEN_FILE"
+chmod 600 "$LOCAL_JOIN_TOKEN_FILE"
+unset LOCAL_JOIN_TOKEN
+
+echo "Starting registered local oracle-worker…"
+WORKER_CAPABILITIES=(--capability "cpu_capacity=${LOCAL_WORKER_CPU_CAPACITY:-$LOCAL_WORKER_SLOTS}")
+if [[ "$ACCELERATOR" == "cuda" ]]; then
+  WORKER_CAPABILITIES+=(--capability "gpu_ids=${CUDA_VISIBLE_DEVICES}")
+elif [[ "$ACCELERATOR" == "metal" ]]; then
+  WORKER_CAPABILITIES+=(--capability "gpu_ids=0")
+fi
+(
+  cd "$ROOT_DIR"
+  export ORACLE_BUILDER_WORKER_REGISTRATION_TOKEN
+  ORACLE_BUILDER_WORKER_REGISTRATION_TOKEN="$(<"$LOCAL_JOIN_TOKEN_FILE")"
+  exec uv run --extra api oracle-worker \
+    --orchestrator-url "$ORCHESTRATOR_URL" \
+    --pool-id "$LOCAL_POOL_ID" \
+    --name "local-$HOST" \
+    --credentials-file "$RUNTIME_DIR/workers/${LOCAL_POOL_ID}.json" \
+    --scratch-root "$RUNTIME_DIR/worker-scratch" \
+    --artifact-timeout-seconds "$WORKER_ARTIFACT_TIMEOUT_SECONDS" \
+    --executor train \
+    --executor infer \
+    "${WORKER_CAPABILITIES[@]}"
+) >"$LOG_DIR/oracle-worker.log" 2>&1 &
+WORKER_PID=$!
+for attempt in $(seq 1 20); do
+  if curl --fail --silent "$ORCHESTRATOR_URL/v1/workers?pool_id=$LOCAL_POOL_ID" | python3 -c '
+import json, sys
+workers = json.load(sys.stdin).get("workers", [])
+raise SystemExit(0 if workers else 1)
+' >/dev/null 2>&1; then
+    echo "Local pull worker registered in pool $LOCAL_POOL_ID"
+    rm -f "$LOCAL_JOIN_TOKEN_FILE"
+    LOCAL_JOIN_TOKEN_FILE=""
+    break
+  fi
+  if ! kill -0 "$WORKER_PID" >/dev/null 2>&1; then
+    echo "oracle-worker stopped before registration. See $LOG_DIR/oracle-worker.log" >&2
+    exit 1
+  fi
+  if [[ "$attempt" == "20" ]]; then
+    echo "oracle-worker did not register within 20 seconds. See $LOG_DIR/oracle-worker.log" >&2
+    exit 1
+  fi
+  sleep 1
+done
+
 echo "Starting web GUI…"
 (
   cd "$ROOT_DIR/webgui"
   export ORCHESTRATOR_URL
+  export ORCHESTRATOR_OPERATOR_TOKEN="${ORACLE_ORCHESTRATOR_TOKEN:-}"
   exec npm run dev -- --host "$HOST" --port "$WEBGUI_PORT"
 ) >"$LOG_DIR/webgui.log" 2>&1 &
 WEBGUI_PID=$!
@@ -286,7 +374,7 @@ cat <<EOF
 Oracle Builder stack is running.
   Web GUI:       http://${HOST}:${WEBGUI_PORT}/
   Orchestrator:  ${ORCHESTRATOR_URL}
-  Compute API:   ${SERVE_URL}
+  Local worker:  registered pull worker (${LOCAL_POOL_ID})
   Runtime data:  ${RUNTIME_DIR}
   Accelerator:   ${ACCELERATOR}
 

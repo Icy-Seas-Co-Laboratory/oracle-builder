@@ -304,7 +304,12 @@ def load_prediction_arrays(
                 "uuid": row["uuid"],
                 "split": row.get("split") or "train",
                 "label_text": row.get("label_text"),
-                "class_index": int(decoded_target if decoded_target is not None else row.get("label_text")) if task == "classification" else None,
+                "class_index": (
+                    int(decoded_target if decoded_target is not None else row.get("label_text"))
+                    if task == "classification"
+                    and (decoded_target is not None or row.get("label_text") is not None)
+                    else None
+                ),
                 "sample_weight": row.get("sample_weight"),
                 "metadata": json.loads(row["metadata_json"]) if row.get("metadata_json") else {},
                 "original_shape": list(np.asarray(x).shape),
@@ -517,10 +522,17 @@ def make_tf_datasets(sqlite_path: str | Path, config: dict[str, Any]):
         else:
             dataset = tf.data.Dataset.from_tensor_slices((x, y))
         if split == "train":
-            dataset = dataset.shuffle(config["data"].get("shuffle_buffer", 512), seed=config["run"].get("seed", 123))
+            ordered_batches = (
+                str(config.get("training", {}).get("step_cursor_policy", "epoch")).lower()
+                == "ordered_batches_v1"
+            )
+            if not ordered_batches:
+                dataset = dataset.shuffle(config["data"].get("shuffle_buffer", 512), seed=config["run"].get("seed", 123))
             repeats_per_epoch = int(config.get("augmentation", {}).get("repeats_per_epoch", 1))
             if repeats_per_epoch < 1:
                 raise ValueError("augmentation.repeats_per_epoch must be at least 1")
+            if ordered_batches and repeats_per_epoch != 1:
+                raise ValueError("ordered_batches_v1 requires augmentation.repeats_per_epoch = 1")
             if repeats_per_epoch > 1:
                 dataset = dataset.repeat(repeats_per_epoch)
         dataset = dataset.batch(config["data"].get("batch_size", 16))

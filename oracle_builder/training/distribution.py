@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
+from contextvars import ContextVar
 import fcntl
 import os
 from subprocess import DEVNULL, run
@@ -44,6 +46,30 @@ def _cross_device_ops(name: str):
 
 
 _GPU_LEASES: dict[str, Any] = {}
+_GPU_LEASE_SCOPE: ContextVar[list[str] | None] = ContextVar("oracle_gpu_lease_scope", default=None)
+
+
+@contextmanager
+def gpu_lease_scope():
+    """Release only reservations acquired by this run/probe, even on failure.
+
+    Context-local ownership prevents one concurrent request from releasing
+    another request's reservation. Nested scopes own their own reservations.
+    """
+    owned: list[str] = []
+    token = _GPU_LEASE_SCOPE.set(owned)
+    try:
+        yield
+    finally:
+        _GPU_LEASE_SCOPE.reset(token)
+        for path in reversed(owned):
+            handle = _GPU_LEASES.pop(path, None)
+            if handle is not None:
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                finally:
+                    handle.close()
+
 
 
 def _gpu_loads() -> dict[int, tuple[int, int]]:
@@ -80,6 +106,9 @@ def _reserve_gpu(index: int, settings: dict[str, Any]) -> str | None:
     handle.write(json.dumps({"pid": os.getpid()}) + "\n")
     handle.flush()
     _GPU_LEASES[str(path)] = handle
+    scope = _GPU_LEASE_SCOPE.get()
+    if scope is not None:
+        scope.append(str(path))
     return str(path)
 
 

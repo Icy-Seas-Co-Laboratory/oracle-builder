@@ -29,6 +29,19 @@ def _evaluation_context(config: dict[str, Any], split: str) -> dict[str, Any]:
     }
 
 
+def _unavailable_split_result(run_dir: str | Path, config: dict[str, Any], split: str) -> dict[str, Any]:
+    """Persist an explicit result instead of evaluating a different split."""
+    summary = {
+        "status": "unavailable",
+        "reason": f"No labeled samples are assigned to requested split {split!r}",
+        "evaluation_context": _evaluation_context(config, split),
+    }
+    path = Path(run_dir) / "evaluation" / "evaluation_summary.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(summary, indent=2) + "\n")
+    return {"summary": summary, "unavailable": True}
+
+
 def evaluate_run_model(
     model,
     config: dict[str, Any],
@@ -55,11 +68,8 @@ def evaluate_run_model(
         index = build_classification_index(
             input_path, config, split, labeled_only=True
         )
-        if not index.refs and split == "test":
-            index = build_classification_index(
-                input_path, config, "validation", labeled_only=True
-            )
-            evaluated_split = "validation"
+        if not index.refs:
+            return _unavailable_split_result(run_dir, config, split)
         source = SQLiteClassificationSource(input_path, config)
         if inference_batch_size is None:
             from oracle_builder.inference.batching import (
@@ -84,9 +94,10 @@ def evaluate_run_model(
     else:
         try:
             x, y, records = load_arrays(input_path, config, split=split)
-        except ValueError:
-            x, y, records = load_arrays(input_path, config, split="validation")
-            evaluated_split = "validation"
+        except ValueError as exc:
+            if "No samples found for split" not in str(exc):
+                raise
+            return _unavailable_split_result(run_dir, config, split)
         if config["run"]["task"] == "classification":
             result = evaluate_classification(
                 model,

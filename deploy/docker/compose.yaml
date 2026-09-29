@@ -1,0 +1,79 @@
+name: oracle-builder
+
+services:
+  orchestrator:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+      target: orchestrator
+    image: oracle-builder/orchestrator:demo
+    environment:
+      ORACLE_DATA_ROOT: /var/lib/oracle-builder
+      ORACLE_WORKER_DEPLOYMENT_PROFILES: /oracle/config/worker-deployments.json
+      ORACLE_ORCHESTRATOR_ROLE_TOKENS_SHA256: ${ORACLE_ORCHESTRATOR_ROLE_TOKENS_SHA256}
+      ORACLE_ARTIFACT_S3_BUCKET: ${ORACLE_ARTIFACT_S3_BUCKET:-}
+      ORACLE_ARTIFACT_S3_PREFIX: ${ORACLE_ARTIFACT_S3_PREFIX:-oracle-builder}
+      ORACLE_ARTIFACT_S3_ENDPOINT_URL: ${ORACLE_ARTIFACT_S3_ENDPOINT_URL:-}
+      ORACLE_ARTIFACT_S3_REGION: ${ORACLE_ARTIFACT_S3_REGION:-}
+    volumes:
+      - ${ORACLE_DOCKER_DATA_ROOT:?Set an absolute host path in deploy/docker/.env}:/var/lib/oracle-builder
+      - ./runtime/worker-deployments.json:/oracle/config/worker-deployments.json:ro
+      # Required only because the Orchestrator manages fixed Docker worker
+      # profiles. Remove this mount and use externally managed workers if that
+      # authority is not appropriate for the host.
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks: [oracle]
+    expose: ["8110"]
+    restart: unless-stopped
+
+  # Compose builds this image but does not start it. The Orchestrator's Docker
+  # provider starts approved instances after a pool and deployment are created.
+  worker-image:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+      target: worker
+    image: oracle-builder/worker:demo
+    profiles: [image]
+    networks: [oracle]
+
+  webgui:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/webgui.Dockerfile
+    image: oracle-builder/webgui:demo
+    environment:
+      ORCHESTRATOR_URL: http://orchestrator:8110
+      ORCHESTRATOR_OPERATOR_TOKEN: ${ORCHESTRATOR_OPERATOR_TOKEN}
+    networks: [oracle]
+    expose: ["3000"]
+    depends_on:
+      orchestrator:
+        condition: service_started
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2.10-alpine
+    environment:
+      ORACLE_PUBLIC_HOST: ${ORACLE_PUBLIC_HOST:-localhost}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks: [oracle]
+    depends_on:
+      webgui:
+        condition: service_started
+    restart: unless-stopped
+
+networks:
+  oracle:
+    name: oracle-builder
+
+volumes:
+  caddy_data:
+  caddy_config:

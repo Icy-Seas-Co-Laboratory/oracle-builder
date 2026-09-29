@@ -4,19 +4,14 @@
 
 | Goal | Guide |
 |---|---|
-| Install and run a first model | [Getting started](getting-started.md) |
-| Build a training database from images or an image-folder library | [Building training-set databases](training-dataset-guide.md) |
-| Train an image classifier from labeled folders | [Classification workflow](classification-workflow.md) |
-| Train an unlabeled ROI representation model | [Downstream ROI clustering](clustering-workflow.md) |
-| Curate ROIs and refine masks | [Mask-refinement workflow](mask-refinement-workflow.md) |
-| Ingest a pre-existing Keras model | [External model products](model-products.md) |
-| Configure training, evaluation, or recovery | [Training, evaluation, and recovery](training-and-evaluation.md) |
-| Assemble a V2 composable encoder, metadata path, and representation cache | [Composable model architecture V2](composable-model-architecture-v2.md) |
-| Look up every training, inference, and Oracle Serve option | [Pipeline options reference](pipeline-options-reference.md) |
-| Diagnose installation or run problems | [Operations and troubleshooting](operations-and-troubleshooting.md) |
-| Serve models to operational systems | [Inference API](inference-api.md) |
-| Execute Oracle Builder work from an orchestrator | [Compute API](compute-api.md) |
-| Plan and catalog experiments for Pelagia | [Orchestrator API](orchestrator-api.md) |
+| Operate the control plane from a terminal | [Oracle control CLI](oracle-cli.md) |
+| Choose the supported GUI, CLI, or API entry point | [Using Oracle Builder](user-entrypoints.md) |
+| Deploy registered pull workers | [Oracle worker](oracle-worker.md) |
+| Deploy the single-host demo | [Non-container demo deployment](../deploy/demo/README.md) |
+| Deploy the containerized single-host demo | [Docker demo deployment](../deploy/docker/README.md) |
+| Use the control-plane protocol | [Orchestrator API](orchestrator-api.md) |
+| Understand portable execution attempts | [WorkUnit V1](work-unit-v1.md) |
+| Migrate historical artifacts or datasets | Offline migration readers in the source tree (not a supported runtime API) |
 
 ## Contract references
 
@@ -27,6 +22,7 @@
 | Training run, split protocol, integrity, and package | [Model-run artifact V1](run-artifact-v1.md) |
 | Shared deployment/training artifact profiles | [Oracle Model Artifact Standard V2](model-artifact-standard-v2.md) |
 | In-memory and persisted inference packet | [Inference contract V1](inference-contract-v1.md) |
+| Orchestrator-to-worker execution attempt | [WorkUnit V1](work-unit-v1.md) |
 
 ## Configuration examples
 

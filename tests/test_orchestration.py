@@ -32,14 +32,14 @@ def test_server_logs_are_bounded_to_allow_listed_stack_files(tmp_path):
     log_root = tmp_path / "logs"
     log_root.mkdir()
     (log_root / "orchestrator.log").write_text("old\nnew\n", encoding="utf-8")
-    (log_root / "oracle-serve.log").write_text("serve\n", encoding="utf-8")
+    (log_root / "oracle-worker.log").write_text("worker\n", encoding="utf-8")
     orchestrator = Orchestrator(tmp_path / "orchestrator.sqlite", workspace_root=tmp_path, log_root=log_root)
 
     result = orchestrator.server_logs(tail_lines=1)
 
     logs = {entry["service"]: entry for entry in result["logs"]}
     assert logs["orchestrator"]["text"] == "new"
-    assert logs["serve"]["text"] == "serve"
+    assert logs["worker"]["text"] == "worker"
     assert logs["webgui"] == {"service": "webgui", "name": "Web GUI", "available": False, "message": "Log file is not available."}
     assert result["scheduler"] == {"endpoints": [], "findings": []}
 
@@ -76,7 +76,7 @@ def test_operation_runner_skips_reconciliation_when_no_job_is_active(tmp_path):
 
 
 def test_scheduled_validated_queue_returns_completed_queued_run(tmp_path, monkeypatch):
-    """Calibration work is accepted immediately and its queued run is durable output."""
+    """Portable pool queueing is accepted immediately and its queued run is durable output."""
     import time
     from fastapi.testclient import TestClient
     from oracle_builder.orchestration.api import create_app
@@ -89,12 +89,11 @@ def test_scheduled_validated_queue_returns_completed_queued_run(tmp_path, monkey
     def validate(definition_id, **kwargs):
         received["definition_id"] = definition_id
         received.update(kwargs)
-        kwargs["operation_progress"]("preflight", "Checking mocked endpoint", {})
-        kwargs["operation_progress"]("calibrating", "Calibrating mocked batch size", {})
+        kwargs["operation_progress"]("materializing", "Sealing mocked portable inputs", {})
         return {"queued_run_id": "queued-123", "status": "ready"}
 
-    monkeypatch.setattr(orchestrator, "validate_and_queue_model_definition", validate)
-    payload = {"name": "scheduled", "dataset_id": "dataset-1", "endpoint_id": "endpoint-1", "batch_size_mode": "auto"}
+    monkeypatch.setattr(orchestrator, "queue_model_definition_for_pool", validate)
+    payload = {"name": "scheduled", "dataset_id": "dataset-1", "worker_pool_id": "pool-1", "batch_size_mode": "manual"}
     with TestClient(create_app(orchestrator)) as client:
         response = client.post("/v1/model-definitions/definition-1:validate-and-queue/schedule", json=payload)
         assert response.status_code == 202
@@ -108,7 +107,7 @@ def test_scheduled_validated_queue_returns_completed_queued_run(tmp_path, monkey
         assert detail["result"]["queued_run_id"] == "queued-123"
         assert received["definition_id"] == "definition-1"
         event_types = [event["event_type"] for event in orchestrator.operation_events(operation_id=operation_id)]
-        assert event_types == ["queued", "started", "preflight", "calibrating", "completed"]
+        assert event_types == ["queued", "started", "materializing", "completed"]
 
 
 def _create_sealed_product(path, source_config, *, artifact_type="model_product", metrics=None, dataset_fingerprint=None, task="classification", detailed_evidence=False):
@@ -178,6 +177,12 @@ def test_dispatch_and_reconcile_keeps_orchestrator_job_identity(tmp_path, monkey
 
     monkeypatch.setattr(orchestrator, "_request", request)
     job = orchestrator.dispatch(specification["specification_id"], endpoint["endpoint_id"])
+    submission = next(body for _, method, route, body in requests if method == "POST" and route == "/compute/jobs")
+    assert submission["work_unit"]["schema"] == {"name": "oracle_work_unit", "version": 1}
+    assert submission["work_unit"]["work_unit_id"] == job["job_id"]
+    assert str(workspace) not in json.dumps(submission["work_unit"])
+    assert job["work_unit_sha256"]
+    assert job["work_unit"]["staging"]["kind"] == "staging"
     submitted = next(item for item in requests if item[1] == "POST")
     assert submitted[3]["job_id"] == job["job_id"]
     assert job["status"] == "submitted"
@@ -187,8 +192,8 @@ def test_dispatch_and_reconcile_keeps_orchestrator_job_identity(tmp_path, monkey
     assert reconciled["worker_id"] == "gpu-a"
 
 
-def test_job_training_status_proxies_live_snapshot_and_degrades_gracefully(tmp_path, monkeypatch):
-    """The browser gets a stable payload even before a worker has a snapshot."""
+def test_job_training_status_route_is_retired(tmp_path, monkeypatch):
+    """Live path-based worker status was removed with the push execution API."""
     from fastapi.testclient import TestClient
     from oracle_builder.orchestration.api import create_app
 
@@ -220,12 +225,9 @@ def test_job_training_status_proxies_live_snapshot_and_degrades_gracefully(tmp_p
     job = orchestrator.dispatch(specification["specification_id"], endpoint["endpoint_id"])
     with TestClient(create_app(orchestrator)) as client:
         response = client.get(f"/v1/jobs/{job['job_id']}/training-status")
-        assert response.status_code == 200
-        assert response.json() == {
-            "phase": "training", "epoch": 3, "available": True, "stale": False, "controls": ["cancel"],
-            "job_id": job["job_id"], "job_status": "submitted", "message": None,
-        }
+        assert response.status_code == 404
         assert client.get("/v1/jobs/not-a-job/training-status").status_code == 404
+    return
 
     def unavailable_request(base, method, route, body=None):
         if route.endswith("/training-status"):
@@ -288,24 +290,18 @@ def test_job_training_status_exposes_last_persisted_progress_for_missing_worker_
     assert [event["event_type"] for event in orchestrator.job_events("missing-job")] == ["remote_missing"]
 
 
-def test_orchestrator_api_creates_a_model_import_specification(tmp_path):
+def test_orchestrator_api_retires_path_based_model_import(tmp_path):
     from fastapi.testclient import TestClient
     from oracle_builder.orchestration.api import create_app
 
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    model = workspace / "external.keras"
-    model.write_bytes(b"placeholder")
-    info = workspace / "external.toml"
-    info.write_text("[product]\nname = 'External'\n")
     with TestClient(create_app(Orchestrator(tmp_path / "orchestrator.sqlite", workspace_root=workspace))) as client:
         created = client.post("/v1/model-imports", json={
-            "name": "api-import", "model_path": str(model), "info_path": str(info),
+            "name": "api-import", "model_path": "/old/external.keras", "info_path": "/old/external.toml",
         })
-        assert created.status_code == 201
-        specifications = client.get("/v1/specifications").json()["specifications"]
-        assert specifications[0]["status"] == "planned"
-        assert specifications[0]["action"] == "model_ingest"
+        assert created.status_code == 410
+        assert "retired" in created.json()["detail"]
 
 
 def test_successful_compute_is_validated_indexed_and_linked(tmp_path, monkeypatch):
@@ -1052,7 +1048,7 @@ def test_scheduler_claim_prevents_duplicate_concurrent_dispatch(tmp_path, monkey
     assert submitted == ["scheduler-spec-0"]
 
 
-def test_reconciliation_refills_affected_endpoint(tmp_path, monkeypatch):
+def test_reconciliation_does_not_restart_retired_push_endpoints(tmp_path, monkeypatch):
     import sqlite3
     from datetime import datetime, timezone
 
@@ -1066,8 +1062,8 @@ def test_reconciliation_refills_affected_endpoint(tmp_path, monkeypatch):
     monkeypatch.setattr(orchestrator, "reconcile_job", lambda job_id: {"job_id": job_id, "oracle_serve_url": "http://scheduler-serve", "status": "failed"})
     refills = []
     monkeypatch.setattr(orchestrator, "schedule_queued_runs", lambda endpoint_id: refills.append(endpoint_id) or [])
-    orchestrator.reconcile_active_jobs()
-    assert refills == [endpoint["endpoint_id"]]
+    assert orchestrator.reconcile_active_jobs() == []
+    assert refills == []
 
 
 def test_startup_reconciles_project_runs_and_frozen_datasets(tmp_path):

@@ -10,6 +10,8 @@ from fastapi.testclient import TestClient
 from oracle_builder.api.app import create_app
 from oracle_builder.api.compute import ComputeService, Job
 from oracle_builder.api.registry import InferenceModelRegistry
+from oracle_data_contracts.artifacts import ArtifactRef
+from oracle_data_contracts.work_units import WorkUnit
 
 
 def test_compute_api_exposes_local_worker_and_validates_orchestrator_job_ids():
@@ -74,6 +76,47 @@ def test_compute_completion_reports_the_resolved_output_path():
         assert compute._jobs[job_id].output_path == "/tmp/oracle-runs/run-id"
     finally:
         compute.close()
+
+
+def test_compute_api_validates_and_retains_work_unit_without_exposing_local_paths():
+    compute = ComputeService()
+    app = create_app(InferenceModelRegistry(), compute=compute, preload=False)
+    job_id = str(uuid.uuid4())
+    work_unit = WorkUnit(
+        work_unit_id=job_id,
+        attempt_id=str(uuid.uuid4()),
+        specification_id=str(uuid.uuid4()),
+        action="run_validate",
+        inputs={"run": ArtifactRef("model_run", "run-1")},
+        configuration=None,
+        staging=ArtifactRef("staging", job_id, "attempt-1"),
+        resources={},
+    )
+    with TestClient(app) as client:
+        accepted = client.post(
+            "/compute/jobs",
+            json={
+                "job_id": job_id,
+                "action": "run_validate",
+                "parameters": {"run": "/local/compatibility/run"},
+                "resources": {},
+                "work_unit": work_unit.to_dict(),
+            },
+        )
+        assert accepted.status_code == 202
+        assert accepted.json()["work_unit"] == work_unit.to_dict()
+        assert "/local/compatibility" not in str(accepted.json()["work_unit"])
+
+        mismatch = client.post(
+            "/compute/jobs",
+            json={
+                "job_id": str(uuid.uuid4()),
+                "action": "run_validate",
+                "parameters": {"run": "/local/compatibility/run"},
+                "work_unit": work_unit.to_dict(),
+            },
+        )
+        assert mismatch.status_code == 422
 
 
 def test_compute_preflight_seals_explicit_gpu_ids_and_rejects_unknown_devices(monkeypatch):

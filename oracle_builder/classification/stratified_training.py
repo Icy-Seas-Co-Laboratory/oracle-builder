@@ -110,7 +110,8 @@ class StratifiedTrainingResult:
     def load_model(self, dimension: int) -> keras.Model:
         # Finalization performs inference/evaluation only; avoiding optimizer
         # deserialization also keeps custom training losses out of this path.
-        return keras.models.load_model(self.model_path(dimension), compile=False)
+        from oracle_builder.saving.load_test import _load_keras_model
+        return _load_keras_model(self.model_path(dimension), compile=False)
 
 
 def write_stratified_metric_artifacts(
@@ -517,6 +518,10 @@ def validate_recovery_state(
 def clear_recovery_state(run_dir: str | Path) -> None:
     _recovery_path(run_dir).unlink(missing_ok=True)
     _recovery_model_path(run_dir).unlink(missing_ok=True)
+    generations = Path(run_dir) / "model" / "recovery" / "generations"
+    if generations.exists():
+        import shutil
+        shutil.rmtree(generations)
     # Remove the former per-stratum layout as well, so completed artifacts do
     # not retain obsolete rolling snapshots after an upgrade.
     for dimension in (Path(run_dir) / "model" / "strata").glob("*/recovery"):
@@ -596,12 +601,25 @@ def _save_recovery_model(
     # avoids duplicating a potentially large Keras archive for every stratum.
     recovery_dir = run_dir / "model" / "recovery"
     recovery_dir.mkdir(parents=True, exist_ok=True)
+    generation_id = uuid.uuid4().hex
+    generations = recovery_dir / "generations"
+    staging = generations / f".{generation_id}.staging"
+    generation = generations / generation_id
+    staging.mkdir(parents=True, exist_ok=False)
+    staged_model = staging / "model.keras"
+    model.save(staged_model)
+    checksum = _sha256(staged_model)
+    os.replace(staging, generation)
+    generation_model = generation / "model.keras"
     target = _recovery_model_path(run_dir)
-    temporary = recovery_dir / f".latest.{uuid.uuid4().hex}.keras"
-    model.save(temporary)
+    temporary = recovery_dir / f".latest.{generation_id}.keras"
+    try:
+        os.link(generation_model, temporary)
+    except OSError:
+        import shutil
+        shutil.copy2(generation_model, temporary)
     os.replace(temporary, target)
-    relative = target.relative_to(run_dir).as_posix()
-    checksum = _sha256(target)
+    relative = generation_model.relative_to(run_dir).as_posix()
     # Child progress is historical metadata; every child intentionally points
     # to this one *current* shared model.  Refreshing existing entries avoids
     # retaining stale checksums after the next stratum updates the weights.
@@ -612,6 +630,11 @@ def _save_recovery_model(
         "completed_epochs": int(completed_epochs),
         "model_path": relative,
         "model_sha256": checksum,
+        "generation": {
+            "id": generation_id,
+            "path": generation.relative_to(run_dir).as_posix(),
+            "schema": "oracle_builder_training_checkpoint_generation/v1",
+        },
         "history": history,
         "control": control,
     }
@@ -734,6 +757,8 @@ def train_stratified_models(
     run_id: str,
     *,
     resume_state: dict[str, Any] | None = None,
+    segment_stop_epoch: int | None = None,
+    segment_control=None,
 ) -> StratifiedTrainingResult:
     """Train and persist every configured resolution child model.
 
@@ -756,6 +781,19 @@ def train_stratified_models(
     indices = build_indices(sqlite_path, config)
     split_summaries = _split_summaries(indices, config)
     total_epochs = int(config["training"].get("epochs", 10))
+    if segment_stop_epoch is not None:
+        segment_stop_epoch = int(segment_stop_epoch)
+        if segment_stop_epoch <= 0 or segment_stop_epoch > total_epochs:
+            raise ValueError("Stratified segment stop epoch is outside the training range")
+        cycle_stops = {
+            stop for _start, stop, dimension in supra_epoch_schedule(config, total_epochs)
+            if dimension == dimensions(config)[-1]
+        }
+        if segment_stop_epoch not in cycle_stops:
+            raise ValueError(
+                "Stratified segments must stop at a complete shared-weight cycle; "
+                f"valid stop epochs are {sorted(cycle_stops)}"
+            )
     save_every = max(1, int(config.get("recovery", {}).get("save_every_epochs", 1)))
     recovery_enabled = bool(config.get("recovery", {}).get("enabled", True))
     for dimension in dimensions(config):
@@ -827,7 +865,8 @@ def train_stratified_models(
     shared_recovery = state.get("shared", {})
     with strategy.scope():
         if shared_recovery.get("model_path"):
-            model = keras.models.load_model(run_path / shared_recovery["model_path"])
+            from oracle_builder.saving.load_test import _load_keras_model
+            model = _load_keras_model(run_path / shared_recovery["model_path"], compile=True)
         else:
             model = build_and_compile_model(shared_config)
 
@@ -850,6 +889,8 @@ def train_stratified_models(
     # Each child remains resident for a supra-epoch block, avoiding a model
     # reload and graph rebuild for every individual parent epoch.
     for block_start, block_stop, dimension in supra_epoch_schedule(config, total_epochs):
+        if segment_stop_epoch is not None and block_start >= segment_stop_epoch:
+            break
         if stop_training:
             break
         child = child_config(config, dimension)
@@ -1280,8 +1321,41 @@ def train_stratified_models(
             cycle_control["completed_block_stops"] = sorted(completed_cycles)
             state["cycle_scheduler"] = cycle_control
             _atomic_json(_recovery_path(run_path), state)
+        # A shared model may only yield after every stratum has committed the
+        # same parent epoch/cycle.  Poll local control here, never inside a
+        # stratum update, so the next unit has a scientifically coherent input.
+        if dimension == dimensions(config)[-1]:
+            decision = segment_control.poll() if segment_control is not None else None
+            if decision is not None and decision.command is not None:
+                state["segment_control"] = {
+                    "command": decision.command,
+                    "sequence": decision.sequence,
+                    "reason": decision.reason,
+                    "completed_epoch": block_stop,
+                }
+                _atomic_json(_recovery_path(run_path), state)
+                break
+            if segment_stop_epoch is not None and block_stop >= segment_stop_epoch:
+                break
         # The dynamic-spatial shared model intentionally remains resident while
         # the next stratum is trained.
+
+    completed_parent_epoch = min(
+        (child.completed_epochs for child in children.values()), default=0
+    )
+    # Segment work units deliberately stop before model packaging.  The shared
+    # recovery snapshot is the only output authority here; evaluation and
+    # final model export belong to the later finalize unit.
+    if (segment_stop_epoch is not None or segment_control is not None) and completed_parent_epoch < total_epochs:
+        manifest = _write_manifest(
+            run_path, config, split_summaries, children, status="training"
+        )
+        return StratifiedTrainingResult(
+            children=children,
+            manifest_path=manifest,
+            recovery_path=_recovery_path(run_path),
+            split_summaries=split_summaries,
+        )
 
     shared_dir = run_path / "model" / "shared"
     if interleaved_status is not None:

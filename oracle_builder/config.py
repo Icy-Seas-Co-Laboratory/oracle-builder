@@ -50,9 +50,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "validation_split": 0.2,
         "test_split": 0.1,
         # "auto" honors a complete explicit source-partition layout when one
-        # was imported; otherwise it creates a deterministic random protocol.
-        # "random" always creates one; "source_partitions" requires one.
+        # was imported; otherwise it deterministically stratifies effective
+        # classification labels. "random" is an explicit legacy escape hatch.
         "split_strategy": "auto",
+        # Every effective class is represented in every enabled split by
+        # default. Set zero only when preserving a sparse trusted benchmark.
+        "split_minimum_per_class": 1,
+        # Grouping is never inferred from filenames or source_key. It is only
+        # consulted by the explicit stratified_group/group_only policies.
+        "split_group_metadata_key": None,
         "candidate_sdf": False,
         "candidate_sdf_clip_distance": 32.0,
         "candidate_distance": "none",
@@ -130,9 +136,16 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # Rich is the default terminal UI; text is a concise one-line-per-epoch
         # alternative for captured logs, and off suppresses console status.
         "display": "rich",
+        # Epoch units are the default. ``ordered_batches_v1`` is an explicit,
+        # narrow opt-in for deterministic CPU partial-epoch continuation.
+        "step_cursor_policy": "epoch",
+        # A positive value asks the scheduler for at most this many ordered
+        # batches per work unit when the step cursor policy supports it.
+        "work_unit_steps": 0,
         "class_weights": {
             "mode": "effective_number",
             "beta": 0.999,
+            "alpha": 0.5,
             "normalize": True,
             "values": [],
         },
@@ -550,10 +563,23 @@ def validate_config(config: dict[str, Any]) -> None:
         if section not in config:
             raise ValueError(f"Missing required config section [{section}]")
     split_strategy = str(config["data"].get("split_strategy", "auto")).lower()
-    if split_strategy not in {"auto", "random", "source_partitions"}:
+    if split_strategy not in {
+        "auto", "random", "source_partitions", "class_stratified",
+        "stratified_group", "group_only",
+    }:
         raise ValueError(
-            "data.split_strategy must be 'auto', 'random', or 'source_partitions'"
+            "data.split_strategy must be 'auto', 'random', 'source_partitions', "
+            "'class_stratified', 'stratified_group', or 'group_only'"
         )
+    if int(config["data"].get("split_minimum_per_class", 1)) < 0:
+        raise ValueError("data.split_minimum_per_class must be non-negative")
+    group_key = config["data"].get("split_group_metadata_key")
+    if split_strategy in {"stratified_group", "group_only"} and not isinstance(group_key, str):
+        raise ValueError(
+            "data.split_group_metadata_key is required for stratified_group and group_only"
+        )
+    if isinstance(group_key, str) and not group_key.strip():
+        raise ValueError("data.split_group_metadata_key cannot be empty")
     invert = config.get("preprocessing", {}).get("invert", False)
     if not isinstance(invert, bool):
         raise ValueError("preprocessing.invert must resolve to a boolean")
@@ -578,6 +604,30 @@ def validate_config(config: dict[str, Any]) -> None:
         raise ValueError("training.display must be 'rich', 'text', or 'off'")
     if float(config.get("training", {}).get("weight_decay", 0.0)) < 0:
         raise ValueError("training.weight_decay must be non-negative")
+    step_policy = str(config.get("training", {}).get("step_cursor_policy", "epoch")).lower()
+    work_unit_steps = int(config.get("training", {}).get("work_unit_steps", 0))
+    if step_policy not in {"epoch", "ordered_batches_v1"}:
+        raise ValueError("training.step_cursor_policy must be 'epoch' or 'ordered_batches_v1'")
+    if work_unit_steps < 0:
+        raise ValueError("training.work_unit_steps must be non-negative")
+    if work_unit_steps and step_policy != "ordered_batches_v1":
+        raise ValueError("training.work_unit_steps requires step_cursor_policy = 'ordered_batches_v1'")
+    if step_policy == "ordered_batches_v1":
+        if config.get("classification", {}).get("stratification", {}).get("enabled", False):
+            raise ValueError("ordered_batches_v1 does not support shared-weight stratification")
+        if str(config.get("distribution", {}).get("strategy", "cpu")).lower() != "cpu":
+            raise ValueError("ordered_batches_v1 requires distribution.strategy = 'cpu'")
+        if config.get("data", {}).get("streaming", {}).get("enabled", False):
+            raise ValueError("ordered_batches_v1 requires data.streaming.enabled = false")
+        if config.get("augmentation", {}).get("enabled", False):
+            raise ValueError("ordered_batches_v1 requires augmentation.enabled = false")
+        if int(config.get("augmentation", {}).get("repeats_per_epoch", 1)) != 1:
+            raise ValueError("ordered_batches_v1 requires augmentation.repeats_per_epoch = 1")
+        callbacks = config.get("callbacks", {})
+        if callbacks.get("early_stopping") or callbacks.get("reduce_lr_on_plateau"):
+            raise ValueError("ordered_batches_v1 does not support epoch callback schedules")
+        if self_supervised_settings(config).get("enabled", False):
+            raise ValueError("ordered_batches_v1 does not support self-supervised training")
     monitoring = config.get("monitoring", {})
     if not isinstance(monitoring, dict):
         raise ValueError("monitoring must be a table/object")
@@ -1001,15 +1051,24 @@ def validate_config(config: dict[str, Any]) -> None:
             )
         weights = config["training"].get("class_weights", {})
         mode = str(weights.get("mode", "inverse_frequency")).lower()
-        if mode not in {"explicit", "inverse_frequency", "effective_number"}:
+        if mode not in {
+            "explicit",
+            "inverse_frequency",
+            "effective_number",
+            "power_law",
+        }:
             raise ValueError(
                 "training.class_weights.mode must be explicit, "
-                "inverse_frequency, or effective_number"
+                "inverse_frequency, effective_number, or power_law"
             )
         if mode == "effective_number" and not (
             0 <= float(weights.get("beta", 0.999)) < 1
         ):
             raise ValueError("training.class_weights.beta must be in [0, 1)")
+        if mode == "power_law" and not (
+            0 <= float(weights.get("alpha", 0.5)) <= 1
+        ):
+            raise ValueError("training.class_weights.alpha must be in [0, 1]")
 
 
 def resolve_config(config_path: str | Path, input_path: str | Path, run_dir: str | Path) -> dict[str, Any]:

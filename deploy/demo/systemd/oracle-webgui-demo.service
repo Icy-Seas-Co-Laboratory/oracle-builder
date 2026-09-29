@@ -1,0 +1,22 @@
+[Unit]
+Description=Oracle Builder Web GUI (demo only)
+After=network-online.target oracle-orchestrator.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=oracle-builder
+Group=oracle-builder
+EnvironmentFile=/etc/oracle-builder/webgui.env
+WorkingDirectory=/opt/oracle-builder/webgui
+ExecStart=/usr/bin/npm run dev -- --host 127.0.0.1 --port 5111
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ReadWritePaths=/opt/oracle-builder/webgui
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

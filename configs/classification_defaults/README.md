@@ -32,6 +32,7 @@ largest compound-scaled variants may need a smaller batch size because their
 activation memory is higher.
 
 `effective_number` class weighting is the standard imbalance policy; choose
+`power_law` with `alpha = 0.5` or `0.75` to use \(p_i^{-\alpha}\) weighting,
 `inverse_frequency` for stronger balancing, `explicit` only for a reviewed
 hand-selected protocol, or `sparse_categorical_crossentropy` to opt out. The
 family defaults also retain their disabled-by-default resolution-stratification
