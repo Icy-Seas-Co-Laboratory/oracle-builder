@@ -267,3 +267,35 @@ def test_segmentation_bundle_returns_logits_and_hashed_array_outputs():
     assert result.output["logits"].values.shape == (8, 8, 1)
     assert result.output["probability_map"].values.shape == (8, 8, 1)
     assert len(result.output["mask"].sha256) == 64
+
+
+def test_candidate_delta_bundle_reconstructs_rectangular_roi_without_broadcasting():
+    class ConstantDeltaModel:
+        def get_layer(self, _name):
+            raise ValueError("no logits layer")
+
+        def predict(self, batch, verbose=0):
+            return np.full((*batch.shape[:3], 1), 0.8, dtype="float32")
+
+    config = {
+        "run": {"task": "segmentation", "model": "unet"},
+        "data": {"input_shape": [4, 5, 2], "output_shape": [4, 5, 1]},
+        "model": {"final_activation": "sigmoid"},
+        "training": {"segmentation_target": "candidate_delta"},
+        "evaluation": {"segmentation_threshold": 0.5},
+        "tiling": {"enabled": False},
+    }
+    candidate = np.zeros((4, 5), dtype="uint8")
+    candidate[0, 0] = 1
+    result = InferenceBundle(
+        ConstantDeltaModel(), config, model_reference("segmentation")
+    ).predict(InferenceItem.from_array(
+        np.zeros((4, 5), dtype="uint8"), candidate_mask=candidate,
+    ))
+
+    assert result.status == "ok"
+    assert result.output["reconstructed_mask"].values.shape == (4, 5)
+    assert result.output["reconstructed_probability_map"].values.shape == (4, 5)
+    np.testing.assert_array_equal(result.output["reconstructed_mask"].values, 1 - candidate)
+    assert np.isclose(result.output["reconstructed_probability_map"].values[0, 0], 0.2)
+    assert np.isclose(result.output["reconstructed_probability_map"].values[0, 1], 0.8)

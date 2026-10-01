@@ -908,6 +908,7 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
     def queued_runs(self) -> list[dict[str, Any]]:
         rows = self._many("SELECT * FROM queued_runs WHERE status != 'archived' ORDER BY priority DESC, created_at")
         for row in rows:
+            row.update(self._queued_run_edit_state(row))
             row["start_authorized"] = bool(row.get("start_authorized"))
             definition = self.model_definition(str(row["definition_id"]), revision=int(row["definition_revision"]))
             row["definition_name"] = definition.get("name") if definition else None
@@ -928,6 +929,7 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
         with self._connection() as db:
             row = _row(db.execute("SELECT * FROM queued_runs WHERE queued_run_id=?", (queued_run_id,)).fetchone())
         if row is not None:
+            row.update(self._queued_run_edit_state(row))
             row["start_authorized"] = bool(row.get("start_authorized"))
             try:
                 sealed = load_toml(row["resolved_toml_path"])
@@ -941,6 +943,28 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
             if (row["batch_execution"] or {}).get("mode") == "verified":
                 row["batch_size"] = row["batch_execution"]["batch_size"]
         return row
+
+    def _queued_run_edit_state(self, row: dict[str, Any]) -> dict[str, Any]:
+        with self._connection() as db:
+            jobs = db.execute(
+                "SELECT status,error FROM jobs WHERE queued_run_id=? ORDER BY submitted_at DESC, rowid DESC",
+                (row["queued_run_id"],),
+            ).fetchall()
+            active_execution = db.execute(
+                "SELECT 1 FROM execution_runs WHERE queued_run_id=? AND status NOT IN ('failed','cancelled','indexed') LIMIT 1",
+                (row["queued_run_id"],),
+            ).fetchone() is not None
+        terminal = {"failed", "cancelled", "indexed", "artifact_invalid", "dispatch_failed", "succeeded"}
+        editable_statuses = {"pending_verification", "ready", "needs_attention", "waiting_for_resources", "failed", "cancelled"}
+        editable = (
+            (row["status"] in editable_statuses and not row["start_authorized"]) or
+            (row["status"] == "queued" and bool(jobs) and jobs[0]["status"] in {"failed", "cancelled", "dispatch_failed", "artifact_invalid"})
+        ) and not active_execution and all(job["status"] in terminal for job in jobs) and not any(job["status"] in {"indexed", "succeeded"} for job in jobs)
+        return {
+            "can_edit": bool(editable),
+            "latest_job_status": jobs[0]["status"] if jobs else None,
+            "latest_job_error": jobs[0]["error"] if jobs else None,
+        }
 
     def validate_and_queue_model_definition(
         self,
@@ -1301,6 +1325,54 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
             )
         progress("queued_run_created", "Portable run was added to the worker-pool queue", {"queued_run_id": queue_id, "worker_pool_id": worker_pool_id})
         return self.queued_run(queue_id)  # type: ignore[return-value]
+
+    def replace_queued_run(
+        self, queued_run_id: str, *, name: str, dataset_id: str, worker_pool_id: str,
+        resources: dict[str, Any], batch_size_mode: str, batch_size: int | None = None,
+        maximum_batch_size: int = 256, epochs: int = 10,
+        definition_id: str | None = None, definition_revision: int | None = None,
+    ) -> dict[str, Any]:
+        """Replace an idle queue decision with a newly sealed revision.
+
+        Prior jobs and artifacts remain available for audit. A stale or active
+        worker job cannot be replaced until it has reached a terminal state.
+        """
+        prior = self.queued_run(queued_run_id)
+        if prior is None:
+            raise KeyError(queued_run_id)
+        if not prior["can_edit"]:
+            raise ValueError("This run has active work or completed training and cannot be edited")
+        chosen_definition_id = definition_id or str(prior["definition_id"])
+        chosen_revision = definition_revision if definition_revision is not None else (int(prior["definition_revision"]) if chosen_definition_id == prior["definition_id"] else None)
+        replacement = self.queue_model_definition_for_pool(
+            chosen_definition_id, revision=chosen_revision,
+            name=name, description=str(prior["description"]), dataset_id=dataset_id,
+            worker_pool_id=worker_pool_id, resources=resources,
+            initialization=dict(prior["initialization"] or {}),
+            batch_size_mode=batch_size_mode, batch_size=batch_size,
+            maximum_batch_size=maximum_batch_size, epochs=epochs,
+        )
+        new_id = str(replacement["queued_run_id"])
+        with self._connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            current = _row(db.execute("SELECT * FROM queued_runs WHERE queued_run_id=?", (queued_run_id,)).fetchone())
+            terminal = {"failed", "cancelled", "indexed", "artifact_invalid", "dispatch_failed", "succeeded"}
+            jobs = db.execute("SELECT status FROM jobs WHERE queued_run_id=? ORDER BY submitted_at DESC, rowid DESC", (queued_run_id,)).fetchall()
+            active_execution = db.execute("SELECT 1 FROM execution_runs WHERE queued_run_id=? AND status NOT IN ('failed','cancelled','indexed') LIMIT 1", (queued_run_id,)).fetchone() is not None
+            still_idle = current is not None and current["status"] == prior["status"] and current["start_authorized"] == int(prior["start_authorized"]) and not active_execution and all(job["status"] in terminal for job in jobs) and not any(job["status"] in {"indexed", "succeeded"} for job in jobs)
+            if still_idle:
+                still_idle = (current["status"] in {"pending_verification", "ready", "needs_attention", "waiting_for_resources", "failed", "cancelled"} and not current["start_authorized"]) or (current["status"] == "queued" and bool(jobs) and jobs[0]["status"] in {"failed", "cancelled", "dispatch_failed", "artifact_invalid"})
+            if not still_idle:
+                db.execute("UPDATE queued_runs SET status='archived',updated_at=? WHERE queued_run_id=?", (_now(), new_id))
+            else:
+                now = _now()
+                db.execute("UPDATE queued_runs SET status='archived',start_authorized=0,updated_at=? WHERE queued_run_id=?", (now, queued_run_id))
+                db.execute("UPDATE experiments SET plan_json=json_set(plan_json, '$.replaces_queued_run_id', ?),updated_at=? WHERE experiment_id=(SELECT experiment_id FROM run_specifications WHERE specification_id=?)", (queued_run_id, now, replacement["specification_id"]))
+        if not still_idle:
+            raise ValueError("The queued run changed while editing. Refresh and try again")
+        replacement = self.queued_run(new_id)  # type: ignore[assignment]
+        replacement["replaces_queued_run_id"] = queued_run_id
+        return replacement
 
     def verify_queued_runs_for_pool(
         self, *, queued_run_ids: list[str], start_after_verification: bool = False,

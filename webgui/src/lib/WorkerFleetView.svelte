@@ -13,7 +13,7 @@
 	let queueAction = false;
 	let queueActionMessage = '';
 	const selectable = (run: RecordValue) => ['pending_verification', 'ready', 'needs_attention'].includes(String(run.status)) && !run.start_authorized;
-	const runStatus = (run: RecordValue) => ({ pending_verification: 'Awaiting verification', verifying: 'Verifying', ready: 'Verified · ready', needs_attention: 'Needs verification', queued: 'Waiting to train', indexed: 'Complete' }[String(run.status)] ?? String(run.status).replaceAll('_', ' '));
+	const runStatus = (run: RecordValue) => run.status === 'queued' && ['failed', 'cancelled', 'dispatch_failed', 'artifact_invalid'].includes(String(run.latest_job_status)) ? 'Previous attempt failed' : ({ pending_verification: 'Awaiting verification', verifying: 'Verifying', ready: 'Verified · ready', needs_attention: 'Needs verification', queued: 'Waiting to train', indexed: 'Complete' }[String(run.status)] ?? String(run.status).replaceAll('_', ' '));
 	$: selectedRuns = queuedRuns.filter((run) => selectedRunIds.includes(String(run.queued_run_id)));
 	$: canVerify = selectedRuns.length > 0 && selectedRuns.every(selectable);
 	$: canStart = selectedRuns.length > 0 && selectedRuns.every((run) => run.status === 'ready' && run.preflight_status === 'valid');
@@ -50,6 +50,12 @@
 	let selectedPoolId = '';
 	let enqueuing = false;
 	let queueName = '';
+	let editingRunId = '';
+	let editingDefinitionName = '';
+	let editingOriginalDefinitionId = '';
+	let editingRevision = 0;
+	let useLatestRevision = false;
+	let editingPoolNotice = '';
 	let selectedDefinitionId = '';
 	let selectedDatasetId = '';
 	let batchSizeMode: 'manual' | 'auto' = 'manual';
@@ -81,9 +87,9 @@
 	$: workerCountFor = (poolId: unknown) => workers.filter((worker) => String(worker.pool_id) === String(poolId)).length;
 	$: selectedPool = pools.find((pool) => String(pool.pool_id) === selectedPoolId);
 	$: selectedPoolWorkers = workers.filter((worker) => String(worker.pool_id) === selectedPoolId);
-	$: poolAllowsTraining = actions(selectedPool?.allowed_actions).includes('train');
-	$: trainingWorkers = selectedPoolWorkers.filter((worker) => actions(object(worker.capabilities).actions).includes('train'));
-	$: gpuWorkers = trainingWorkers.filter((worker) => gpuCapacity(worker) >= gpuCount && object(worker.capabilities).training_verification_v1 === true);
+	$: poolAllowsTraining = selectedPool?.enabled !== false && actions(selectedPool?.allowed_actions).includes('train');
+	$: trainingWorkers = selectedPoolWorkers.filter((worker) => worker.state !== 'offline' && actions(object(worker.capabilities).actions).includes('train'));
+	$: gpuWorkers = trainingWorkers.filter((worker) => gpuCapacity(worker) >= gpuCount && object(worker.capabilities).training_verification_v1 === true && object(worker.capabilities).work_unit_v2 === true);
 	$: selectedWorkerMessage = !selectedPool
 		? 'Choose a worker pool.'
 		: !poolAllowsTraining
@@ -132,26 +138,62 @@
 			return;
 		}
 		enqueuing = true;
-		queueFeedback = { state: 'working', message: 'Adding the definition and frozen input to the queue…' };
+		queueFeedback = { state: 'working', message: editingRunId ? 'Saving an updated queued run…' : 'Adding the definition and frozen input to the queue…' };
 		try {
-			const queued = await api.queueDefinition(selectedDefinitionId, {
+			const payload = {
 				name: queueName.trim(), dataset_id: selectedDatasetId, worker_pool_id: selectedPoolId,
 				resources: { gpu_count: gpuCount }, batch_size_mode: batchSizeMode, epochs,
+				...(editingRunId ? { definition_id: selectedDefinitionId, ...(selectedDefinitionId === editingOriginalDefinitionId && !useLatestRevision ? { definition_revision: editingRevision } : {}) } : {}),
 				...(batchSizeMode === 'manual' ? { batch_size: batchSize } : { maximum_batch_size: maximumBatchSize })
-			});
+			};
+			const queued = editingRunId ? await api.replaceQueuedRun(editingRunId, payload) : await api.queueDefinition(selectedDefinitionId, payload);
 			const queueId = text(queued.queued_run_id, '');
 			if (!queueId) throw new Error('The Orchestrator did not return the durable queued-run id.');
-			queueFeedback = { state: 'success', queueId, message: 'Added to the queue. Select this run below to verify it before training.' };
+			const successMessage = editingRunId ? 'Updated run is queued. Select it below to verify before training.' : 'Added to the queue. Select this run below to verify it before training.';
 			selectedRunIds = [...selectedRunIds, queueId];
-			queueName = '';
+			if (editingRunId) cancelEdit(); else queueName = '';
+			queueFeedback = { state: 'success', queueId, message: successMessage };
 			await load();
-			onchanged('Training run added to the queue. Verification and start are separate steps.');
+			onchanged('Training run is queued. Verification and start are separate steps.');
 		} catch (error) {
 			const message = error instanceof Error ? error.message : 'Could not add the training run to the queue.';
 			queueFeedback = { state: 'error', message };
 			onfailure(message);
 		}
 		finally { enqueuing = false; }
+	}
+
+	function cancelEdit() {
+		editingRunId = ''; editingDefinitionName = ''; editingOriginalDefinitionId = ''; editingRevision = 0; useLatestRevision = false; editingPoolNotice = '';
+		queueName = ''; queueFeedback = null;
+		selectedDefinitionId = String(definitions[0]?.definition_id ?? '');
+		selectedDatasetId = String(datasets[0]?.dataset_id ?? '');
+		selectedPoolId = String(pools[0]?.pool_id ?? '');
+		batchSizeMode = 'manual'; batchSize = 16; maximumBatchSize = 256; epochs = 10; gpuCount = 0;
+	}
+
+	function editRun(run: RecordValue) {
+		editingRunId = String(run.queued_run_id);
+		editingDefinitionName = `${text(run.definition_name)} · rev ${text(run.definition_revision)}`;
+		editingOriginalDefinitionId = String(run.definition_id);
+		editingRevision = Number(run.definition_revision);
+		useLatestRevision = false;
+		queueName = String(run.name ?? '');
+		selectedDefinitionId = String(run.definition_id);
+		selectedDatasetId = String(run.dataset_id);
+		gpuCount = Number(object(run.resources).gpu_count ?? 0);
+		const compatible = (pool: RecordValue) => pool.enabled !== false && actions(pool.allowed_actions).includes('train') && workers.some((worker) => String(worker.pool_id) === String(pool.pool_id) && worker.state !== 'offline' && actions(object(worker.capabilities).actions).includes('train') && object(worker.capabilities).training_verification_v1 === true && object(worker.capabilities).work_unit_v2 === true && gpuCapacity(worker) >= gpuCount);
+		const originalPool = pools.find((pool) => String(pool.pool_id) === String(run.worker_pool_id));
+		const chosenPool = originalPool && compatible(originalPool) ? originalPool : pools.find(compatible) ?? originalPool;
+		selectedPoolId = String(chosenPool?.pool_id ?? run.worker_pool_id);
+		editingPoolNotice = originalPool && chosenPool && originalPool.pool_id !== chosenPool.pool_id ? `The original pool has no compatible verifier. Selected ${text(chosenPool.name)}; review this choice before saving.` : '';
+		const policy = object(object(run.batch_execution).requested_policy ?? run.batch_execution);
+		batchSizeMode = policy.mode === 'auto' ? 'auto' : 'manual';
+		batchSize = Number(policy.batch_size ?? run.batch_size ?? 16);
+		maximumBatchSize = Number(policy.maximum_batch_size ?? 256);
+		epochs = Number(run.epochs ?? policy.epochs ?? 10);
+		queueFeedback = null;
+		document.getElementById('queue-run-form')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
 	}
 
 	async function createPool() {
@@ -196,7 +238,7 @@
 {/if}
 
 {#if mode === 'queue'}
-	<section class="panel fleet-enqueue"><div class="panel-head"><div><p class="eyebrow">SUBMIT</p><h2>Prepare a training run</h2><p>Adding a run pins the definition and dataset. Verification and training happen only when you request them below.</p></div></div>{#if pools.length && definitions.length && datasets.length}<div class="fleet-form run-form"><label>Run name<input bind:value={queueName} placeholder="e.g. resnet18-isiisnet-1epoch" aria-describedby="run-name-help" /><small id="run-name-help">A human-readable label for this immutable run.</small></label><label>Definition<select bind:value={selectedDefinitionId}>{#each definitions as definition}<option value={String(definition.definition_id)}>{text(definition.name)} · rev {text(definition.revision)}</option>{/each}</select></label><label>Frozen dataset<select bind:value={selectedDatasetId}>{#each datasets as dataset}<option value={String(dataset.dataset_id)}>{text(dataset.name)}</option>{/each}</select></label><label>Worker pool<select bind:value={selectedPoolId}>{#each pools as pool}<option value={String(pool.pool_id)}>{text(pool.name)} · {actions(pool.allowed_actions).join(', ')}</option>{/each}</select></label><label>GPUs required<input type="number" min="0" bind:value={gpuCount} /><small>Use 0 for CPU-only work.</small></label><label>Batch sizing<select bind:value={batchSizeMode}><option value="manual">Set manually</option><option value="auto">Automatically calibrate on worker</option></select><small>{batchSizeMode === 'auto' ? 'Verification tests safe sizes on a compatible worker.' : 'Use a known-safe batch size.'}</small></label>{#if batchSizeMode === 'manual'}<label>Batch size<input type="number" min="1" bind:value={batchSize} /></label>{:else}<label>Maximum batch size<input type="number" min="1" bind:value={maximumBatchSize} /><small>Calibration chooses a conservative safe size at or below this limit.</small></label>{/if}<label>Epochs<input type="number" min="1" bind:value={epochs} /></label><div class="enqueue-action"><button disabled={enqueuing || !queueName.trim() || !poolAllowsTraining} on:click={queueDefinition}>{enqueuing ? 'Adding…' : 'Add to queue'}</button><small>Adding to the queue does not start verification or training.</small></div></div><div class:warning={!poolAllowsTraining || (gpuCount > 0 && trainingWorkers.length > 0 && !gpuWorkers.length)} class="capacity-guidance" role="status"><strong>Worker capacity check</strong><span>{selectedWorkerMessage}</span><small>Selected pool: {text(selectedPool?.name)} · {selectedPoolWorkers.length} registered · {trainingWorkers.length} train-capable · {gpuWorkers.length} matching GPU request</small></div>{#if queueFeedback}<div class:success={queueFeedback.state === 'success'} class:error={queueFeedback.state === 'error'} class:working={queueFeedback.state === 'working'} class="queue-feedback" role={queueFeedback.state === 'error' ? 'alert' : 'status'}><strong>{queueFeedback.state === 'working' ? 'Preparing portable work' : queueFeedback.state === 'success' ? 'Training run queued' : 'Could not queue training run'}</strong><span>{queueFeedback.message}</span>{#if queueFeedback.queueId}<small>Queued run: <code>{queueFeedback.queueId}</code></small>{/if}</div>{/if}{:else}<p class="empty">Before queueing: create a worker pool in Workers, save a versioned definition, and freeze a dataset revision.</p>{/if}</section>
+	<section id="queue-run-form" class="panel fleet-enqueue"><div class="panel-head"><div><p class="eyebrow">{editingRunId ? 'EDIT QUEUED RUN' : 'SUBMIT'}</p><h2>{editingRunId ? 'Update training run' : 'Prepare a training run'}</h2><p>{editingRunId ? 'Saving creates a new sealed run and archives this queue entry. Prior jobs remain in the history; verify the updated run before starting.' : 'Adding a run pins the definition and dataset. Verification and training happen only when you request them below.'}</p></div>{#if editingRunId}<button class="secondary small" disabled={enqueuing} on:click={cancelEdit}>Cancel edit</button>{/if}</div>{#if editingPoolNotice}<p class="queue-result" role="status">{editingPoolNotice}</p>{/if}{#if pools.length && definitions.length && datasets.length}<div class="fleet-form run-form"><label>Run name<input bind:value={queueName} placeholder="e.g. resnet18-isiisnet-1epoch" aria-describedby="run-name-help" /><small id="run-name-help">A human-readable label for this immutable run.</small></label><label>Definition<select bind:value={selectedDefinitionId}>{#each definitions as definition}<option value={String(definition.definition_id)}>{text(definition.name)} · rev {editingRunId && String(definition.definition_id) === editingOriginalDefinitionId && !useLatestRevision ? editingRevision : text(definition.revision)}</option>{/each}</select>{#if editingRunId}<small>Original: {editingDefinitionName}. Changing definitions creates a new sealed run.</small>{#if selectedDefinitionId === editingOriginalDefinitionId && Number(definitions.find((definition) => String(definition.definition_id) === selectedDefinitionId)?.revision) !== editingRevision}<small class="latest-revision"><input type="checkbox" bind:checked={useLatestRevision} /> Use latest revision</small>{/if}{/if}</label><label>Frozen dataset<select bind:value={selectedDatasetId}>{#each datasets as dataset}<option value={String(dataset.dataset_id)}>{text(dataset.name)}</option>{/each}</select></label><label>Worker pool<select bind:value={selectedPoolId}>{#each pools as pool}<option value={String(pool.pool_id)}>{text(pool.name)} · {actions(pool.allowed_actions).join(', ')}</option>{/each}</select></label><label>GPUs required<input type="number" min="0" bind:value={gpuCount} /><small>Use 0 for CPU-only work.</small></label><label>Batch sizing<select bind:value={batchSizeMode}><option value="manual">Set manually</option><option value="auto">Automatically calibrate on worker</option></select><small>{batchSizeMode === 'auto' ? 'Verification tests safe sizes on a compatible worker.' : 'Use a known-safe batch size.'}</small></label>{#if batchSizeMode === 'manual'}<label>Batch size<input type="number" min="1" bind:value={batchSize} /></label>{:else}<label>Maximum batch size<input type="number" min="1" bind:value={maximumBatchSize} /><small>Calibration chooses a conservative safe size at or below this limit.</small></label>{/if}<label>Epochs<input type="number" min="1" bind:value={epochs} /></label><div class="enqueue-action"><button disabled={enqueuing || !queueName.trim() || !poolAllowsTraining} on:click={queueDefinition}>{enqueuing ? 'Saving…' : editingRunId ? 'Save updated run' : 'Add to queue'}</button><small>{editingRunId ? 'The updated run will need verification before training.' : 'Adding to the queue does not start verification or training.'}</small></div></div><div class:warning={!poolAllowsTraining || (gpuCount > 0 && trainingWorkers.length > 0 && !gpuWorkers.length)} class="capacity-guidance" role="status"><strong>Worker capacity check</strong><span>{selectedWorkerMessage}</span><small>Selected pool: {text(selectedPool?.name)} · {selectedPoolWorkers.length} registered · {trainingWorkers.length} train-capable · {gpuWorkers.length} matching GPU request</small></div>{#if queueFeedback}<div class:success={queueFeedback.state === 'success'} class:error={queueFeedback.state === 'error'} class:working={queueFeedback.state === 'working'} class="queue-feedback" role={queueFeedback.state === 'error' ? 'alert' : 'status'}><strong>{queueFeedback.state === 'working' ? 'Preparing portable work' : queueFeedback.state === 'success' ? 'Training run queued' : 'Could not queue training run'}</strong><span>{queueFeedback.message}</span>{#if queueFeedback.queueId}<small>Queued run: <code>{queueFeedback.queueId}</code></small>{/if}</div>{/if}{:else}<p class="empty">Before queueing: create a worker pool in Workers, save a versioned definition, and freeze a dataset revision.</p>{/if}</section>
 {/if}
 
 {#if mode === 'queue'}
@@ -209,13 +251,13 @@
 		<button disabled={queueAction || !canStart} on:click={() => actOnSelection('start')}>Start selected</button>
 	</div>
 	{#if queueActionMessage}<p class="queue-result" role="status">{queueActionMessage}</p>{/if}
-	{#if queuedRuns.length}<div class="table-scroll"><table class="fleet-table"><thead><tr><th><input type="checkbox" aria-label="Select all unstarted runs" disabled={queueAction} checked={queuedRuns.some(selectable) && queuedRuns.filter(selectable).every((run) => selectedRunIds.includes(String(run.queued_run_id)))} on:change={(event) => selectedRunIds = event.currentTarget.checked ? queuedRuns.filter(selectable).map((run) => String(run.queued_run_id)) : []} /></th><th>Run / definition</th><th>Stage</th><th>Batch / epochs</th><th>Verification details</th></tr></thead><tbody>
+	{#if queuedRuns.length}<div class="table-scroll"><table class="fleet-table"><thead><tr><th><input type="checkbox" aria-label="Select all unstarted runs" disabled={queueAction} checked={queuedRuns.some(selectable) && queuedRuns.filter(selectable).every((run) => selectedRunIds.includes(String(run.queued_run_id)))} on:change={(event) => selectedRunIds = event.currentTarget.checked ? queuedRuns.filter(selectable).map((run) => String(run.queued_run_id)) : []} /></th><th>Run / definition</th><th>Stage</th><th>Batch / epochs</th><th>Verification details</th><th>Actions</th></tr></thead><tbody>
 	{#each queuedRuns as run}
 		{@const policy = object(run.batch_execution)}
 		{@const report = object(run.preflight_report)}
 		{@const splitManifest = object(report.split_manifest)}
 		{@const coverage = object(splitManifest.coverage)}
-		<tr><td><input type="checkbox" aria-label={`Select ${text(run.name)}`} disabled={queueAction || !selectable(run)} checked={selectedRunIds.includes(String(run.queued_run_id))} on:change={(event) => toggleRun(String(run.queued_run_id), event.currentTarget.checked)} /></td><td><strong>{text(run.name)}</strong><small>{text(run.definition_name)} · rev {text(run.definition_revision)}</small><small>{text(pools.find((pool) => pool.pool_id === run.worker_pool_id)?.name)}</small></td><td><span class="status {text(run.status)}">{runStatus(run)}</span>{#if run.status === 'verifying'}<small>{run.start_authorized ? 'Will start if verification passes' : 'Will wait for your start command'}</small>{/if}</td><td><strong>{policy.mode === 'auto' ? 'Automatic · pending' : `${text(run.batch_size)} / batch`}</strong><small>{text(run.epochs)} epochs</small></td><td>{#if run.failure_reason}<small class="queue-problem">{text(run.failure_reason)}</small>{:else if run.status === 'verifying'}<small>Waiting for or checking on a verification-capable worker.</small>{:else if report.ready}<strong>Preflight passed</strong><small>{text(workers.find((worker) => worker.worker_id === report.worker_id)?.name, text(report.worker_id))}</small>{:else}<small>{actions(report.reasons).join('; ') || 'Select this run to verify.'}</small>{/if}{#if report.ready}<details><summary>View checks</summary><ul>{#each actions(report.checks) as check}<li>{check.replaceAll('_', ' ')}</li>{/each}</ul>{#if Object.keys(coverage).length}<strong>Split coverage {coverage.valid === false ? 'needs attention' : 'verified'}</strong><small>Minimum per class: {text(coverage.minimum_per_class)}</small><dl class="split-coverage">{#each Object.entries(object(coverage.class_counts)) as [classId, counts]}<dt>Class {classId}</dt><dd>{#each Object.entries(object(counts)) as [split, count], index}{index ? ' · ' : ''}{split}: {count}{/each}</dd>{/each}</dl>{/if}<small>Verified {text(report.verified_at)}</small></details>{/if}</td></tr>
+		<tr><td><input type="checkbox" aria-label={`Select ${text(run.name)}`} disabled={queueAction || !selectable(run)} checked={selectedRunIds.includes(String(run.queued_run_id))} on:change={(event) => toggleRun(String(run.queued_run_id), event.currentTarget.checked)} /></td><td><strong>{text(run.name)}</strong><small>{text(run.definition_name)} · rev {text(run.definition_revision)}</small><small>{text(pools.find((pool) => pool.pool_id === run.worker_pool_id)?.name)}</small></td><td><span class="status {text(run.status)}">{runStatus(run)}</span>{#if run.status === 'verifying'}<small>{run.start_authorized ? 'Will start if verification passes' : 'Will wait for your start command'}</small>{/if}</td><td><strong>{policy.mode === 'auto' ? 'Automatic · pending' : `${text(run.batch_size)} / batch`}</strong><small>{text(run.epochs)} epochs</small></td><td>{#if run.latest_job_error && run.can_edit}<small class="queue-problem">{text(run.latest_job_error)}</small>{:else if run.failure_reason}<small class="queue-problem">{text(run.failure_reason)}</small>{:else if run.status === 'verifying'}<small>Waiting for or checking on a verification-capable worker.</small>{:else if report.ready}<strong>Preflight passed</strong><small>{text(workers.find((worker) => worker.worker_id === report.worker_id)?.name, text(report.worker_id))}</small>{:else}<small>{actions(report.reasons).join('; ') || 'Select this run to verify.'}</small>{/if}{#if report.ready}<details><summary>View checks</summary><ul>{#each actions(report.checks) as check}<li>{check.replaceAll('_', ' ')}</li>{/each}</ul>{#if Object.keys(coverage).length}<strong>Split coverage {coverage.valid === false ? 'needs attention' : 'verified'}</strong><small>Minimum per class: {text(coverage.minimum_per_class)}</small><dl class="split-coverage">{#each Object.entries(object(coverage.class_counts)) as [classId, counts]}<dt>Class {classId}</dt><dd>{#each Object.entries(object(counts)) as [split, count], index}{index ? ' · ' : ''}{split}: {count}{/each}</dd>{/each}</dl>{/if}<small>Verified {text(report.verified_at)}</small></details>{/if}</td><td>{#if run.can_edit}<button class="secondary small" disabled={enqueuing || queueAction} on:click={() => editRun(run)}>Edit</button>{:else}<small>{run.status === 'queued' ? 'Active or waiting on worker' : '—'}</small>{/if}</td></tr>
 	{/each}</tbody></table></div>{:else}<p class="empty">Your queue is empty. Add a training run above to get started.</p>{/if}
 </section>
 {/if}
@@ -235,6 +277,8 @@
 	.queue-toolbar > span { font-size:.8rem; color:var(--muted); margin-right:auto; }
 	.verify-start { display:flex; align-items:center; gap:.5rem; font-size:.8rem; }
 	.queue-result { padding:.7rem; background:var(--teal-soft); border-radius:6px; color:var(--teal-dark); }
+	.latest-revision { display:flex; align-items:center; gap:.4rem; }
+	.latest-revision input[type=checkbox] { width:1rem; height:1rem; margin:0; }
 	.queue-problem { color:var(--red) !important; }
 	.queue-workflow input[type=checkbox] { width:1rem; height:1rem; accent-color:var(--teal); }
 	.queue-workflow details { margin-top:.4rem; font-size:.75rem; }

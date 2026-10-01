@@ -6,11 +6,13 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RUNTIME_DIR="${ORACLE_RUNTIME_DIR:-$ROOT_DIR/.oracle-runtime}"
 HOST="${ORACLE_HOST:-127.0.0.1}"
 ORCHESTRATOR_PORT="${ORACLE_ORCHESTRATOR_PORT:-8110}"
+INFERENCE_PORT="${ORACLE_INFERENCE_PORT:-8111}"
 WEBGUI_PORT="${ORACLE_WEBGUI_PORT:-5111}"
 ORCHESTRATOR_URL="http://${HOST}:${ORCHESTRATOR_PORT}"
 LOG_DIR="$RUNTIME_DIR/logs"
 WORKER_PID=""
 ORCHESTRATOR_PID=""
+INFERENCE_PID=""
 WEBGUI_PID=""
 LOCAL_JOIN_TOKEN_FILE=""
 ACCELERATOR_REQUEST="${ORACLE_ACCELERATOR:-auto}"
@@ -177,6 +179,7 @@ cleanup() {
   trap - EXIT INT TERM
   stop_process "$WEBGUI_PID"
   stop_process "$ORCHESTRATOR_PID"
+  stop_process "$INFERENCE_PID"
   stop_process "$WORKER_PID"
   if [[ -n "$LOCAL_JOIN_TOKEN_FILE" && -f "$LOCAL_JOIN_TOKEN_FILE" ]]; then rm -f "$LOCAL_JOIN_TOKEN_FILE"; fi
   exit "$exit_code"
@@ -189,6 +192,7 @@ require_command npm
 require_command curl
 require_command python3
 require_positive_integer "ORACLE_LOCAL_WORKER_SLOTS" "$LOCAL_WORKER_SLOTS"
+require_positive_integer "ORACLE_INFERENCE_PORT" "$INFERENCE_PORT"
 require_positive_integer "ORACLE_WORKER_ARTIFACT_TIMEOUT_SECONDS" "$WORKER_ARTIFACT_TIMEOUT_SECONDS"
 if [[ -n "$LOCAL_WORKER_CPU_CAPACITY" ]]; then
   require_positive_integer "ORACLE_LOCAL_WORKER_CPU_CAPACITY" "$LOCAL_WORKER_CPU_CAPACITY"
@@ -210,8 +214,9 @@ fi
 ORCHESTRATOR_RUNNING=0
 if is_online "$ORCHESTRATOR_URL/health/live"; then
   if has_startup_reconciliation; then
-    ORCHESTRATOR_RUNNING=1
-    echo "Reusing oracle-orchestrator at $ORCHESTRATOR_URL"
+    echo "An oracle-orchestrator is already running at $ORCHESTRATOR_URL." >&2
+    echo "Stop that stack before starting this version so the V2 runtime token and proxy can be configured together." >&2
+    exit 1
   else
     echo "An older oracle-orchestrator is running at $ORCHESTRATOR_URL." >&2
     echo "Restart it from this checkout so model setup and startup reconciliation are available, then run this script again." >&2
@@ -221,6 +226,11 @@ else
   require_free_port "$ORCHESTRATOR_PORT"
 fi
 require_free_port "$WEBGUI_PORT"
+require_free_port "$INFERENCE_PORT"
+
+# A process-local secret protects the loopback inference service from callers
+# that bypass the orchestrator's catalog and role checks.
+INFERENCE_INTERNAL_TOKEN="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
 
 if [[ "${ORACLE_STACK_SKIP_SETUP:-0}" != "1" ]]; then
   echo "Synchronizing Python API dependencies…"
@@ -274,6 +284,8 @@ if [[ "$ORCHESTRATOR_RUNNING" == "0" ]]; then
   fi
   (
     cd "$ROOT_DIR"
+    export ORACLE_INFERENCE_RUNTIME_URL="http://127.0.0.1:${INFERENCE_PORT}"
+    export ORACLE_INFERENCE_RUNTIME_TOKEN="$INFERENCE_INTERNAL_TOKEN"
     ORCHESTRATOR_EXTRAS=(--extra api)
     if [[ -n "$ARTIFACT_S3_BUCKET" ]]; then ORCHESTRATOR_EXTRAS+=(--extra storage-s3); fi
     exec uv run "${ORCHESTRATOR_EXTRAS[@]}" oracle-orchestrator "${ORCHESTRATOR_ARGS[@]}"
@@ -281,6 +293,23 @@ if [[ "$ORCHESTRATOR_RUNNING" == "0" ]]; then
   ORCHESTRATOR_PID=$!
   wait_for "orchestrator" "$ORCHESTRATOR_URL/health/live" "$ORCHESTRATOR_PID"
 fi
+
+echo "Starting resident inference runtime…"
+(
+  cd "$ROOT_DIR"
+  export ORACLE_INFERENCE_RUNTIME_TOKEN="$INFERENCE_INTERNAL_TOKEN"
+  if [[ -n "${ORACLE_INFERENCE_CUDA_VISIBLE_DEVICES:-}" ]]; then
+    export CUDA_VISIBLE_DEVICES="$ORACLE_INFERENCE_CUDA_VISIBLE_DEVICES"
+  fi
+  exec uv run --extra api oracle-inference-runtime \
+    --database "$RUNTIME_DIR/orchestrator.sqlite" \
+    --workspace-root "$ROOT_DIR" \
+    --artifact-root "$RUNTIME_DIR/artifacts" \
+    --host 127.0.0.1 \
+    --port "$INFERENCE_PORT"
+) >"$LOG_DIR/inference-runtime.log" 2>&1 &
+INFERENCE_PID=$!
+wait_for "inference-runtime" "http://127.0.0.1:${INFERENCE_PORT}/internal/v2/health" "$INFERENCE_PID"
 
 # A local stack proves the production boundary: create an admission pool, then
 # run a registered pull worker. The one-time token never reaches the GUI or a

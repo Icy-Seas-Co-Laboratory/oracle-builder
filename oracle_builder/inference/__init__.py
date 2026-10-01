@@ -7,16 +7,6 @@ the workflow here would turn that ordinary contracts import into a cycle.
 
 from typing import TYPE_CHECKING
 
-from oracle_builder.inference.bundle import InferenceBundle
-from oracle_builder.inference.batching import (
-    InferenceBatchPlan,
-    resolve_inference_batch_size,
-)
-from oracle_builder.inference.connectors import (
-    InMemorySink,
-    JSONLinesSink,
-    run_connector,
-)
 from oracle_builder.inference.contracts import (
     ArrayPayload,
     InferenceItem,
@@ -26,6 +16,16 @@ from oracle_builder.inference.contracts import (
     SourceReference,
 )
 if TYPE_CHECKING:
+    from oracle_builder.inference.batching import (
+        InferenceBatchPlan,
+        resolve_inference_batch_size,
+    )
+    from oracle_builder.inference.connectors import (
+        InMemorySink,
+        JSONLinesSink,
+        run_connector,
+    )
+    from oracle_builder.inference.bundle import InferenceBundle
     from oracle_builder.inference.workflow import (
         INFERENCE_RESULT_SCHEMA_NAME,
         INFERENCE_RESULT_SCHEMA_VERSION,
@@ -49,6 +49,15 @@ def __getattr__(name: str):
     }:
         from oracle_builder.inference import workflow
         return getattr(workflow, name)
+    if name == "InferenceBundle":
+        from oracle_builder.inference.bundle import InferenceBundle
+        return InferenceBundle
+    if name in {"InferenceBatchPlan", "resolve_inference_batch_size"}:
+        from oracle_builder.inference import batching
+        return getattr(batching, name)
+    if name in {"InMemorySink", "JSONLinesSink", "run_connector"}:
+        from oracle_builder.inference import connectors
+        return getattr(connectors, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 __all__ = [

@@ -108,6 +108,10 @@ def main() -> None:
     parser.add_argument("--upload-limit-mib", type=int, default=10_240, help="Maximum uploaded file size in MiB.")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8110)
+    parser.add_argument("--inference-runtime-url", default=os.environ.get("ORACLE_INFERENCE_RUNTIME_URL"),
+                        help="Private resident inference runtime URL, for example http://127.0.0.1:8111.")
+    parser.add_argument("--inference-runtime-token", default=os.environ.get("ORACLE_INFERENCE_RUNTIME_TOKEN"),
+                        help="Shared internal bearer token; prefer ORACLE_INFERENCE_RUNTIME_TOKEN to avoid process arguments.")
     parser.add_argument("--role-tokens-sha256", default=os.environ.get("ORACLE_ORCHESTRATOR_ROLE_TOKENS_SHA256"),
                         help="JSON role-to-SHA256 token map (or ORACLE_ORCHESTRATOR_ROLE_TOKENS_SHA256).")
     parser.add_argument("--allow-unauthenticated-mutations", action="store_true",
@@ -124,6 +128,8 @@ def main() -> None:
         parser.error(f"invalid --role-tokens-sha256: {exc}")
     if not configured_roles and not args.allow_unauthenticated_mutations:
         parser.error("configure --role-tokens-sha256 (hashed tokens only) or explicitly use --allow-unauthenticated-mutations for local development")
+    if bool(args.inference_runtime_url) != bool(args.inference_runtime_token):
+        parser.error("inference runtime URL and token must be configured together")
     artifact_root = os.path.abspath(os.path.expanduser(args.artifact_root)) if args.artifact_root else os.path.join(os.path.dirname(os.path.abspath(args.database)), "oracle-artifacts")
     artifact_store = None
     if args.s3_bucket:
@@ -152,7 +158,12 @@ def main() -> None:
         upload_limit_bytes=args.upload_limit_mib * 1024 * 1024, artifact_store=artifact_store,
         deployment_profiles=deployment_profiles, deployment_providers=deployment_providers,
     )
-    uvicorn.run(create_app(orchestrator, role_tokens=configured_roles), host=args.host, port=args.port)
+    from oracle_builder.orchestration.inference_v2_routes import MAX_FRAME_BYTES
+    uvicorn.run(create_app(
+        orchestrator, role_tokens=configured_roles,
+        inference_runtime_url=args.inference_runtime_url,
+        inference_runtime_token=args.inference_runtime_token,
+    ), host=args.host, port=args.port, ws_max_size=MAX_FRAME_BYTES)
 
 
 if __name__ == "__main__":  # pragma: no cover

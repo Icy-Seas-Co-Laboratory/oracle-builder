@@ -243,6 +243,70 @@ def test_queue_verify_api_defaults_to_no_training(queue_setup):
         assert result.status_code == 422
 
 
+def test_edit_queued_run_reseals_settings_and_preserves_original(queue_setup):
+    orch, pool, worker, queue = queue_setup
+    queued = queue(batch_size=4)
+    original_id = queued["queued_run_id"]
+    with TestClient(create_app(orch)) as client:
+        result = client.post(f"/v1/queued-runs/{original_id}:replace", json={
+            "name": "updated run", "dataset_id": queued["dataset_id"],
+            "worker_pool_id": pool["pool_id"], "resources": {"gpu_count": 0},
+            "batch_size_mode": "manual", "batch_size": 8, "epochs": 3,
+        })
+        assert result.status_code == 201, result.text
+        updated = result.json()
+        assert updated["queued_run_id"] != original_id
+        assert updated["replaces_queued_run_id"] == original_id
+        assert updated["status"] == "pending_verification"
+        assert updated["batch_size"] == 8 and updated["epochs"] == 3
+        assert updated["definition_revision"] == queued["definition_revision"]
+        assert not updated["start_authorized"]
+        assert orch.queued_run(original_id)["status"] == "archived"
+        assert not orch.jobs()
+        result = client.post("/v1/queued-runs:verify", json={"queued_run_ids": [updated["queued_run_id"]]})
+        assert result.status_code == 202, result.text
+        assert orch.queued_run(updated["queued_run_id"])["status"] == "verifying"
+        blocked = client.post(f"/v1/queued-runs/{updated['queued_run_id']}:replace", json={
+            "name": "unsafe edit", "dataset_id": queued["dataset_id"],
+            "worker_pool_id": pool["pool_id"], "resources": {"gpu_count": 0},
+            "batch_size_mode": "manual", "batch_size": 8, "epochs": 3,
+        })
+        assert blocked.status_code == 409
+
+
+def test_failed_legacy_queue_row_can_be_replaced(queue_setup):
+    orch, pool, worker, queue = queue_setup
+    queued = queue(batch_size=4)
+    orch.verify_queued_runs_for_pool(queued_run_ids=[queued["queued_run_id"]])
+    finish_verification(orch, worker, success=False)
+    with orch._connection() as db:
+        db.execute("UPDATE queued_runs SET status='queued',start_authorized=1 WHERE queued_run_id=?", (queued["queued_run_id"],))
+    assert orch.queued_run(queued["queued_run_id"])["can_edit"]
+    updated = orch.replace_queued_run(
+        queued["queued_run_id"], name="retry", dataset_id=queued["dataset_id"],
+        worker_pool_id=pool["pool_id"], resources={"gpu_count": 0},
+        batch_size_mode="manual", batch_size=4, epochs=1,
+    )
+    assert updated["status"] == "pending_verification"
+    assert orch.queued_run(queued["queued_run_id"])["status"] == "archived"
+    assert len(orch.jobs()) == 1
+
+
+def test_edit_can_choose_another_model_definition(queue_setup):
+    orch, pool, _worker, queue = queue_setup
+    queued = queue(batch_size=4)
+    alternate = orch.create_model_definition(name="alternate", template_id="resnet18")
+    updated = orch.replace_queued_run(
+        queued["queued_run_id"], name="alternate run",
+        definition_id=alternate["definition_id"], dataset_id=queued["dataset_id"],
+        worker_pool_id=pool["pool_id"], resources={"gpu_count": 0},
+        batch_size_mode="manual", batch_size=4, epochs=2,
+    )
+    assert updated["definition_id"] == alternate["definition_id"]
+    assert updated["definition_revision"] == alternate["revision"]
+    assert orch.queued_run(queued["queued_run_id"])["status"] == "archived"
+
+
 def test_restarted_worker_updates_verification_capability_on_poll(queue_setup):
     orch, pool, worker, queue = queue_setup
     queued = queue(batch_size=4)

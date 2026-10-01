@@ -22,6 +22,7 @@
 | Training run, split protocol, integrity, and package | [Model-run artifact V1](run-artifact-v1.md) |
 | Shared deployment/training artifact profiles | [Oracle Model Artifact Standard V2](model-artifact-standard-v2.md) |
 | In-memory and persisted inference packet | [Inference contract V1](inference-contract-v1.md) |
+| Interactive inference return structures and examples | [Inference envelope V2](inference-envelope-v2.md) |
 | Orchestrator-to-worker execution attempt | [WorkUnit V1](work-unit-v1.md) |
 
 ## Configuration examples

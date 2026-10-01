@@ -896,10 +896,20 @@ class InferenceBundle:
                         "candidate_delta inference requires candidate_mask"
                     )
                 candidate = raw[..., 1]
+            # The model emits [H, W, 1] while the candidate is [H, W].
+            # Reconstruct in matching spatial dimensions; broadcasting the
+            # unsqueezed channel can create [H, W, W] or fail for rectangular
+            # ROIs. Preserve raw model outputs in their existing shape above.
+            delta_probability = np.asarray(probability)
+            delta_mask = np.asarray(binary)
+            if delta_probability.ndim == 3 and delta_probability.shape[-1] == 1:
+                delta_probability = delta_probability[..., 0]
+            if delta_mask.ndim == 3 and delta_mask.shape[-1] == 1:
+                delta_mask = delta_mask[..., 0]
             output["reconstructed_probability_map"] = ArrayPayload(
-                reconstruct_validated_probability(candidate, probability)
+                reconstruct_validated_probability(candidate, delta_probability)
             )
             output["reconstructed_mask"] = ArrayPayload(
-                reconstruct_validated_mask(candidate, binary).astype("uint8")
+                reconstruct_validated_mask(candidate, delta_mask).astype("uint8")
             )
         return output

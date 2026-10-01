@@ -167,6 +167,20 @@ class ValidatedQueueRunRequest(BaseModel):
     epochs: int = Field(default=10, ge=1, description="Run-specific training epoch budget sealed with this queued run.")
 
 
+class QueuedRunReplacementRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: str = Field(min_length=1)
+    definition_id: str | None = None
+    definition_revision: int | None = Field(default=None, ge=1)
+    dataset_id: str
+    worker_pool_id: str
+    resources: dict[str, Any] = Field(default_factory=dict)
+    batch_size_mode: str = "manual"
+    batch_size: int | None = Field(default=None, ge=1)
+    maximum_batch_size: int = Field(default=256, ge=1)
+    epochs: int = Field(default=10, ge=1)
+
+
 class InferenceRunRequest(BaseModel):
     """Typed, path-free request for durable batch inference."""
     model_config = ConfigDict(extra="forbid")
@@ -365,6 +379,7 @@ def role_token_digests(configured: Mapping[str, str] | None) -> dict[str, str]:
 def create_app(
     orchestrator: Orchestrator, *, role_tokens: Mapping[str, str] | None = None,
     anonymous_get_limit: int = 120, anonymous_get_window_seconds: float = 60.0,
+    inference_runtime_url: str | None = None, inference_runtime_token: str | None = None,
 ) -> FastAPI:
     """Create the control-plane API with optional configured operator roles.
 
@@ -386,6 +401,7 @@ def create_app(
         app.state.startup_deployments = await run_in_threadpool(orchestrator.reconcile_worker_deployments)
         orchestrator.start_operation_runner()
         yield
+        await app.state.inference_http_client.aclose()
         orchestrator.stop_operation_runner()
 
     app = FastAPI(title="Oracle Builder Orchestrator API", version="0.1.0", lifespan=lifespan)
@@ -411,7 +427,7 @@ def create_app(
         return path == "/v1/workers:register" or path.startswith("/v1/workers/") or path.startswith("/v1/worker-leases/") or path.startswith("/v1/worker-artifacts/")
 
     def is_analytical_request(path: str) -> bool:
-        return path in {"/v1/model-previews", "/v1/artifacts/catalog/query"} or path.endswith(":preflight")
+        return path in {"/v1/model-previews", "/v1/artifacts/catalog/query"} or path.endswith(":preflight") or path.startswith("/v2/inference/models/")
 
     @app.middleware("http")
     async def role_auth_and_anonymous_read_limit(request: Request, call_next):
@@ -475,6 +491,13 @@ def create_app(
         if not token:
             raise HTTPException(status_code=401, detail="Worker bearer token is required")
         return token
+
+    from oracle_builder.orchestration.inference_v2_routes import register_inference_v2_routes
+    register_inference_v2_routes(
+        app, orchestrator, runtime_url=inference_runtime_url,
+        runtime_token=inference_runtime_token, role_for_authorization=api_role,
+        role_tokens_configured=bool(configured_role_tokens),
+    )
 
     @app.get("/health/live")
     def live() -> dict[str, str]: return {"status": "ok"}
@@ -1593,6 +1616,12 @@ def create_app(
     @app.get("/v1/queued-runs")
     def queued_runs() -> dict[str, Any]:
         return {"queued_runs": orchestrator.queued_runs()}
+
+    @app.post("/v1/queued-runs/{queued_run_id}:replace", status_code=201)
+    def replace_queued_run(queued_run_id: str, body: QueuedRunReplacementRequest) -> dict[str, Any]:
+        try: return orchestrator.replace_queued_run(queued_run_id, **body.model_dump())
+        except KeyError as exc: raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc: raise HTTPException(status_code=409 if "cannot be edited" in str(exc) or "changed while editing" in str(exc) else 422, detail=str(exc)) from exc
 
     @app.post("/v1/queued-runs:verify", status_code=202)
     def verify_queued_runs(body: QueueVerifyRequest) -> dict[str, Any]:

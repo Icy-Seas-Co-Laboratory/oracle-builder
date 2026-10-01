@@ -82,6 +82,7 @@ export const api = {
 	workerLeases: (workerId?: string) => request<{ leases: RecordValue[] }>(`/v1/worker-leases${workerId ? `?worker_id=${encodeURIComponent(workerId)}` : ''}`),
 	executionRun: (runId: string) => request<{ run: RecordValue }>(`/v1/execution-runs/${encodeURIComponent(runId)}`),
 	queuedRuns: () => request<{ queued_runs: RecordValue[] }>('/v1/queued-runs'),
+	replaceQueuedRun: (id: string, body: RecordValue) => request<RecordValue>(`/v1/queued-runs/${encodeURIComponent(id)}:replace`, { method: 'POST', body: JSON.stringify(body) }, 960_000),
 	artifactReplicas: (status?: 'pending' | 'replicated' | 'failed') => request<{ replications: RecordValue[] }>(`/v1/artifact-replicas${status ? `?status=${status}` : ''}`),
 	jobEvents: (id: string) => request<{ events: RecordValue[] }>(`/v1/jobs/${id}/events`),
 	jobCommands: (id: string) => request<{ commands: RecordValue[] }>(`/v1/jobs/${encodeURIComponent(id)}/commands`),
