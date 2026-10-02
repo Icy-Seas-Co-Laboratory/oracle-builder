@@ -19,6 +19,9 @@ are replaceable.
 | `oracle-worker` | pull-only training/inference compute | disposable scratch under the data root |
 
 The worker does not publish a port and no browser or CLI connects to it.
+This Compose stack creates the `oracle-builder` network. Pelagia's Docker
+stack joins it as an external network by default, so Pelagia containers can
+reach the Orchestrator at `http://orchestrator:8110`. Start this stack first.
 The Docker socket is mounted only into the Orchestrator because it owns the
 fixed-profile worker lifecycle. If that authority is unacceptable, remove the
 socket/profile mount and run workers from an external orchestrator instead.
@@ -132,7 +135,11 @@ backup.
 
 For an image/configuration upgrade: stop Compose, take a consistent backup of
 the data root, build the new images, start the control-plane services, verify
-`/health/ready`, then reconcile worker deployments and run one small job.
+`/health/ready`, then reconcile worker deployments and run one small job. When
+Oracle Builder runs with Pelagia's Docker stack, use Pelagia's
+`deploy/docker/update-dev.py` for updates from all three `main` branches. It
+restarts idle Docker deployments from the rebuilt worker image and records the
+deployed commits and image IDs.
 
 ## Guardrails
 

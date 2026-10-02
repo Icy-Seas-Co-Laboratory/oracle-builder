@@ -72,6 +72,8 @@ services:
 
 networks:
   oracle:
+    # Shared with Pelagia's external "oracle" network. Keep this name in sync
+    # with Pelagia/deploy/docker/compose.yaml and the worker deployment profile.
     name: oracle-builder
 
 volumes:
