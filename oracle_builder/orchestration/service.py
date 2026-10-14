@@ -293,7 +293,7 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
     # single-slot for SQLite/local-filesystem deployments; a later distributed
     # scheduler can claim the same queued rows.
     def create_operation(self, operation_type: str, parameters: dict[str, Any] | None = None) -> dict[str, Any]:
-        if operation_type not in {"catalog_scan", "training_catalog_scan", "artifact_reindex", "worker_reconciliation", "validated_queue_validation", "artifact_replication"}:
+        if operation_type not in {"catalog_scan", "training_catalog_scan", "training_catalog_freeze", "artifact_reindex", "worker_reconciliation", "validated_queue_validation", "artifact_replication"}:
             raise ValueError(f"Unsupported operation type: {operation_type}")
         now, operation_id = _now(), str(uuid.uuid4())
         with self._connection() as connection:
@@ -360,6 +360,12 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
         try:
             if kind == "catalog_scan": result = self.scan(parameters["root"])
             elif kind == "training_catalog_scan": result = self.scan_training_catalog(parameters.get("root_id"))
+            elif kind == "training_catalog_freeze":
+                self.emit_operation_event(operation_id, "freezing", "Freezing training-set revision")
+                result = self.freeze_training_catalog_entry(
+                    parameters["catalog_id"],
+                    operation_progress=lambda stage, message: self.emit_operation_event(operation_id, stage, message),
+                )
             elif kind == "artifact_reindex": result = self.reindex_artifact_catalog(parameters.get("artifact_ids"))
             elif kind == "artifact_replication":
                 action = parameters.get("action", "retry")
@@ -947,23 +953,33 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
     def _queued_run_edit_state(self, row: dict[str, Any]) -> dict[str, Any]:
         with self._connection() as db:
             jobs = db.execute(
-                "SELECT status,error FROM jobs WHERE queued_run_id=? ORDER BY submitted_at DESC, rowid DESC",
+                "SELECT job_id,status,error,work_unit_json FROM jobs WHERE queued_run_id=? ORDER BY submitted_at DESC, rowid DESC",
                 (row["queued_run_id"],),
             ).fetchall()
             active_execution = db.execute(
                 "SELECT 1 FROM execution_runs WHERE queued_run_id=? AND status NOT IN ('failed','cancelled','indexed') LIMIT 1",
                 (row["queued_run_id"],),
             ).fetchone() is not None
-        terminal = {"failed", "cancelled", "indexed", "artifact_invalid", "dispatch_failed", "succeeded"}
+        terminal = {"completed", "failed", "cancelled", "indexed", "artifact_invalid", "dispatch_failed", "succeeded", "historical"}
         editable_statuses = {"pending_verification", "ready", "needs_attention", "waiting_for_resources", "failed", "cancelled"}
         editable = (
             (row["status"] in editable_statuses and not row["start_authorized"]) or
-            (row["status"] == "queued" and bool(jobs) and jobs[0]["status"] in {"failed", "cancelled", "dispatch_failed", "artifact_invalid"})
+            (row["status"] == "queued" and bool(jobs) and jobs[0]["status"] in {"failed", "cancelled", "dispatch_failed", "artifact_invalid", "historical"})
         ) and not active_execution and all(job["status"] in terminal for job in jobs) and not any(job["status"] in {"indexed", "succeeded"} for job in jobs)
+        clearable = not active_execution and all(job["status"] in terminal for job in jobs) and (
+            bool(jobs) or row["status"] in {"failed", "cancelled", "complete", "needs_attention", "waiting_for_resources", "indexed"}
+        )
+        latest = _row(jobs[0]) if jobs else None
+        work_unit = latest.get("work_unit") if latest else None
+        parameters = work_unit.get("parameters", {}) if isinstance(work_unit, dict) else {}
+        segment = parameters.get("execution_segment") if isinstance(parameters, dict) else None
         return {
             "can_edit": bool(editable),
+            "can_clear": bool(clearable),
             "latest_job_status": jobs[0]["status"] if jobs else None,
             "latest_job_error": jobs[0]["error"] if jobs else None,
+            "latest_job_id": latest.get("job_id") if latest else None,
+            "latest_job_resumable": isinstance(segment, dict) and segment.get("phase") == "train",
         }
 
     def validate_and_queue_model_definition(
@@ -1356,12 +1372,12 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
         with self._connection() as db:
             db.execute("BEGIN IMMEDIATE")
             current = _row(db.execute("SELECT * FROM queued_runs WHERE queued_run_id=?", (queued_run_id,)).fetchone())
-            terminal = {"failed", "cancelled", "indexed", "artifact_invalid", "dispatch_failed", "succeeded"}
+            terminal = {"completed", "failed", "cancelled", "indexed", "artifact_invalid", "dispatch_failed", "succeeded", "historical"}
             jobs = db.execute("SELECT status FROM jobs WHERE queued_run_id=? ORDER BY submitted_at DESC, rowid DESC", (queued_run_id,)).fetchall()
             active_execution = db.execute("SELECT 1 FROM execution_runs WHERE queued_run_id=? AND status NOT IN ('failed','cancelled','indexed') LIMIT 1", (queued_run_id,)).fetchone() is not None
             still_idle = current is not None and current["status"] == prior["status"] and current["start_authorized"] == int(prior["start_authorized"]) and not active_execution and all(job["status"] in terminal for job in jobs) and not any(job["status"] in {"indexed", "succeeded"} for job in jobs)
             if still_idle:
-                still_idle = (current["status"] in {"pending_verification", "ready", "needs_attention", "waiting_for_resources", "failed", "cancelled"} and not current["start_authorized"]) or (current["status"] == "queued" and bool(jobs) and jobs[0]["status"] in {"failed", "cancelled", "dispatch_failed", "artifact_invalid"})
+                still_idle = (current["status"] in {"pending_verification", "ready", "needs_attention", "waiting_for_resources", "failed", "cancelled"} and not current["start_authorized"]) or (current["status"] == "queued" and bool(jobs) and jobs[0]["status"] in {"failed", "cancelled", "dispatch_failed", "artifact_invalid", "historical"})
             if not still_idle:
                 db.execute("UPDATE queued_runs SET status='archived',updated_at=? WHERE queued_run_id=?", (_now(), new_id))
             else:
@@ -1746,20 +1762,25 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
 
     def archive_terminal_queued_run(self, queued_run_id: str) -> dict[str, Any]:
         """Clear a finished queue row while preserving the immutable job audit."""
-        queued = self.queued_run(queued_run_id)
-        if queued is None:
-            raise KeyError(queued_run_id)
         with self._connection() as db:
-            job = _row(db.execute("SELECT job_id,status FROM jobs WHERE queued_run_id=? ORDER BY submitted_at DESC LIMIT 1", (queued_run_id,)).fetchone())
-            terminal = {"failed", "cancelled", "indexed", "artifact_invalid", "dispatch_failed", "succeeded"}
-            if job is not None and job["status"] not in terminal:
+            db.execute("BEGIN IMMEDIATE")
+            queued = db.execute("SELECT status FROM queued_runs WHERE queued_run_id=?", (queued_run_id,)).fetchone()
+            if queued is None:
+                raise KeyError(queued_run_id)
+            jobs = db.execute("SELECT job_id,status FROM jobs WHERE queued_run_id=? ORDER BY submitted_at DESC, rowid DESC", (queued_run_id,)).fetchall()
+            terminal = {"completed", "failed", "cancelled", "indexed", "artifact_invalid", "dispatch_failed", "succeeded", "historical"}
+            active_execution = db.execute(
+                "SELECT 1 FROM execution_runs WHERE queued_run_id=? AND status NOT IN ('failed','cancelled','indexed') LIMIT 1",
+                (queued_run_id,),
+            ).fetchone() is not None
+            if active_execution or any(job["status"] not in terminal for job in jobs):
                 raise ValueError("Only a finished or failed run can be cleared from the queue")
-            if job is None and queued["status"] not in {"failed", "cancelled", "complete", "needs_attention", "waiting_for_resources"}:
+            if not jobs and queued["status"] not in {"failed", "cancelled", "complete", "needs_attention", "waiting_for_resources", "indexed"}:
                 raise ValueError("Only a non-running queue entry can be cleared")
             db.execute("UPDATE queued_runs SET status='archived', start_authorized=0, updated_at=? WHERE queued_run_id=?", (_now(), queued_run_id))
-        if job is not None:
-            self._record_event(str(job["job_id"]), "queue_cleared", "Queue row cleared by user; execution logs remain retained", {"queued_run_id": queued_run_id})
-        return {"queued_run_id": queued_run_id, "archived": True, "job_id": job.get("job_id") if job else None}
+        if jobs:
+            self._record_event(str(jobs[0]["job_id"]), "queue_cleared", "Queue row cleared by user; execution logs remain retained", {"queued_run_id": queued_run_id})
+        return {"queued_run_id": queued_run_id, "archived": True, "job_id": jobs[0]["job_id"] if jobs else None}
 
     def control_job(self, job_id: str, action: str) -> dict[str, Any]:
         """Proxy an explicit lifecycle control to the owning compute service.
@@ -4715,7 +4736,9 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
         path = self._training_catalog_sqlite_path(entry)
         return self._sqlite_preview_image(path, item_id, max_size=max_size)
 
-    def freeze_training_catalog_entry(self, catalog_id: str) -> dict[str, Any]:
+    def freeze_training_catalog_entry(
+        self, catalog_id: str, *, operation_progress: Callable[[str, str], None] | None = None,
+    ) -> dict[str, Any]:
         """Freeze one explicit SQLite revision, then register its immutable state."""
         entry = self.training_catalog_entry(catalog_id)
         if entry is None: raise KeyError(catalog_id)
@@ -4727,9 +4750,13 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
             if info["lifecycle"] == "working":
                 set_dataset_lifecycle(db, "frozen", actor="oracle-orchestrator", details={"catalog_id": catalog_id})
             db.commit()
+        if operation_progress:
+            operation_progress("reconciling", "Updating the training-set catalog")
         report = self.scan_training_catalog(entry["root_id"])
         refreshed = next((item for item in report["entries"] if item["catalog_id"] == catalog_id), None)
         if refreshed is None: raise RuntimeError("Frozen dataset was not returned by catalog reconciliation")
+        if operation_progress:
+            operation_progress("registering", "Registering frozen dataset for training")
         dataset = self.ingest_dataset(path)
         return {"entry": refreshed, "dataset": dataset}
 

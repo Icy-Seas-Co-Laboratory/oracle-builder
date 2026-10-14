@@ -1322,6 +1322,12 @@ def create_app(
         except KeyError as exc: raise HTTPException(status_code=404, detail="Training catalog entry was not found") from exc
         except (OSError, ValueError) as exc: raise HTTPException(status_code=422, detail=str(exc)) from exc
 
+    @app.post("/v1/training-catalog/{catalog_id}:freeze/schedule", status_code=202)
+    async def schedule_training_catalog_freeze(catalog_id: str) -> dict[str, Any]:
+        if orchestrator.training_catalog_entry(catalog_id) is None:
+            raise HTTPException(status_code=404, detail="Training catalog entry was not found")
+        return {"operation": await run_in_threadpool(orchestrator.create_operation, "training_catalog_freeze", {"catalog_id": catalog_id})}
+
     @app.get("/v1/training-catalog/{catalog_id}")
     def training_catalog_entry(catalog_id: str) -> dict[str, Any]:
         entry = required(orchestrator.training_catalog_entry(catalog_id), "Training catalog entry")

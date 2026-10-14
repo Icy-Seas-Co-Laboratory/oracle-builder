@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import time
 
 from oracle_builder.orchestration.training_catalog import scan_training_catalog
 
@@ -87,3 +88,33 @@ def test_control_plane_catalog_serves_sqlite_previews_freezes_and_groups_revisio
         assert frozen_response.status_code == 200
         assert frozen_response.json()["entry"]["status"] == "frozen"
         assert len(client.get("/v1/datasets").json()["datasets"]) == 2
+
+
+def test_training_catalog_freeze_can_be_scheduled_and_reports_completion(tmp_path):
+    from fastapi.testclient import TestClient
+
+    from oracle_builder.orchestration.api import create_app
+    from oracle_builder.orchestration.service import Orchestrator
+
+    source_root = tmp_path / "datasets"
+    source_root.mkdir()
+    working = source_root / "working.sqlite"
+    _sqlite_dataset(working)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    orchestrator = Orchestrator(tmp_path / "orchestrator.sqlite", workspace_root=workspace, training_catalog_roots=[source_root])
+    entry = orchestrator.scan_training_catalog()["entries"][0]
+
+    with TestClient(create_app(orchestrator)) as client:
+        response = client.post(f"/v1/training-catalog/{entry['catalog_id']}:freeze/schedule")
+        assert response.status_code == 202
+        operation_id = response.json()["operation"]["operation_id"]
+        for _ in range(100):
+            operation = client.get(f"/v1/operations/{operation_id}").json()
+            if operation["status"] in {"completed", "failed"}:
+                break
+            time.sleep(0.05)
+        assert operation["status"] == "completed", operation.get("error")
+        assert operation["result"]["entry"]["status"] == "frozen"
+        assert operation["result"]["dataset"]["lifecycle"] == "frozen"
+        assert client.get("/v1/training-catalog").json()["entries"][0]["status"] == "frozen"

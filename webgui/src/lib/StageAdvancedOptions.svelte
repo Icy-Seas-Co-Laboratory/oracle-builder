@@ -8,6 +8,7 @@
 	export let config: RecordValue = {};
 	export let sections: string[] = [];
 	export let excludePaths: string[] = [];
+	export let excludePrefixes: string[] = [];
 	export let fieldDefinitions: RecordValue[] = [];
 	export let description = 'Less frequently changed controls for this stage.';
 
@@ -19,14 +20,15 @@
 		return Object.entries(value as RecordValue).flatMap(([key, item]) => leaves(item, `${path}.${key}`));
 	}
 	function update(path: string, nextValue: unknown) { dispatch('change', { config: configWithValue(config, path, nextValue) }); }
+	const excluded = (path: string) => excludePaths.includes(path) || excludePrefixes.some((prefix) => path.startsWith(prefix));
 	let showExpert = false;
 	$: definitions = new Map((fieldDefinitions as ConfigFieldDefinition[]).map((field) => [field.path, field]));
 	$: fields = sections.flatMap((section) => leaves(config[section], section)).filter((item) => {
 		const definition = definitions.get(item.path);
 		const exposure = definition?.exposure ?? (fieldDefinitions.length ? 'expert' : 'advanced');
-		return !excludePaths.includes(item.path) && exposure !== 'internal' && (exposure !== 'expert' || showExpert) && fieldApplies(definition ?? { path: item.path }, config);
+		return !excluded(item.path) && exposure !== 'internal' && (exposure !== 'expert' || showExpert) && fieldApplies(definition ?? { path: item.path }, config);
 	});
-	$: hasExpert = sections.flatMap((section) => leaves(config[section], section)).some((item) => definitions.get(item.path)?.exposure === 'expert' && !excludePaths.includes(item.path));
+	$: hasExpert = sections.flatMap((section) => leaves(config[section], section)).some((item) => definitions.get(item.path)?.exposure === 'expert' && !excluded(item.path));
 </script>
 
 {#if fields.length || hasExpert}

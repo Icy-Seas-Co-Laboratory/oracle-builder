@@ -10,7 +10,7 @@ INFERENCE_PORT="${ORACLE_INFERENCE_PORT:-8111}"
 WEBGUI_PORT="${ORACLE_WEBGUI_PORT:-5111}"
 ORCHESTRATOR_URL="http://${HOST}:${ORCHESTRATOR_PORT}"
 LOG_DIR="$RUNTIME_DIR/logs"
-WORKER_PID=""
+WORKER_PIDS=()
 ORCHESTRATOR_PID=""
 INFERENCE_PID=""
 WEBGUI_PID=""
@@ -180,7 +180,7 @@ cleanup() {
   stop_process "$WEBGUI_PID"
   stop_process "$ORCHESTRATOR_PID"
   stop_process "$INFERENCE_PID"
-  stop_process "$WORKER_PID"
+  for worker_pid in "${WORKER_PIDS[@]}"; do stop_process "$worker_pid"; done
   if [[ -n "$LOCAL_JOIN_TOKEN_FILE" && -f "$LOCAL_JOIN_TOKEN_FILE" ]]; then rm -f "$LOCAL_JOIN_TOKEN_FILE"; fi
   exit "$exit_code"
 }
@@ -311,10 +311,8 @@ echo "Starting resident inference runtime…"
 INFERENCE_PID=$!
 wait_for "inference-runtime" "http://127.0.0.1:${INFERENCE_PORT}/internal/v2/health" "$INFERENCE_PID"
 
-# A local stack proves the production boundary: create an admission pool, then
-# run a registered pull worker. The one-time token never reaches the GUI or a
-# WorkUnit. A new pool per launcher invocation also avoids accidentally
-# reusing a token that was intentionally only returned at creation time.
+# Keep the worker in its existing pool across restarts. Queued work is scoped
+# to a pool, and the private worker credentials are sufficient to rejoin it.
 LOCAL_POOL_NAME="local-$(date +%s)-$$"
 ORCHESTRATOR_CURL_ARGS=(-H 'Content-Type: application/json')
 if [[ -n "${ORACLE_ORCHESTRATOR_ROLE_TOKENS_SHA256:-}" ]]; then
@@ -324,36 +322,104 @@ if [[ -n "${ORACLE_ORCHESTRATOR_ROLE_TOKENS_SHA256:-}" ]]; then
   fi
   ORCHESTRATOR_CURL_ARGS+=(-H "Authorization: Bearer ${ORACLE_ORCHESTRATOR_TOKEN}")
 fi
-POOL_RESPONSE="$(curl --fail --silent --show-error \
-  "${ORCHESTRATOR_CURL_ARGS[@]}" \
-  -d "{\"name\":\"${LOCAL_POOL_NAME}\",\"allowed_actions\":[\"train\",\"infer\"]}" \
-  "${ORCHESTRATOR_URL}/v1/worker-pools")"
-read -r LOCAL_POOL_ID LOCAL_JOIN_TOKEN < <(python3 -c '
+LOCAL_POOL_IDS=()
+LOCAL_POOL_IDS_OUTPUT="$(ORACLE_LOCAL_POOL_URL="$ORCHESTRATOR_URL" ORACLE_LOCAL_POOL_TOKEN="${ORACLE_ORCHESTRATOR_TOKEN:-}" python3 - "$RUNTIME_DIR/workers" <<'PY'
+import json, os, pathlib, sys, urllib.request
+
+root = pathlib.Path(sys.argv[1])
+base = os.environ['ORACLE_LOCAL_POOL_URL'].rstrip('/')
+headers = {}
+if os.environ.get('ORACLE_LOCAL_POOL_TOKEN'):
+    headers['Authorization'] = 'Bearer ' + os.environ['ORACLE_LOCAL_POOL_TOKEN']
+
+def fetch(path):
+    with urllib.request.urlopen(urllib.request.Request(base + path, headers=headers), timeout=5) as response:
+        return json.load(response)
+
+try:
+    pools = {item['pool_id']: item for item in fetch('/v1/worker-pools')['pools']}
+    jobs = fetch('/v1/jobs')['jobs']
+except (OSError, ValueError, KeyError):
+    sys.exit(0)
+
+pending = {}
+for job in jobs:
+    if job.get('status') in {'queued', 'leased', 'running', 'paused', 'cancel_requested'} and job.get('worker_pool_id'):
+        pool_id = job['worker_pool_id']
+        pending[pool_id] = pending.get(pool_id, 0) + 1
+try:
+    queued_runs = fetch('/v1/queued-runs')['queued_runs']
+except (OSError, ValueError, KeyError):
+    queued_runs = []
+for run in queued_runs:
+    if run.get('status') in {'pending_verification', 'verifying', 'ready', 'queued', 'running', 'paused', 'waiting_for_resources'} and run.get('worker_pool_id'):
+        pool_id = run['worker_pool_id']
+        pending[pool_id] = pending.get(pool_id, 0) + 1
+
+candidates = []
+for path in root.glob('*.json'):
+    try:
+        if path.is_symlink() or path.stat().st_mode & 0o077:
+            continue
+        credential = json.loads(path.read_text())
+        pool_id = credential['pool_id']
+        pool = pools.get(pool_id)
+        if (credential['orchestrator_url'].rstrip('/') == base and pool
+                and pool.get('enabled') and {'train', 'infer'} <= set(pool.get('allowed_actions') or [])):
+            candidates.append((pending.get(pool_id, 0), path.stat().st_mtime, pool_id))
+    except (OSError, ValueError, KeyError, TypeError):
+        continue
+if candidates:
+    needed = sorted((candidate for candidate in candidates if candidate[0]), reverse=True)
+    for _, _, pool_id in needed or [max(candidates)]:
+        print(pool_id)
+PY
+)"
+while IFS= read -r pool_id; do
+  [[ -n "$pool_id" ]] && LOCAL_POOL_IDS+=("$pool_id")
+done <<< "$LOCAL_POOL_IDS_OUTPUT"
+if (( ${#LOCAL_POOL_IDS[@]} )); then
+  echo "Reusing local worker pools: ${LOCAL_POOL_IDS[*]}"
+else
+  POOL_RESPONSE="$(curl --fail --silent --show-error \
+    "${ORCHESTRATOR_CURL_ARGS[@]}" \
+    -d "{\"name\":\"${LOCAL_POOL_NAME}\",\"allowed_actions\":[\"train\",\"infer\"]}" \
+    "${ORCHESTRATOR_URL}/v1/worker-pools")"
+  read -r LOCAL_POOL_ID LOCAL_JOIN_TOKEN < <(python3 -c '
 import json, sys
 value = json.load(sys.stdin)
 print(value["pool_id"], value["registration_token"])
 ' <<<"$POOL_RESPONSE")
+  LOCAL_POOL_IDS=("$LOCAL_POOL_ID")
+fi
 # Keep the one-time join secret off the process command line. The worker gets
 # it from its environment only for the initial registration, then persists its
 # server-issued identity in the owner-only credentials file.
 umask 077
 mkdir -p "$RUNTIME_DIR/worker-secrets"
-LOCAL_JOIN_TOKEN_FILE="$RUNTIME_DIR/worker-secrets/${LOCAL_POOL_ID}.join-token"
-printf '%s\n' "$LOCAL_JOIN_TOKEN" >"$LOCAL_JOIN_TOKEN_FILE"
-chmod 600 "$LOCAL_JOIN_TOKEN_FILE"
-unset LOCAL_JOIN_TOKEN
+if [[ -n "${LOCAL_JOIN_TOKEN:-}" ]]; then
+  LOCAL_JOIN_TOKEN_FILE="$RUNTIME_DIR/worker-secrets/${LOCAL_POOL_ID}.join-token"
+  printf '%s\n' "$LOCAL_JOIN_TOKEN" >"$LOCAL_JOIN_TOKEN_FILE"
+  chmod 600 "$LOCAL_JOIN_TOKEN_FILE"
+  unset LOCAL_JOIN_TOKEN
+fi
 
-echo "Starting registered local oracle-worker…"
+echo "Starting registered local oracle-worker(s)…"
 WORKER_CAPABILITIES=(--capability "cpu_capacity=${LOCAL_WORKER_CPU_CAPACITY:-$LOCAL_WORKER_SLOTS}")
 if [[ "$ACCELERATOR" == "cuda" ]]; then
   WORKER_CAPABILITIES+=(--capability "gpu_ids=${CUDA_VISIBLE_DEVICES}")
 elif [[ "$ACCELERATOR" == "metal" ]]; then
   WORKER_CAPABILITIES+=(--capability "gpu_ids=0")
 fi
+for LOCAL_POOL_ID in "${LOCAL_POOL_IDS[@]}"; do
 (
   cd "$ROOT_DIR"
   export ORACLE_BUILDER_WORKER_REGISTRATION_TOKEN
-  ORACLE_BUILDER_WORKER_REGISTRATION_TOKEN="$(<"$LOCAL_JOIN_TOKEN_FILE")"
+  if [[ -n "$LOCAL_JOIN_TOKEN_FILE" ]]; then
+    ORACLE_BUILDER_WORKER_REGISTRATION_TOKEN="$(<"$LOCAL_JOIN_TOKEN_FILE")"
+  else
+    unset ORACLE_BUILDER_WORKER_REGISTRATION_TOKEN
+  fi
   exec uv run --extra api oracle-worker \
     --orchestrator-url "$ORCHESTRATOR_URL" \
     --pool-id "$LOCAL_POOL_ID" \
@@ -364,13 +430,16 @@ fi
     --executor train \
     --executor infer \
     "${WORKER_CAPABILITIES[@]}"
-) >"$LOG_DIR/oracle-worker.log" 2>&1 &
+) >"$LOG_DIR/oracle-worker-${LOCAL_POOL_ID}.log" 2>&1 &
 WORKER_PID=$!
+WORKER_PIDS+=("$WORKER_PID")
 for attempt in $(seq 1 20); do
   if curl --fail --silent "$ORCHESTRATOR_URL/v1/workers?pool_id=$LOCAL_POOL_ID" | python3 -c '
 import json, sys
+from datetime import datetime, timezone
 workers = json.load(sys.stdin).get("workers", [])
-raise SystemExit(0 if workers else 1)
+recent = lambda worker: worker.get("state") != "offline" and (datetime.now(timezone.utc) - datetime.fromisoformat(worker["last_seen_at"])).total_seconds() < 30
+raise SystemExit(0 if any(recent(worker) for worker in workers) else 1)
 ' >/dev/null 2>&1; then
     echo "Local pull worker registered in pool $LOCAL_POOL_ID"
     rm -f "$LOCAL_JOIN_TOKEN_FILE"
@@ -378,14 +447,15 @@ raise SystemExit(0 if workers else 1)
     break
   fi
   if ! kill -0 "$WORKER_PID" >/dev/null 2>&1; then
-    echo "oracle-worker stopped before registration. See $LOG_DIR/oracle-worker.log" >&2
+    echo "oracle-worker stopped before registration. See $LOG_DIR/oracle-worker-${LOCAL_POOL_ID}.log" >&2
     exit 1
   fi
   if [[ "$attempt" == "20" ]]; then
-    echo "oracle-worker did not register within 20 seconds. See $LOG_DIR/oracle-worker.log" >&2
+    echo "oracle-worker did not register within 20 seconds. See $LOG_DIR/oracle-worker-${LOCAL_POOL_ID}.log" >&2
     exit 1
   fi
   sleep 1
+done
 done
 
 echo "Starting web GUI…"
@@ -403,7 +473,7 @@ cat <<EOF
 Oracle Builder stack is running.
   Web GUI:       http://${HOST}:${WEBGUI_PORT}/
   Orchestrator:  ${ORCHESTRATOR_URL}
-  Local worker:  registered pull worker (${LOCAL_POOL_ID})
+  Local workers: registered pull workers (${LOCAL_POOL_IDS[*]})
   Runtime data:  ${RUNTIME_DIR}
   Accelerator:   ${ACCELERATOR}
 

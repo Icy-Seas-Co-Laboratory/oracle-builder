@@ -2,7 +2,8 @@
 	import { onMount, tick } from 'svelte';
 	import { api, type RecordValue } from '$lib/api';
 	import { subscribeOperationalRefresh } from '$lib/operational-refresh';
-	import MetricPlot from '$lib/MetricPlot.svelte';
+	import PairedMetricPlot from '$lib/PairedMetricPlot.svelte';
+	import SplitMetricPlot from '$lib/SplitMetricPlot.svelte';
 
 	export let onfailure: (message: string) => void = () => {};
 	let jobs: RecordValue[] = [];
@@ -25,10 +26,12 @@
 	let paused = false;
 	let disposed = false;
 	let selectedJobId = '';
-	let traceMode: 'batch' | 'epoch' = 'batch';
+	let traceMode: 'batch' | 'epoch' = 'epoch';
+	const traceModeStorageKey = 'oracle-builder.dashboard.detail-chart-mode';
 	let runFilter: 'active' | 'all' = 'active';
 	let dialog: HTMLDialogElement;
-	let detail: { kind: string; title: string; metric?: string; data?: RecordValue } | null = null;
+	let detail: { kind: string; title: string; metric?: string; data?: RecordValue; mode?: 'batch' | 'epoch' } | null = null;
+	let detailValuesOpen = false;
 	let returnFocus: HTMLElement | null = null;
 
 	const records = (value: unknown): RecordValue[] => Array.isArray(value) ? value as RecordValue[] : [];
@@ -50,6 +53,39 @@
 	const jobName = (job: RecordValue) => text(queuedRuns.find((run) => run.queued_run_id === job.queued_run_id)?.name, text(job.artifact_name, `Run ${String(job.job_id).slice(0, 8)}`));
 	const workerName = (id: unknown) => text(workers.find((worker) => worker.worker_id === id)?.name, text(id, 'Waiting for a worker'));
 	const latest = (job: RecordValue) => events[String(job.job_id)]?.at(-1);
+	const progressSnapshot = (job: RecordValue, sourceEvents: Record<string, RecordValue[]>) => object(sourceEvents[String(job.job_id)]?.filter((event) => ['worker.training_progress', 'training_progress'].includes(String(event.event_type))).at(-1)?.data);
+	const segment = (job: RecordValue) => object(object(object(job.work_unit).parameters).execution_segment);
+	function completedEpochHistory(runJobs: RecordValue[], sourceEvents: Record<string, RecordValue[]>): RecordValue[] {
+		const byEpoch = new Map<number, RecordValue>();
+		for (const job of runJobs) {
+			const start = number(segment(job).start_epoch) ?? 0;
+			const stop = number(segment(job).stop_epoch);
+			for (const point of records(progressSnapshot(job, sourceEvents).history)) {
+				const reported = number(point.epoch);
+				if (reported === null) continue;
+				// Worker status files number epochs within each training unit.
+				const epoch = stop !== null && reported <= stop - start ? start + reported : reported;
+				byEpoch.set(epoch, { ...point, epoch });
+			}
+		}
+		return [...byEpoch.values()].sort((a, b) => Number(a.epoch) - Number(b.epoch));
+	}
+	function currentEpochBatches(job: RecordValue | null, sourceEvents: Record<string, RecordValue[]>, current: RecordValue): RecordValue[] {
+		if (!job) return [];
+		const epoch = number(object(current.progress).epoch);
+		if (epoch === null) return [];
+		const byBatch = new Map<number, RecordValue>();
+		for (const event of sourceEvents[String(job.job_id)] ?? []) {
+			if (!['worker.training_progress', 'training_progress'].includes(String(event.event_type))) continue;
+			const data = object(event.data);
+			if (number(object(data.progress).epoch) !== epoch) continue;
+			for (const point of records(data.trace)) {
+				const batch = number(point.batch);
+				if (batch !== null) byBatch.set(batch, point);
+			}
+		}
+		return [...byBatch.values()].sort((a, b) => Number(a.batch) - Number(b.batch));
+	}
 	const metricInfo: Record<string, string> = {
 		loss: 'The objective being minimized. Lower values generally indicate a better fit; compare validation loss to check generalization.',
 		accuracy: 'Fraction of correct predictions. Accuracy alone can hide poor performance on rare classes.',
@@ -63,8 +99,12 @@
 	$: pendingRuns = queuedRuns.filter((run) => ['pending_verification', 'needs_attention'].includes(String(run.status)));
 	$: readyRuns = queuedRuns.filter((run) => run.status === 'ready');
 	$: waitingJobs = activeJobs.filter((job) => job.status === 'queued');
-	$: busyWorkers = workers.filter((worker) => worker.state === 'leased');
-	$: unavailableWorkers = workers.filter((worker) => ['offline', 'unhealthy'].includes(String(worker.state)));
+	$: currentWorkers = workers.filter((worker) => {
+		const seen = Date.parse(String(worker.last_seen_at ?? ''));
+		return worker.state !== 'offline' && Number.isFinite(seen) && Date.now() - seen < 60_000;
+	});
+	$: busyWorkers = currentWorkers.filter((worker) => worker.state === 'leased');
+	$: unavailableWorkers = currentWorkers.filter((worker) => worker.state === 'unhealthy');
 	$: activeLeases = leases.filter((lease) => ['active', 'acknowledged', 'uploading'].includes(String(lease.status)));
 	$: focusedJob = jobs.find((job) => String(job.job_id) === selectedJobId) ?? trainingJobs.find((job) => job.status === 'running') ?? activeJobs[0] ?? pausedJobs[0] ?? jobs[0] ?? null;
 	$: focusedRunId = logicalRunId(focusedJob);
@@ -72,14 +112,19 @@
 	$: focusedLease = focusedJob ? leases.find((lease) => String(lease.job_id) === String(focusedJob?.job_id)) ?? {} : {};
 	$: committedCheckpoint = object(focusedExecutionRun.checkpoint_ref);
 	$: focusedEvents = focusedJob ? events[String(focusedJob.job_id)] ?? [] : [];
+	$: focusedRunJobs = focusedJob ? jobs.filter((job) => job.action === 'train' && !isVerification(job) && (focusedRunId ? logicalRunId(job) === focusedRunId : job.job_id === focusedJob.job_id)).sort((a, b) => Number(object(a.work_unit).sequence ?? 0) - Number(object(b.work_unit).sequence ?? 0)) : [];
 	$: focusedCommands = focusedJob ? commands[String(focusedJob.job_id)] ?? [] : [];
 	$: latestCommand = focusedCommands.at(-1);
 	$: focusedHeartbeat = focusedJob?.worker_id ? heartbeats[String(focusedJob.worker_id)] ?? {} : {};
-	$: snapshot = object(focusedEvents.filter((event) => event.event_type === 'training_progress').at(-1)?.data);
+	$: currentSnapshot = focusedJob ? progressSnapshot(focusedJob, events) : {};
+	$: snapshot = Object.keys(currentSnapshot).length ? currentSnapshot : [...focusedRunJobs].reverse().map((job) => progressSnapshot(job, events)).find((value) => Object.keys(value).length) ?? {};
 	$: liveMetrics = object(snapshot.metrics);
-	$: completedMetrics = object(snapshot.completed_metrics);
-	$: trace = records(traceMode === 'batch' ? snapshot.trace : snapshot.history);
-	$: chartKeys = ['loss', 'val_loss', 'accuracy', 'val_accuracy', 'macro_f1', 'val_macro_f1'].filter((key) => trace.some((point) => number(point[key]) !== null));
+	$: epochHistory = completedEpochHistory(focusedRunJobs, events);
+	$: currentBatchTrace = currentEpochBatches(focusedJob, events, currentSnapshot);
+	$: learningMetricKeys = ['loss', 'accuracy', 'macro_f1'].filter((key) => epochHistory.some((point) => number(point[key]) !== null || number(point[`val_${key}`]) !== null) || currentBatchTrace.some((point) => number(point[key]) !== null));
+	$: trace = traceMode === 'batch' ? currentBatchTrace : epochHistory;
+	$: detailTrace = detail?.mode === 'epoch' ? epochHistory : currentBatchTrace;
+	$: chartKeys = ['loss', 'accuracy', 'macro_f1'].filter((key) => trace.some((point) => number(point[key]) !== null || number(point[`val_${key}`]) !== null));
 	$: progress = object(snapshot.progress);
 	$: timing = object(snapshot.timing);
 	$: focusedTiming = focusedJob ? timings[String(focusedJob.job_id)] ?? {} : {};
@@ -145,12 +190,17 @@
 		} catch (error) { refreshError = error instanceof Error ? error.message : 'Could not refresh execution state.'; if (manual) onfailure(refreshError); }
 		finally { loading = false; }
 	}
-	async function selectJob(id: string) { selectedJobId = id; traceMode = 'batch'; await load(true); }
+	async function selectJob(id: string) { selectedJobId = id; await load(true); }
+	function setTraceMode(mode: 'batch' | 'epoch') {
+		traceMode = mode;
+		try { localStorage.setItem(traceModeStorageKey, mode); } catch { /* Browsers may disable local storage. */ }
+	}
 	function metrics(source: RecordValue) { const order = ['loss', 'accuracy', 'macro_f1', 'learning_rate']; return Object.entries(source).filter((entry): entry is [string, number] => number(entry[1]) !== null).sort(([a], [b]) => (order.includes(a) ? order.indexOf(a) : 99) - (order.includes(b) ? order.indexOf(b) : 99)).slice(0, 8); }
-	async function openDetail(kind: string, title: string, metric?: string, data?: RecordValue) {
+	async function openDetail(kind: string, title: string, metric?: string, data?: RecordValue, mode: 'batch' | 'epoch' = traceMode) {
 		returnFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
 		if (focusedJob && ['metric', 'timing'].includes(kind)) selectedJobId = String(focusedJob.job_id);
-		detail = { kind, title, metric, data }; await tick(); dialog.showModal();
+		detailValuesOpen = false;
+		detail = { kind, title, metric, data, mode }; await tick(); dialog.showModal();
 	}
 	function closeDetail() { dialog.close(); detail = null; returnFocus?.focus(); }
 	function commandLabel(command: RecordValue | undefined) {
@@ -183,6 +233,10 @@
 		return uploads[String(job.job_id)]?.status === 'finalized' ? 'Staged · sealing' : 'Transferring';
 	}
 	onMount(() => {
+		try {
+			const saved = localStorage.getItem(traceModeStorageKey);
+			if (saved === 'batch' || saved === 'epoch') traceMode = saved;
+		} catch { /* Use the epoch default when storage is unavailable. */ }
 		void load();
 		const unsubscribe = subscribeOperationalRefresh(() => { void load(); });
 		return () => { disposed = true; unsubscribe(); };
@@ -205,23 +259,24 @@
 			<div class="section-heading"><div><p class="eyebrow">RUN SPOTLIGHT</p><h2>{focusedJob ? jobName(focusedJob) : 'Ready for your next experiment'}</h2></div>{#if focusedJob}<span class="status {text(focusedJob.status)}">{isVerification(focusedJob) ? 'Verification' : label(text(focusedJob.status))}</span>{/if}</div>
 			{#if jobs.length}<label class="run-picker">Inspect a run<select value={focusedJob?.job_id} on:change={(event) => selectJob(event.currentTarget.value)}>{#each jobs as job}<option value={String(job.job_id)}>{jobName(job)} · {isVerification(job) ? 'verification' : text(job.status)} · {String(job.job_id).slice(0, 8)}</option>{/each}</select></label>{/if}
 			{#if focusedJob}
-				<p class="phase-message">{text(snapshot.message, text(latest(focusedJob)?.message, 'Waiting for the worker to report progress.'))}</p>
+				<p class="phase-message">{text(currentSnapshot.message, text(latest(focusedJob)?.message, text(snapshot.message, 'Waiting for the worker to report progress.')))}</p>
 				<div class="run-context"><span>Worker <strong>{workerName(focusedJob.worker_id)}</strong></span><span>Telemetry <strong>{snapshot.updated_at ? date(snapshot.updated_at) : 'Not yet available'}</strong></span><span>Heartbeat <strong>{focusedHeartbeat.received_at ? date(focusedHeartbeat.received_at) : 'Not reported'}</strong></span></div>
 				<div class="unit-context"><span>Run <strong>{text(focusedRunId)}</strong></span><span>Unit <strong>{text(object(focusedJob.work_unit).sequence)} · {label(text(object(focusedJob.work_unit).phase))}</strong></span><span>Attempt <strong>{text(focusedLease.generation ?? focusedLease.attempt_id, 'Not leased')}</strong></span><span>Committed cursor <strong>{text(focusedExecutionRun.completed_epoch, 'Not committed')}</strong></span><span>Checkpoint <strong>{text(committedCheckpoint.artifact_id, 'None committed')}</strong></span></div>
 				<section class="command-strip" aria-label="Worker controls"><div><strong>Worker control</strong><small>{commandLabel(latestCommand)}</small></div><div class="command-actions"><button class="secondary small" disabled={!canCommand('pause', focusedJob) || Boolean(commandAction)} on:click={() => issueCommand('pause')}>Pause safely</button><button class="secondary small" disabled={!canCommand('yield', focusedJob) || Boolean(commandAction)} on:click={() => issueCommand('yield')}>Yield</button><button class="secondary small" disabled={!canCommand('restart', focusedJob) || Boolean(commandAction)} on:click={() => issueCommand('restart')}>Restart unit</button><button class="secondary small" disabled={!canCommand('resume', focusedJob) || Boolean(commandAction)} on:click={() => issueCommand('resume')}>Resume</button><button class="danger small" disabled={!canCommand('stop_now', focusedJob) || Boolean(commandAction)} on:click={() => issueCommand('stop_now')}>Stop now</button></div>{#if commandMessage}<p role="status">{commandMessage}</p>{/if}</section>
 				{#if Object.keys(snapshot).length}
 					<div class="progress-heading"><strong>Epoch {format(progress.epoch)} <span>/ {format(progress.total_epochs)}</span></strong><span>Batch {format(progress.completed_batches ?? progress.batch)} / {format(progress.total_batches)}</span></div>
 					{#if progressPercent !== null}<progress max="100" value={progressPercent} aria-label="Training progress"></progress>{/if}
-					<div class="metric-cards">{#each metrics(liveMetrics).slice(0, 4) as [key, value]}<button on:click={() => openDetail('metric', label(key), key)} title={metricInfo[key] ?? 'Click for metric details and sampled values.'}><span>{label(key)} <i>↗</i></span><strong>{format(value)}</strong><small>Current batch</small></button>{/each}</div>
-					<div class="chart-heading"><h3>Learning curves</h3><div class="segmented" aria-label="Chart interval"><button class:chosen={traceMode === 'batch'} aria-pressed={traceMode === 'batch'} on:click={() => traceMode = 'batch'}>Batches</button><button class:chosen={traceMode === 'epoch'} aria-pressed={traceMode === 'epoch'} on:click={() => traceMode = 'epoch'}>Epochs</button></div></div>
-					{#if chartKeys.length}<div class="chart-grid">{#each chartKeys as key}<button class="chart-card" on:click={() => openDetail('metric', label(key), key)} aria-label={`Expand ${label(key)} chart`}><header><strong>{label(key)}</strong><span>Explore ↗</span></header><MetricPlot points={trace} metric={key} title={label(key)} axis={traceMode === 'batch' ? 'Batch' : 'Epoch'} /></button>{/each}</div><p class="chart-note">Bounded worker samples · each chart has its own scale · click to explore values</p>{:else}<div class="quiet-empty">{traceMode === 'epoch' ? 'Completed epoch metrics will appear after the first epoch.' : 'Waiting for sampled batch metrics.'}</div>{/if}
+					<div class="metric-cards">{#each metrics(liveMetrics).slice(0, 4) as [key, value]}<button on:click={() => openDetail('metric', label(key), key, undefined, 'batch')} title={metricInfo[key] ?? 'Click for metric details and sampled values.'}><span>{label(key)} <i>↗</i></span><strong>{format(value)}</strong><small>Current batch</small></button>{/each}</div>
+					<section class="learning-section" aria-label="Training and validation with split epoch and batch axes"><div class="learning-section-head"><div><h3>Learning curves</h3><p>Completed epochs and batches in the current epoch share a metric scale</p></div><span>Epoch → batch</span></div>{#if learningMetricKeys.length}<div class="learning-stack">{#each learningMetricKeys as key}<div class="learning-card"><strong>{label(key)}</strong><SplitMetricPlot epochs={epochHistory} batches={currentBatchTrace} metric={key} title={label(key)} currentEpoch={epoch} /></div>{/each}</div>{:else}<div class="quiet-empty compact">Metrics will appear when training batches arrive.</div>{/if}</section>
+					<div class="chart-heading"><h3>Detailed charts</h3><div class="segmented" aria-label="Chart interval"><button class:chosen={traceMode === 'batch'} aria-pressed={traceMode === 'batch'} on:click={() => setTraceMode('batch')}>Batches</button><button class:chosen={traceMode === 'epoch'} aria-pressed={traceMode === 'epoch'} on:click={() => setTraceMode('epoch')}>Epochs</button></div></div>
+					{#if chartKeys.length}<div class="chart-grid">{#each chartKeys as key}<button class="chart-card" on:click={() => openDetail('metric', label(key), key)} aria-label={`Expand ${label(key)} chart`}><header><strong>{label(key)}</strong><span>Explore ↗</span></header><PairedMetricPlot points={trace} metric={key} title={label(key)} mode={traceMode} validationValue={number(epochHistory.at(-1)?.[`val_${key}`])} validationLabel={`Validation after epoch ${format(epochHistory.at(-1)?.epoch)}`} /></button>{/each}</div><p class="chart-note">Training and validation share each metric’s scale · validation is measured after each epoch · batch charts show the current epoch only</p>{:else}<div class="quiet-empty">{traceMode === 'epoch' ? 'Completed epoch metrics will appear after the first epoch.' : 'Waiting for sampled batch metrics.'}</div>{/if}
 				{:else}<div class="quiet-empty"><span class="empty-symbol">{isVerification(focusedJob) ? '✓' : '◌'}</span><h3>{isVerification(focusedJob) ? 'Preflight before training' : 'Waiting for training telemetry'}</h3><p>{isVerification(focusedJob) ? 'The worker checks the dataset, builds the model, and probes batch capacity. This job does not train or save a model.' : 'Metrics appear when the worker reports its first training batch.'}</p></div>{/if}
 				<button class="timing-strip" on:click={() => openDetail('timing', 'Where the time goes')}><span>Elapsed<strong>{duration(timing.elapsed_seconds ?? summary.runtime_seconds)}</strong></span><span>Throughput<strong>{format(timing.batches_per_second)} <small>batches/s</small></strong></span><span>Queue wait<strong>{duration(summary.queue_seconds)}</strong></span><b>Timing details ↗</b></button>
 			{:else}<div class="quiet-empty"><span class="empty-symbol">◈</span><p>Add a run to the queue, verify it, then start training. Progress will appear here.</p><a href="#queue">Open training queue →</a></div>{/if}
 		</section>
 
 		<aside class="dashboard-aside">
-			<section class="panel capacity-panel"><div class="section-heading"><div><p class="eyebrow">CAPACITY</p><h2>Worker fleet</h2></div><button class="text-button" on:click={() => openDetail('workers', 'Worker fleet')}>Details ↗</button></div><div class="capacity-count"><strong>{workers.filter((worker) => worker.state === 'idle').length}</strong><span>idle workers<br /><small>{busyWorkers.length} busy · {unavailableWorkers.length} unavailable</small></span></div><div class="capacity-bar" aria-label={`${busyWorkers.length} of ${workers.length} workers busy`}>{#each workers as worker}<span class:busy={worker.state === 'leased'} class:unavailable={['offline', 'unhealthy'].includes(String(worker.state))} title={`${text(worker.name)}: ${text(worker.state)}`}></span>{/each}</div><div class="fleet-list">{#each workers.slice(0, 5) as worker}<button on:click={() => openDetail('worker', text(worker.name), undefined, worker)}><span class="worker-dot {text(worker.state)}"></span><span><strong>{text(worker.name)}</strong><small>{label(text(worker.state))}</small></span><b>↗</b></button>{/each}{#if !workers.length}<p class="empty-copy">No workers registered yet.</p><a href="#workers">Set up workers →</a>{/if}</div></section>
+			<section class="panel capacity-panel"><div class="section-heading"><div><p class="eyebrow">CAPACITY</p><h2>Worker fleet</h2></div><button class="text-button" on:click={() => openDetail('workers', 'Worker fleet')}>Details ↗</button></div><div class="capacity-count"><strong>{currentWorkers.filter((worker) => worker.state === 'idle').length}</strong><span>idle workers<br /><small>{busyWorkers.length} busy · {unavailableWorkers.length} unavailable</small></span></div><div class="capacity-bar" aria-label={`${busyWorkers.length} of ${currentWorkers.length} workers busy`}>{#each currentWorkers as worker}<span class:busy={worker.state === 'leased'} class:unavailable={worker.state === 'unhealthy'} title={`${text(worker.name)}: ${text(worker.state)}`}></span>{/each}</div><div class="fleet-list">{#each currentWorkers.slice(0, 5) as worker}<button on:click={() => openDetail('worker', text(worker.name), undefined, worker)}><span class="worker-dot {text(worker.state)}"></span><span><strong>{text(worker.name)}</strong><small>{label(text(worker.state))}</small></span><b>↗</b></button>{/each}{#if !currentWorkers.length}<p class="empty-copy">No active workers. Open Workers to inspect past registrations.</p><a href="#workers">Inspect workers →</a>{/if}</div></section>
 			<section class="panel queue-panel"><p class="eyebrow">NEXT UP</p><h2>Queue at a glance</h2><button on:click={() => openDetail('queue', 'Queue at a glance')}><span>Awaiting verification</span><strong>{pendingRuns.length}</strong></button><button on:click={() => openDetail('queue', 'Queue at a glance')}><span>Verifying now / waiting</span><strong>{verificationJobs.length}</strong></button><button on:click={() => openDetail('queue', 'Queue at a glance')}><span>Verified, ready to start</span><strong>{readyRuns.length}</strong></button><p>Verified runs wait for your start command unless you selected “verify and start.”</p><a href="#queue">Manage queue →</a></section>
 		</aside>
 	</div>
@@ -234,9 +289,13 @@
 <dialog bind:this={dialog} on:cancel={(event) => { event.preventDefault(); closeDetail(); }} aria-labelledby="dashboard-detail-title">
 	{#if detail}<header class="dialog-header"><div><p class="eyebrow">DASHBOARD DETAILS</p><h2 id="dashboard-detail-title">{detail.title}</h2></div><button class="secondary small" on:click={closeDetail} aria-label="Close details">Close ×</button></header><div class="dialog-body">
 		{#if detail.kind === 'metric' && detail.metric}
-			<p>{metricInfo[detail.metric.replace('val_', '')] ?? 'Numeric telemetry reported by the worker for this run.'} {detail.metric.startsWith('val_') ? 'This value is measured on the validation split.' : ''}</p><div class="detail-metrics"><span>Current batch<strong>{format(liveMetrics[detail.metric])}</strong></span><span>Last completed epoch<strong>{format(completedMetrics[detail.metric])}</strong></span></div><MetricPlot points={trace} metric={detail.metric} title={detail.title} axis={traceMode === 'batch' ? 'Batch' : 'Epoch'} expanded /><p class="chart-note">{traceMode === 'batch' ? 'Current-epoch batch trace (up to 60 samples).' : 'Completed epoch history (up to 50 epochs).'} Missing values are not interpolated.</p><details><summary>Inspect sampled values</summary><table><thead><tr><th>{traceMode === 'batch' ? 'Batch' : 'Epoch'}</th><th>{detail.title}</th></tr></thead><tbody>{#each trace as point, index}<tr><td>{text(point[traceMode] ?? index + 1)}</td><td>{format(point[detail.metric])}</td></tr>{/each}</tbody></table></details>
+			<p>{metricInfo[detail.metric] ?? 'Numeric telemetry reported by the worker for this run.'}</p>
+			<div class="detail-metrics"><span>Current training batch<strong>{format(liveMetrics[detail.metric])}</strong></span><span>Last completed training epoch<strong>{format(epochHistory.at(-1)?.[detail.metric])}</strong></span><span>Last completed validation epoch<strong>{format(epochHistory.at(-1)?.[`val_${detail.metric}`])}</strong></span></div>
+			<PairedMetricPlot points={detailTrace} metric={detail.metric} title={detail.title} mode={detail.mode ?? 'batch'} validationValue={number(epochHistory.at(-1)?.[`val_${detail.metric}`])} validationLabel={`Validation after epoch ${format(epochHistory.at(-1)?.epoch)}`} />
+			<p class="chart-note">{detail.mode === 'epoch' ? 'Training and validation are paired for each completed epoch.' : 'Only current-epoch training batches appear here. The dashed orange line is validation from the last completed epoch.'}</p>
+			<details on:toggle={(event) => detailValuesOpen = event.currentTarget.open}><summary>Inspect sampled values</summary>{#if detailValuesOpen}<table><thead><tr><th>{detail.mode === 'epoch' ? 'Epoch' : 'Batch'}</th><th>Training</th><th>Validation</th></tr></thead><tbody>{#each detailTrace as point, index}<tr><td>{text(point[detail.mode ?? 'batch'] ?? index + 1)}</td><td>{format(point[detail.metric])}</td><td>{format(point[`val_${detail.metric}`])}</td></tr>{/each}</tbody></table>{/if}</details>
 		{:else if detail.kind === 'timing'}<p>Measured worker stages can overlap. Derived intervals use durable timestamps; they are not an additive breakdown.</p><div class="detail-metrics"><span>Queue<strong>{duration(summary.queue_seconds)}</strong></span><span>Runtime<strong>{duration(summary.runtime_seconds)}</strong></span><span>Training<strong>{duration(summary.training_elapsed_seconds)}</strong></span></div><table><thead><tr><th>Stage</th><th>Duration</th></tr></thead><tbody>{#each stages as stage}<tr><td>{label(text(stage.stage))}</td><td>{duration(stage.duration_seconds)}</td></tr>{/each}</tbody></table>{#if !stages.length}<p>No stage timings reported yet.</p>{/if}
-		{:else if ['workers', 'alerts', 'worker'].includes(detail.kind)}<p>Worker states and heartbeat timestamps are reported by the control plane.</p>{#each detail.kind === 'worker' && detail.data ? [detail.data] : detail.kind === 'alerts' ? unavailableWorkers : workers as worker}{@const heartbeat = heartbeats[String(worker.worker_id)] ?? {}}<article class="detail-record"><h3>{text(worker.name)} <span class="status">{text(worker.state)}</span></h3><dl><dt>Last heartbeat</dt><dd>{date(heartbeat.received_at ?? worker.last_seen_at)}</dd><dt>Worker ID</dt><dd>{text(worker.worker_id)}</dd><dt>Generation</dt><dd>{text(heartbeat.generation)}</dd><dt>GPUs</dt><dd>{Array.isArray(object(worker.capabilities).gpu_ids) ? (object(worker.capabilities).gpu_ids as unknown[]).length : 0}</dd><dt>Actions</dt><dd>{text(object(worker.capabilities).actions)}</dd><dt>Verification</dt><dd>{object(worker.capabilities).training_verification_v1 ? 'Supported' : 'Worker update required'}</dd></dl></article>{/each}{#if detail.kind === 'alerts' && !unavailableWorkers.length}<p>No offline or unhealthy workers reported.</p>{/if}
+		{:else if ['workers', 'alerts', 'worker'].includes(detail.kind)}<p>Worker states and heartbeat timestamps are reported by the control plane. Past offline registrations are available on the Workers page.</p>{#each detail.kind === 'worker' && detail.data ? [detail.data] : detail.kind === 'alerts' ? unavailableWorkers : currentWorkers as worker}{@const heartbeat = heartbeats[String(worker.worker_id)] ?? {}}<article class="detail-record"><h3>{text(worker.name)} <span class="status">{text(worker.state)}</span></h3><dl><dt>Last heartbeat</dt><dd>{date(heartbeat.received_at ?? worker.last_seen_at)}</dd><dt>Worker ID</dt><dd>{text(worker.worker_id)}</dd><dt>Generation</dt><dd>{text(heartbeat.generation)}</dd><dt>GPUs</dt><dd>{Array.isArray(object(worker.capabilities).gpu_ids) ? (object(worker.capabilities).gpu_ids as unknown[]).length : 0}</dd><dt>Actions</dt><dd>{text(object(worker.capabilities).actions)}</dd><dt>Verification</dt><dd>{object(worker.capabilities).training_verification_v1 ? 'Supported' : 'Worker update required'}</dd></dl></article>{/each}{#if detail.kind === 'alerts' && !unavailableWorkers.length}<p>No unhealthy workers reported.</p>{/if}
 		{:else if detail.kind === 'queue'}<p>Only verified and explicitly started training runs can execute. Verification itself may wait for a compatible worker.</p>{#each queuedRuns.filter((run) => !['indexed', 'complete', 'cancelled', 'archived'].includes(String(run.status))) as run}<article class="detail-record"><h3>{text(run.name)}</h3><span class="status">{label(text(run.status))}</span><p>{text(run.failure_reason, run.status === 'ready' ? 'Verified. Waiting for your start command.' : run.status === 'verifying' ? 'Preflight is queued or running on a worker.' : 'Open the queue to review this run.')}</p></article>{/each}<a href="#queue" on:click={closeDetail}>Open training queue →</a>
 		{:else if detail.kind === 'runs'}{#each activeJobs as job}<article class="detail-record"><h3>{jobName(job)}</h3><p>{isVerification(job) ? 'Verification' : 'Execution'} · {label(text(job.status))} · {workerName(job.worker_id)}</p><p>{text(latest(job)?.message, 'Waiting for an event')}</p><button class="secondary small" on:click={() => { void selectJob(String(job.job_id)); closeDetail(); }}>Inspect this run</button></article>{/each}{#if !activeJobs.length}<p>No active runs or verification jobs.</p>{/if}
 		{:else if detail.kind === 'publication'}<p>Uploads are staged before the Orchestrator validates and publishes them. Interrupted transfers may retain recovery data on the worker.</p><dl>{#each Object.entries(detail.data ?? {}).filter(([key]) => !['uploaded_parts'].includes(key)) as [key, value]}<dt>{label(key)}</dt><dd>{typeof value === 'object' ? JSON.stringify(value) : text(value)}</dd>{/each}</dl>{/if}
@@ -270,6 +329,10 @@
 	.progress-heading { display:flex; justify-content:space-between; gap:.5rem; align-items:center; font-size:.73rem; margin-bottom:.5rem; }.progress-heading strong { font-size:.9rem; }.progress-heading span { color:var(--muted); font-weight:500; }
 	progress { display:block; appearance:none; border:0; width:100%; height:6px; border-radius:8px; overflow:hidden; background:#e6efed; }progress::-webkit-progress-bar { background:#e6efed; }progress::-webkit-progress-value { background:var(--teal); border-radius:8px; }progress::-moz-progress-bar { background:var(--teal); border-radius:8px; }
 	.metric-cards { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:.65rem; margin:1.2rem 0 1.5rem; }.metric-cards button { text-align:left; padding:.8rem; border:1px solid var(--line); background:var(--surface-soft); color:var(--ink); }.metric-cards button:hover { background:var(--teal-soft); }.metric-cards span { display:flex; justify-content:space-between; font-size:.68rem; color:var(--muted); }.metric-cards i { font-style:normal; }.metric-cards strong { display:block; font-size:1.3rem; letter-spacing:-.04em; margin:.5rem 0 .15rem; font-variant-numeric:tabular-nums; }.metric-cards small { color:var(--muted); font-size:.63rem; font-weight:500; }
+	.learning-section { min-width:0; padding:.85rem; border:1px solid var(--line); border-radius:10px; background:#f8fbfa; margin:0 0 1.6rem; }
+	.learning-section-head { display:flex; justify-content:space-between; gap:.4rem; align-items:start; margin-bottom:.7rem; }
+	.learning-section-head h3 { margin:0; font-size:.83rem; }.learning-section-head p { margin:.16rem 0 0; color:var(--muted); font-size:.67rem; }.learning-section-head > span { color:var(--teal); font-size:.6rem; font-weight:700; white-space:nowrap; }
+	.learning-stack { display:grid; gap:.6rem; }.learning-card { min-width:0; padding:.65rem; border:1px solid var(--line); border-radius:8px; background:white; }.learning-card > strong { display:block; color:var(--ink); font-size:.71rem; margin-bottom:.25rem; }
 	.chart-heading { display:flex; justify-content:space-between; align-items:center; margin-bottom:.75rem; }.chart-heading h3 { font-size:.88rem; margin:0; }.segmented { display:flex; gap:2px; background:#edf2f1; padding:3px; border-radius:7px; }.segmented button { background:transparent; color:var(--muted); font-size:.68rem; padding:.38rem .65rem; border-radius:5px; }.segmented button.chosen { background:white; color:var(--ink); box-shadow:0 1px 3px #102a3518; }
 	.chart-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:.8rem; }.chart-card { min-width:0; text-align:left; background:white; border:1px solid var(--line); color:var(--ink); border-radius:9px; padding:.8rem; }.chart-card:hover { background:#fafffe; border-color:#9bc9c0; }.chart-card header { display:flex; justify-content:space-between; gap:.5rem; font-size:.74rem; margin-bottom:.3rem; }.chart-card header span { font-size:.65rem; color:var(--teal); font-weight:500; }.chart-note { color:var(--muted); font-size:.66rem; margin:.7rem 0 0; }
 	.timing-strip { display:flex; justify-content:space-between; flex-wrap:wrap; gap:.8rem; width:100%; text-align:left; background:#f4f7f7; color:var(--ink); padding:1rem; margin-top:1.2rem; border:1px solid var(--line); }.timing-strip:hover { background:#ecf5f2; }.timing-strip span { font-size:.66rem; color:var(--muted); font-weight:500; }.timing-strip strong { display:block; margin-top:.3rem; color:var(--ink); font-size:.95rem; }.timing-strip strong small { font-size:.65rem; color:var(--muted); }.timing-strip b { align-self:center; color:var(--teal); font-size:.69rem; }

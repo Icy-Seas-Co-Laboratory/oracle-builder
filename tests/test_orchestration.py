@@ -943,6 +943,66 @@ def _seed_scheduler_queue(orchestrator, endpoint_id, resources_list):
     return [f"scheduler-queue-{index}" for index in range(len(resources_list))]
 
 
+def test_queue_actions_expose_latest_job_and_allow_clearing_completed_verification(tmp_path):
+    orchestrator = Orchestrator(tmp_path / "queue.sqlite", workspace_root=tmp_path)
+    endpoint = orchestrator.register_compute_endpoint(name="queue", base_url="http://queue-serve")
+    [queue_id] = _seed_scheduler_queue(orchestrator, endpoint["endpoint_id"], [{"gpu_count": 0}])
+    now = "2026-01-01T00:00:00+00:00"
+    with orchestrator._connection() as db:
+        db.execute("UPDATE queued_runs SET start_authorized=0 WHERE queued_run_id=?", (queue_id,))
+        db.execute(
+            """INSERT INTO jobs(job_id,oracle_serve_url,action,parameters_json,resources_json,
+               work_unit_json,queued_run_id,status,submitted_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?)""",
+            ("verification-job", "pull://queue", "train", "{}", "{}",
+             json.dumps({"parameters": {"queue_execution": {"phase": "verify"}}}),
+             queue_id, "completed", now, now),
+        )
+
+    queued = orchestrator.queued_run(queue_id)
+    assert queued["latest_job_id"] == "verification-job"
+    assert queued["latest_job_status"] == "completed"
+    assert queued["latest_job_resumable"] is False
+    assert queued["can_edit"] is True
+    assert queued["can_clear"] is True
+
+    with orchestrator._connection() as db:
+        db.execute(
+            "UPDATE jobs SET status='running', work_unit_json=? WHERE job_id='verification-job'",
+            (json.dumps({"parameters": {"execution_segment": {"phase": "train"}}}),),
+        )
+    running = orchestrator.queued_run(queue_id)
+    assert running["latest_job_resumable"] is True
+    assert running["can_edit"] is False
+    assert running["can_clear"] is False
+    with pytest.raises(ValueError, match="finished or failed"):
+        orchestrator.archive_terminal_queued_run(queue_id)
+
+    with orchestrator._connection() as db:
+        db.execute("UPDATE jobs SET status='completed' WHERE job_id='verification-job'")
+    assert orchestrator.archive_terminal_queued_run(queue_id)["archived"] is True
+
+
+def test_historical_job_does_not_block_clearing_cancelled_queue_row(tmp_path):
+    orchestrator = Orchestrator(tmp_path / "queue.sqlite", workspace_root=tmp_path)
+    endpoint = orchestrator.register_compute_endpoint(name="queue", base_url="http://queue-serve")
+    [queue_id] = _seed_scheduler_queue(orchestrator, endpoint["endpoint_id"], [{"gpu_count": 0}])
+    now = "2026-01-01T00:00:00+00:00"
+    with orchestrator._connection() as db:
+        db.execute("UPDATE queued_runs SET status='cancelled' WHERE queued_run_id=?", (queue_id,))
+        db.execute(
+            """INSERT INTO jobs(job_id,oracle_serve_url,action,parameters_json,resources_json,
+               queued_run_id,status,submitted_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?)""",
+            ("historical-job", "http://retired-worker", "train", "{}", "{}", queue_id, "historical", now, now),
+        )
+
+    queued = orchestrator.queued_run(queue_id)
+    assert queued["latest_job_status"] == "historical"
+    assert queued["can_clear"] is True
+    assert orchestrator.archive_terminal_queued_run(queue_id)["archived"] is True
+
+
 def _scheduler_endpoint(endpoint_id, *, workers=2, gpu_leases=None, cpu_capacity=8, cpu_in_use=0):
     return {
         "endpoint_id": endpoint_id, "base_url": "http://scheduler-serve", "enabled": True, "status": "ready",

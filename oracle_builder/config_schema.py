@@ -262,7 +262,7 @@ _OVERRIDES: dict[str, dict[str, Any]] = {
             "auto", "class_stratified", "stratified_group", "group_only",
             "random", "source_partitions",
         ),
-        "help": "Auto preserves complete imported partitions; otherwise it stratifies effective classification labels.",
+        "help": "Auto preserves imported partitions, deriving validation from train when only train/test exist; otherwise it stratifies effective classification labels.",
     },
     "data.split_minimum_per_class": {"minimum": 0, "advanced": True},
     "data.split_group_metadata_key": {

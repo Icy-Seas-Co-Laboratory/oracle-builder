@@ -514,6 +514,41 @@ def create_split_manifest(
             "method": "source_partitions",
             "source_metadata_key": "source_partition",
         }
+        # Benchmarks such as CIFAR provide an official train/test boundary but
+        # no validation partition. Auto may derive validation from official
+        # training examples; the held-out test examples must stay untouched.
+        source_splits = {row["split"] for row in source_assignments}
+        if strategy == "auto" and validation > 0 and source_splits == {"train", "test"}:
+            train_ids = {row["item_id"] for row in source_assignments if row["split"] == "train"}
+            train_rows = [row for row in effective_rows if str(row["item_id"]) in train_ids]
+            train_fraction = len(train_ids) / len(item_ids)
+            if validation >= train_fraction:
+                raise ValueError(
+                    "data.validation_split must be smaller than the official training "
+                    "partition when auto derives validation from source train/test partitions"
+                )
+            within_train_validation = validation / train_fraction
+            if info["dataset_type"] == "classification":
+                derived, _ = _class_stratified_assignments(
+                    train_rows, seed=seed, validation=within_train_validation,
+                    test=0, minimum=minimum,
+                )
+            else:
+                derived = _assignment_rows(
+                    sorted(train_ids), seed=seed, validation=within_train_validation, test=0,
+                )
+            assignments = sorted(
+                [row for row in source_assignments if row["split"] == "test"] + derived,
+                key=lambda row: row["item_id"],
+            )
+            policy = {
+                "method": "source_partitions_with_derived_validation",
+                "source_metadata_key": "source_partition",
+                "validation_source": "train",
+                "validation_algorithm": "class_stratified_v1" if info["dataset_type"] == "classification" else "stable_sha256_rank",
+                "seed": seed,
+                "validation_fraction": validation,
+            }
         coverage = _coverage_report(
             assignments, effective_rows,
             enabled=_enabled_splits(validation=validation, test=test), minimum=minimum,

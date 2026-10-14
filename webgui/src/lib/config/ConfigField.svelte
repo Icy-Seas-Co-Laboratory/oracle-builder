@@ -7,6 +7,8 @@
 	export let value: unknown;
 	export let disabled = false;
 	export let config: Record<string, unknown> = {};
+	export let helpDisplay: 'inline' | 'tooltip' = 'inline';
+	let tooltipOpen = false;
 
 	const dispatch = createEventDispatcher<{ change: { value: unknown } }>();
 	$: choiceContext = definition.allowed_values_path ? getPath(config, definition.allowed_values_path) : undefined;
@@ -55,7 +57,7 @@
 </script>
 
 <label class:readonly={disabled} class="config-field">
-	<span class="field-label" title={definition.help}>{definition.label ?? humanize(definition.path.split('.').at(-1) ?? definition.path)}</span>
+	<span class="field-label"><span>{definition.label ?? humanize(definition.path.split('.').at(-1) ?? definition.path)}</span>{#if definition.help && helpDisplay === 'tooltip'}<span class="help-trigger" class:open={tooltipOpen} role="button" tabindex="0" aria-label={`${definition.label ?? humanize(definition.path.split('.').at(-1) ?? definition.path)} help`} aria-expanded={tooltipOpen} on:click|preventDefault|stopPropagation={() => tooltipOpen = !tooltipOpen} on:keydown={(event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); tooltipOpen = !tooltipOpen; } else if (event.key === 'Escape') tooltipOpen = false; }} on:blur={() => tooltipOpen = false}>ⓘ<span class="help-popover" role="tooltip">{definition.help}</span></span>{/if}</span>
 	{#if isBooleanAuto}
 		<span class="segmented" role="group" aria-label={definition.label ?? definition.path}>
 			{#each [true, false, 'auto'] as choice}
@@ -83,12 +85,16 @@
 	{:else}
 		<input type="text" disabled={disabled} value={String(value ?? '')} on:change={(event) => emit(event.currentTarget.value)} />
 	{/if}
-	{#if definition.help}<small>{definition.help}</small>{/if}
+	{#if definition.help && helpDisplay === 'inline'}<small>{definition.help}</small>{/if}
 </label>
 
 <style>
 	.config-field { display:grid; gap:.25rem; min-width:0; }
-	.field-label { color:var(--muted); font-size:.67rem; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+	.field-label { align-items:center; color:var(--muted); display:flex; font-size:.67rem; gap:.32rem; min-width:0; }
+	.field-label > span:first-child { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+	.help-trigger { align-items:center; border-radius:50%; color:#316eb4; cursor:help; display:inline-flex; flex:none; font-size:.72rem; font-weight:700; height:1rem; justify-content:center; outline-offset:2px; position:relative; width:1rem; }
+	.help-popover { background:#19313a; border-radius:6px; bottom:calc(100% + .45rem); box-shadow:0 6px 20px #11292f33; color:white; display:none; font-size:.7rem; font-weight:500; left:0; line-height:1.4; max-width:min(19rem,70vw); padding:.55rem .65rem; position:absolute; white-space:normal; width:max-content; z-index:20; }
+	.help-trigger:hover .help-popover,.help-trigger:focus .help-popover,.help-trigger.open .help-popover { display:block; }
 	.config-field input,.config-field select,.config-field textarea { min-height:2.1rem; padding:.42rem .5rem; font:inherit; }
 	.config-field textarea { resize:vertical; font-family:'SFMono-Regular',Consolas,monospace; font-size:.7rem; }
 	.config-field small { color:var(--muted); font-size:.66rem; line-height:1.25; }

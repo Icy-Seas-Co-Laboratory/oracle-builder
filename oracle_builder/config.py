@@ -49,9 +49,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "shuffle_buffer": 512,
         "validation_split": 0.2,
         "test_split": 0.1,
-        # "auto" honors a complete explicit source-partition layout when one
-        # was imported; otherwise it deterministically stratifies effective
-        # classification labels. "random" is an explicit legacy escape hatch.
+        # "auto" honors imported partitions, deriving validation from an
+        # official train/test layout when needed; otherwise it deterministically
+        # stratifies effective classification labels.
         "split_strategy": "auto",
         # Every effective class is represented in every enabled split by
         # default. Set zero only when preserving a sparse trusted benchmark.

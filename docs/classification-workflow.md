@@ -58,8 +58,10 @@ training-library/
 
 Those directory names are retained as `source_partition` provenance for each
 item. They do not become dataset-level split state. A training run with the
-default `data.split_strategy = "auto"` uses a complete source-partition layout;
-otherwise it creates deterministic class-stratified assignments. Every class
+default `data.split_strategy = "auto"` uses a complete source-partition layout.
+For an imported `train`/`test` benchmark such as CIFAR, it derives validation
+from `train` and preserves the official `test` examples. Otherwise it creates
+deterministic class-stratified assignments. Every class
 must have at least one member in each enabled split by default, so a rare class
 that cannot populate the requested splits stops verification with a useful
 report instead of silently disappearing from validation or test. Set

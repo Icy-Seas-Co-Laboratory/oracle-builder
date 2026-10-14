@@ -254,8 +254,10 @@ library/
 two of those top-level directories are present. They are stored as per-item
 `source_partition` provenance, not as permanent dataset splits. A run may use
 a complete source-partition layout with `data.split_strategy = "auto"`, or you
-can request `"source_partitions"`; without a complete imported layout `auto`
-uses deterministic class stratification. `"random"` deliberately ignores
+can request `"source_partitions"`. With imported `train` and `test` partitions,
+`auto` derives requested validation examples from `train` and preserves `test`.
+Without a complete imported layout, `auto` uses deterministic class
+stratification. `"random"` deliberately ignores
 both imported partitions and class coverage. The
 run artifact's split manifest—not these folders—is the authoritative training,
 validation, and test assignment.

@@ -92,6 +92,49 @@ def test_auto_preserves_complete_source_partitions_but_reports_coverage_conflict
         )
 
 
+def test_auto_derives_validation_from_official_train_without_moving_test(tmp_path):
+    database = tmp_path / "cifar-like.sqlite"
+    create_synthetic_classification(database, n=60, shape=(8, 8, 3), classes=10)
+    official_test: set[str] = set()
+    with sqlite3.connect(database) as connection:
+        rows = connection.execute(
+            """
+            SELECT di.item_id, label.class_index
+            FROM dataset_items di
+            JOIN classification_annotations annotation ON annotation.item_id = di.item_id AND annotation.is_current = 1
+            JOIN classification_labels label ON label.label_id = annotation.label_id
+            ORDER BY di.item_id
+            """
+        ).fetchall()
+        per_class: dict[int, int] = {}
+        for item_id, label in rows:
+            index = per_class.get(label, 0)
+            per_class[label] = index + 1
+            partition = "test" if index == 0 else "train"
+            if partition == "test":
+                official_test.add(item_id)
+            connection.execute(
+                "UPDATE dataset_items SET metadata_json = ? WHERE item_id = ?",
+                (json.dumps({"source_partition": partition}), item_id),
+            )
+        connection.commit()
+
+    config = _config(split_strategy="auto")
+    first = create_split_manifest(tmp_path / "first", database, config)
+    second = create_split_manifest(tmp_path / "second", database, config)
+    assigned = {row["item_id"]: row["split"] for row in first["assignments"]}
+
+    assert first["policy"]["method"] == "source_partitions_with_derived_validation"
+    assert first["assignment_digest_sha256"] == second["assignment_digest_sha256"]
+    assert {item_id for item_id, split in assigned.items() if split == "test"} == official_test
+    assert first["counts"]["validation"] > 0
+    assert first["coverage"]["valid"] is True
+    assert all(counts["validation"] >= 1 for counts in first["coverage"]["class_counts"].values())
+
+    with pytest.raises(ValueError, match="Trusted source partitions violate"):
+        create_split_manifest(tmp_path / "explicit", database, _config(split_strategy="source_partitions"))
+
+
 def test_explicit_group_policy_requires_metadata_and_never_splits_a_group(tmp_path):
     database = tmp_path / "classification.sqlite"
     create_synthetic_classification(database, n=18, shape=(8, 8, 1), classes=3)
