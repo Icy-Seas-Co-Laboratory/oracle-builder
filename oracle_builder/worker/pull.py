@@ -226,6 +226,29 @@ class TrainingExecutor:
     def execute(self, *, work_unit: Mapping[str, Any], inputs: Mapping[str, Path],
                 configuration: Path | None, staging: Path,
                 emit_event: Callable[[str, str, Mapping[str, Any] | None], None]) -> Mapping[str, Any]:
+        posthoc = work_unit.get("parameters", {}).get("posthoc_fit")
+        if posthoc is not None:
+            if configuration is not None or set(inputs) != {"model", "input"} or not isinstance(posthoc, Mapping):
+                raise PullProtocolError("Post-hoc fitting requires exactly a model and frozen dataset")
+            if set(posthoc) - {"name", "validation_split", "test_split", "split_strategy"}:
+                raise PullProtocolError("Post-hoc fitting contains unsupported parameters")
+            model, dataset = inputs["model"], inputs["input"]
+            if not (model / "artifact.json").is_file() or not (dataset / "payload").is_file():
+                raise PullProtocolError("Post-hoc inputs are incomplete")
+            from oracle_builder.posthoc.workflow import fit_existing_model_posthoc
+
+            result = fit_existing_model_posthoc(
+                model, dataset / "payload", staging / "product",
+                name=posthoc.get("name"),
+                validation_split=posthoc.get("validation_split", 0.2),
+                test_split=posthoc.get("test_split", 0.1),
+                split_strategy=posthoc.get("split_strategy", "auto"),
+                progress=emit_event,
+            )
+            for child in (staging / "product").iterdir():
+                child.replace(staging / child.name)
+            (staging / "product").rmdir()
+            return {"artifact_root": ".", "artifact_id": result["artifact_id"]}
         dataset = inputs.get("input")
         if dataset is None or not (dataset / "payload").is_file():
             raise PullProtocolError("train executor requires a materialized dataset payload")
@@ -419,6 +442,18 @@ def training_progress_payload(status_path: Path) -> dict[str, Any] | None:
     completed = metrics.get("last_completed_epoch") if isinstance(metrics, Mapping) else None
     history = raw.get("history")
     trace = metrics.get("current_epoch_history") if isinstance(metrics, Mapping) else None
+    post = raw.get("post_training")
+    post_training = {}
+    if isinstance(post, Mapping):
+        for key in ("stage", "status"):
+            if isinstance(post.get(key), str):
+                post_training[key] = post[key][:160]
+        for key in ("stage_index", "total_stages", "completed_epochs", "planned_epochs", "completed_items", "total_items", "elapsed_seconds"):
+            value = _finite_number(post.get(key))
+            if value is not None:
+                post_training[key] = value
+        if isinstance(post.get("stopped_early"), bool):
+            post_training["stopped_early"] = post["stopped_early"]
     bounded_trace = [_numeric_fields(item, limit=8) for item in trace[-60:]] if isinstance(trace, list) else []
     bounded_history = [_numeric_fields(item, limit=24) for item in history[-50:]] if isinstance(history, list) else []
     return {
@@ -431,6 +466,7 @@ def training_progress_payload(status_path: Path) -> dict[str, Any] | None:
         "completed_metrics": _numeric_fields(completed, limit=24),
         "trace": bounded_trace,
         "history": bounded_history,
+        "post_training": post_training,
     }
 
 

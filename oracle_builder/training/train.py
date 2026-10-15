@@ -88,6 +88,12 @@ def compile_model(model: keras.Model, config: dict[str, Any]) -> keras.Model:
         if str(metric).lower() == "iou":
             continue
         metrics.append(metric)
+    if config["run"]["task"] == "classification" and not any(
+        isinstance(metric, SparseCategoricalMacroF1) for metric in metrics
+    ):
+        # This uses the predictions already produced by model.fit and keeps
+        # a training-side F1 series to compare with validation each epoch.
+        metrics.append(SparseCategoricalMacroF1(config["data"]["num_classes"]))
     model.compile(optimizer=optimizer, loss=loss, metrics=metrics)
     return model
 

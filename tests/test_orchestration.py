@@ -152,6 +152,37 @@ def _create_sealed_product(path, source_config, *, artifact_type="model_product"
     return seal_run_artifact(path)
 
 
+def test_posthoc_fit_can_be_created_and_started_for_frozen_dataset(tmp_path):
+    import sqlite3
+    from oracle_builder.data.sqlite_dataset import create_synthetic_classification
+    from oracle_builder.datasets.schema import set_dataset_lifecycle
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    source_config = workspace / "source.toml"
+    source_config.write_text("[run]\ntask = 'classification'\n")
+    product = workspace / "source-model"
+    manifest = _create_sealed_product(product, source_config, metrics={"accuracy": 0.8})
+    dataset_path = workspace / "frozen.sqlite"
+    create_synthetic_classification(dataset_path, n=30, shape=(4, 4, 1), classes=2)
+    with sqlite3.connect(dataset_path) as db:
+        set_dataset_lifecycle(db, "frozen")
+
+    orchestrator = Orchestrator(tmp_path / "orchestrator.sqlite", workspace_root=workspace,
+                                artifact_root=tmp_path / "artifacts")
+    orchestrator.scan(product)
+    dataset = orchestrator.ingest_dataset(dataset_path)
+    pool = orchestrator.create_worker_pool(name="Training", allowed_actions=["train"])
+    created = orchestrator.create_posthoc_run(
+        name="new head", model_artifact_id=manifest["artifact_id"],
+        dataset_id=dataset["dataset_id"], worker_pool_id=pool["pool_id"],
+    )
+    assert created["status"] == "ready"
+    started = orchestrator.start_posthoc_run(created["posthoc_run_id"])
+    assert started["status"] == "queued"
+    assert orchestrator.job(created["posthoc_run_id"])["status"] == "queued"
+
+
 def test_dispatch_and_reconcile_keeps_orchestrator_job_identity(tmp_path, monkeypatch):
     workspace = tmp_path / "workspace"
     workspace.mkdir()

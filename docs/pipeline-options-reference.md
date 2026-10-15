@@ -40,7 +40,7 @@ interrupted non-embedding run with a valid recovery snapshot.
 | GPU selection controls | `unused_first`; safe fallbacks off | `require_unused_gpu`, `allow_busy_fallback`, `gpu_light_share_memory_mb`, `gpu_light_share_utilization_percent`, and `gpu_lease_directory` avoid stealing a busy GPU. Favor the defaults in shared environments. |
 | `training.epochs`, `optimizer`, `learning_rate` | `10`, `adam`, `0.001` | Optimizer accepts `adam`, `sgd`, or a Keras optimizer name. Lower the rate for unstable/large models. |
 | `training.display` | `rich` | `rich`, `text`, or `off`; display changes console output, not saved metrics. |
-| `callbacks.*` | early stopping/LR reduction off | Enable `early_stopping` and/or `reduce_lr_on_plateau`; use `early_stopping_patience` and `checkpoint_monitor` (normally `val_loss`). |
+| `callbacks.*` | early stopping/LR reduction off | Enable `early_stopping` and/or `reduce_lr_on_plateau`; use `early_stopping_patience` and `checkpoint_monitor` (normally `val_loss`). Early stopping first considers epoch N when patience is N, then waits N unimproved epochs before stopping. |
 | `recovery.*` | enabled, each epoch | Writes one rolling full-state snapshot. `save_every_epochs` must be positive. Keep enabled for long runs you may resume. |
 | `output.*` | checkpoints off; predictions/figures/SavedModel on | `save_checkpoints` retains each epoch; `save_predictions`, `save_figures`, and `export_savedmodel` trade disk space/portability for artifacts. |
 | `evaluation.segmentation_threshold` | `0.5` | Binary-mask decision threshold. Validate it on held-out data rather than assuming 0.5 is optimal. |

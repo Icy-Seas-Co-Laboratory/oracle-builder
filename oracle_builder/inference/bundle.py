@@ -40,12 +40,13 @@ from oracle_builder.inference.executor import (
 )
 from oracle_builder.saving.load_test import load_model_for_run, load_model_from_dir
 from oracle_builder.saving.save_model import read_stratification_manifest
+from oracle_builder.posthoc.head import load_posthoc_head, posthoc_output
 
 
 def _labels(config: dict[str, Any]) -> dict[int, dict[str, Any]]:
     return {
         int(row["class_index"]): dict(row)
-        for row in config.get("dataset", {}).get("labels", [])
+        for row in config.get("neural_labels", config.get("dataset", {}).get("labels", []))
     }
 
 
@@ -150,6 +151,7 @@ class InferenceBundle:
         evidence_index: IdentityEvidenceIndex | None = None,
         cluster_index: ClusterEvidenceIndex | None = None,
         strata: dict[int, "InferenceBundle"] | None = None,
+        posthoc_head: Any | None = None,
     ):
         self.model = model
         self.config = config
@@ -157,6 +159,7 @@ class InferenceBundle:
         self.evidence_index = evidence_index
         self.cluster_index = cluster_index
         self.strata = dict(strata or {})
+        self.posthoc_head = posthoc_head
         self._classification_executor = (
             ClassificationExecutor(model, tuple(config["data"]["input_shape"]))
             if model_reference.task in {"classification", "clustering"}
@@ -249,6 +252,7 @@ class InferenceBundle:
             reference,
             evidence_index=evidence,
             cluster_index=cluster_index,
+            posthoc_head=load_posthoc_head(run_dir) if reference.task == "classification" else None,
         )
 
     def predict(
@@ -751,6 +755,13 @@ class InferenceBundle:
                     query_uuid=(item.source.resource_id if item.source is not None else None),
                     top_k=int(self.config.get("clustering", {}).get("top_k", 5)),
                 )
+        if self.posthoc_head is not None:
+            fused = values.get("fused_embedding")
+            if fused is None:
+                raise ValueError("Post-hoc head requires the fused embedding output")
+            output["posthoc"] = posthoc_output(
+                self.posthoc_head, np.asarray(fused[batch_index])
+            )
         return output
 
     def _success_result(

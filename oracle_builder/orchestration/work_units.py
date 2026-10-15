@@ -124,6 +124,11 @@ def build_work_unit(
             raise ValueError("queue_execution must be an object")
         if raw_execution:
             action_parameters = {"queue_execution": dict(raw_execution)}
+        raw_posthoc = parameters.get("posthoc_fit")
+        if raw_posthoc is not None:
+            if not isinstance(raw_posthoc, Mapping) or action_parameters:
+                raise ValueError("posthoc_fit must be an object and cannot share a training policy")
+            action_parameters = {"posthoc_fit": dict(raw_posthoc)}
     return WorkUnit(
         work_unit_id=work_unit_id,
         attempt_id=attempt_id,

@@ -194,6 +194,19 @@ class InferenceRunRequest(BaseModel):
     shard_size: int | None = Field(default=1024, ge=1, le=100000)
 
 
+class PosthocRunRequest(BaseModel):
+    """Fit a separate classifier head to a sealed model and frozen dataset."""
+    model_config = ConfigDict(extra="forbid")
+    name: str = Field(min_length=1, max_length=240)
+    model_artifact_id: str
+    dataset_id: str
+    worker_pool_id: str
+    validation_split: float = Field(default=0.2, gt=0, lt=1)
+    test_split: float = Field(default=0.1, gt=0, lt=1)
+    split_strategy: str = "auto"
+    resources: dict[str, Any] = Field(default_factory=dict)
+
+
 class QueueStartRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     worker_pool_id: str
@@ -1661,6 +1674,32 @@ def create_app(
     @app.get("/v1/inference-runs")
     def inference_runs(limit: int = Query(default=100, ge=1, le=500)) -> dict[str, Any]:
         return {"inference_runs": orchestrator.inference_runs(limit=limit)}
+
+    @app.get("/v1/posthoc-runs")
+    def posthoc_runs(limit: int = Query(default=100, ge=1, le=500)) -> dict[str, Any]:
+        return {"posthoc_runs": orchestrator.posthoc_runs(limit=limit)}
+
+    @app.post("/v1/posthoc-runs", status_code=201)
+    def create_posthoc_run(body: PosthocRunRequest) -> dict[str, Any]:
+        try: return {"posthoc_run": orchestrator.create_posthoc_run(**body.model_dump())}
+        except KeyError as exc: raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except (OSError, ValueError) as exc: raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/v1/posthoc-runs/{posthoc_run_id}:start")
+    def start_posthoc_run(posthoc_run_id: str) -> dict[str, Any]:
+        try: return {"posthoc_run": orchestrator.start_posthoc_run(posthoc_run_id)}
+        except KeyError as exc: raise HTTPException(status_code=404, detail="Post-hoc run was not found") from exc
+        except ValueError as exc: raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/v1/posthoc-runs/{posthoc_run_id}:cancel")
+    def cancel_posthoc_run(posthoc_run_id: str) -> dict[str, Any]:
+        try: return {"posthoc_run": orchestrator.cancel_posthoc_run(posthoc_run_id)}
+        except KeyError as exc: raise HTTPException(status_code=404, detail="Post-hoc run was not found") from exc
+        except ValueError as exc: raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.get("/v1/posthoc-runs/{posthoc_run_id}")
+    def posthoc_run(posthoc_run_id: str) -> dict[str, Any]:
+        return {"posthoc_run": required(orchestrator.posthoc_run(posthoc_run_id), "Post-hoc run")}
 
     @app.post("/v1/inference-runs", status_code=201)
     def create_inference_run(body: InferenceRunRequest) -> dict[str, Any]:

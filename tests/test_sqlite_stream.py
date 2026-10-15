@@ -209,3 +209,34 @@ def test_streaming_evidence_and_predictions_are_disk_backed(tmp_path):
         assert connection.execute(
             "SELECT count(*) FROM predictions WHERE prediction_packet_json IS NOT NULL"
         ).fetchone()[0] == 8
+
+
+def test_streaming_predictions_include_posthoc_head_and_neural_prediction(tmp_path):
+    database = tmp_path / "classification.sqlite"
+    output = tmp_path / "predictions.sqlite"
+    create_synthetic_classification(database, n=5, shape=(12, 12, 1), classes=3)
+    config = stream_config()
+    source = SQLiteClassificationSource(database, config)
+    index = build_all_classification_index(database, config, labeled_only=False)
+    model = build_and_compile_model(config)
+
+    class Head:
+        classes_ = np.array([0, 1, 2])
+
+        def predict_proba(self, values):
+            return np.tile([[0.1, 0.2, 0.7]], (len(values), 1))
+
+    written = write_classification_predictions_streaming(
+        model, source.indexed_image_dataset(index, batch_size=2), index, config,
+        output, source_sqlite=database, prediction_set="stream", posthoc_head=Head(),
+        progress=False,
+    )
+    assert written == 5
+    with sqlite3.connect(output) as connection:
+        neural, result = connection.execute(
+            "SELECT y_prob_json, inference_result_json FROM predictions LIMIT 1"
+        ).fetchone()
+    import json
+
+    assert len(json.loads(neural)) == 3
+    assert json.loads(result)["output"]["posthoc"]["class_index"] == 2

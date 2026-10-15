@@ -2471,6 +2471,103 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
                     db.execute("UPDATE inference_runs SET status='cancelled',completed_at=?,updated_at=? WHERE inference_run_id=?", (_now(), _now(), inference_run_id))
         return self.inference_run(inference_run_id) or {}
 
+    def create_posthoc_run(
+        self, *, name: str, model_artifact_id: str, dataset_id: str,
+        worker_pool_id: str, validation_split: float = 0.2,
+        test_split: float = 0.1, split_strategy: str = "auto",
+        resources: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Seal a model-plus-dataset request without starting neural training."""
+        if not isinstance(name, str) or not (name := name.strip()) or len(name) > 240:
+            raise ValueError("Post-hoc run name must contain 1 to 240 characters")
+        if (not 0 < validation_split < 1 or not 0 < test_split < 1
+                or validation_split + test_split >= 1):
+            raise ValueError("Validation and test fractions must be positive and sum to less than one")
+        if split_strategy not in {"auto", "random", "source_partitions", "class_stratified", "stratified_group", "group_only"}:
+            raise ValueError("Unsupported split strategy")
+        artifact, dataset, pool = self.artifact(model_artifact_id), self.dataset(dataset_id), self.worker_pool(worker_pool_id)
+        if artifact is None: raise KeyError("Model artifact was not found")
+        if dataset is None: raise KeyError("Dataset was not found")
+        if pool is None: raise KeyError("Worker pool was not found")
+        if artifact.get("task") != "classification" or artifact.get("artifact_type") not in {"model_run", "model_product"}:
+            raise ValueError("Post-hoc fitting requires a classification model artifact")
+        if artifact.get("lifecycle") != "sealed" or artifact.get("status") != "complete":
+            raise ValueError("Post-hoc fitting requires a sealed, complete model")
+        if dataset.get("lifecycle") != "frozen" or dataset.get("dataset_type") != "classification":
+            raise ValueError("Post-hoc fitting requires a frozen classification dataset")
+        if not pool["enabled"] or "train" not in set(pool["allowed_actions"]):
+            raise ValueError("Worker pool is not enabled for train work")
+        model_ref = self._model_artifact_ref_for_inference(artifact)
+        from oracle_builder.orchestration.storage import artifact_ref_for_file
+        input_ref = artifact_ref_for_file("dataset", dataset_id, dataset["path"], revision=str(dataset.get("revision_id") or "frozen"))
+        self.artifact_store.ingest_file(input_ref, dataset["path"])
+        self.record_artifact_replica(input_ref)
+        parameters = {
+            "name": name, "validation_split": validation_split,
+            "test_split": test_split, "split_strategy": split_strategy,
+        }
+        run_id, attempt_id, now = str(uuid.uuid4()), str(uuid.uuid4()), _now()
+        unit = build_work_unit(
+            work_unit_id=run_id, attempt_id=attempt_id, specification_id=run_id, action="train",
+            parameters={"artifact_inputs": {"model": model_ref.to_dict(), "input": input_ref.to_dict()}, "posthoc_fit": parameters},
+            resources=dict(resources or {}), require_portable=True,
+        )
+        with self._connection() as db:
+            db.execute("""INSERT INTO posthoc_runs(posthoc_run_id,name,model_artifact_id,dataset_id,parameters_json,
+                resources_json,worker_pool_id,work_unit_json,work_unit_sha256,status,created_at,updated_at)
+                VALUES(?,?,?,?,?,?,?,?,?,'ready',?,?)""", (
+                run_id, name, model_artifact_id, dataset_id, _json(parameters), _json(resources or {}),
+                worker_pool_id, unit.canonical_json(), unit.sha256, now, now,
+            ))
+        return self.posthoc_run(run_id) or {}
+
+    def posthoc_run(self, posthoc_run_id: str) -> dict[str, Any] | None:
+        with self._connection() as db:
+            row = db.execute("""SELECT posthoc_runs.*, jobs.status AS job_status, jobs.error AS job_error
+                FROM posthoc_runs LEFT JOIN jobs USING(job_id) WHERE posthoc_run_id=?""", (posthoc_run_id,)).fetchone()
+        return _row(row)
+
+    def posthoc_runs(self, *, limit: int = 100) -> list[dict[str, Any]]:
+        with self._connection() as db:
+            rows = db.execute("""SELECT posthoc_runs.*, jobs.status AS job_status, jobs.error AS job_error
+                FROM posthoc_runs LEFT JOIN jobs USING(job_id) ORDER BY posthoc_runs.created_at DESC LIMIT ?""", (limit,)).fetchall()
+        return [_row(row) for row in rows if row is not None]
+
+    def start_posthoc_run(self, posthoc_run_id: str) -> dict[str, Any]:
+        now = _now()
+        with self._connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT * FROM posthoc_runs WHERE posthoc_run_id=?", (posthoc_run_id,)).fetchone()
+            if row is None: raise KeyError(posthoc_run_id)
+            if row["status"] != "ready": raise ValueError("Only ready post-hoc runs can be started")
+            pool = db.execute("SELECT * FROM worker_pools WHERE pool_id=?", (row["worker_pool_id"],)).fetchone()
+            if pool is None or not pool["enabled"] or "train" not in set(json.loads(pool["allowed_actions_json"])):
+                raise ValueError("Worker pool is not enabled for train work")
+            db.execute("""INSERT INTO jobs(job_id,specification_id,oracle_serve_url,action,parameters_json,resources_json,
+                work_unit_json,work_unit_sha256,worker_pool_id,status,remote_status,worker_id,error,submitted_at,updated_at,completed_at)
+                VALUES(?,NULL,?,'train',?,?,?,?,?,'queued',NULL,NULL,NULL,?,?,NULL)""", (
+                posthoc_run_id, f"pull://{row['worker_pool_id']}", _json({}), row["resources_json"],
+                row["work_unit_json"], row["work_unit_sha256"], row["worker_pool_id"], now, now,
+            ))
+            db.execute("UPDATE posthoc_runs SET job_id=?,status='queued',started_at=?,updated_at=? WHERE posthoc_run_id=?",
+                       (posthoc_run_id, now, now, posthoc_run_id))
+        self._record_event(posthoc_run_id, "queued", "Post-hoc fit queued for pull workers", {"pool_id": row["worker_pool_id"]})
+        return self.posthoc_run(posthoc_run_id) or {}
+
+    def cancel_posthoc_run(self, posthoc_run_id: str) -> dict[str, Any]:
+        run = self.posthoc_run(posthoc_run_id)
+        if run is None: raise KeyError(posthoc_run_id)
+        if run["status"] == "ready":
+            with self._connection() as db:
+                db.execute("UPDATE posthoc_runs SET status='cancelled',completed_at=?,updated_at=? WHERE posthoc_run_id=?", (_now(), _now(), posthoc_run_id))
+            return self.posthoc_run(posthoc_run_id) or {}
+        if run.get("job_id"):
+            job = self.request_pull_job_cancellation(str(run["job_id"]))
+            if job["status"] == "cancelled":
+                with self._connection() as db:
+                    db.execute("UPDATE posthoc_runs SET status='cancelled',completed_at=?,updated_at=? WHERE posthoc_run_id=?", (_now(), _now(), posthoc_run_id))
+        return self.posthoc_run(posthoc_run_id) or {}
+
     def enqueue_specification_for_pool(self, specification_id: str, pool_id: str) -> dict[str, Any]:
         with self._connection() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -3285,7 +3382,10 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
                         published_model_artifact_id = str(uuid.UUID(str(manifest["artifact_id"])))
                     except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
                         raise ValueError(f"Staged training artifact has no valid identity: {exc}") from exc
-                    output_ref = ArtifactRef("model_run", published_model_artifact_id, revision=str(lease["output_attempt_id"]))
+                    output_ref = ArtifactRef(
+                        "model_product" if manifest.get("artifact_type") == "model_product" else "model_run",
+                        published_model_artifact_id, revision=str(lease["output_attempt_id"]),
+                    )
                 elif is_inference_result:
                     try:
                         manifest = json.loads((self.artifact_store.staging_path(staging) / "artifact.json").read_text(encoding="utf-8"))
@@ -3330,11 +3430,16 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
                 elif is_inference_result:
                     db.execute("""UPDATE inference_runs SET status='completed',output_ref_json=?,completed_at=?,updated_at=?
                         WHERE job_id=?""", (_json(output_ref.to_dict()) if output_ref else None, now, now, job["job_id"]))
+                if job["action"] == "train" and sealed_unit.get("parameters", {}).get("posthoc_fit"):
+                    db.execute("""UPDATE posthoc_runs SET status='completed',output_artifact_id=?,completed_at=?,updated_at=?
+                        WHERE job_id=?""", (published_model_artifact_id, now, now, job["job_id"]))
                 self._finish_execution_attempt_in_connection(db, lease_id, status="completed", classification="success", error=None, now=now, output_ref=output_ref)
             else:
                 db.execute("UPDATE jobs SET status='failed',remote_status='failed',completed_at=?,error=?,updated_at=? WHERE job_id=?", (now, message, now, job["job_id"]))
                 if job["action"] == "infer":
                     db.execute("UPDATE inference_runs SET status='failed',error=?,completed_at=?,updated_at=? WHERE job_id=?", (message, now, now, job["job_id"]))
+                if job["action"] == "train" and sealed_unit.get("parameters", {}).get("posthoc_fit"):
+                    db.execute("UPDATE posthoc_runs SET status='failed',error=?,completed_at=?,updated_at=? WHERE job_id=?", (message, now, now, job["job_id"]))
                 # A worker-reported failure is scientific/action failure; it
                 # never consumes the infrastructure-only retry path.
                 self._finish_execution_attempt_in_connection(db, lease_id, status="failed", classification="scientific", error=message, now=now)
@@ -3371,6 +3476,9 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
                 db.execute("UPDATE run_specifications SET status='indexed',artifact_id=?,updated_at=? WHERE specification_id=?", (published_model_artifact_id, now, job["specification_id"]))
                 if job["queued_run_id"]:
                     db.execute("UPDATE queued_runs SET status='indexed',updated_at=? WHERE queued_run_id=?", (now, job["queued_run_id"]))
+                if sealed_unit.get("parameters", {}).get("posthoc_fit"):
+                    db.execute("UPDATE posthoc_runs SET status='indexed',output_artifact_id=?,updated_at=? WHERE job_id=?",
+                               (published_model_artifact_id, now, job["job_id"]))
                 if sealed_unit.get('schema', {}).get('version') == 2:
                     db.execute("UPDATE execution_runs SET status='indexed',updated_at=? WHERE run_id=?", (now, sealed_unit['run_id']))
             self._record_event(str(job["job_id"]), "artifact_indexed", "Published training artifact was indexed", {"artifact_id": published_model_artifact_id})
@@ -4865,6 +4973,8 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
             raise KeyError(artifact_id)
         root = Path(artifact["path"])
         result = self._artifact_result(artifact)
+        posthoc = self._json_file(root / "model" / "posthoc" / "report.json")
+        resolved_config = self._json_file(root / "config" / "resolved.json")
         confusion: dict[str, Any] | None = None
         try:
             loaded = json.loads((root / "evaluation" / "confusion_matrix.json").read_text(encoding="utf-8"))
@@ -4900,6 +5010,8 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
 
         return {
             "artifact": result,
+            "posthoc": posthoc,
+            "posthoc_config": resolved_config.get("posthoc") if isinstance(resolved_config, dict) else None,
             "classification": {
                 "confusion_matrix": confusion,
                 "per_class_metrics": per_class,
@@ -5068,7 +5180,8 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
         rows = self._evidence_csv(root / "metrics" / "history.csv", limit=limit)
         columns = list(rows[0]) if rows else []
         return {"artifact_id": artifact_id, "rows": rows, "columns": columns, "limit": limit,
-                "truncated": len(rows) == limit and (root / "metrics" / "history.csv").is_file()}
+                "truncated": len(rows) == limit and (root / "metrics" / "history.csv").is_file(),
+                "provenance": self._json_file(root / "metrics" / "provenance.json")}
 
     def artifact_detail(self, artifact_id: str) -> dict[str, Any]:
         """Read-only inspector payload for a sealed artifact; all large media stays separate."""
@@ -5084,11 +5197,64 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
         runtime = self._json_file(root / "provenance" / "runtime.json")
         config = self._json_file(root / "config" / "resolved.json")
         contract = self._json_file(root / "model" / "contract.json")
+        inspection = self._json_file(root / "model" / "inspection.json")
+        if inspection is None:
+            inspection = self._legacy_model_inspection(root / "model", model_summary)
+        posthoc = self._json_file(root / "model" / "posthoc" / "report.json")
         return {"artifact": self._artifact_result(artifact), "facts": self._artifact_facts(artifact_id), "manifest": artifact["manifest"],
-                "runtime": runtime, "config": config, "model_contract": contract,
+                "runtime": runtime, "config": config, "model_contract": contract, "model_inspection": inspection, "posthoc": posthoc,
+                "history_provenance": self._json_file(root / "metrics" / "provenance.json"),
+                "source_neural_evaluation": self._json_file(root / "provenance" / "source_model" / "evaluation" / "evaluation_summary.json"),
+                "source_posthoc": self._json_file(root / "provenance" / "source_model" / "posthoc" / "report.json"),
                 "architecture": {"summary": model_summary, "available": model_summary is not None},
                 "history_url": f"/api/v1/artifacts/{artifact_id}/history",
                 "evidence_url": f"/api/v1/artifacts/{artifact_id}/evidence"}
+
+    @staticmethod
+    def _legacy_model_inspection(model_dir: Path, summary: str | None) -> dict[str, Any] | None:
+        """Read counts and layer settings from older sealed Keras artifacts."""
+        inspection: dict[str, Any] = {}
+        if summary:
+            for label, field in (
+                ("Total params", "parameter_count"),
+                ("Trainable params", "trainable_parameter_count"),
+                ("Non-trainable params", "non_trainable_parameter_count"),
+            ):
+                match = re.search(rf"{re.escape(label)}:\s*([\d,]+)", summary, flags=re.IGNORECASE)
+                if match:
+                    inspection[field] = int(match.group(1).replace(",", ""))
+            trainable = inspection.get("trainable_parameter_count")
+            non_trainable = inspection.get("non_trainable_parameter_count")
+            total = inspection.get("parameter_count")
+            if isinstance(trainable, int) and isinstance(non_trainable, int):
+                model_total = trainable + non_trainable
+                if isinstance(total, int) and total > model_total:
+                    inspection["optimizer_parameter_count"] = total - model_total
+                    inspection["parameter_count"] = model_total
+        keras_path = model_dir / "final.keras"
+        try:
+            with zipfile.ZipFile(keras_path) as archive:
+                info = archive.getinfo("config.json")
+                if info.file_size > 5_000_000:
+                    return inspection or None
+                config = json.loads(archive.read(info))
+            layers = (config.get("config") or {}).get("layers") or []
+            if isinstance(layers, list):
+                inspection["layer_count"] = len(layers)
+                inspection["layers"] = [
+                    {
+                        "name": layer_config.get("name"),
+                        "class_name": layer.get("class_name"),
+                        **{key: layer_config[key] for key in ("filters", "kernel_size", "strides", "units") if key in layer_config},
+                    }
+                    for layer in layers
+                    if isinstance(layer, dict)
+                    for layer_config in [layer.get("config") or {}]
+                    if isinstance(layer_config, dict)
+                ]
+        except (OSError, KeyError, ValueError, zipfile.BadZipFile, json.JSONDecodeError):
+            pass
+        return inspection or None
 
     @staticmethod
     def _comparison_check(results: list[dict[str, Any]]) -> dict[str, Any]:

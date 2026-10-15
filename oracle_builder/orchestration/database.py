@@ -142,6 +142,26 @@ CREATE TABLE IF NOT EXISTS inference_runs (
 );
 CREATE INDEX IF NOT EXISTS inference_runs_status_idx ON inference_runs(status, created_at DESC);
 CREATE INDEX IF NOT EXISTS inference_runs_model_idx ON inference_runs(model_artifact_id, created_at DESC);
+CREATE TABLE IF NOT EXISTS posthoc_runs (
+  posthoc_run_id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  model_artifact_id TEXT NOT NULL REFERENCES artifacts(artifact_id),
+  dataset_id TEXT NOT NULL REFERENCES datasets(dataset_id),
+  parameters_json TEXT NOT NULL,
+  resources_json TEXT NOT NULL,
+  worker_pool_id TEXT NOT NULL REFERENCES worker_pools(pool_id),
+  work_unit_json TEXT NOT NULL,
+  work_unit_sha256 TEXT NOT NULL,
+  job_id TEXT UNIQUE REFERENCES jobs(job_id) ON DELETE SET NULL,
+  status TEXT NOT NULL,
+  output_artifact_id TEXT,
+  error TEXT,
+  created_at TEXT NOT NULL,
+  started_at TEXT,
+  completed_at TEXT,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS posthoc_runs_model_idx ON posthoc_runs(model_artifact_id, created_at DESC);
 CREATE TABLE IF NOT EXISTS training_catalog_entries (
   catalog_id TEXT PRIMARY KEY, root_id TEXT NOT NULL, name TEXT NOT NULL,
   path TEXT NOT NULL, source_type TEXT NOT NULL, fingerprint_sha256 TEXT,

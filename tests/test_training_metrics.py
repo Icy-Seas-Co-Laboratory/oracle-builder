@@ -10,6 +10,7 @@ from oracle_builder.evaluation.classification import classification_epoch_metric
 from oracle_builder.training.logging_callbacks import (
     ClassificationEpochMetricsLogger,
     JSONLMetricLogger,
+    _confusion_summary,
 )
 from oracle_builder.training.metrics import BinaryDice, SparseCategoricalMacroF1
 
@@ -49,6 +50,24 @@ def test_sparse_categorical_macro_f1_accumulates_one_confusion_matrix_across_bat
     assert float(metric.result()) == 0.0
 
 
+def test_training_decision_metrics_use_the_epoch_confusion_matrix():
+    values = _confusion_summary(np.array([[2, 1], [0, 1]]))
+    assert values["micro_f1"] == 0.75
+    assert values["macro_precision"] == (1.0 + 0.5) / 2
+    assert values["macro_recall"] == (2 / 3 + 1.0) / 2
+    assert np.isclose(values["weighted_f1"], ((0.8 * 3) + (2 / 3)) / 4)
+
+
+def test_epoch_logger_adds_training_confusion_metrics_to_keras_logs(tmp_path):
+    inputs = np.array([[1.0, 0.0], [0.0, 1.0], [0.8, 0.2], [0.2, 0.8]], dtype="float32")
+    labels = np.array([0, 1, 0, 1], dtype="int64")
+    model = keras.Sequential([keras.Input(shape=(2,)), keras.layers.Dense(2, activation="softmax")])
+    model.compile(optimizer="sgd", loss="sparse_categorical_crossentropy", metrics=["accuracy", SparseCategoricalMacroF1(2)])
+    logger = ClassificationEpochMetricsLogger(tmp_path / "training.sqlite", "run", {}, {0: "a", 1: "b"})
+    history = model.fit(inputs, labels, epochs=1, batch_size=2, callbacks=[logger], verbose=0)
+    assert {"macro_precision", "macro_recall", "weighted_f1", "micro_f1", "cohen_kappa"} <= history.history.keys()
+
+
 def test_epoch_classification_records_include_summary_and_per_class_metrics():
     records = classification_epoch_metric_records(
         np.array([0, 1, 1]),
@@ -85,7 +104,12 @@ def test_epoch_classification_logger_writes_validation_only(tmp_path):
         log_path, "run-1", datasets, {0: "copepod", 1: "diatom"}
     )
     callback.set_model(model)
-    callback.on_epoch_end(0)
+    logs = {"accuracy": 0.75, "loss": 0.4}
+    callback.on_epoch_end(0, logs)
+    assert logs["micro_f1"] == 0.75
+    assert logs["val_micro_f1"] == 1.0
+    assert logs["val_macro_f1"] == 1.0
+    assert "val_log_loss" in logs
 
     rows = [
         json.loads(line)

@@ -102,6 +102,11 @@ class ClassificationExecutor:
                     if outputs.get("features") is not None
                     else None
                 ),
+                "fused_embedding": (
+                    np.asarray(outputs["fused_embedding"])
+                    if outputs.get("fused_embedding") is not None
+                    else None
+                ),
                 "logits_source": str(outputs.get("logits_source", "model")),
             }
         probabilities = np.asarray(outputs)
@@ -114,6 +119,7 @@ class ClassificationExecutor:
             "logits": np.log(np.clip(probabilities, 1e-7, 1.0)).astype("float32"),
             "probabilities": probabilities,
             "features": features,
+            "fused_embedding": features,
             "logits_source": "derived_log_probability",
         }
 

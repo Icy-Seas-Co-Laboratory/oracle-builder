@@ -20,6 +20,7 @@ from oracle_builder.evaluation.segmentation_targets import CANDIDATE_DELTA, reco
 from oracle_builder.inference.contracts import ArrayPayload
 from oracle_builder.data.tiling import group_and_reassemble
 from oracle_builder.progress import BatchProgress
+from oracle_builder.posthoc.head import posthoc_output
 
 
 def init_predictions_db(
@@ -221,6 +222,7 @@ def write_predictions_db(
     prediction_set: str = "default",
     evidence_index: IdentityEvidenceIndex | None = None,
     inference_batch_size: int | None = None,
+    posthoc_head: Any | None = None,
 ) -> None:
     task = config["run"]["task"]
     if task == "segmentation":
@@ -250,6 +252,7 @@ def write_predictions_db(
         features = classification_outputs["features"]
         logits = classification_outputs["logits"]
         logits_source = str(classification_outputs["logits_source"])
+        fused_embeddings = classification_outputs.get("fused_embedding")
     connection = init_predictions_db(sqlite_path, source_sqlite=source_sqlite)
     _prediction_set_id, result_set_id = _upsert_prediction_set(
         connection, prediction_set, config
@@ -270,6 +273,12 @@ def write_predictions_db(
             "overlap_fraction": float(config.get("tiling", {}).get("overlap_fraction", 0.0)),
             "blend_mode": config.get("tiling", {}).get("blend_mode", "uniform"),
         }
+        posthoc = None
+        if task == "classification" and posthoc_head is not None:
+            if fused_embeddings is None:
+                raise ValueError("Post-hoc head requires the fused embedding output")
+            posthoc = posthoc_output(posthoc_head, fused_embeddings[record_index])
+            prediction_metadata["prediction"]["posthoc"] = posthoc
         if true_value is None:
             y_true_blob = None
             true_encoding = None
@@ -399,6 +408,7 @@ def write_predictions_db(
                                 np.asarray(logit_values, dtype="float32")
                             ).sha256,
                             "output_sha256": output_payload.sha256,
+                            **({"posthoc": posthoc} if posthoc is not None else {}),
                         },
                     },
                     sort_keys=True,
@@ -458,6 +468,7 @@ def write_classification_predictions_streaming(
     prediction_set: str,
     evidence_index: IdentityEvidenceIndex | None = None,
     progress: bool = True,
+    posthoc_head: Any | None = None,
 ) -> int:
     connection = init_predictions_db(sqlite_path, source_sqlite=source_sqlite)
     _prediction_set_id, result_set_id = _upsert_prediction_set(
@@ -478,12 +489,17 @@ def write_classification_predictions_streaming(
         logits = np.asarray(outputs["logits"], dtype="float32")
         probabilities = np.asarray(outputs["probabilities"])
         features = np.asarray(outputs["features"], dtype="float32")
-        for position, probability, logit_values, feature in zip(
-            np.asarray(positions, dtype="int64"),
-            probabilities,
-            logits,
-            features,
-            strict=True,
+        fused_embeddings = outputs.get("fused_embedding")
+        if posthoc_head is not None and fused_embeddings is None:
+            raise ValueError("Post-hoc head requires the fused embedding output")
+        for batch_position, (position, probability, logit_values, feature) in enumerate(
+            zip(
+                np.asarray(positions, dtype="int64"),
+                probabilities,
+                logits,
+                features,
+                strict=True,
+            )
         ):
             ref = sample_index.refs[int(position)]
             pred_class = int(np.argmax(probability))
@@ -505,6 +521,12 @@ def write_classification_predictions_streaming(
                 ),
                 "streaming": True,
             }
+            posthoc = (
+                posthoc_output(posthoc_head, np.asarray(fused_embeddings)[batch_position])
+                if posthoc_head is not None else None
+            )
+            if posthoc is not None:
+                metadata["prediction"]["posthoc"] = posthoc
             connection.execute(
                 """
                 INSERT OR REPLACE INTO predictions (
@@ -574,6 +596,7 @@ def write_classification_predictions_streaming(
                                 "logits_source": "model",
                                 "logits": [float(value) for value in logit_values],
                                 "output_sha256": output_payload.sha256,
+                                **({"posthoc": posthoc} if posthoc is not None else {}),
                             },
                         },
                         sort_keys=True,

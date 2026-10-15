@@ -175,6 +175,24 @@ def save_model_artifacts(
     if not model_path.is_absolute():
         model_path = Path(run_dir) / model_path
     model_path.mkdir(parents=True, exist_ok=True)
+    inspection = {
+        "name": model.name,
+        "framework": "Keras / TensorFlow",
+        "parameter_count": int(model.count_params()),
+        "trainable_parameter_count": int(sum(tf.size(weight).numpy() for weight in model.trainable_weights)),
+        "non_trainable_parameter_count": int(sum(tf.size(weight).numpy() for weight in model.non_trainable_weights)),
+        "layer_count": len(model.layers),
+        "layers": [
+            {
+                "name": layer.name,
+                "class_name": layer.__class__.__name__,
+                "trainable": bool(layer.trainable),
+                **{key: getattr(layer, key) for key in ("filters", "kernel_size", "strides", "units") if hasattr(layer, key)},
+            }
+            for layer in model.layers
+        ],
+    }
+    (model_path / "inspection.json").write_text(json.dumps(inspection, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     report: dict[str, Any] = {
         "final_keras_saved": False,
         "weights_saved": False,

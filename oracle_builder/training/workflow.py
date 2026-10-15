@@ -763,6 +763,10 @@ def _run_training(request: TrainingRequest) -> int:
         from oracle_builder.progress import PostTrainingProgress
 
         post_stage_count = 6
+        if config["run"]["task"] == "classification":
+            post_stage_count += 1  # Representation artifacts.
+            if config.get("posthoc", {}).get("enabled", False):
+                post_stage_count += 1
         if config["run"]["task"] == "classification" and config.get(
             "evidence", {}
         ).get("enabled", True):
@@ -771,7 +775,13 @@ def _run_training(request: TrainingRequest) -> int:
             post_stage_count += 1
         if config.get("output", {}).get("save_predictions", True):
             post_stage_count += 1
-        post_progress = PostTrainingProgress(post_stage_count)
+        post_progress = PostTrainingProgress(
+            post_stage_count,
+            status_path=run_dir / "training-status.json",
+            completed_epochs=completed if args.finalize_only else None,
+            planned_epochs=total_epochs,
+            stopped_early=finalize_stopped_early,
+        )
 
         with post_progress.stage("Rendering training-history figures"):
             plot_history(history, run_dir)
@@ -810,6 +820,7 @@ def _run_training(request: TrainingRequest) -> int:
                         progress=bool(
                             config.get("inference", {}).get("progress", True)
                         ),
+                        progress_callback=post_progress.update_items,
                     )
                     evidence_reference_count = len(evidence_sample_index)
                 else:
@@ -870,6 +881,7 @@ def _run_training(request: TrainingRequest) -> int:
         with post_progress.stage("Saving portable model formats and manifests"):
             save_report = save_model_artifacts(model, run_dir, config)
         representation_artifacts = None
+        posthoc_report = None
         if config["run"]["task"] == "classification":
             with post_progress.stage("Writing memory-bounded representation artifacts"):
                 from oracle_builder.artifacts.representations import (
@@ -916,6 +928,12 @@ def _run_training(request: TrainingRequest) -> int:
                         "Wrote representation artifacts",
                         representation_artifacts,
                     )
+            if config.get("posthoc", {}).get("enabled", False):
+                with post_progress.stage("Tuning post-hoc classifier on validation embeddings"):
+                    from oracle_builder.posthoc.training import train_posthoc_classifier
+
+                    posthoc_report = train_posthoc_classifier(model, args.input, config, run_dir)
+                    log_event(training_log, run_id, "INFO", "Trained post-hoc classifier", posthoc_report)
         with post_progress.stage("Reloading and testing saved model formats"):
             load_report = run_load_tests(run_dir, config, save_report)
             write_load_test_report(run_dir, load_report)
@@ -935,6 +953,9 @@ def _run_training(request: TrainingRequest) -> int:
 
             plot_classification_roi_size_metrics(run_dir)
         if config.get("output", {}).get("save_predictions", True):
+            from oracle_builder.posthoc.head import load_posthoc_head
+
+            posthoc_head = load_posthoc_head(run_dir) if posthoc_report else None
             with post_progress.stage(
                 "Generating and storing predictions for every dataset split"
             ):
@@ -966,6 +987,7 @@ def _run_training(request: TrainingRequest) -> int:
                         source_sqlite=args.input,
                         prediction_set=args.output,
                         evidence_index=evidence_index,
+                        posthoc_head=posthoc_head,
                         progress=bool(
                             config.get("inference", {}).get("progress", True)
                         ),
@@ -984,6 +1006,7 @@ def _run_training(request: TrainingRequest) -> int:
                         source_sqlite=args.input,
                         prediction_set=args.output,
                         evidence_index=evidence_index,
+                        posthoc_head=posthoc_head,
                         inference_batch_size=inference_batch_size,
                     )
         summary = {
@@ -992,16 +1015,21 @@ def _run_training(request: TrainingRequest) -> int:
         }
         if representation_artifacts is not None:
             summary["representation_artifacts"] = representation_artifacts
+        if posthoc_report is not None:
+            summary["posthoc"] = posthoc_report
         if threshold_analysis is not None:
             summary["validation_threshold_analysis"] = {
                 key: value for key, value in threshold_analysis.items() if key != "curve"
             }
-        with post_progress.stage("Finalizing and sealing the run artifact"):
+        # The status file is part of the sealed artifact; do not mutate it
+        # after sealing completes.
+        with post_progress.stage("Finalizing and sealing the run artifact", publish_completion=False):
             from oracle_builder.training.recovery import clear_recovery_snapshot
 
             clear_recovery_snapshot(run_dir)
             mark_run_complete(training_log, run_id, "complete")
             update_run_artifact(run_dir, status="complete", summary=summary)
+            post_progress.complete_current()
             seal_run_artifact(run_dir)
         print(f"Training run complete: {run_dir}", flush=True)
         return 0

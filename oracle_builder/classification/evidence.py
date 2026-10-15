@@ -219,6 +219,7 @@ def build_evidence_index_streaming(
     path: str | Path,
     *,
     progress: bool = True,
+    progress_callback=None,
 ) -> IdentityEvidenceIndex:
     """Build an evidence index without retaining decoded source images."""
     feature_model = build_feature_model(model)
@@ -246,6 +247,7 @@ def build_evidence_index_streaming(
         len(sample_index),
         enabled=progress,
     )
+    processed = 0
     for images, positions in dataset:
         outputs = feature_model(images, training=False)
         batch_features = np.asarray(outputs["features"], dtype="float32")
@@ -258,6 +260,9 @@ def build_evidence_index_streaming(
             prototype_sums[int(label)] += selected.sum(axis=0)
             prototype_counts[int(label)] += len(selected)
         display.update(len(position_values))
+        processed += len(position_values)
+        if progress_callback is not None:
+            progress_callback(processed, len(sample_index))
     display.close()
     prototypes = np.stack(
         [

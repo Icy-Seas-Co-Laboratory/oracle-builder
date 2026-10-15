@@ -35,13 +35,16 @@ class _CallbackStateRestorer(keras.callbacks.Callback):
         if self.early is not None:
             saved = self.state.get("early_stopping", {})
             if isinstance(saved, dict):
-                for name in ("wait", "stopped_epoch", "best_epoch"):
-                    if name in saved:
-                        setattr(self.early, name, int(saved[name]))
-                if saved.get("best") is not None:
-                    self.early.best = float(saved["best"])
-                if saved.get("best_weights") is not None:
-                    self.early.best_weights = saved["best_weights"]
+                # An older checkpoint may contain a best score from the new
+                # warmup period. It must not become the stopping baseline.
+                if saved.get("best") is None or int(saved.get("best_epoch", 0)) >= self.early.start_from_epoch:
+                    for name in ("wait", "stopped_epoch", "best_epoch"):
+                        if name in saved:
+                            setattr(self.early, name, int(saved[name]))
+                    if saved.get("best") is not None:
+                        self.early.best = float(saved["best"])
+                    if saved.get("best_weights"):
+                        self.early.best_weights = saved["best_weights"]
         if self.reduce_lr is not None:
             saved = self.state.get("reduce_lr_on_plateau", {})
             if isinstance(saved, dict):
@@ -103,11 +106,15 @@ def build_callbacks(
     early_stopping = None
     reduce_lr = None
     if callback_config.get("early_stopping", False):
+        patience = int(callback_config.get("early_stopping_patience", 5))
         early_stopping = keras.callbacks.EarlyStopping(
             monitor=monitor,
-            patience=int(callback_config.get("early_stopping_patience", 5)),
+            patience=patience,
             baseline=callback_config.get("early_stopping_baseline"),
             restore_best_weights=True,
+            # User-facing epochs are one-based: patience=18 first observes
+            # epoch 18 (Keras epoch index 17), then waits for non-improvement.
+            start_from_epoch=max(0, patience - 1),
         )
         callbacks.append(early_stopping)
     if callback_config.get("reduce_lr_on_plateau", False):

@@ -466,9 +466,9 @@ _EXTRA_FIELDS: tuple[FieldSpec, ...] = (
         help="Filter scale used by the selected blur, Laplacian, or local-contrast channel.",
     ),
     FieldSpec("output.prediction_commit_batches", "integer", 20, minimum=1, advanced=True),
-    FieldSpec("posthoc.enabled", "boolean", False, advanced=True),
-    FieldSpec("posthoc.representation", "enum", "fused_embedding", choices=("fused_embedding",), advanced=True),
-    FieldSpec("posthoc.estimator", "enum", "logistic_regression", choices=("logistic_regression",), advanced=True),
+    FieldSpec("posthoc.enabled", "boolean", False, advanced=True, help="After neural training, fit a separate classifier on training embeddings and evaluate it on held-out data."),
+    FieldSpec("posthoc.representation", "enum", "fused_embedding", choices=("fused_embedding",), advanced=True, help="Neural feature vector used by the downstream classifier."),
+    FieldSpec("posthoc.estimator", "enum", "logistic_regression", choices=("logistic_regression",), advanced=True, help="Logistic regression regularization is selected using validation macro F1; the test split is used only for final scoring."),
     FieldSpec("metadata.fields[].transform", "enum", "identity", choices=("identity", "log1p", "sqrt"), help="Per-field transform applied before fitting metadata scaling."),
     *(
         FieldSpec(

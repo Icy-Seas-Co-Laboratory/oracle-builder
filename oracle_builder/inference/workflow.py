@@ -167,6 +167,8 @@ def run_inference(request: InferenceRequest, *, progress: Callable[[str, str, Ma
         raise ValueError("inference requires a sealed, completed model artifact")
     report("inference_loading", "Loading sealed model artifact", {"model_artifact_id": model_manifest.get("artifact_id")})
     config = read_run_config(run_dir)
+    from oracle_builder.posthoc.head import load_posthoc_head
+    posthoc_head = load_posthoc_head(run_dir) if config["run"]["task"] == "classification" else None
     model = load_model_for_run(run_dir, config)
     evidence_path = run_dir / "model" / "classification_evidence"
     if not evidence_path.exists():
@@ -194,7 +196,7 @@ def run_inference(request: InferenceRequest, *, progress: Callable[[str, str, Ma
                 raise ValueError(f"inference shard item ids are unavailable for this sealed input: {sorted(missing)[:3]}")
             index.refs = [ref for ref in index.refs if ref.item_id in selected_ids]
         source = SQLiteClassificationSource(input_path, config)
-        written = write_classification_predictions_streaming(model, source.indexed_image_dataset(index, batch_size=batch_size), index, config, prediction_path, source_sqlite=input_path, prediction_set=prediction_set, evidence_index=evidence_index, progress=bool(config.get("inference", {}).get("progress", True)))
+        written = write_classification_predictions_streaming(model, source.indexed_image_dataset(index, batch_size=batch_size), index, config, prediction_path, source_sqlite=input_path, prediction_set=prediction_set, evidence_index=evidence_index, progress=bool(config.get("inference", {}).get("progress", True)), posthoc_head=posthoc_head)
     else:
         x, targets, records = load_prediction_arrays(input_path, config, split=selected_split)
         if request.shard_item_ids is not None:
@@ -205,7 +207,7 @@ def run_inference(request: InferenceRequest, *, progress: Callable[[str, str, Ma
             x = x[positions]
             targets = [targets[index] for index in positions]
             records = [records[index] for index in positions]
-        write_predictions_db(model, x, targets, records, config, prediction_path, source_sqlite=input_path, prediction_set=prediction_set, evidence_index=evidence_index, inference_batch_size=batch_size)
+        write_predictions_db(model, x, targets, records, config, prediction_path, source_sqlite=input_path, prediction_set=prediction_set, evidence_index=evidence_index, inference_batch_size=batch_size, posthoc_head=posthoc_head)
         written = len(records)
     actual_ids = _prediction_item_ids(prediction_path, prediction_set)
     _write_shard_manifest(output, request, actual_ids)

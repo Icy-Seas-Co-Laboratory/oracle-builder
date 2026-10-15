@@ -219,7 +219,9 @@ def test_segment_restores_stateful_callback_continuation(tmp_path):
         layout.root, config, artifact_id=artifact_id, run_id=run_id
     )
     callback_state = read_recovery_callback_state(layout.root, state)
-    assert callback_state["early_stopping"]["best_weights"]
+    # Patience also defines the warmup: epoch 1 must not seed a stopping
+    # baseline when monitoring begins at epoch 20.
+    assert callback_state["early_stopping"]["best_weights"] == []
     assert "reduce_lr_on_plateau" in callback_state
     # A second segment loads the counters and weight snapshot rather than
     # silently restarting callback-managed behavior.

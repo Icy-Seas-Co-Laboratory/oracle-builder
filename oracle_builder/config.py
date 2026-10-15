@@ -649,6 +649,16 @@ def validate_config(config: dict[str, Any]) -> None:
     architecture = config.get("architecture", {})
     if architecture and (not isinstance(architecture, dict) or int(architecture.get("version", 1)) not in {1, 2}):
         raise ValueError("architecture.version must be 1 or 2")
+    posthoc = config.get("posthoc", {})
+    if posthoc.get("enabled", False):
+        if task != "classification" or int(architecture.get("version", 1)) < 2:
+            raise ValueError("posthoc.enabled requires a V2 classification model")
+        if config.get("classification", {}).get("stratification", {}).get("enabled", False):
+            raise ValueError("posthoc.enabled is not yet supported for stratified classification runs")
+        if posthoc.get("representation", "fused_embedding") != "fused_embedding":
+            raise ValueError("posthoc.representation must be fused_embedding")
+        if posthoc.get("estimator", "logistic_regression") != "logistic_regression":
+            raise ValueError("posthoc.estimator must be logistic_regression")
     if isinstance(architecture, dict) and int(architecture.get("version", 1)) >= 2:
         pooling = config.get("pooling", {})
         if not isinstance(pooling, dict) or str(pooling.get("type", "avg")).lower() not in {"avg", "max", "avg_max", "gem"}:

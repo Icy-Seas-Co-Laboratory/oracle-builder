@@ -150,6 +150,37 @@ def test_classification_bundle_uses_one_model_call_for_a_supplied_batch():
     assert all(result.output["decision"]["class_index"] == 1 for result in result_set.results)
 
 
+def test_classification_bundle_includes_posthoc_head_without_replacing_neural_output():
+    class Model:
+        def predict_outputs(self, values, verbose=0):
+            batch = len(values)
+            return {
+                "logits": np.tile([[2.0, 1.0]], (batch, 1)),
+                "probabilities": np.tile([[0.8, 0.2]], (batch, 1)),
+                "features": np.tile([[1.0, 2.0]], (batch, 1)),
+                "fused_embedding": np.tile([[3.0, 4.0]], (batch, 1)),
+            }
+
+    class Head:
+        classes_ = np.array([0, 1])
+
+        def predict_proba(self, values):
+            assert values.tolist() == [[3.0, 4.0]]
+            return np.array([[0.1, 0.9]])
+
+    config = {
+        "run": {"task": "classification", "model": "test"},
+        "data": {"input_shape": [4, 4, 1]},
+        "preprocessing": {"resize_mode": "fit_pad", "normalization": "dtype", "rescale": True,
+                          "channel_mode": "grayscale", "interpolation": "bilinear"},
+    }
+    bundle = InferenceBundle(Model(), config, model_reference(), posthoc_head=Head())
+    result = bundle.predict(InferenceItem.from_array(np.ones((4, 4), dtype="uint8")))
+    assert result.status == "ok"
+    assert result.output["decision"]["class_index"] == 0
+    assert result.output["posthoc"]["class_index"] == 1
+
+
 def test_classification_bundle_reconstructs_configured_derived_channels():
     class ShapeRecordingModel:
         def __init__(self):

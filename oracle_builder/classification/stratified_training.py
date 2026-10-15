@@ -649,6 +649,22 @@ def _monitor_mode(name: str) -> str:
     return "max" if any(token in name.lower() for token in ("acc", "f1", "auc")) else "min"
 
 
+def _advance_early_stopping(control: dict[str, Any], *, epoch: int, value: float,
+                            mode: str, patience: int, eligible: bool) -> bool:
+    """Count parent epochs only after a warmup; checkpoint best is separate."""
+    patience = max(1, int(patience))
+    if epoch < patience:
+        return False
+    best = control.get("early_stopping_best")
+    if eligible and _is_improvement(value, float(best) if best is not None else None, mode):
+        control["early_stopping_best"] = value
+        control["early_stopping_best_epoch"] = epoch
+        return False
+    if best is None:
+        return False
+    return epoch - int(control["early_stopping_best_epoch"]) >= patience
+
+
 def _cycle_validation(
     model: keras.Model,
     sqlite_path: str | Path,
@@ -1288,15 +1304,19 @@ def train_stratified_models(
                         model.optimizer.learning_rate = reduced_learning_rate
                     cycle_control["reduce_lr_wait"] = 0
                     cycle_control["learning_rate"] = reduced_learning_rate
-                if (
-                    not improved
-                    and bool(config.get("callbacks", {}).get("early_stopping", False))
-                    and int(cycle_control.get("wait", 0)) >= int(
-                        config.get("callbacks", {}).get("early_stopping_patience", 5)
-                    )
-                ):
-                    stop_training = True
-                    cycle_control["stopped_early"] = True
+                if bool(config.get("callbacks", {}).get("early_stopping", False)):
+                    previous_early_best_epoch = cycle_control.get("early_stopping_best_epoch")
+                    if _advance_early_stopping(
+                        cycle_control, epoch=block_stop, value=float(value), mode=mode,
+                        patience=int(config.get("callbacks", {}).get("early_stopping_patience", 5)),
+                        eligible=checkpoint_eligible,
+                    ):
+                        stop_training = True
+                        cycle_control["stopped_early"] = True
+                    if cycle_control.get("early_stopping_best_epoch") != previous_early_best_epoch:
+                        warm_best_path = run_path / "model" / "shared" / "early_stop_best.weights.h5"
+                        warm_best_path.parent.mkdir(parents=True, exist_ok=True)
+                        model.save_weights(warm_best_path)
                 cycle_metrics["monitor"] = monitor
                 cycle_metrics["monitor_value"] = float(value)
                 cycle_metrics["improved"] = improved
@@ -1361,8 +1381,14 @@ def train_stratified_models(
     if interleaved_status is not None:
         interleaved_status.on_train_end()
     shared_dir.mkdir(parents=True, exist_ok=True)
-    if cycle_control.get("stopped_early") and (shared_dir / "best.weights.h5").exists():
-        model.load_weights(shared_dir / "best.weights.h5")
+    if cycle_control.get("stopped_early"):
+        warm_best_path = shared_dir / "early_stop_best.weights.h5"
+        if warm_best_path.exists():
+            model.load_weights(warm_best_path)
+        elif "early_stopping_best_epoch" not in cycle_control and (shared_dir / "best.weights.h5").exists():
+            # A checkpoint written before the warmup rule used the ordinary
+            # checkpoint best for early stopping.
+            model.load_weights(shared_dir / "best.weights.h5")
     write_model_summary(model, shared_dir / "model_summary.txt")
     for dimension in dimensions(config):
         write_model_summary(

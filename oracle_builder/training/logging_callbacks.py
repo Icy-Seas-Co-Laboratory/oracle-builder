@@ -11,6 +11,7 @@ import numpy as np
 from tensorflow import keras
 
 from oracle_builder.evaluation.classification import classification_epoch_metric_records
+from oracle_builder.training.metrics import SparseCategoricalMacroF1
 
 
 EVENT_SCHEMA = "oracle_training_event"
@@ -265,6 +266,43 @@ class JSONLMetricLogger(keras.callbacks.Callback):
             )
 
 
+def _confusion_summary(matrix: np.ndarray) -> dict[str, float]:
+    """Derive training decisions from the confusion matrix already kept by Keras."""
+    matrix = np.asarray(matrix, dtype="float64")
+    total = float(matrix.sum())
+    if not total:
+        return {}
+    true_counts = matrix.sum(axis=1)
+    predicted_counts = matrix.sum(axis=0)
+    correct = np.diag(matrix)
+    precision = np.divide(correct, predicted_counts, out=np.zeros_like(correct), where=predicted_counts > 0)
+    recall = np.divide(correct, true_counts, out=np.zeros_like(correct), where=true_counts > 0)
+    f1 = np.divide(2 * correct, true_counts + predicted_counts, out=np.zeros_like(correct), where=(true_counts + predicted_counts) > 0)
+    accuracy = float(correct.sum() / total)
+    expected = float(np.dot(true_counts, predicted_counts) / total**2)
+    mcc_denominator = np.sqrt(
+        max(total**2 - float(np.dot(predicted_counts, predicted_counts)), 0.0)
+        * max(total**2 - float(np.dot(true_counts, true_counts)), 0.0)
+    )
+    return {
+        "micro_precision": accuracy,
+        "micro_recall": accuracy,
+        "micro_f1": accuracy,
+        "macro_precision": float(precision.mean()),
+        "macro_recall": float(recall.mean()),
+        "macro_f1": float(f1.mean()),
+        "balanced_accuracy": float(recall.mean()),
+        "weighted_precision": float(np.dot(precision, true_counts) / total),
+        "weighted_recall": float(np.dot(recall, true_counts) / total),
+        "weighted_f1": float(np.dot(f1, true_counts) / total),
+        "cohen_kappa": float((accuracy - expected) / (1 - expected)) if expected < 1 else 0.0,
+        "matthews_correlation_coefficient": (
+            float((correct.sum() * total - np.dot(true_counts, predicted_counts)) / mcc_denominator)
+            if mcc_denominator else 0.0
+        ),
+    }
+
+
 class ClassificationEpochMetricsLogger(keras.callbacks.Callback):
     """Append rich, unaugmented validation metrics after every epoch."""
 
@@ -284,7 +322,25 @@ class ClassificationEpochMetricsLogger(keras.callbacks.Callback):
         self.status_callback = status_callback
 
     def on_epoch_end(self, epoch: int, logs=None):
-        del logs
+        # Keras passes the same mutable log to subsequent callbacks. Put the
+        # aggregate metrics here so SQLiteMetricLogger and history.csv retain
+        # them alongside loss and accuracy for plotting after the run.
+        if logs is not None:
+            confusion_metric = next(
+                (
+                    metric
+                    for group in self.model.metrics
+                    for metric in getattr(group, "metrics", [group])
+                    if isinstance(metric, SparseCategoricalMacroF1)
+                ),
+                None,
+            )
+            if confusion_metric is not None:
+                for name, value in _confusion_summary(np.asarray(confusion_metric.confusion)).items():
+                    logs.setdefault(name, value)
+            elif "accuracy" in logs:
+                for name in ("micro_precision", "micro_recall", "micro_f1"):
+                    logs.setdefault(name, float(logs["accuracy"]))
         for split, dataset in self.datasets.items():
             if split != "validation":
                 continue
@@ -313,6 +369,10 @@ class ClassificationEpochMetricsLogger(keras.callbacks.Callback):
                 np.concatenate(probabilities, axis=0),
                 class_names=self.class_names,
             ):
+                if logs is not None and "label" not in metric and "bin_index" not in metric:
+                    value = metric.get("value")
+                    if value is not None and np.isfinite(value):
+                        logs.setdefault(f"val_{metric['metric']}", float(value))
                 _append_jsonl(
                     _metrics_path(self.sqlite_path),
                     {
