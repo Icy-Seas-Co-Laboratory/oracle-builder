@@ -16,6 +16,7 @@ from oracle_builder.training.logging_callbacks import (
     init_training_log,
 )
 from oracle_builder.training.recovery import (
+    RollingRecoveryCallback,
     read_recovery_callback_state,
     validate_recovery_state,
 )
@@ -47,6 +48,49 @@ def recovery_config() -> dict:
         "recovery": {"enabled": True, "save_every_epochs": 1},
         "output": {"save_checkpoints": False},
     }
+
+
+def test_rolling_recovery_prunes_only_after_state_commit(tmp_path, monkeypatch):
+    from oracle_builder.training import recovery
+
+    config = recovery_config()
+    layout = RunLayout(tmp_path / "run")
+    layout.create_directories()
+    monkeypatch.setattr(recovery, "log_event", lambda *args, **kwargs: None)
+
+    class Model:
+        def save(self, path):
+            path.write_bytes(b"snapshot")
+
+    callback = RollingRecoveryCallback(
+        layout.root, config, layout.training_log,
+        config["run"]["run_id"], config["artifact"]["artifact_id"],
+    )
+    callback.set_model(Model())
+    callback.on_epoch_end(0)
+    first = recovery.read_recovery_state(layout.root)["generation"]["id"]
+    generations = layout.recovery / "generations"
+    orphan = generations / ".abandoned.staging"
+    orphan.mkdir()
+    (orphan / "partial.keras").write_bytes(b"partial")
+
+    original_write = recovery._write_json
+
+    def fail_state_commit(path, value):
+        if path == layout.recovery_state:
+            raise OSError("interrupted before state commit")
+        original_write(path, value)
+
+    monkeypatch.setattr(recovery, "_write_json", fail_state_commit)
+    with pytest.raises(OSError, match="interrupted"):
+        callback.on_epoch_end(1)
+    assert (generations / first / "model.keras").exists()
+    monkeypatch.setattr(recovery, "_write_json", original_write)
+
+    callback.on_epoch_end(1)
+    current = recovery.read_recovery_state(layout.root)["generation"]["id"]
+    assert {path.name for path in generations.iterdir()} == {current}
+    assert (generations / current / "model.keras").exists()
 
 
 def test_rolling_recovery_restores_optimizer_model_and_continues_history(tmp_path):

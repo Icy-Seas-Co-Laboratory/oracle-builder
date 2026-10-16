@@ -46,6 +46,7 @@ from oracle_builder.training.distribution import (
     select_distribution_strategy,
     write_distribution_info,
 )
+from oracle_builder.training.recovery import prune_recovery_generations
 from oracle_builder.saving.save_model import write_stratification_manifest
 
 
@@ -620,25 +621,29 @@ def _save_recovery_model(
         shutil.copy2(generation_model, temporary)
     os.replace(temporary, target)
     relative = generation_model.relative_to(run_dir).as_posix()
+    generation_metadata = {
+        "id": generation_id,
+        "path": generation.relative_to(run_dir).as_posix(),
+        "schema": "oracle_builder_training_checkpoint_generation/v1",
+    }
     # Child progress is historical metadata; every child intentionally points
     # to this one *current* shared model.  Refreshing existing entries avoids
     # retaining stale checksums after the next stratum updates the weights.
     for child in state["children"].values():
         child["model_path"] = relative
         child["model_sha256"] = checksum
+        child["generation"] = dict(generation_metadata)
     state["children"][str(dimension)] = {
         "completed_epochs": int(completed_epochs),
         "model_path": relative,
         "model_sha256": checksum,
-        "generation": {
-            "id": generation_id,
-            "path": generation.relative_to(run_dir).as_posix(),
-            "schema": "oracle_builder_training_checkpoint_generation/v1",
-        },
+        "generation": dict(generation_metadata),
         "history": history,
         "control": control,
     }
+    state["shared"] = dict(state["children"][str(dimension)])
     _atomic_json(_recovery_path(run_dir), state)
+    prune_recovery_generations(generations, generation_id)
 
 
 def _is_improvement(value: float, best: float | None, mode: str) -> bool:
@@ -1154,8 +1159,6 @@ def train_stratified_models(
                     history,
                     control,
                 )
-                state["shared"] = dict(state["children"][str(dimension)])
-                _atomic_json(_recovery_path(run_path), state)
                 log_event(
                     training_log,
                     run_id,
@@ -1408,8 +1411,6 @@ def train_stratified_models(
             _read_history(run_path / latest.history_path),
             state.get("children", {}).get(str(latest_dimension), {}).get("control", {}),
         )
-        state["shared"] = dict(state["children"][str(latest_dimension)])
-        _atomic_json(_recovery_path(run_path), state)
         log_event(
             training_log,
             run_id,

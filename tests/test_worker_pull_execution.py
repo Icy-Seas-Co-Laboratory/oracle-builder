@@ -172,11 +172,14 @@ def test_worker_recovers_retained_output_before_polling_for_more_work(tmp_path):
         "archive": "output.tar", "archive_sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
         "archive_size": archive.stat().st_size, "part_size": 64 * 1024,
     }))
+    (recovery / "staging").mkdir()
+    (recovery / "staging" / "duplicate.bin").write_bytes(b"duplicate")
 
     class Client:
         base_url = "https://orch"
         def __init__(self): self.calls = []
         def resume_output_publication(self, **kwargs):
+            assert not (recovery / "staging").exists()
             self.calls.append("resume")
             return {"status": "active", "lease_token": "fresh-token"}
         def start_output_upload(self, **kwargs):
@@ -211,13 +214,13 @@ def test_recovery_discards_a_matching_already_completed_receipt(tmp_path):
     assert not recovery.exists()
 
 
-@pytest.mark.parametrize("outcome", ["cancelled", "restart"])
-def test_recovery_discards_archive_after_operator_abandons_publication(tmp_path, outcome):
+@pytest.mark.parametrize("outcome", ["cancelled", "restart", "expired"])
+def test_recovery_discards_archive_after_publication_is_terminal(tmp_path, outcome):
     recovery = tmp_path / "recovery"; recovery.mkdir()
     (recovery / "recovery.json").write_text(json.dumps({"lease_id": "lease", "archive_sha256": "a" * 64}))
     class Client:
         def resume_output_publication(self, **kwargs):
-            return {"status": "released", "outcome": outcome}
+            return {"status": "expired" if outcome == "expired" else "released", "outcome": outcome}
     assert recover_retained_output(Client(), recovery_dir=recovery, worker_id="worker", worker_token="secret")["status"] == outcome
     assert not recovery.exists()
 
@@ -236,6 +239,7 @@ def test_runtime_retains_output_for_recovery_when_multipart_publication_fails(tm
     assert metadata["archive"] == "output.tar"
     assert "token" not in json.dumps(metadata).lower()
     assert (retained[0] / "output.tar").is_file()
+    assert {path.name for path in retained[0].iterdir()} == {"output.tar", "recovery.json"}
     assert not any(name == "complete" for name, _ in client.calls)
 
 
@@ -252,6 +256,7 @@ def test_runtime_retains_output_when_completion_response_is_lost(tmp_path):
     metadata = json.loads((retained[0] / "recovery.json").read_text())
     assert metadata["worker_id"] == "worker-1"
     assert (retained[0] / "output.tar").is_file()
+    assert {path.name for path in retained[0].iterdir()} == {"output.tar", "recovery.json"}
 
 
 def test_client_assigns_event_ids_for_idempotent_receipts(monkeypatch):

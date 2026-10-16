@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
+import sys
 import uuid
 from pathlib import Path
 from typing import Any
@@ -189,6 +191,27 @@ def clear_recovery_snapshot(run_dir: str | Path) -> None:
         shutil.rmtree(generations)
 
 
+def prune_recovery_generations(generations: Path, current_id: str) -> None:
+    """Discard superseded local snapshots after their replacement is committed.
+
+    A snapshot directory can also contain incomplete staging from a previous
+    crash. The current generation is the only one named by recovery state.
+    Published artifacts are never modified by this local cleanup.
+    """
+    for path in generations.iterdir():
+        if path.name == current_id:
+            continue
+        try:
+            if path.is_dir() and not path.is_symlink():
+                shutil.rmtree(path)
+            else:
+                path.unlink()
+        except OSError as exc:
+            # Recovery state already names the new generation. A failed
+            # cleanup must not turn a committed checkpoint into a failed run.
+            print(f"Could not prune superseded recovery snapshot {path}: {exc}", file=sys.stderr, flush=True)
+
+
 class RollingRecoveryCallback(keras.callbacks.Callback):
     """Persist one atomic full-model snapshot after selected supervised epochs."""
 
@@ -300,6 +323,7 @@ class RollingRecoveryCallback(keras.callbacks.Callback):
             state["callback_state"] = callback_descriptor
         _write_json(generation_dir / "state.json", state)
         _write_json(self.layout.recovery_state, state)
+        prune_recovery_generations(generations, generation_id)
         log_event(
             self.training_log,
             self.run_id,

@@ -87,6 +87,31 @@ def test_disk_full_finalization_reports_retryable_storage_error(tmp_path, monkey
     assert orch.job_worker_output_upload(lease["job_id"])["status"] == "uploading"
 
 
+def test_expired_lease_abandons_partial_upload_and_returns_terminal_receipt(tmp_path):
+    orch, worker, lease, credentials = _leased(tmp_path)
+    archive = _archive()
+    upload = orch.create_worker_output_upload(
+        **credentials, archive_size=len(archive),
+        archive_sha256=hashlib.sha256(archive).hexdigest(), part_size=len(archive),
+    )
+    orch.upload_worker_output_part(
+        **{key: value for key, value in credentials.items() if key != "lease_id"},
+        upload_id=upload["upload_id"], part_number=0,
+        part_sha256=hashlib.sha256(archive).hexdigest(), part=archive,
+    )
+    spool = orch.artifact_root / "worker-output-uploads" / upload["upload_id"]
+    assert spool.exists()
+    with orch._connection() as db:
+        db.execute("UPDATE worker_leases SET expires_at=? WHERE lease_id=?", ("2000-01-01T00:00:00+00:00", lease["lease_id"]))
+    assert orch.expire_worker_leases() == 1
+    assert orch.resume_worker_output_publication(
+        lease_id=lease["lease_id"], worker_id=worker["worker_id"],
+        worker_token=worker["worker_token"],
+    ) == {"status": "expired", "outcome": "expired"}
+    assert not spool.exists()
+    assert orch.job(lease["job_id"])["status"] == "queued"
+
+
 def test_resumable_output_upload_rejects_bad_digest_and_incomplete_finalize(tmp_path):
     orch, _worker, _lease, credentials = _leased(tmp_path)
     archive = _archive()

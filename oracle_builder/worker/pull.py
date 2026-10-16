@@ -1047,6 +1047,11 @@ def recover_retained_output(client: Any, *, recovery_dir: str | Path,
     lease_id = metadata.get("lease_id") if isinstance(metadata, dict) else None
     if not isinstance(lease_id, str) or not lease_id:
         raise PullProtocolError("output recovery metadata is invalid")
+    archive_name = metadata.get("archive")
+    if isinstance(archive_name, str) and Path(archive_name).name == archive_name:
+        archive = root / archive_name
+        if archive.is_file() and not archive.is_symlink() and archive.stat().st_size == metadata.get("archive_size"):
+            _prune_retained_output_files(root, archive_name)
     resumed = client.resume_output_publication(
         lease_id=lease_id, worker_id=worker_id, worker_token=worker_token,
     )
@@ -1055,7 +1060,7 @@ def recover_retained_output(client: Any, *, recovery_dir: str | Path,
             raise PullProtocolError("completed output receipt does not match retained archive")
         shutil.rmtree(root)
         return {"status": "completed", "idempotent": True}
-    if resumed.get("status") == "released" and resumed.get("outcome") in {"cancelled", "restart"}:
+    if resumed.get("status") in {"released", "expired"} and resumed.get("outcome") in {"cancelled", "restart", "expired"}:
         # The operator explicitly abandoned this publication. The server has
         # fenced the lease, so retaining these bytes would block new work.
         shutil.rmtree(root)
@@ -1063,12 +1068,34 @@ def recover_retained_output(client: Any, *, recovery_dir: str | Path,
     lease_token = resumed.get("lease_token")
     if not isinstance(lease_token, str) or not lease_token:
         raise PullProtocolError("output recovery did not receive a fresh lease token")
+    if not isinstance(archive_name, str) or Path(archive_name).name != archive_name:
+        raise PullProtocolError("output recovery archive name is invalid")
+    archive = root / archive_name
+    if not archive.is_file() or archive.is_symlink() or archive.stat().st_size != metadata.get("archive_size"):
+        raise PullProtocolError("retained output archive is missing or incomplete")
+    _prune_retained_output_files(root, archive_name)
     recover_output_upload(client, recovery_dir=root, worker_token=worker_token,
                           lease_token=lease_token, remove_on_success=False)
     result = client.complete(lease_id=lease_id, worker_token=worker_token,
                              lease_token=lease_token, outcome="succeeded")
     shutil.rmtree(root)
     return result
+
+
+def _prune_retained_output_files(root: Path, archive_name: str) -> None:
+    """Keep only the bytes required to retry a finished output publication."""
+    for path in root.iterdir():
+        if path.name in {archive_name, "recovery.json"}:
+            continue
+        try:
+            if path.is_dir() and not path.is_symlink():
+                shutil.rmtree(path)
+            else:
+                path.unlink()
+        except OSError as exc:
+            # The archive is already durable in this directory. Retrying its
+            # publication is more important than deleting a redundant copy.
+            print(f"Could not prune redundant output recovery file {path}: {exc}", file=sys.stderr, flush=True)
 
 
 class PullWorkerRuntime:
@@ -1101,6 +1128,7 @@ class PullWorkerRuntime:
             output.write("\n")
         os.chmod(metadata_path, 0o600)
         shutil.move(str(scratch), str(destination))
+        _prune_retained_output_files(destination, archive_name)
         return destination
 
     def _materialize_ref(self, ref: Mapping[str, Any], *, lease_id: str, worker_token: str, lease_token: str, destination: Path) -> Path:

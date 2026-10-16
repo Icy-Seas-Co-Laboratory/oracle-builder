@@ -2209,6 +2209,14 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
                     db, str(lease["job_id"]), lease_id=str(lease["lease_id"]),
                     reason="Worker lease expired before durable completion", now=now,
                 )
+        # A fenced lease can no longer finalize its multipart upload. This
+        # also catches uploads left by leases that expired before an upgrade.
+        db.execute(
+            """UPDATE worker_output_uploads SET status='abandoned',updated_at=?
+               WHERE status IN ('uploading','assembling') AND lease_id IN
+                 (SELECT lease_id FROM worker_leases WHERE status='expired')""",
+            (now,),
+        )
         if expired_rows:
             db.execute("UPDATE registered_workers SET state='idle',updated_at=? WHERE state='leased' AND worker_id NOT IN (SELECT worker_id FROM worker_leases WHERE status='active')", (now,))
         return expired
@@ -3346,6 +3354,8 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
                 }
             if lease["status"] == "released" and lease["outcome"] in {"cancelled", "restart"}:
                 return {"status": "released", "outcome": lease["outcome"]}
+            if lease["status"] == "expired":
+                return {"status": "expired", "outcome": "expired"}
             if lease["status"] == "publication_paused":
                 raise ValueError("Output publication is paused by the operator")
             if lease["status"] == "active" and lease["expires_at"] <= now:
@@ -3748,6 +3758,12 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
             db.execute("BEGIN IMMEDIATE")
             expired = self._expire_worker_leases_in_connection(db, now)
             db.execute("UPDATE registered_workers SET state='idle',updated_at=? WHERE state='leased' AND worker_id NOT IN (SELECT worker_id FROM worker_leases WHERE status='active')", (now,))
+            abandoned_uploads = db.execute("SELECT * FROM worker_output_uploads WHERE status='abandoned'").fetchall()
+        for upload in abandoned_uploads:
+            try:
+                self._cleanup_finalized_worker_upload(upload)
+            except (OSError, ValueError):
+                pass
         return expired
 
     def request_pull_job_cancellation(self, job_id: str) -> dict[str, Any]:

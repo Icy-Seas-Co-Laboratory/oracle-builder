@@ -7,6 +7,7 @@ import numpy as np
 
 from oracle_builder.classification.stratified_training import (
     RECOVERY_SCHEMA,
+    _save_recovery_model,
     _sha256,
     child_config,
     epoch_stratum_schedule,
@@ -141,6 +142,24 @@ def test_stratified_recovery_validates_every_child_checksum(tmp_path):
         artifact_id="artifact-1",
         run_id="run-1",
     )["children"]["32"]["completed_epochs"] == 1
+
+
+def test_stratified_recovery_keeps_only_shared_current_generation(tmp_path):
+    class Model:
+        def save(self, path):
+            path.write_bytes(b"snapshot")
+
+    state = {"children": {}}
+    _save_recovery_model(Model(), tmp_path, 32, 1, state, {}, {})
+    first = state["shared"]["generation"]["id"]
+    _save_recovery_model(Model(), tmp_path, 64, 1, state, {}, {})
+    current = state["shared"]["generation"]["id"]
+    generations = tmp_path / "model" / "recovery" / "generations"
+    assert {path.name for path in generations.iterdir()} == {current}
+    assert first != current
+    saved = json.loads((tmp_path / "model" / "recovery" / "stratified_state.json").read_text())
+    assert all(child["generation"]["id"] == current for child in saved["children"].values())
+    assert saved["shared"]["generation"]["id"] == current
 
 
 def test_tiny_end_to_end_run_persists_both_children(tmp_path):
