@@ -211,6 +211,17 @@ def test_recovery_discards_a_matching_already_completed_receipt(tmp_path):
     assert not recovery.exists()
 
 
+@pytest.mark.parametrize("outcome", ["cancelled", "restart"])
+def test_recovery_discards_archive_after_operator_abandons_publication(tmp_path, outcome):
+    recovery = tmp_path / "recovery"; recovery.mkdir()
+    (recovery / "recovery.json").write_text(json.dumps({"lease_id": "lease", "archive_sha256": "a" * 64}))
+    class Client:
+        def resume_output_publication(self, **kwargs):
+            return {"status": "released", "outcome": outcome}
+    assert recover_retained_output(Client(), recovery_dir=recovery, worker_id="worker", worker_token="secret")["status"] == outcome
+    assert not recovery.exists()
+
+
 def test_runtime_retains_output_for_recovery_when_multipart_publication_fails(tmp_path):
     class FailingMultipart(_Client):
         def start_output_upload(self, **kwargs):

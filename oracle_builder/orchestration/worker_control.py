@@ -39,6 +39,23 @@ class WorkerControlMixin:
         return result
 
     def request_job_command(self, job_id, *, action, reason='', command_id=None):
+        # Completion and publication recovery use the same lease file lock.
+        # A stop or restart must not race an artifact-store publish that has
+        # released its SQLite transaction for slow filesystem work.
+        with self._connection() as db:
+            lease = db.execute(
+                "SELECT worker_leases.lease_id FROM worker_leases JOIN jobs ON jobs.job_id=worker_leases.job_id "
+                "WHERE jobs.job_id=? AND jobs.status IN ('publishing','publication_pending','publication_paused') "
+                "AND worker_leases.status IN ('active','publication_pending','publication_paused') "
+                "ORDER BY worker_leases.rowid DESC LIMIT 1", (job_id,),
+            ).fetchone()
+        if lease:
+            lock_path = self._worker_output_upload_root() / f"lease-{lease['lease_id']}.lock"
+            with self._worker_output_file_lock(lock_path):
+                return self._request_job_command_locked(job_id, action=action, reason=reason, command_id=command_id)
+        return self._request_job_command_locked(job_id, action=action, reason=reason, command_id=command_id)
+
+    def _request_job_command_locked(self, job_id, *, action, reason='', command_id=None):
         if action not in COMMAND_ACTIONS:
             raise ValueError('Unsupported worker command')
         if not isinstance(reason, str) or len(reason) > 2000:
@@ -59,6 +76,53 @@ class WorkerControlMixin:
                 raise ValueError('Only pull-worker jobs support directives')
             if job['status'] in {'completed', 'indexed', 'failed', 'cancelled', 'historical'}:
                 raise ValueError('A terminal job cannot accept a directive')
+            publication = db.execute(
+                "SELECT * FROM worker_leases WHERE job_id=? AND status IN ('active','publication_pending','publication_paused') "
+                "ORDER BY rowid DESC LIMIT 1", (job_id,),
+            ).fetchone() if job['status'] in {'publishing', 'publication_pending', 'publication_paused'} else None
+            if publication:
+                if action == 'yield':
+                    raise ValueError('Output publication can be paused, resumed, stopped, or restarted')
+                if action == 'pause' and job['status'] == 'publication_paused':
+                    raise ValueError('Output publication is already paused')
+                if action == 'resume' and job['status'] not in {'publication_paused', 'publication_pending'}:
+                    raise ValueError('Output publication is already in progress')
+                if action == 'pause':
+                    target, lease_status, outcome = 'publication_paused', 'publication_paused', 'publication_paused'
+                elif action == 'resume':
+                    target, lease_status, outcome = 'publication_pending', 'publication_pending', 'publication_pending'
+                else:
+                    target, lease_status, outcome = ('queued', 'released', 'restart') if action == 'restart' else ('cancelled', 'released', 'cancelled')
+                if lease_status == 'released':
+                    db.execute('UPDATE worker_leases SET status=?,outcome=?,released_at=?,updated_at=? WHERE lease_id=?',
+                               (lease_status, outcome, now, now, publication['lease_id']))
+                else:
+                    db.execute('UPDATE worker_leases SET status=?,outcome=?,updated_at=? WHERE lease_id=?',
+                               (lease_status, outcome, now, publication['lease_id']))
+                db.execute('UPDATE jobs SET status=?,remote_status=?,worker_id=CASE WHEN ?=? THEN NULL ELSE worker_id END,error=NULL, '
+                           'cancel_requested_at=NULL,updated_at=? WHERE job_id=?', (target, target, target, 'queued', now, job_id))
+                if action == 'stop_now':
+                    db.execute('UPDATE jobs SET cancel_requested_at=?,cancelled_at=?,completed_at=? WHERE job_id=?', (now, now, now, job_id))
+                    if job['queued_run_id']:
+                        db.execute('UPDATE queued_runs SET start_authorized=0 WHERE queued_run_id=?', (job['queued_run_id'],))
+                if action in {'stop_now', 'restart'}:
+                    self._finish_execution_attempt_in_connection(db, publication['lease_id'], status='cancelled', classification='directive', error=action, now=now)
+                    db.execute("UPDATE registered_workers SET state='idle',updated_at=? WHERE worker_id=?", (now, publication['worker_id']))
+                    db.execute("UPDATE worker_commands SET status='superseded',updated_at=? WHERE job_id=? AND status NOT IN ('applied','failed','expired','superseded')", (now, job_id))
+                    upload = db.execute('SELECT * FROM worker_output_uploads WHERE lease_id=?', (publication['lease_id'],)).fetchone()
+                    if upload:
+                        db.execute("UPDATE worker_output_uploads SET status='abandoned',updated_at=? WHERE upload_id=?", (now, upload['upload_id']))
+                self._control_queue_status(db, job, target, now)
+                sequence = db.execute('SELECT COALESCE(MAX(sequence),0)+1 FROM worker_commands WHERE job_id=?', (job_id,)).fetchone()[0]
+                generation_row = db.execute('SELECT ordinal FROM execution_attempts WHERE lease_id=?', (publication['lease_id'],)).fetchone()
+                db.execute('INSERT INTO worker_commands(command_id,job_id,lease_id,generation,sequence,action,status,reason,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)',
+                           (command_id, job_id, publication['lease_id'], generation_row[0] if generation_row else 0, sequence, action, 'applied', reason, now, now))
+                self._record_job_event_in_connection(db, job_id, 'command_applied', f'Output publication: {action}', {'command_id': command_id, 'action': action})
+                result = _public(db.execute('SELECT * FROM worker_commands WHERE command_id=?', (command_id,)).fetchone())
+                db.commit()
+                if action in {'stop_now', 'restart'} and upload:
+                    self._cleanup_finalized_worker_upload(upload)
+                return result
             lease = db.execute("SELECT * FROM worker_leases WHERE job_id=? AND status='active' AND expires_at>?", (job_id, now)).fetchone()
             generation = 0
             if lease:

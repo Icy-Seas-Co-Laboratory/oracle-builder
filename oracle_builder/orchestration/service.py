@@ -472,7 +472,7 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
         self._operation_stop = threading.Event()
         def clean_finalized_uploads() -> None:
             with self._connection() as connection:
-                finalized_uploads = connection.execute("SELECT * FROM worker_output_uploads WHERE status='finalized'").fetchall()
+                finalized_uploads = connection.execute("SELECT * FROM worker_output_uploads WHERE status IN ('finalized','abandoned')").fetchall()
             for upload in finalized_uploads:
                 if self._operation_stop.is_set():
                     return
@@ -3344,6 +3344,10 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
                     "status": "released", "outcome": "completed",
                     "output_archive_sha256": lease["output_archive_sha256"],
                 }
+            if lease["status"] == "released" and lease["outcome"] in {"cancelled", "restart"}:
+                return {"status": "released", "outcome": lease["outcome"]}
+            if lease["status"] == "publication_paused":
+                raise ValueError("Output publication is paused by the operator")
             if lease["status"] == "active" and lease["expires_at"] <= now:
                 raise ValueError("Lease expired before output recovery")
             if lease["status"] not in {"publication_pending", "active"} or lease["job_id"] is None:
@@ -3753,6 +3757,11 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
         until its worker observes the request, reports cancellation, or loses
         its lease; this avoids concurrent duplicate execution.
         """
+        with self._connection() as db:
+            publication = db.execute("SELECT status FROM jobs WHERE job_id=?", (job_id,)).fetchone()
+        if publication is not None and publication["status"] in {"publishing", "publication_pending", "publication_paused"}:
+            self.request_job_command(job_id, action="stop_now", reason="Operator cancelled output publication")
+            return self.job(job_id) or {}
         now = _now()
         with self._connection() as db:
             db.execute("BEGIN IMMEDIATE")

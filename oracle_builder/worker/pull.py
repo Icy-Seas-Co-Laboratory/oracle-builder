@@ -749,9 +749,10 @@ class OrchestratorPullClient:
             timeout_seconds=self.artifact_timeout_seconds if outcome == "succeeded" else None,
         ) or {}
 
-    def defer_output_publication(self, *, lease_id: str, worker_token: str, lease_token: str) -> dict[str, Any]:
+    def defer_output_publication(self, *, lease_id: str, worker_token: str, lease_token: str,
+                                 message: str = "Output publication deferred for worker recovery") -> dict[str, Any]:
         return self._request(
-            "POST", f"/v1/worker-leases/{lease_id}:defer-output", {"lease_token": lease_token},
+            "POST", f"/v1/worker-leases/{lease_id}:defer-output", {"lease_token": lease_token, "message": message},
             worker_token=worker_token,
         ) or {}
 
@@ -1054,6 +1055,11 @@ def recover_retained_output(client: Any, *, recovery_dir: str | Path,
             raise PullProtocolError("completed output receipt does not match retained archive")
         shutil.rmtree(root)
         return {"status": "completed", "idempotent": True}
+    if resumed.get("status") == "released" and resumed.get("outcome") in {"cancelled", "restart"}:
+        # The operator explicitly abandoned this publication. The server has
+        # fenced the lease, so retaining these bytes would block new work.
+        shutil.rmtree(root)
+        return {"status": resumed["outcome"], "idempotent": True}
     lease_token = resumed.get("lease_token")
     if not isinstance(lease_token, str) or not lease_token:
         raise PullProtocolError("output recovery did not receive a fresh lease token")
@@ -1313,13 +1319,14 @@ class PullWorkerRuntime:
                 self._complete_cancellation(lease_id=lease_id, worker_token=worker_token, lease_token=lease_token)
             # Expired/revoked leases have no authority to report completion.
             return {'status': 'interrupted', 'action': exc.action}
-        except OutputPublicationError:
+        except OutputPublicationError as exc:
             # Do not mark the lease failed: its retained output can be resumed
             # while the lease is still valid using fresh credentials.
             defer = getattr(self.client, "defer_output_publication", None)
             if callable(defer):
                 try:
-                    defer(lease_id=lease_id, worker_token=worker_token, lease_token=lease_token)
+                    defer(lease_id=lease_id, worker_token=worker_token, lease_token=lease_token,
+                          message=f"Output publication failed: {str(exc)[:800]}")
                 except Exception:
                     # A network loss can also prevent the transition. Retained
                     # bytes are still safer than rerunning scientific work.

@@ -15,10 +15,11 @@
 	let queueActionMessage = '';
 	const selectable = (run: RecordValue) => ['pending_verification', 'ready', 'needs_attention'].includes(String(run.status)) && !run.start_authorized;
 	const canStartRun = (run: RecordValue) => run.status === 'ready' && run.preflight_status === 'valid' && !run.start_authorized;
-	const activeJobStatuses = new Set(['queued', 'leased', 'acknowledged', 'running', 'uploading', 'publishing', 'publication_pending', 'cancel_requested', 'paused']);
-	const canPauseRun = (run: RecordValue) => Boolean(run.latest_job_id && run.latest_job_resumable) && ['queued', 'leased', 'acknowledged', 'running'].includes(String(run.latest_job_status));
-	const canResumeRun = (run: RecordValue) => Boolean(run.latest_job_id) && run.latest_job_status === 'paused';
-	const canStopRun = (run: RecordValue) => Boolean(run.latest_job_id) && ['queued', 'leased', 'acknowledged', 'running', 'uploading', 'paused'].includes(String(run.latest_job_status));
+	const activeJobStatuses = new Set(['queued', 'leased', 'acknowledged', 'running', 'uploading', 'publishing', 'publication_pending', 'publication_paused', 'cancel_requested', 'paused']);
+	const canPauseRun = (run: RecordValue) => Boolean(run.latest_job_id) && (['publishing', 'publication_pending'].includes(String(run.latest_job_status)) || Boolean(run.latest_job_resumable) && ['queued', 'leased', 'acknowledged', 'running'].includes(String(run.latest_job_status)));
+	const canResumeRun = (run: RecordValue) => Boolean(run.latest_job_id) && ['paused', 'publication_paused', 'publication_pending'].includes(String(run.latest_job_status));
+	const canStopRun = (run: RecordValue) => Boolean(run.latest_job_id) && ['queued', 'leased', 'acknowledged', 'running', 'uploading', 'publishing', 'publication_pending', 'publication_paused', 'paused'].includes(String(run.latest_job_status));
+	const canRestartPublication = (run: RecordValue) => Boolean(run.latest_job_id) && ['publishing', 'publication_pending', 'publication_paused'].includes(String(run.latest_job_status));
 	const canRemoveRun = (run: RecordValue) => !activeJobStatuses.has(String(run.latest_job_status)) && (Boolean(run.can_edit) || Boolean(run.can_clear));
 	const runStatus = (run: RecordValue) => run.status === 'queued' && ['failed', 'cancelled', 'dispatch_failed', 'artifact_invalid'].includes(String(run.latest_job_status)) ? 'Previous attempt failed' : ({ pending_verification: 'Awaiting verification', verifying: 'Verifying', ready: 'Verified · ready', needs_attention: 'Needs verification', queued: 'Waiting to train', indexed: 'Complete' }[String(run.status)] ?? String(run.status).replaceAll('_', ' '));
 	$: selectedRuns = queuedRuns.filter((run) => selectedRunIds.includes(String(run.queued_run_id)));
@@ -48,7 +49,8 @@
 	}
 	async function controlRun(run: RecordValue, action: 'pause' | 'resume' | 'stop_now') {
 		if (queueAction || !run.latest_job_id) return;
-		if (action === 'stop_now' && !window.confirm(run.status === 'verifying'
+		if (action === 'stop_now' && !window.confirm(['publishing', 'publication_pending', 'publication_paused'].includes(String(run.latest_job_status))
+			? `Stop ${text(run.name)}? The retained output archive will be discarded.` : run.status === 'verifying'
 			? `Stop verification for ${text(run.name)}?`
 			: `Stop ${text(run.name)}? Training progress in the current work unit may be lost.`)) return;
 		queueAction = true; queueActionMessage = '';
@@ -74,6 +76,17 @@
 				: 'Failed unit queued from its last committed checkpoint.';
 			onchanged(queueActionMessage);
 		} catch (error) { onfailure(error instanceof Error ? error.message : 'Could not restart this unit.'); }
+		finally { queueAction = false; await load(); }
+	}
+	async function restartPublication(run: RecordValue) {
+		if (queueAction || !canRestartPublication(run)) return;
+		if (!window.confirm(`Restart ${text(run.name)}? The retained output archive will be discarded and this unit will run again from its committed checkpoint.`)) return;
+		queueAction = true; queueActionMessage = '';
+		try {
+			await api.issueJobCommand(String(run.latest_job_id), { action: 'restart', reason: 'Requested from Queue after publication failure', command_id: crypto.randomUUID() });
+			queueActionMessage = 'Unit queued again from its last committed checkpoint.';
+			onchanged(queueActionMessage);
+		} catch (error) { onfailure(error instanceof Error ? error.message : 'Could not restart publication unit.'); }
 		finally { queueAction = false; await load(); }
 	}
 	async function removeRun(run: RecordValue) {
@@ -371,11 +384,12 @@
 			{#if selectable(run)}<button class="secondary small" disabled={queueAction} on:click={() => actOnRuns([run], 'verify')}><QueueActionIcon name="verify" />Verify</button>{/if}
 			{#if canStartRun(run)}<button class="secondary small" disabled={queueAction} on:click={() => actOnRuns([run], 'start')}><QueueActionIcon name="start" />Start</button>{/if}
 			{#if canPauseRun(run)}<button class="secondary small" disabled={queueAction} on:click={() => controlRun(run, 'pause')}><QueueActionIcon name="pause" />Pause</button>{/if}
-			{#if canResumeRun(run)}<button class="secondary small" disabled={queueAction} on:click={() => controlRun(run, 'resume')}><QueueActionIcon name="resume" />Resume</button>{/if}
+			{#if canResumeRun(run)}<button class="secondary small" disabled={queueAction} on:click={() => controlRun(run, 'resume')}><QueueActionIcon name="resume" />{run.latest_job_status === 'publication_pending' ? 'Retry upload' : 'Resume'}</button>{/if}
+			{#if canRestartPublication(run)}<button class="secondary small" disabled={queueAction} on:click={() => restartPublication(run)}><QueueActionIcon name="restart" />Restart unit</button>{/if}
 			{#if run.can_restart}<button class="secondary small" disabled={queueAction} title={`Restart from committed epoch ${text(run.restart_epoch, '0')}`} on:click={() => restartFailedRun(run)}><QueueActionIcon name="restart" />Restart</button>{/if}
 			{#if canStopRun(run)}<button class="secondary small queue-danger" disabled={queueAction} on:click={() => controlRun(run, 'stop_now')}><QueueActionIcon name="stop" />Stop</button>{/if}
 			{#if canRemoveRun(run)}<button class="secondary small queue-danger" disabled={queueAction} on:click={() => removeRun(run)}><QueueActionIcon name="delete" />Delete</button>{/if}
-			{#if !run.can_edit && !selectable(run) && !canStartRun(run) && !canPauseRun(run) && !canResumeRun(run) && !run.can_restart && !canStopRun(run) && !canRemoveRun(run)}<small>—</small>{/if}
+			{#if !run.can_edit && !selectable(run) && !canStartRun(run) && !canPauseRun(run) && !canResumeRun(run) && !canRestartPublication(run) && !run.can_restart && !canStopRun(run) && !canRemoveRun(run)}<small>—</small>{/if}
 		</div></td></tr>
 	{/each}</tbody></table></div>{:else}<p class="empty">Your queue is empty. Add a training run above to get started.</p>{/if}
 </section>

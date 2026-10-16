@@ -312,6 +312,10 @@ class WorkerLeaseAcknowledgeRequest(BaseModel):
     lease_token: str = Field(min_length=1, max_length=512)
 
 
+class WorkerLeaseDeferOutputRequest(WorkerLeaseAcknowledgeRequest):
+    message: str = Field(default="Output publication deferred for worker recovery", min_length=1, max_length=1000)
+
+
 class WorkerOutputUploadCreateRequest(WorkerLeaseAcknowledgeRequest):
     """Metadata only; archive bytes are uploaded through bounded part routes."""
     model_config = ConfigDict(extra="forbid")
@@ -1158,7 +1162,7 @@ def create_app(
 
     @app.post("/v1/worker-leases/{lease_id}:defer-output")
     def defer_worker_output_publication(
-        lease_id: str, body: WorkerLeaseAcknowledgeRequest,
+        lease_id: str, body: WorkerLeaseDeferOutputRequest,
         authorization: str | None = Header(default=None),
     ) -> dict[str, Any]:
         try:
@@ -1166,6 +1170,7 @@ def create_app(
             return orchestrator.defer_worker_output_publication(
                 lease_id=lease_id, worker_id=str(context["lease"]["worker_id"]),
                 worker_token=worker_bearer(authorization), lease_token=body.lease_token,
+                message=body.message,
             )
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="Worker lease was not found") from exc

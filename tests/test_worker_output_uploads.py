@@ -115,6 +115,48 @@ def test_deferred_output_recovery_rotates_a_fresh_lease_token_for_owning_worker(
     assert orch.job(lease["job_id"])["status"] == "publishing"
 
 
+@pytest.mark.parametrize("action,expected", [("stop_now", "cancelled"), ("restart", "queued")])
+def test_operator_can_abandon_pending_publication_without_worker_ack(tmp_path, action, expected):
+    orch, worker, lease, credentials = _leased(tmp_path)
+    orch.defer_worker_output_publication(**credentials)
+    paused = orch.request_job_command(lease["job_id"], action="pause")
+    assert paused["status"] == "applied"
+    assert orch.job(lease["job_id"])["status"] == "publication_paused"
+    with pytest.raises(ValueError, match="paused"):
+        orch.resume_worker_output_publication(lease_id=lease["lease_id"], worker_id=worker["worker_id"], worker_token=worker["worker_token"])
+    orch.request_job_command(lease["job_id"], action="resume")
+    assert orch.job(lease["job_id"])["status"] == "publication_pending"
+    abandoned = orch.request_job_command(lease["job_id"], action=action)
+    assert abandoned["status"] == "applied"
+    assert orch.job(lease["job_id"])["status"] == expected
+    assert orch.resume_worker_output_publication(lease_id=lease["lease_id"], worker_id=worker["worker_id"], worker_token=worker["worker_token"]) == {"status": "released", "outcome": "restart" if action == "restart" else "cancelled"}
+
+
+def test_operator_can_retry_and_cancel_pending_publication(tmp_path):
+    orch, worker, lease, credentials = _leased(tmp_path)
+    archive = _archive()
+    upload = orch.create_worker_output_upload(**credentials, archive_size=len(archive), archive_sha256=hashlib.sha256(archive).hexdigest(), part_size=len(archive))
+    orch.upload_worker_output_part(**{key: value for key, value in credentials.items() if key != "lease_id"}, upload_id=upload["upload_id"], part_number=0, part_sha256=hashlib.sha256(archive).hexdigest(), part=archive)
+    spool = orch.artifact_root / "worker-output-uploads" / upload["upload_id"]
+    assert spool.exists()
+    orch.defer_worker_output_publication(**credentials)
+    assert orch.request_job_command(lease["job_id"], action="resume")["status"] == "applied"
+    assert orch.job(lease["job_id"])["status"] == "publication_pending"
+    assert orch.request_pull_job_cancellation(lease["job_id"])["status"] == "cancelled"
+    assert not spool.exists()
+    assert orch.resume_worker_output_publication(lease_id=lease["lease_id"], worker_id=worker["worker_id"], worker_token=worker["worker_token"])["outcome"] == "cancelled"
+
+
+def test_deferred_publication_reports_upload_failure_to_operator(tmp_path):
+    orch, worker, lease, _credentials = _leased(tmp_path)
+    with TestClient(create_app(orch)) as client:
+        response = client.post(f"/v1/worker-leases/{lease['lease_id']}:defer-output",
+                               headers={"Authorization": f"Bearer {worker['worker_token']}"},
+                               json={"lease_token": lease["lease_token"], "message": "Output publication failed: upload finalization timed out"})
+    assert response.status_code == 200
+    assert "timed out" in orch.job(lease["job_id"])["error"]
+
+
 def test_output_recovery_handles_a_lost_defer_or_completion_response(tmp_path):
     orch, worker, lease, credentials = _leased(tmp_path)
     resumed = orch.resume_worker_output_publication(

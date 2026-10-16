@@ -43,8 +43,8 @@
 	const date = (value: unknown) => value && Number.isFinite(Date.parse(String(value))) ? new Date(String(value)).toLocaleString() : 'Not yet';
 	const duration = (value: unknown) => { const seconds = number(value); return seconds === null ? '—' : seconds < 60 ? `${seconds.toFixed(1)}s` : `${Math.floor(seconds / 60)}m ${Math.round(seconds % 60)}s`; };
 	const bytes = (value: unknown) => { const n = number(value); return n === null ? '—' : n < 1048576 ? `${(n / 1024).toFixed(1)} KB` : `${(n / 1048576).toFixed(1)} MB`; };
-	const activeStatus = new Set(['queued', 'leased', 'acknowledged', 'running', 'uploading', 'cancel_requested']);
-	const visibleStatus = new Set([...activeStatus, 'paused']);
+	const activeStatus = new Set(['queued', 'leased', 'acknowledged', 'running', 'uploading', 'publishing', 'publication_pending', 'cancel_requested']);
+	const visibleStatus = new Set([...activeStatus, 'paused', 'publication_paused']);
 	const isVerification = (job: RecordValue) => object(object(object(job.work_unit).parameters).queue_execution).phase === 'verify';
 	const isPosthocFit = (job: RecordValue) => Boolean(object(object(job.work_unit).parameters).posthoc_fit);
 	const logicalRunId = (job: RecordValue | null | undefined) => {
@@ -94,7 +94,7 @@
 		learning_rate: 'The optimizer step size reported by the worker. Scheduling changes can affect the learning curve.'
 	};
 	$: activeJobs = jobs.filter((job) => activeStatus.has(String(job.status)));
-	$: pausedJobs = jobs.filter((job) => String(job.status) === 'paused');
+	$: pausedJobs = jobs.filter((job) => ['paused', 'publication_paused'].includes(String(job.status)));
 	$: trainingJobs = activeJobs.filter((job) => job.action === 'train' && !isVerification(job));
 	$: verificationJobs = activeJobs.filter(isVerification);
 	$: pendingRuns = queuedRuns.filter((run) => ['pending_verification', 'needs_attention'].includes(String(run.status)));
@@ -162,7 +162,7 @@
 			const candidate = jobs.find((job) => String(job.job_id) === selectedJobId)
 				?? jobs.find((job) => job.action === 'train' && !isVerification(job) && job.status === 'running')
 				?? jobs.find((job) => activeStatus.has(String(job.status)))
-				?? jobs.find((job) => String(job.status) === 'paused');
+				?? jobs.find((job) => ['paused', 'publication_paused'].includes(String(job.status)));
 			const candidateRunId = logicalRunId(candidate);
 			if (candidateRunId) {
 				try {
@@ -220,6 +220,12 @@
 	function canCommand(action: string, job: RecordValue) {
 		const segment = object(object(job.work_unit).parameters).execution_segment;
 		const phase = String(object(job.work_unit).phase ?? '');
+		const status = String(job.status);
+		if (['publishing', 'publication_pending', 'publication_paused'].includes(status)) {
+			if (action === 'pause') return status !== 'publication_paused';
+			if (action === 'resume') return status === 'publication_paused' || status === 'publication_pending';
+			return action === 'stop_now' || action === 'restart';
+		}
 		if (action === 'pause' || action === 'yield') return Boolean(segment) && phase !== 'finalize' && ['running', 'leased', 'acknowledged'].includes(String(job.status));
 		if (action === 'resume') return String(job.status) === 'paused';
 		return ['queued', 'paused', 'leased', 'acknowledged', 'running', 'uploading', 'cancel_requested'].includes(String(job.status));
@@ -240,6 +246,11 @@
 	}
 	async function issueCommand(action: 'pause' | 'yield' | 'stop_now' | 'restart' | 'resume') {
 		if (!focusedJob || commandAction) return;
+		if (['stop_now', 'restart'].includes(action) && !window.confirm(
+			['publishing', 'publication_pending', 'publication_paused'].includes(String(focusedJob.status))
+				? `${action === 'restart' ? 'Restart' : 'Stop'} ${jobName(focusedJob)}? The retained output archive will be discarded. Restart runs this unit again from its committed checkpoint.`
+				: `${action === 'restart' ? 'Restart' : 'Stop'} ${jobName(focusedJob)}? Progress in the current unit may be lost.`
+		)) return;
 		commandAction = action; commandMessage = '';
 		try {
 			const result = await api.issueJobCommand(String(focusedJob.job_id), { action, command_id: crypto.randomUUID() });
@@ -252,6 +263,9 @@
 	}
 	function publicationState(job: RecordValue) {
 		if (['indexed', 'completed'].includes(String(job.status))) return 'Published';
+		if (job.status === 'publication_paused') return 'Paused';
+		if (job.status === 'publication_pending') return 'Recovery needed';
+		if (job.status === 'publishing') return 'Retrying publication';
 		const history = events[String(job.job_id)] ?? [];
 		if (history.filter((event) => ['output_publication_deferred', 'output_published'].includes(String(event.event_type))).at(-1)?.event_type === 'output_publication_deferred') return 'Recovery needed';
 		return uploads[String(job.job_id)]?.status === 'finalized' ? 'Staged · sealing' : 'Transferring';
@@ -283,11 +297,12 @@
 			<div class="section-heading"><div><p class="eyebrow">RUN SPOTLIGHT</p><h2>{focusedJob ? jobName(focusedJob) : 'Ready for your next experiment'}</h2></div>{#if focusedJob}<span class="status {text(focusedJob.status)}">{isVerification(focusedJob) ? 'Verification' : isFinalizing && focusedJob.status === 'running' ? 'Generating artifacts' : label(text(focusedJob.status))}</span>{/if}</div>
 			{#if jobs.length}<label class="run-picker">Inspect a run<select value={focusedJob?.job_id} on:change={(event) => selectJob(event.currentTarget.value)}>{#each jobs as job}<option value={String(job.job_id)}>{jobName(job)} · {isVerification(job) ? 'verification' : text(job.status)} · {String(job.job_id).slice(0, 8)}</option>{/each}</select></label>{/if}
 			{#if focusedJob}
+				{#if ['publishing', 'publication_pending', 'publication_paused'].includes(String(focusedJob.status))}<div class="refresh-warning" role="status"><strong>Output publication needs attention.</strong> {text(focusedJob.error, 'The worker is retaining the completed output.')} {focusedJob.status === 'publication_paused' ? 'Resume to allow another upload attempt.' : 'The worker will retry while it is online. You can pause, restart, or stop this unit below.'}</div>{/if}
 				<p class="phase-message">{focusedJob && isPosthocFit(focusedJob) ? text(focusedPosthocEvent?.message, text(latest(focusedJob)?.message, 'Waiting for a worker to start the fit.')) : isFinalizing ? text(postTraining.stage, postActivityDone ? 'Post-training artifacts complete' : 'Preparing post-training artifacts') : text(currentSnapshot.message, text(latest(focusedJob)?.message, text(snapshot.message, 'Waiting for the worker to report progress.')))}</p>
 				<div class="run-context"><span>Worker <strong>{workerName(focusedJob.worker_id)}</strong></span><span>Telemetry <strong>{snapshot.updated_at ? date(snapshot.updated_at) : 'Not yet available'}</strong></span><span>Heartbeat <strong>{focusedHeartbeat.received_at ? date(focusedHeartbeat.received_at) : 'Not reported'}</strong></span></div>
 				{#if !isPosthocFit(focusedJob)}<div class="unit-context"><span>Run <strong>{text(focusedRunId)}</strong></span><span>Unit <strong>{text(object(focusedJob.work_unit).sequence)} · {label(text(object(focusedJob.work_unit).phase))}</strong></span><span>Attempt <strong>{text(focusedLease.generation ?? focusedLease.attempt_id, 'Not leased')}</strong></span><span>Committed cursor <strong>{text(focusedExecutionRun.completed_epoch, 'Not committed')}</strong></span><span>Checkpoint <strong>{text(committedCheckpoint.artifact_id, 'None committed')}</strong></span></div>{/if}
 				{#if isFinalizing}<section class="post-training-status" aria-label="Post-training activity"><strong>{stoppedEarly ? 'Training ended early' : 'Training epochs complete'}</strong><p>{completedTrainingEpochs === null ? 'Training has ended.' : `${completedTrainingEpochs} of ${format(plannedTrainingEpochs)} planned epochs completed.`} {postActivityDone ? 'Final artifacts were generated.' : stoppedEarly ? 'The early-stopping rule ended training; the worker is now generating final artifacts.' : 'The worker is now generating final artifacts.'}</p><div><span>{postTraining.stage ? `Stage ${format(postTraining.stage_index)} of ${format(postTraining.total_stages)} · ${text(postTraining.stage)}` : postActivityDone ? 'Final artifacts complete' : 'Waiting for the worker to report its artifact stage'}</span>{#if number(postTraining.total_items)}<small>{format(postTraining.completed_items)} / {format(postTraining.total_items)} items</small>{:else if postTraining.status}<small>{label(text(postTraining.status))} · {duration(postTraining.elapsed_seconds)}</small>{/if}</div>{#if postTraining.activity}<p class="post-activity" role="status">{text(postTraining.activity)}</p>{/if}{#if number(postTraining.total_stages)}<progress max={Number(postTraining.total_stages)} value={Math.min(Number(postTraining.total_stages), postStageFraction)} aria-label="Post-training artifact progress"></progress>{/if}</section>{/if}
-				<section class="command-strip" aria-label="Worker controls"><div><strong>Worker control</strong><small>{commandLabel(latestCommand)}</small></div><div class="command-actions"><button class="secondary small" disabled={!canCommand('pause', focusedJob) || Boolean(commandAction)} on:click={() => issueCommand('pause')}>Pause safely</button><button class="secondary small" disabled={!canCommand('yield', focusedJob) || Boolean(commandAction)} on:click={() => issueCommand('yield')}>Yield</button><button class="secondary small" disabled={!canCommand('restart', focusedJob) || Boolean(commandAction)} on:click={() => issueCommand('restart')}>Restart active unit</button>{#if canRestartFailed(focusedJob)}<button class="secondary small" disabled={Boolean(commandAction)} on:click={() => restartFailed(focusedJob)}>Restart failed unit</button>{/if}<button class="secondary small" disabled={!canCommand('resume', focusedJob) || Boolean(commandAction)} on:click={() => issueCommand('resume')}>Resume</button><button class="secondary danger small" disabled={!canCommand('stop_now', focusedJob) || Boolean(commandAction)} on:click={() => issueCommand('stop_now')}>Stop now</button></div>{#if commandMessage}<p role="status">{commandMessage}</p>{/if}</section>
+				<section class="command-strip" aria-label="Worker controls"><div><strong>Worker control</strong><small>{commandLabel(latestCommand)}</small></div><div class="command-actions"><button class="secondary small" disabled={!canCommand('pause', focusedJob) || Boolean(commandAction)} on:click={() => issueCommand('pause')}>Pause safely</button><button class="secondary small" disabled={!canCommand('yield', focusedJob) || Boolean(commandAction)} on:click={() => issueCommand('yield')}>Yield</button><button class="secondary small" disabled={!canCommand('restart', focusedJob) || Boolean(commandAction)} on:click={() => issueCommand('restart')}>Restart unit</button>{#if canRestartFailed(focusedJob)}<button class="secondary small" disabled={Boolean(commandAction)} on:click={() => restartFailed(focusedJob)}>Restart failed unit</button>{/if}<button class="secondary small" disabled={!canCommand('resume', focusedJob) || Boolean(commandAction)} on:click={() => issueCommand('resume')}>{focusedJob.status === 'publication_pending' ? 'Retry publication' : 'Resume'}</button><button class="secondary danger small" disabled={!canCommand('stop_now', focusedJob) || Boolean(commandAction)} on:click={() => issueCommand('stop_now')}>Stop now</button></div>{#if commandMessage}<p role="status">{commandMessage}</p>{/if}</section>
 				{#if isPosthocFit(focusedJob)}
 					<section class="post-training-status" aria-label="Post-hoc fitting activity">
 						<strong>Post-hoc classifier fit</strong>
