@@ -916,7 +916,7 @@ def _run_training(request: TrainingRequest) -> int:
                         model,
                         source.indexed_image_dataset(
                             cache_index,
-                            batch_size=int(artifact_settings.get("batch_size", 256)),
+                            batch_size=min(int(artifact_settings.get("batch_size", 256)), inference_batch_size),
                         ),
                         cache_index,
                         config,

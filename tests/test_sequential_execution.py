@@ -282,6 +282,91 @@ def test_manual_restart_requeues_failed_unit_from_committed_checkpoint(tmp_path)
     assert [row[0] for row in attempts] == [1, 2, 3]
 
 
+def _failed_finalization(tmp_path):
+    orch, worker, unit, _lease, credentials = _sequential_lease(tmp_path, unit_epochs=2)
+    artifact = _segment_artifact(
+        tmp_path / "artifact", run_id=unit.run_id, completed_epoch=2, stop_epoch=2,
+    )
+    _complete_segment(orch, credentials, artifact)
+    checkpoint = orch.execution_run(unit.run_id)["checkpoint_ref"]
+    finalizer = _units_for_run(orch, unit.run_id)[-1]
+    assert finalizer["work_unit"]["phase"] == "finalize"
+    lease = orch.acquire_next_worker_lease(
+        worker_id=worker["worker_id"], worker_token=worker["worker_token"],
+    )
+    assert lease["job_id"] == finalizer["job_id"]
+    finalizer_credentials = {
+        "lease_id": lease["lease_id"], "worker_id": worker["worker_id"],
+        "worker_token": worker["worker_token"], "lease_token": lease["lease_token"],
+    }
+    orch.acknowledge_worker_lease(**finalizer_credentials)
+    orch.complete_worker_lease(
+        **finalizer_credentials, success=False,
+        message="Artifact generation failed after training completed",
+    )
+    assert orch.job(finalizer["job_id"])["status"] == "failed"
+    return orch, worker, unit, finalizer, checkpoint
+
+
+def test_failed_finalization_can_retry_from_committed_checkpoint(tmp_path):
+    orch, worker, unit, finalizer, checkpoint = _failed_finalization(tmp_path)
+    job_id = finalizer["job_id"]
+    queue_id = str(uuid.uuid4())
+    with orch._connection() as db:
+        db.execute("UPDATE jobs SET queued_run_id=? WHERE job_id=?", (queue_id, job_id))
+        db.execute("UPDATE execution_runs SET queued_run_id=? WHERE run_id=?", (queue_id, unit.run_id))
+    edit_state = orch._queued_run_edit_state({"queued_run_id": queue_id, "status": "failed", "start_authorized": 0})
+    assert edit_state["can_restart"] is True
+    assert edit_state["restart_phase"] == "finalize"
+
+    from fastapi.testclient import TestClient
+    from oracle_builder.orchestration.api import create_app
+    with TestClient(create_app(orch)) as client:
+        response = client.post(f"/v1/jobs/{job_id}:restart")
+    assert response.status_code == 202, response.text
+    assert response.json()["job"]["status"] == "queued"
+    assert orch.execution_run(unit.run_id)["checkpoint_ref"] == checkpoint
+    assert orch.execution_run(unit.run_id)["completed_epoch"] == 2
+    assert len(_units_for_run(orch, unit.run_id)) == 2
+    next_lease = orch.acquire_next_worker_lease(
+        worker_id=worker["worker_id"], worker_token=worker["worker_token"],
+    )
+    assert next_lease["job_id"] == job_id
+    assert next_lease["work_unit"]["phase"] == "finalize"
+
+
+def test_failed_finalization_rejects_a_damaged_checkpoint(tmp_path):
+    orch, _worker, unit, finalizer, checkpoint = _failed_finalization(tmp_path)
+    path = orch.artifact_store.resolve(ArtifactRef.from_dict(checkpoint))
+    model = next((path / "model" / "recovery" / "generations").glob("*/model.keras"))
+    model.write_bytes(b"damaged")
+    with pytest.raises(ValueError, match="checkpoint is missing or invalid"):
+        orch.restart_failed_training_unit(finalizer["job_id"])
+    assert orch.job(finalizer["job_id"])["status"] == "failed"
+    assert orch.execution_run(unit.run_id)["completed_epoch"] == 2
+
+
+def test_scientific_training_failure_cannot_use_finalization_retry(tmp_path):
+    orch, worker, unit, _lease, credentials = _sequential_lease(tmp_path)
+    artifact = _segment_artifact(
+        tmp_path / "artifact", run_id=unit.run_id, completed_epoch=1, stop_epoch=1,
+    )
+    _complete_segment(orch, credentials, artifact)
+    training = _units_for_run(orch, unit.run_id)[-1]
+    lease = orch.acquire_next_worker_lease(
+        worker_id=worker["worker_id"], worker_token=worker["worker_token"],
+    )
+    retry_credentials = {
+        "lease_id": lease["lease_id"], "worker_id": worker["worker_id"],
+        "worker_token": worker["worker_token"], "lease_token": lease["lease_token"],
+    }
+    orch.acknowledge_worker_lease(**retry_credentials)
+    orch.complete_worker_lease(**retry_credentials, success=False, message="Training failed")
+    with pytest.raises(ValueError, match="Only infrastructure failures or failed finalization"):
+        orch.restart_failed_training_unit(training["job_id"])
+    assert orch.job(training["job_id"])["status"] == "failed"
+
+
 def test_pending_restart_fences_segment_commit_before_any_successor_is_created(tmp_path):
     orch, _worker, unit, lease, credentials = _sequential_lease(tmp_path)
     orch.acknowledge_worker_lease(**credentials)

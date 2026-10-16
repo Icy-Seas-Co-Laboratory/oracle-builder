@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections import Counter, defaultdict
 
 import pytest
 
@@ -55,15 +56,133 @@ def test_class_stratified_assignment_is_independent_of_input_row_order():
     assert forward == reverse
 
 
-def test_class_stratified_reports_rare_class_feasibility_failure(tmp_path):
+def _sparse_classification_database(path):
+    """Create labels with one, two, and three examples respectively."""
+    create_synthetic_classification(path, n=6, shape=(8, 8, 1), classes=6)
+    with sqlite3.connect(path) as connection:
+        labels = [
+            row[0]
+            for row in connection.execute(
+                "SELECT label_id FROM classification_labels ORDER BY class_index"
+            )
+        ]
+        annotations = [
+            row[0]
+            for row in connection.execute(
+                "SELECT annotation_id FROM classification_annotations ORDER BY annotation_id"
+            )
+        ]
+        # The class indexes are intentionally 0:1 item, 1:2 items, 2:3 items.
+        for annotation_id, label_id in zip(annotations, [labels[0], labels[1], labels[1], labels[2], labels[2], labels[2]]):
+            connection.execute(
+                "UPDATE classification_annotations SET label_id = ? WHERE annotation_id = ?",
+                (label_id, annotation_id),
+            )
+        connection.commit()
+
+
+@pytest.mark.parametrize("strategy", ["auto", "class_stratified"])
+def test_sparse_classes_are_split_with_warnings_instead_of_rejecting_training(tmp_path, strategy):
     database = tmp_path / "classification.sqlite"
-    create_synthetic_classification(database, n=5, shape=(8, 8, 1), classes=2)
+    _sparse_classification_database(database)
 
-    with pytest.raises(ValueError, match="Class-coverage split is infeasible.*class"):
-        create_split_manifest(tmp_path / "run", database, _config())
+    manifest = create_split_manifest(
+        tmp_path / strategy,
+        database,
+        _config(split_strategy=strategy),
+    )
+    repeated = create_split_manifest(
+        tmp_path / f"{strategy}-repeat",
+        database,
+        _config(split_strategy=strategy),
+    )
+    assigned = {row["item_id"]: row["split"] for row in manifest["assignments"]}
+    labels_by_item: dict[str, str] = {}
+    with sqlite3.connect(database) as connection:
+        labels_by_item = {
+            str(item_id): str(label)
+            for item_id, label in connection.execute(
+                """
+                SELECT annotation.item_id, label.class_index
+                FROM classification_annotations annotation
+                JOIN classification_labels label ON label.label_id = annotation.label_id
+                WHERE annotation.is_current = 1
+                """
+            )
+        }
+    splits_by_label: dict[str, set[str]] = defaultdict(set)
+    for item_id, split in assigned.items():
+        splits_by_label[labels_by_item[item_id]].add(split)
+
+    # Sparse labels establish the most useful evaluation sequence before any
+    # fraction-based allocation: train, validation, then test.
+    assert splits_by_label["0"] == {"train"}
+    assert splits_by_label["1"] == {"train", "validation"}
+    assert splits_by_label["2"] == {"train", "validation", "test"}
+    assert manifest["coverage"]["warnings"]
+    assert not manifest["coverage"]["valid"]
+    assert manifest["assignment_digest_sha256"] == repeated["assignment_digest_sha256"]
 
 
-def test_auto_preserves_complete_source_partitions_but_reports_coverage_conflicts(tmp_path):
+def test_class_stratified_uses_requested_fractions_after_sparse_coverage_reservation():
+    rows = [
+        {"item_id": f"example-{index}", "label": "common", "metadata": {}}
+        for index in range(8)
+    ]
+
+    assignments, coverage = _class_stratified_assignments(
+        rows, seed=4, validation=0.2, test=0.2, minimum=1
+    )
+
+    assert Counter(row["split"] for row in assignments) == {
+        "train": 4,
+        "validation": 2,
+        "test": 2,
+    }
+    assert coverage["warnings"] == []
+
+
+def test_sparse_classes_use_one_item_per_split_before_applying_a_custom_minimum():
+    rows = [
+        {"item_id": f"example-{index}", "label": "rare", "metadata": {}}
+        for index in range(2)
+    ]
+
+    assignments, coverage = _class_stratified_assignments(
+        rows, seed=4, validation=0.2, test=0.2, minimum=2
+    )
+
+    assert Counter(row["split"] for row in assignments) == {
+        "train": 1,
+        "validation": 1,
+    }
+    assert coverage["missing_coverage"] == {
+        "rare": ["train", "validation", "test"]
+    }
+    assert coverage["warnings"]
+
+
+def test_source_partitions_report_sparse_coverage_as_a_warning(tmp_path):
+    database = tmp_path / "classification.sqlite"
+    _sparse_classification_database(database)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE dataset_items SET metadata_json = ?",
+            (json.dumps({"source_partition": "train"}),),
+        )
+        connection.commit()
+
+    manifest = create_split_manifest(
+        tmp_path / "source-partitions",
+        database,
+        _config(split_strategy="source_partitions"),
+    )
+
+    assert manifest["coverage"]["valid"] is False
+    assert manifest["coverage"]["warnings"]
+
+
+def test_auto_preserves_complete_source_partitions_and_warns_about_coverage_conflicts(tmp_path):
     database = tmp_path / "classification.sqlite"
     create_synthetic_classification(database, n=9, shape=(8, 8, 1), classes=3)
     with sqlite3.connect(database) as connection:
@@ -85,11 +204,13 @@ def test_auto_preserves_complete_source_partitions_but_reports_coverage_conflict
             )
         connection.commit()
 
-    with pytest.raises(ValueError, match="Trusted source partitions violate"):
-        create_split_manifest(
-            tmp_path / "run", database,
-            {"run": {"seed": 91}, "data": {"split_strategy": "auto"}},
-        )
+    manifest = create_split_manifest(
+        tmp_path / "run", database,
+        {"run": {"seed": 91}, "data": {"split_strategy": "auto"}},
+    )
+    assert manifest["policy"]["method"] == "source_partitions"
+    assert manifest["coverage"]["valid"] is False
+    assert manifest["coverage"]["warnings"]
 
 
 def test_auto_derives_validation_from_official_train_without_moving_test(tmp_path):
@@ -131,8 +252,11 @@ def test_auto_derives_validation_from_official_train_without_moving_test(tmp_pat
     assert first["coverage"]["valid"] is True
     assert all(counts["validation"] >= 1 for counts in first["coverage"]["class_counts"].values())
 
-    with pytest.raises(ValueError, match="Trusted source partitions violate"):
-        create_split_manifest(tmp_path / "explicit", database, _config(split_strategy="source_partitions"))
+    explicit = create_split_manifest(
+        tmp_path / "explicit", database, _config(split_strategy="source_partitions")
+    )
+    assert explicit["coverage"]["valid"] is False
+    assert explicit["coverage"]["warnings"]
 
 
 def test_explicit_group_policy_requires_metadata_and_never_splits_a_group(tmp_path):

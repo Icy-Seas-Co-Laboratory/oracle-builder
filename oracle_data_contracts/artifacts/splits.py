@@ -115,10 +115,23 @@ def _allocate_counts(
 ) -> dict[str, int]:
     required = minimum * len(enabled)
     if total < required:
-        raise ValueError(
-            f"requires at least {required} samples for minimum class coverage "
-            f"across {len(enabled)} enabled splits, but has {total}"
-        )
+        # A rare class should not prevent a run from starting.  Preserve the
+        # useful priority order for sparse classes: train first, validation
+        # second, then test.  With the default minimum of one this gives two
+        # examples to train/validation and three to train/validation/test.
+        # The manifest records the resulting coverage gap as a warning.
+        counts = {split: 0 for split in enabled}
+        remaining = total
+        # Give every enabled split one example before adding a second one to
+        # any split.  This makes a custom minimum greater than one degrade in
+        # the same useful order as the default policy.
+        for _ in range(minimum):
+            for split in enabled:
+                if not remaining:
+                    return counts
+                counts[split] += 1
+                remaining -= 1
+        return counts
     counts = {split: minimum for split in enabled}
     remaining = total - required
     ideal = {split: remaining * weights[split] / sum(weights.values()) for split in enabled}
@@ -159,15 +172,10 @@ def _class_stratified_assignments(
         raise ValueError("class_stratified splitting requires at least one labeled item")
     assignments: list[dict[str, str]] = []
     class_counts: dict[str, dict[str, int]] = {}
-    infeasible: dict[str, str] = {}
     for label, item_ids in sorted(classes.items()):
-        try:
-            allocated = _allocate_counts(
-                len(item_ids), enabled=enabled, weights=weights, minimum=minimum
-            )
-        except ValueError as exc:
-            infeasible[label] = str(exc)
-            continue
+        allocated = _allocate_counts(
+            len(item_ids), enabled=enabled, weights=weights, minimum=minimum
+        )
         ranked = sorted(item_ids, key=lambda item_id: _stable_rank(seed, item_id))
         offset = 0
         for split in enabled:
@@ -175,19 +183,26 @@ def _class_stratified_assignments(
             assignments.extend({"item_id": item_id, "split": split} for item_id in selected)
             offset += allocated[split]
         class_counts[label] = {split: allocated.get(split, 0) for split in SPLIT_NAMES}
-    if infeasible:
-        details = "; ".join(f"class {label}: {reason}" for label, reason in infeasible.items())
-        raise ValueError(
-            "Class-coverage split is infeasible: " + details + ". Reduce enabled splits or "
-            "data.split_minimum_per_class, or add labeled examples."
-        )
+    missing = {
+        label: [split for split in enabled if counts[split] < minimum]
+        for label, counts in class_counts.items()
+        if any(counts[split] < minimum for split in enabled)
+    }
+    warnings = [
+        "Class "
+        f"{label} has {sum(class_counts[label].values())} samples, so it cannot meet "
+        f"the requested minimum of {minimum} per enabled split; missing "
+        f"{', '.join(splits)}. Training will continue with the available assignments."
+        for label, splits in sorted(missing.items())
+    ]
     return sorted(assignments, key=lambda row: row["item_id"]), {
         "enabled_splits": list(enabled),
         "minimum_per_class": minimum,
         "class_counts": class_counts,
         "unlabeled_count": 0,
-        "missing_coverage": {},
-        "valid": True,
+        "missing_coverage": missing,
+        "warnings": warnings,
+        "valid": not missing,
     }
 
 
@@ -326,6 +341,7 @@ def _group_assignments(
         "group_count": len(groups),
         "group_metadata_key": group_key,
         "missing_coverage": {},
+        "warnings": [],
         "valid": True,
     }
 
@@ -424,11 +440,18 @@ def _coverage_report(
         for label in sorted(counts)
         if any(counts[label][split] < minimum for split in enabled)
     }
+    warnings = [
+        f"Class {label} is below the requested minimum of {minimum} in "
+        f"{', '.join(splits)} under the imported source partitions. "
+        "Training will continue with those partitions."
+        for label, splits in sorted(missing.items())
+    ]
     return {
         "enabled_splits": list(enabled),
         "minimum_per_class": minimum,
         "class_counts": counts,
         "missing_coverage": missing,
+        "warnings": warnings,
         "valid": not missing,
     }
 
@@ -553,17 +576,6 @@ def create_split_manifest(
             assignments, effective_rows,
             enabled=_enabled_splits(validation=validation, test=test), minimum=minimum,
         )
-        if info["dataset_type"] == "classification" and minimum and not coverage["valid"]:
-            details = "; ".join(
-                f"class {label} missing {', '.join(splits)}"
-                for label, splits in coverage["missing_coverage"].items()
-            )
-            raise ValueError(
-                "Trusted source partitions violate the configured class-coverage requirement: "
-                + details
-                + ". Keep the benchmark partition and set data.split_minimum_per_class = 0, "
-                "or explicitly choose class_stratified."
-            )
     elif strategy in {"auto", "class_stratified"}:
         if info["dataset_type"] != "classification":
             if strategy == "class_stratified":
@@ -576,7 +588,7 @@ def create_split_manifest(
                 "validation_fraction": validation, "test_fraction": test,
                 "fallback_from": "auto",
             }
-            coverage = {"valid": True, "unassessed": "non_classification_dataset"}
+            coverage = {"valid": True, "unassessed": "non_classification_dataset", "warnings": []}
         else:
             assignments, coverage = _class_stratified_assignments(
                 effective_rows, seed=seed, validation=validation, test=test, minimum=minimum
@@ -608,7 +620,7 @@ def create_split_manifest(
             "validation_fraction": validation,
             "test_fraction": test,
         }
-        coverage = {"valid": True, "unassessed": "random_policy"}
+        coverage = {"valid": True, "unassessed": "random_policy", "warnings": []}
     counts = {
         name: sum(row["split"] == name for row in assignments)
         for name in SPLIT_NAMES

@@ -11,6 +11,26 @@ from oracle_data_contracts.artifacts import ArtifactRef
 
 
 class SequentialExecutionMixin:
+    def _validate_finalization_restart_checkpoint(self, *, checkpoint: dict, unit: dict, completed_epoch: int) -> None:
+        """Verify that a failed finalizer can reuse its committed training output."""
+        from oracle_builder.artifacts import validate_run_artifact
+
+        path = self.artifact_store.resolve(ArtifactRef.from_dict(checkpoint))
+        report = validate_run_artifact(path)
+        if not report['valid'] or report['lifecycle'] != 'sealed':
+            raise ValueError('Committed training checkpoint is missing or invalid')
+        predecessor_id = unit.get('predecessor_work_unit_id')
+        with self._connection() as db:
+            predecessor = db.execute('SELECT work_unit_json FROM jobs WHERE job_id=?', (predecessor_id,)).fetchone()
+        if predecessor is None:
+            raise ValueError('Finalization checkpoint has no recorded training predecessor')
+        prior_unit = json.loads(predecessor['work_unit_json'])
+        result = self._read_segment_result(path, prior_unit)
+        if (result['next_phase'] != 'finalize'
+                or result['cursor']['completed_epoch'] != completed_epoch
+                or report['run_id'] != unit.get('run_id')):
+            raise ValueError('Committed checkpoint does not match finalization progress')
+
     def restart_failed_training_unit(self, job_id: str) -> dict:
         """Manually requeue a failed unit from its last committed checkpoint."""
         with self._connection() as db:
@@ -33,8 +53,16 @@ class SequentialExecutionMixin:
             if run is None or unit.get('schema', {}).get('version') != 2 or unit.get('phase') not in {'train', 'finalize'}:
                 raise ValueError('Only the current sequential training unit can be restarted')
             checkpoint = json.loads(run['checkpoint_ref_json']) if run['checkpoint_ref_json'] else None
+            attempt = db.execute('SELECT classification FROM execution_attempts WHERE job_id=? ORDER BY ordinal DESC LIMIT 1', (job_id,)).fetchone()
+            finalization_retry = bool(unit.get('phase') == 'finalize' and attempt is not None and attempt['classification'] == 'scientific')
         if checkpoint is not None:
             self.artifact_store.resolve(ArtifactRef.from_dict(checkpoint))
+        if finalization_retry:
+            if checkpoint is None:
+                raise ValueError('Finalization retry requires a committed training checkpoint')
+            self._validate_finalization_restart_checkpoint(
+                checkpoint=checkpoint, unit=unit, completed_epoch=int(run['completed_epoch']),
+            )
         with self._connection() as db:
             db.execute('BEGIN IMMEDIATE')
             job = db.execute('SELECT * FROM jobs WHERE job_id=?', (job_id,)).fetchone()
@@ -47,8 +75,9 @@ class SequentialExecutionMixin:
                     or int(unit.get('start_cursor', {}).get('completed_epoch', -1)) != int(run['completed_epoch'])):
                 raise ValueError('The failed unit no longer matches the committed checkpoint')
             attempt = db.execute('SELECT classification FROM execution_attempts WHERE job_id=? ORDER BY ordinal DESC LIMIT 1', (job_id,)).fetchone()
-            if attempt is None or attempt['classification'] != 'infrastructure':
-                raise ValueError('Only infrastructure failures can be manually restarted')
+            if attempt is None or (attempt['classification'] != 'infrastructure'
+                    and not (unit.get('phase') == 'finalize' and attempt['classification'] == 'scientific' and finalization_retry)):
+                raise ValueError('Only infrastructure failures or failed finalization can be manually restarted')
             active = db.execute("SELECT 1 FROM worker_leases WHERE job_id=? AND status IN ('active','publication_pending')", (job_id,)).fetchone()
             if active:
                 raise ValueError('This unit still has an active or pending publication lease')
@@ -57,7 +86,9 @@ class SequentialExecutionMixin:
             db.execute("UPDATE execution_runs SET status='queued',updated_at=? WHERE run_id=?", (now, run['run_id']))
             if job['queued_run_id']:
                 db.execute("UPDATE queued_runs SET status='queued',start_authorized=1,failure_reason=NULL,updated_at=? WHERE queued_run_id=?", (now, job['queued_run_id']))
-            self._record_job_event_in_connection(db, job_id, 'manual_restart', 'Failed training unit manually restarted from committed checkpoint', {'completed_epoch': run['completed_epoch'], 'checkpoint_ref': checkpoint})
+            self._record_job_event_in_connection(db, job_id, 'manual_restart',
+                'Failed finalization retried from committed training checkpoint' if finalization_retry else 'Failed training unit manually restarted from committed checkpoint',
+                {'completed_epoch': run['completed_epoch'], 'checkpoint_ref': checkpoint, 'phase': unit['phase']})
         return self.job(job_id) or {}
 
     def _begin_sequential_in_connection(self, db, *, unit, queued_run_id, pool_id, now):

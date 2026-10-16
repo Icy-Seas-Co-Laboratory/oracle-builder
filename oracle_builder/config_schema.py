@@ -264,7 +264,8 @@ _OVERRIDES: dict[str, dict[str, Any]] = {
         ),
         "help": "Auto preserves imported partitions, deriving validation from train when only train/test exist; otherwise it stratifies effective classification labels.",
     },
-    "data.split_minimum_per_class": {"minimum": 0, "advanced": True},
+    "data.split_minimum_per_class": {"minimum": 0, "advanced": True,
+        "help": "Target samples per class in each enabled split. Sparse classes use train, then validation, then test as available; unmet coverage is reported as a warning."},
     "data.split_group_metadata_key": {
         "value_type": "string_or_null",
         "advanced": True,

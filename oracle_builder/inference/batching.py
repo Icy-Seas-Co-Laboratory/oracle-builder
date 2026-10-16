@@ -71,6 +71,11 @@ def resolve_inference_batch_size(
     if isinstance(requested, str) and requested.lower() == "auto":
         mode = "auto"
         candidate = estimate_inference_batch_size(config)
+        # The training batch has already been verified on this worker. Start
+        # no higher when probing post-training inference memory.
+        training_batch = config.get("data", {}).get("batch_size")
+        if isinstance(training_batch, int) and not isinstance(training_batch, bool) and training_batch > 0:
+            candidate = min(candidate, max(minimum, training_batch))
     else:
         mode = "fixed"
         candidate = int(requested)

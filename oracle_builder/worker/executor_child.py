@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import sys
+import traceback
 
 EVENT_PREFIX = 'ORACLE_WORKER_EVENT='
 
@@ -18,9 +19,16 @@ def main():
     executor = executors[action]()
     # This control path is generated locally and never comes from a WorkUnit.
     executor.control_file = request.get('control_file')
-    result = executor.execute(work_unit=request['work_unit'], inputs={key: Path(value) for key,value in request['inputs'].items()},
-        configuration=Path(request['configuration']) if request.get('configuration') else None,
-        staging=Path(request['staging']), emit_event=emit)
+    try:
+        result = executor.execute(work_unit=request['work_unit'], inputs={key: Path(value) for key,value in request['inputs'].items()},
+            configuration=Path(request['configuration']) if request.get('configuration') else None,
+            staging=Path(request['staging']), emit_event=emit)
+    except Exception as exc:
+        Path(request['result_path']).write_text(json.dumps({'execution_error': {
+            'type': type(exc).__name__, 'message': str(exc)[:1200],
+            'traceback': ''.join(traceback.format_tb(exc.__traceback__))[-6000:],
+        }}, allow_nan=False))
+        raise
     Path(request['result_path']).write_text(json.dumps(result or {}, allow_nan=False))
 
 

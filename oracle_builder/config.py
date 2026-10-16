@@ -53,8 +53,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # official train/test layout when needed; otherwise it deterministically
         # stratifies effective classification labels.
         "split_strategy": "auto",
-        # Every effective class is represented in every enabled split by
-        # default. Set zero only when preserving a sparse trusted benchmark.
+        # Target one item per enabled split where possible. Sparse classes
+        # remain trainable; unmet coverage is recorded as a warning.
         "split_minimum_per_class": 1,
         # Grouping is never inferred from filenames or source_key. It is only
         # consulted by the explicit stratified_group/group_only policies.

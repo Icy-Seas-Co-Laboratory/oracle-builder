@@ -1031,17 +1031,29 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
             ).fetchall()
             restartable = False
             restart_epoch = None
+            restart_phase = None
             if jobs and jobs[0]["status"] == "failed":
                 latest_attempt = db.execute(
                     "SELECT classification FROM execution_attempts WHERE job_id=? ORDER BY ordinal DESC LIMIT 1",
                     (jobs[0]["job_id"],),
                 ).fetchone()
                 restart_run = db.execute(
-                    "SELECT completed_epoch FROM execution_runs WHERE current_job_id=?", (jobs[0]["job_id"],)
+                    "SELECT completed_epoch,checkpoint_ref_json FROM execution_runs WHERE current_job_id=?", (jobs[0]["job_id"],)
                 ).fetchone()
-                restartable = bool(latest_attempt and latest_attempt["classification"] == "infrastructure" and restart_run)
+                failed_unit = json.loads(jobs[0]["work_unit_json"] or '{}')
+                phase = failed_unit.get('phase')
+                checkpoint = json.loads(restart_run['checkpoint_ref_json']) if restart_run and restart_run['checkpoint_ref_json'] else None
+                finalization_checkpoint = bool(
+                    checkpoint is not None and failed_unit.get('inputs', {}).get('checkpoint') == checkpoint
+                    and failed_unit.get('start_cursor', {}).get('completed_epoch') == restart_run['completed_epoch']
+                )
+                restartable = bool(latest_attempt and restart_run and (
+                    latest_attempt["classification"] == "infrastructure" or
+                    (phase == 'finalize' and latest_attempt["classification"] == "scientific" and finalization_checkpoint)
+                ))
                 if restartable:
                     restart_epoch = int(restart_run["completed_epoch"])
+                    restart_phase = phase
             active_execution = db.execute(
                 "SELECT 1 FROM execution_runs WHERE queued_run_id=? AND status NOT IN ('failed','cancelled','indexed') LIMIT 1",
                 (row["queued_run_id"],),
@@ -1068,6 +1080,7 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
             "latest_job_resumable": isinstance(segment, dict) and segment.get("phase") == "train",
             "can_restart": restartable,
             "restart_epoch": restart_epoch,
+            "restart_phase": restart_phase,
         }
 
     def validate_and_queue_model_definition(

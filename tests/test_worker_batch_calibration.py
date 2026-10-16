@@ -76,6 +76,28 @@ def test_verification_probes_but_never_enters_training(tmp_path, monkeypatch):
     assert not (staging / 'run').exists()
 
 
+def test_verification_reports_sparse_split_warning_and_remains_ready(tmp_path, monkeypatch):
+    configuration, dataset, staging = [tmp_path / name for name in ('configuration', 'dataset', 'staging')]
+    for path in (configuration, dataset, staging): path.mkdir()
+    (configuration / 'payload').write_text('[data]\nbatch_size = 4\n')
+    (dataset / 'payload').write_bytes(b'sqlite')
+    monkeypatch.setattr('oracle_builder.worker.pull.subprocess.run', lambda *_args, **_kwargs:
+                        SimpleNamespace(returncode=0, stdout='ORACLE_BATCH_TUNE_RESULT=' + json.dumps({'ready': True, 'recommended_batch_size': 4})))
+    monkeypatch.setattr('oracle_builder.config.resolve_config', lambda *args: {'classification': {}})
+    warning = 'Class 56 has no test example; train and validation are preserved.'
+    monkeypatch.setattr('oracle_data_contracts.artifacts.splits.create_split_manifest',
+                        lambda *args: {'assignments': [], 'coverage': {'valid': False, 'warnings': [warning]}})
+    events = []
+    TrainingExecutor().execute(
+        work_unit={'work_unit_id': 'verify-job', 'parameters': {'queue_execution': {'mode': 'manual', 'phase': 'verify', 'batch_size': 4}}},
+        inputs={'input': dataset}, configuration=configuration, staging=staging,
+        emit_event=lambda event, _message, data=None: events.append((event, data)),
+    )
+    report = json.loads((staging / 'verification.json').read_text())
+    assert report['ready'] is True and report['warnings'] == [warning]
+    assert any(event == 'split_coverage_warning' and data['warning_count'] == 1 for event, data in events)
+
+
 def test_verified_training_applies_batch_without_recalibrating(tmp_path, monkeypatch):
     configuration, dataset, staging = [tmp_path / name for name in ('configuration', 'dataset', 'staging')]
     for path in (configuration, dataset, staging): path.mkdir()

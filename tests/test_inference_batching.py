@@ -54,3 +54,12 @@ def test_fixed_batch_is_still_verified():
 
     assert plan.batch_size == 6
     assert plan.mode == "fixed"
+
+
+def test_auto_probe_starts_within_verified_training_capacity():
+    settings = config()
+    settings["data"]["batch_size"] = 3
+    plan = resolve_inference_batch_size(LimitedModel(3), settings, announce=None)
+
+    assert plan.batch_size == 3
+    assert plan.attempts == (3,)

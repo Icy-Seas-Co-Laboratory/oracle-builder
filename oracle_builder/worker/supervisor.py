@@ -1,5 +1,6 @@
 """Bounded process-group termination while the parent retains lease control."""
 from __future__ import annotations
+import gzip
 import json
 import os
 from pathlib import Path
@@ -11,6 +12,38 @@ import threading
 import time
 
 from oracle_builder.worker.executor_child import EVENT_PREFIX
+
+
+_FAILURE_LOG_TAIL_BYTES = 4 * 1024 * 1024
+_FAILURE_LOG_LIMIT = 20
+
+
+def _retain_failure_log(scratch: Path) -> Path | None:
+    """Keep a bounded diagnostic tail outside disposable execution scratch."""
+    source = scratch / 'executor.log'
+    if not source.is_file():
+        return None
+    failures = scratch.parent / 'failure-logs'
+    target = failures / f'{scratch.name}.log.gz'
+    temporary = failures / f'.{scratch.name}.{os.getpid()}.tmp'
+    try:
+        failures.mkdir(mode=0o700, exist_ok=True)
+        os.chmod(failures, 0o700)
+        with source.open('rb') as log, temporary.open('xb') as output:
+            os.chmod(temporary, 0o600)
+            log.seek(max(0, source.stat().st_size - _FAILURE_LOG_TAIL_BYTES))
+            with gzip.GzipFile(fileobj=output, mode='wb') as compressed:
+                compressed.write(log.read(_FAILURE_LOG_TAIL_BYTES))
+        os.replace(temporary, target)
+    except OSError:
+        temporary.unlink(missing_ok=True)
+        return None
+    try:
+        for old in sorted(failures.glob('*.log.gz'), key=lambda path: path.stat().st_mtime, reverse=True)[_FAILURE_LOG_LIMIT:]:
+            old.unlink(missing_ok=True)
+    except OSError:
+        pass
+    return target
 
 
 def terminate_process_group(process, *, grace_seconds=2):
@@ -80,8 +113,22 @@ def execute_supervised(*, work_unit, inputs, configuration, staging, emit_event,
         control.check()
         reader.join(timeout=1)
         if process.returncode:
-            tail = (scratch / 'executor.log').read_text(errors='replace')[-4000:]
-            raise RuntimeError(f'Execution child exited with status {process.returncode}: {tail}')
+            saved_log = _retain_failure_log(scratch)
+            detail = ''
+            if result_path.is_file():
+                try:
+                    failure = json.loads(result_path.read_text()).get('execution_error', {})
+                    detail = f"{failure.get('type', '')}: {failure.get('message', '')}".strip(': ')
+                except (OSError, ValueError, AttributeError):
+                    pass
+            if not detail:
+                log_path = scratch / 'executor.log'
+                if log_path.is_file():
+                    with log_path.open('rb') as log:
+                        log.seek(max(0, log_path.stat().st_size - 1200))
+                        detail = log.read(1200).decode(errors='replace')
+            suffix = f' [diagnostic log: {saved_log}]' if saved_log else ''
+            raise RuntimeError(f'Execution child exited with status {process.returncode}: {detail[:1400]}{suffix}')
         if not result_path.is_file():
             raise RuntimeError('Execution child did not write its result')
         return json.loads(result_path.read_text())

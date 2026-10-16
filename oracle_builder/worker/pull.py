@@ -278,6 +278,10 @@ class TrainingExecutor:
             if self_supervised_settings(config).get('enabled', False):
                 raise PullProtocolError('Resumable queued execution does not yet support self-supervised training; use the explicit whole-phase training workflow')
             split = create_split_manifest(staging, dataset / 'payload', config)
+            split_warnings = list(split.get('coverage', {}).get('warnings', []))
+            if split_warnings:
+                emit_event('split_coverage_warning', 'Sparse classes adjusted in the split; training can continue',
+                           {'warnings': split_warnings[:10], 'warning_count': len(split_warnings)})
             stratified = config.get('classification', {}).get('stratification', {})
             unit_epochs = int(stratified.get('supra_epochs', 1)) if stratified.get('enabled') else 1
             training_policy = config.get('training', {})
@@ -286,6 +290,7 @@ class TrainingExecutor:
                       "checks": ["configuration_resolution", "dataset_loading", "model_forward_backward", "split_coverage"],
                       "execution_contract_version": 2, "unit_epochs": unit_epochs,
                       "unit_steps": unit_steps,
+                      "warnings": split_warnings[:10], "warning_count": len(split_warnings),
                       "split_manifest": {key: value for key,value in split.items() if key != 'assignments'},
                       "work_unit_id": work_unit.get("work_unit_id")}
             (staging / "verification.json").write_text(json.dumps(report), encoding="utf-8")
