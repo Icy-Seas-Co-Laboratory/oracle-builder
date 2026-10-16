@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import errno
 import io
+from pathlib import Path
 import uuid
 import zipfile
 
@@ -53,9 +55,36 @@ def test_resumable_output_upload_accepts_out_of_order_parts_and_finalizes(tmp_pa
     assert orch.upload_worker_output_part(**{key: value for key, value in credentials.items() if key != "lease_id"}, upload_id=upload["upload_id"], part_number=0, part_sha256=hashlib.sha256(first).hexdigest(), part=first)["part_idempotent"]
     final = orch.finalize_worker_output_upload(**{key: value for key, value in credentials.items() if key != "lease_id"}, upload_id=upload["upload_id"])
     assert final["status"] == "finalized"
+    assert not (orch.artifact_root / "worker-output-uploads" / upload["upload_id"]).exists()
     assert orch.finalize_worker_output_upload(**{key: value for key, value in credentials.items() if key != "lease_id"}, upload_id=upload["upload_id"])["idempotent"]
     assert orch.complete_worker_lease(**credentials, success=True)["outcome"] == "completed"
     assert orch.job(lease["job_id"])["status"] == "completed"
+
+
+def test_disk_full_finalization_reports_retryable_storage_error(tmp_path, monkeypatch):
+    orch, worker, lease, credentials = _leased(tmp_path)
+    archive = _archive()
+    upload = orch.create_worker_output_upload(**credentials, archive_size=len(archive),
+                                              archive_sha256=hashlib.sha256(archive).hexdigest(), part_size=len(archive))
+    orch.upload_worker_output_part(**{key: value for key, value in credentials.items() if key != "lease_id"},
+                                   upload_id=upload["upload_id"], part_number=0,
+                                   part_sha256=hashlib.sha256(archive).hexdigest(), part=archive)
+    original_open = Path.open
+
+    def full_disk_open(path, *args, **kwargs):
+        if path.suffix == ".assembling":
+            raise OSError(errno.ENOSPC, "No space left on device")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", full_disk_open)
+    with TestClient(create_app(orch)) as client:
+        response = client.post(f"/v1/worker-output-uploads/{upload['upload_id']}:finalize",
+                               headers={"Authorization": f"Bearer {worker['worker_token']}"},
+                               json={"lease_token": lease["lease_token"]})
+    assert response.status_code == 507
+    assert "Insufficient disk space" in response.json()["detail"]
+    assert "Insufficient disk space" in orch.job(lease["job_id"])["error"]
+    assert orch.job_worker_output_upload(lease["job_id"])["status"] == "uploading"
 
 
 def test_resumable_output_upload_rejects_bad_digest_and_incomplete_finalize(tmp_path):
@@ -84,6 +113,23 @@ def test_deferred_output_recovery_rotates_a_fresh_lease_token_for_owning_worker(
     )
     assert resumed["status"] == "active" and resumed["lease_token"] != credentials["lease_token"]
     assert orch.job(lease["job_id"])["status"] == "publishing"
+
+
+def test_output_recovery_handles_a_lost_defer_or_completion_response(tmp_path):
+    orch, worker, lease, credentials = _leased(tmp_path)
+    resumed = orch.resume_worker_output_publication(
+        lease_id=lease["lease_id"], worker_id=worker["worker_id"], worker_token=worker["worker_token"],
+    )
+    assert resumed["status"] == "active"
+    assert resumed["lease_token"] != credentials["lease_token"]
+    current = {**credentials, "lease_token": resumed["lease_token"]}
+    archive = _archive()
+    orch.upload_worker_lease_output_archive(**current, archive=archive)
+    orch.complete_worker_lease(**current, success=True)
+    receipt = orch.resume_worker_output_publication(
+        lease_id=lease["lease_id"], worker_id=worker["worker_id"], worker_token=worker["worker_token"],
+    )
+    assert receipt == {"status": "released", "outcome": "completed", "output_archive_sha256": hashlib.sha256(archive).hexdigest()}
 
 
 def test_resumable_output_upload_api_contract(tmp_path):

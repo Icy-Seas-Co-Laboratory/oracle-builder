@@ -123,17 +123,23 @@
 	function setLabel(value: string) { label = value; page = 0; void loadPreviews(); }
 	function movePage(delta: number) { page = Math.max(0, page + delta); void loadPreviews(); }
 	function chooseUpload(event: Event) { uploadFile = (event.currentTarget as HTMLInputElement).files?.[0] ?? null; uploadError = ''; }
-	async function uploadFrozenDataset() {
+	async function uploadDataset() {
 		if (!uploadFile) return;
 		uploading = true; uploadError = ''; uploadTransferred = 0;
 		try {
 			const file = uploadFile;
 			const uploaded = await api.resumableUpload('datasets', file, (progress) => uploadTransferred = progress.transferredBytes);
-			const dataset = await api.ingestDataset(String(uploaded.path));
+			const report = await api.scanTrainingCatalog({ root_id: 'uploads' });
+			const entry = asRecords(report.entries).find((item) => String(item.path) === String(uploaded.path));
+			if (!entry) throw new Error('The uploaded file is not a readable Oracle SQLite training set.');
 			uploadFile = null;
-			await onchanged?.(`Uploaded and registered frozen dataset ${display(dataset.name)}. It is ready in Queue.`);
+			await load(false);
+			await select(String(entry.catalog_id));
+			await onchanged?.(entryStatus(entry) === 'frozen'
+				? `Uploaded ${display(entry.name)}. It is frozen and ready in Queue.`
+				: `Uploaded ${display(entry.name)}. Freeze this revision in the catalog before training.`);
 		} catch (error) {
-			uploadError = error instanceof Error ? error.message : 'Could not upload and register the frozen dataset.';
+			uploadError = error instanceof Error ? error.message : 'Could not add the dataset to the catalog.';
 			onfailure?.(uploadError);
 		} finally { uploading = false; }
 	}
@@ -145,7 +151,7 @@
 	});
 </script>
 
-<section class="catalog-intro"><div><p class="eyebrow">TRAINING SET CATALOG</p><h1>Versioned Oracle SQLite training sets.</h1><p>Only Oracle Builder dataset revisions are cataloged. Image folders must be converted before they become training evidence.</p></div><div class="catalog-actions"><label class="dataset-upload">Upload frozen SQLite<input type="file" accept=".sqlite" on:change={chooseUpload} disabled={uploading} /><span>{uploadFile?.name ?? 'Choose .sqlite file'}</span></label><button disabled={!uploadFile || uploading} on:click={uploadFrozenDataset}>{uploading ? `Uploading ${Math.round(uploadTransferred / Math.max(uploadFile?.size ?? 1, 1) * 100)}%` : 'Upload & register'}</button><button class="secondary" on:click={scan} disabled={scanning}>{scanning ? 'Scanning…' : 'Scan datasets'}</button></div></section>
+<section class="catalog-intro"><div><p class="eyebrow">TRAINING SET CATALOG</p><h1>Versioned Oracle SQLite training sets.</h1><p>Only Oracle Builder dataset revisions are cataloged. Image folders must be converted before they become training evidence.</p></div><div class="catalog-actions"><label class="dataset-upload">Upload SQLite dataset<input type="file" accept=".sqlite" on:change={chooseUpload} disabled={uploading} /><span>{uploadFile?.name ?? 'Choose .sqlite file'}</span></label><button disabled={!uploadFile || uploading} on:click={uploadDataset}>{uploading ? `Uploading ${Math.round(uploadTransferred / Math.max(uploadFile?.size ?? 1, 1) * 100)}%` : 'Upload to catalog'}</button><button class="secondary" on:click={scan} disabled={scanning}>{scanning ? 'Scanning…' : 'Scan datasets'}</button></div></section>
 {#if uploading}<div class="dataset-upload-progress" role="status"><progress value={uploadTransferred} max={uploadFile?.size ?? 1}></progress><span>{Math.round(uploadTransferred / Math.max(uploadFile?.size ?? 1, 1) * 100)}% transferred; retrying the same selected file resumes its upload.</span></div>{/if}
 {#if uploadError}<p class="inline-error" role="alert">{uploadError}</p>{/if}
 {#if freezeStatus}<div class="freeze-progress" role="status"><progress></progress><span>{freezeStatus}</span>{#if freezeError}<button class="secondary small" on:click={resumeFreeze} disabled={pollingFreeze}>Check progress again</button>{/if}</div>{/if}

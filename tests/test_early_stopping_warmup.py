@@ -75,9 +75,16 @@ def test_post_training_stage_preserves_metrics_and_reports_item_progress(tmp_pat
     status = PostTrainingProgress(3, status_path=path, planned_epochs=25)
     with status.stage("Building classification evidence"):
         status.update_items(64, 100)
+        status.update_activity("Extracted 64 of 100 validation embeddings", completed_items=64,
+                               total_items=100, stage_fraction=0.64)
         raw = json.loads(path.read_text())
         assert raw["post_training"]["stopped_early"] is True
         assert raw["post_training"]["stage_index"] == 1
+        assert raw["post_training"]["activity"] == "Extracted 64 of 100 validation embeddings"
+        assert raw["post_training"]["stage_fraction"] == 0.64
+        live = training_progress_payload(path)
+        assert live["post_training"]["activity"] == raw["post_training"]["activity"]
+        assert live["post_training"]["stage_fraction"] == 0.64
         assert raw["history"] == [{"epoch": 21, "val_loss": 2.1}]
     projection = training_progress_payload(path)
     assert projection["post_training"]["status"] == "completed"

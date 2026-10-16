@@ -7,6 +7,7 @@ import sys
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, Mapping
 
 from oracle_builder.artifacts import (
     RunLayout,
@@ -932,7 +933,18 @@ def _run_training(request: TrainingRequest) -> int:
                 with post_progress.stage("Tuning post-hoc classifier on validation embeddings"):
                     from oracle_builder.posthoc.training import train_posthoc_classifier
 
-                    posthoc_report = train_posthoc_classifier(model, args.input, config, run_dir)
+                    def posthoc_progress(event: str, message: str, data: Mapping[str, Any] | None = None) -> None:
+                        values = data or {}
+                        post_progress.update_activity(
+                            message,
+                            completed_items=values.get("completed") if isinstance(values.get("completed"), int) else None,
+                            total_items=values.get("total") if isinstance(values.get("total"), int) else None,
+                            stage_fraction=values.get("stage_fraction") if isinstance(values.get("stage_fraction"), (int, float)) else None,
+                            force=event != "posthoc_embedding_progress",
+                        )
+
+                    posthoc_report = train_posthoc_classifier(model, args.input, config, run_dir,
+                                                              progress=posthoc_progress)
                     log_event(training_log, run_id, "INFO", "Trained post-hoc classifier", posthoc_report)
         with post_progress.stage("Reloading and testing saved model formats"):
             load_report = run_load_tests(run_dir, config, save_report)

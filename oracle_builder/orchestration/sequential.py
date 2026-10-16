@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import hashlib
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 from oracle_data_contracts.work_units import WorkUnitV2
@@ -10,6 +11,55 @@ from oracle_data_contracts.artifacts import ArtifactRef
 
 
 class SequentialExecutionMixin:
+    def restart_failed_training_unit(self, job_id: str) -> dict:
+        """Manually requeue a failed unit from its last committed checkpoint."""
+        with self._connection() as db:
+            initial = db.execute('SELECT status FROM jobs WHERE job_id=?', (job_id,)).fetchone()
+        if initial is None:
+            raise KeyError(job_id)
+        if initial['status'] != 'failed':
+            raise ValueError('Only a failed training unit can be restarted')
+        # A completed filesystem publication wins over a failure receipt.
+        # Reconcile before considering another execution of the same unit.
+        self.reconcile_worker_publications()
+        with self._connection() as db:
+            job = db.execute('SELECT * FROM jobs WHERE job_id=?', (job_id,)).fetchone()
+            if job is None:
+                raise KeyError(job_id)
+            if job['status'] in {'completed', 'indexed'}:
+                return self.job(job_id) or {}
+            unit = json.loads(job['work_unit_json'] or '{}')
+            run = db.execute('SELECT * FROM execution_runs WHERE current_job_id=?', (job_id,)).fetchone()
+            if run is None or unit.get('schema', {}).get('version') != 2 or unit.get('phase') not in {'train', 'finalize'}:
+                raise ValueError('Only the current sequential training unit can be restarted')
+            checkpoint = json.loads(run['checkpoint_ref_json']) if run['checkpoint_ref_json'] else None
+        if checkpoint is not None:
+            self.artifact_store.resolve(ArtifactRef.from_dict(checkpoint))
+        with self._connection() as db:
+            db.execute('BEGIN IMMEDIATE')
+            job = db.execute('SELECT * FROM jobs WHERE job_id=?', (job_id,)).fetchone()
+            run = db.execute('SELECT * FROM execution_runs WHERE current_job_id=?', (job_id,)).fetchone()
+            if job is None or run is None or job['status'] != 'failed':
+                raise ValueError('Only a failed current training unit can be restarted')
+            unit = json.loads(job['work_unit_json'] or '{}')
+            expected = json.loads(run['checkpoint_ref_json']) if run['checkpoint_ref_json'] else None
+            if (expected != checkpoint or unit.get('inputs', {}).get('checkpoint') != checkpoint
+                    or int(unit.get('start_cursor', {}).get('completed_epoch', -1)) != int(run['completed_epoch'])):
+                raise ValueError('The failed unit no longer matches the committed checkpoint')
+            attempt = db.execute('SELECT classification FROM execution_attempts WHERE job_id=? ORDER BY ordinal DESC LIMIT 1', (job_id,)).fetchone()
+            if attempt is None or attempt['classification'] != 'infrastructure':
+                raise ValueError('Only infrastructure failures can be manually restarted')
+            active = db.execute("SELECT 1 FROM worker_leases WHERE job_id=? AND status IN ('active','publication_pending')", (job_id,)).fetchone()
+            if active:
+                raise ValueError('This unit still has an active or pending publication lease')
+            now = datetime.now(timezone.utc).isoformat()
+            db.execute("UPDATE jobs SET status='queued',remote_status='queued',worker_id=NULL,error=NULL,completed_at=NULL,retry_count=0,cancel_requested_at=NULL,cancelled_at=NULL,updated_at=? WHERE job_id=?", (now, job_id))
+            db.execute("UPDATE execution_runs SET status='queued',updated_at=? WHERE run_id=?", (now, run['run_id']))
+            if job['queued_run_id']:
+                db.execute("UPDATE queued_runs SET status='queued',start_authorized=1,failure_reason=NULL,updated_at=? WHERE queued_run_id=?", (now, job['queued_run_id']))
+            self._record_job_event_in_connection(db, job_id, 'manual_restart', 'Failed training unit manually restarted from committed checkpoint', {'completed_epoch': run['completed_epoch'], 'checkpoint_ref': checkpoint})
+        return self.job(job_id) or {}
+
     def _begin_sequential_in_connection(self, db, *, unit, queued_run_id, pool_id, now):
         execution = unit.parameters['queue_execution']
         total = execution['epochs']

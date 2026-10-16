@@ -113,20 +113,23 @@ class WorkerControlMixin:
         encoded = json.dumps(telemetry, sort_keys=True, allow_nan=False)
         if len(encoded.encode()) > 8192:
             raise ValueError('Heartbeat telemetry exceeds 8 KiB')
-        now, expiry = _now(), self._lease_expiry(ttl_seconds)
+        received_at = _now()
+        self._lease_expiry(ttl_seconds)
         with self._connection() as db:
             db.execute('BEGIN IMMEDIATE')
-            lease, worker, job = self._authenticate_active_worker_lease(db, lease_id=lease_id, worker_id=worker_id, worker_token=worker_token, lease_token=lease_token)
+            lease, worker, job = self._authenticate_active_worker_lease(db, lease_id=lease_id, worker_id=worker_id, worker_token=worker_token, lease_token=lease_token, allow_publication_pending=True, received_at=received_at)
             generation = db.execute('SELECT ordinal FROM execution_attempts WHERE lease_id=?', (lease_id,)).fetchone()[0]
             if telemetry.get('generation', generation) != generation:
                 raise ValueError('Heartbeat belongs to a stale attempt generation')
             boot = json.loads(worker['capabilities_json']).get('execution_instance_id')
             if telemetry.get('worker_boot_id', boot) != boot:
                 raise ValueError('Heartbeat belongs to a different worker boot')
+            now, expiry = _now(), self._lease_expiry(ttl_seconds)
             db.execute('UPDATE worker_leases SET expires_at=?,updated_at=? WHERE lease_id=?', (expiry, now, lease_id))
             db.execute('UPDATE registered_workers SET last_seen_at=?,updated_at=? WHERE worker_id=?', (now, now, worker_id))
             db.execute('INSERT INTO worker_heartbeats VALUES(?,?,?,?,?) ON CONFLICT(worker_id) DO UPDATE SET lease_id=excluded.lease_id,generation=excluded.generation,telemetry_json=excluded.telemetry_json,received_at=excluded.received_at', (worker_id, lease_id, generation, encoded, now))
-            return {'expires_at': expiry, 'ttl_seconds': ttl_seconds, 'generation': generation, 'cancel_requested': job['cancel_requested_at'] is not None}
+            return {'expires_at': expiry, 'ttl_seconds': ttl_seconds, 'generation': generation,
+                    'cancel_requested': lease['status'] == 'active' and job['cancel_requested_at'] is not None}
 
     def poll_worker_commands(self, *, lease_id, worker_id, worker_token, lease_token, wait_seconds=0):
         if isinstance(wait_seconds, bool) or not isinstance(wait_seconds, (int, float)) or not 0 <= wait_seconds <= 30:
@@ -134,9 +137,10 @@ class WorkerControlMixin:
         deadline = time.monotonic() + wait_seconds
         while True:
             with self._connection() as db:
-                lease, worker, job = self._authenticate_active_worker_lease(db, lease_id=lease_id, worker_id=worker_id, worker_token=worker_token, lease_token=lease_token)
-                rows = db.execute("SELECT * FROM worker_commands WHERE lease_id=? AND status IN ('pending','received','accepted') ORDER BY sequence", (lease_id,)).fetchall()
-                result = {'commands': [_public(row) for row in rows], 'cancel_requested': job['cancel_requested_at'] is not None}
+                lease, worker, job = self._authenticate_active_worker_lease(db, lease_id=lease_id, worker_id=worker_id, worker_token=worker_token, lease_token=lease_token, allow_publication_pending=True)
+                rows = db.execute("SELECT * FROM worker_commands WHERE lease_id=? AND status IN ('pending','received','accepted') ORDER BY sequence", (lease_id,)).fetchall() if lease['status'] == 'active' else []
+                result = {'commands': [_public(row) for row in rows],
+                          'cancel_requested': lease['status'] == 'active' and job['cancel_requested_at'] is not None}
             if rows or result['cancel_requested'] or time.monotonic() >= deadline:
                 return result
             # Notifications wake this process immediately; periodic rechecks

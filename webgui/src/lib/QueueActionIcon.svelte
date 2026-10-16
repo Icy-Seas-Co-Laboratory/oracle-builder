@@ -1,5 +1,5 @@
 <script lang="ts">
-	export let name: 'edit' | 'verify' | 'start' | 'pause' | 'resume' | 'stop' | 'delete';
+	export let name: 'edit' | 'verify' | 'start' | 'pause' | 'resume' | 'restart' | 'stop' | 'delete';
 </script>
 
 <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
@@ -11,6 +11,8 @@
 		<path d="m8 5 11 7-11 7V5Z" />
 	{:else if name === 'pause'}
 		<path d="M8 5v14M16 5v14" />
+	{:else if name === 'restart'}
+		<path d="M20 11a8 8 0 1 0-2.3 6.1M20 4v7h-7" />
 	{:else if name === 'stop'}
 		<rect x="5" y="5" width="14" height="14" rx="2" />
 	{:else}

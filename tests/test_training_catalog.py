@@ -118,3 +118,28 @@ def test_training_catalog_freeze_can_be_scheduled_and_reports_completion(tmp_pat
         assert operation["result"]["entry"]["status"] == "frozen"
         assert operation["result"]["dataset"]["lifecycle"] == "frozen"
         assert client.get("/v1/training-catalog").json()["entries"][0]["status"] == "frozen"
+
+
+def test_uploaded_working_dataset_can_be_registered_and_frozen(tmp_path):
+    from fastapi.testclient import TestClient
+
+    from oracle_builder.orchestration.api import create_app
+    from oracle_builder.orchestration.service import Orchestrator
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    orchestrator = Orchestrator(tmp_path / "orchestrator.sqlite", workspace_root=workspace)
+    uploaded = orchestrator.upload_destination("datasets", "working.sqlite")
+    _sqlite_dataset(uploaded)
+
+    with TestClient(create_app(orchestrator)) as client:
+        response = client.post("/v1/datasets:ingest", json={"path": str(uploaded)})
+        assert response.status_code == 201
+        assert response.json()["lifecycle"] == "working"
+        report = client.post("/v1/training-catalog:scan", json={}).json()
+        entry = next(item for item in report["entries"] if item["path"] == str(uploaded))
+        assert entry["status"] == "working"
+        frozen = client.post(f"/v1/training-catalog/{entry['catalog_id']}:freeze")
+        assert frozen.status_code == 200
+        assert frozen.json()["dataset"]["lifecycle"] == "frozen"
+        assert client.get("/v1/datasets").json()["datasets"][0]["lifecycle"] == "frozen"

@@ -152,6 +152,8 @@ class ArtifactStore(Protocol):
     def begin_staging(self, job_id: str, attempt_id: str) -> StagingArea: ...
     def staging(self, job_id: str, attempt_id: str) -> StagingArea: ...
     def staging_path(self, staging: StagingArea) -> Path: ...
+    def candidate_path(self, staging: StagingArea) -> Path: ...
+    def staging_status(self, staging: StagingArea) -> str: ...
     def validate(self, staging: StagingArea, validator: Validator) -> ValidationResult: ...
     def seal(self, staging: StagingArea) -> None: ...
     def publish(self, staging: StagingArea, ref: ArtifactRef) -> Path: ...
@@ -360,6 +362,12 @@ class S3ReplicatedArtifactStore:
     def staging_path(self, staging: StagingArea) -> Path:
         return self.local.staging_path(staging)
 
+    def candidate_path(self, staging: StagingArea) -> Path:
+        return self.local.candidate_path(staging)
+
+    def staging_status(self, staging: StagingArea) -> str:
+        return self.local.staging_status(staging)
+
     def validate(self, staging: StagingArea, validator: Validator) -> ValidationResult:
         return self.local.validate(staging, validator)
 
@@ -373,6 +381,10 @@ class S3ReplicatedArtifactStore:
         except Exception as exc:
             self._last_results[ref.uri] = {"status": "failed", "error": str(exc)}
         return published
+
+    def publish_local(self, staging: StagingArea, ref: ArtifactRef) -> Path:
+        """Publish locally; the orchestrator schedules durable replication."""
+        return self.local.publish(staging, ref)
 
     def published_ref(self, job_id: str, attempt_id: str) -> ArtifactRef | None:
         return self.local.published_ref(job_id, attempt_id)
@@ -549,6 +561,16 @@ class LocalArtifactStore:
         if state["status"] != "staging":
             raise ValueError(f"staging area is {state['status']}, not writable")
         return path
+
+    def candidate_path(self, staging: StagingArea) -> Path:
+        """Read an uploaded candidate again after validation was interrupted."""
+        path, state = self._checked_staging(staging)
+        if state["status"] not in {"staging", "validated", "sealed"}:
+            raise ValueError(f"staging area is {state['status']}, not readable")
+        return path
+
+    def staging_status(self, staging: StagingArea) -> str:
+        return str(self._checked_staging(staging)[1]["status"])
 
     def validate(self, staging: StagingArea, validator: Validator) -> ValidationResult:
         path, state = self._checked_staging(staging)

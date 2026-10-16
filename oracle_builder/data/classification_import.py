@@ -85,11 +85,12 @@ def discover_classes(root: Path) -> tuple[dict[str, list[tuple[Path, str | None]
                 for path in sorted(class_dir.rglob("*"))
                 if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES
             ]
+    for name in list(classes):
+        if not classes[name]:
+            warnings.append(f"Ignoring directory {name!r}: no supported images")
+            del classes[name]
     if not classes:
         raise ValueError(f"No class folders containing supported images found under {root}")
-    for name, files in classes.items():
-        if not files:
-            warnings.append(f"Class {name!r} contains no supported images")
     return classes, warnings
 
 
@@ -361,6 +362,24 @@ def import_folders(options: argparse.Namespace) -> dict[str, Any]:
     finally:
         if state_connection is not connection:
             state_connection.close()
+    # Resolve conflicting source labels as a group. Otherwise the first class
+    # encountered would be imported while later copies were skipped.
+    source_by_hash: dict[str, list[Candidate]] = {}
+    for candidate in candidates:
+        if candidate.status == "ready":
+            source_by_hash.setdefault(candidate.sha256, []).append(candidate)
+    for group in source_by_hash.values():
+        class_names = {candidate.class_name for candidate in group}
+        if len(class_names) < 2 or options.duplicate_policy == "allow":
+            continue
+        paths = ", ".join(candidate.relative_path for candidate in group)
+        reason = f"Identical content has conflicting class assignments: {paths}"
+        for candidate in group:
+            candidate.status = (
+                "skipped_conflict" if options.duplicate_policy == "skip" else "error"
+            )
+            candidate.error = reason
+
     seen_hashes: dict[str, Candidate] = {}
     for candidate in candidates:
         if candidate.status != "ready":
@@ -375,15 +394,20 @@ def import_folders(options: argparse.Namespace) -> dict[str, Any]:
                 for _, metadata in existing_duplicates
             )
             if conflicting and options.duplicate_policy != "allow":
-                candidate.status = "error"
-                candidate.error = "Identical content has conflicting class assignments"
+                candidate.status = (
+                    "skipped_conflict" if options.duplicate_policy == "skip" else "error"
+                )
+                candidate.error = (
+                    "Identical content has conflicting class assignments with "
+                    "an item already in the output dataset"
+                )
             elif options.duplicate_policy == "error":
                 candidate.status = "error"
                 candidate.error = "Duplicate image content"
             elif options.duplicate_policy == "skip":
                 candidate.status = "skipped_duplicate"
         seen_hashes.setdefault(candidate.sha256, candidate)
-        if candidate.sample_uuid in by_uuid:
+        if candidate.status != "skipped_conflict" and candidate.sample_uuid in by_uuid:
             if options.existing_policy == "error":
                 candidate.status = "error"
                 candidate.error = "Sample UUID already exists"
@@ -415,7 +439,8 @@ def import_folders(options: argparse.Namespace) -> dict[str, Any]:
         name
         for name in classes
         if sum(
-            candidate.class_name == name and candidate.status != "error"
+            candidate.class_name == name
+            and candidate.status in {"ready", "update", "skipped_existing", "skipped_duplicate"}
             for candidate in candidates
         )
         < options.minimum_images_per_class
@@ -442,6 +467,11 @@ def import_folders(options: argparse.Namespace) -> dict[str, Any]:
         "errors": [
             {"path": candidate.relative_path, "error": candidate.error}
             for candidate in errors
+        ],
+        "skipped_conflicts": [
+            {"path": candidate.relative_path, "reason": candidate.error}
+            for candidate in candidates
+            if candidate.status == "skipped_conflict"
         ],
     }
     if not options.dry_run:
@@ -609,7 +639,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--require-rgb", action="store_true")
     parser.add_argument("--allow-grayscale", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--on-error", choices=("error", "skip"), default="error")
-    parser.add_argument("--duplicate-policy", choices=("error", "skip", "allow"), default="skip")
+    parser.add_argument(
+        "--duplicate-policy",
+        choices=("error", "skip", "allow"),
+        default="skip",
+        help=("skip excludes every source copy of content assigned to multiple classes "
+              "and records those paths in the import report"),
+    )
     parser.add_argument("--existing-policy", choices=("error", "skip", "update"), default="skip")
     parser.add_argument("--storage-mode", choices=("original", "materialized"), default="original")
     parser.add_argument(

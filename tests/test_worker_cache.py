@@ -86,3 +86,27 @@ def test_eviction_skips_an_entry_held_by_another_thread(tmp_path):
     cache.materialize(second, {"content_manifest_sha256": second_digest}, second_download)
     assert cache.materialize(first, {"content_manifest_sha256": first_digest}, first_download).is_dir()
     release.set(); thread.join(2)
+
+
+def test_cache_limits_total_bytes_even_below_entry_count_limit(tmp_path):
+    cache = WorkerArtifactCache(tmp_path / "cache", max_entries=32, max_bytes=5)
+
+    def materialize(name):
+        source = tmp_path / name
+        (source / "payload").mkdir(parents=True)
+        (source / "payload" / "data").write_text(name)
+        digest = directory_content_digest(source / "payload")
+
+        def download(destination):
+            artifact = destination / "artifact"
+            (artifact / "payload").mkdir(parents=True)
+            (artifact / "payload" / "data").write_text(name)
+            return artifact
+
+        return cache.materialize(ArtifactRef("dataset", name),
+                                 {"content_manifest_sha256": digest}, download)
+
+    first = materialize("one")
+    second = materialize("two")
+    assert not first.exists()
+    assert second.joinpath("data").read_text() == "two"

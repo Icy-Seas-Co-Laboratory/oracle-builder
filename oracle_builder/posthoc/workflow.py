@@ -87,8 +87,17 @@ def fit_existing_model_posthoc(
         "training_dataset_id": info["dataset_id"],
         "training_dataset_fingerprint_sha256": fingerprint,
     }
+    source_lineage = source_manifest.get("lineage") or {}
+    source_evaluation_head = "posthoc" if (source_manifest.get("summary") or {}).get("evaluation_head") == "posthoc" or source_lineage.get("source_model_artifact_id") else "neural"
+    original_neural_artifact_id = source_lineage.get("original_neural_artifact_id") or (source_manifest["artifact_id"] if source_evaluation_head == "neural" else None)
+    original_neural_dataset_id = source_lineage.get("original_neural_dataset_id") or (source_manifest.get("dataset_id") if source_evaluation_head == "neural" else None)
+    original_neural_dataset_fingerprint = source_lineage.get("original_neural_dataset_fingerprint_sha256") or (source_manifest.get("dataset_fingerprint_sha256") if source_evaluation_head == "neural" else None)
     lineage = {
         "source_model_artifact_id": source_manifest["artifact_id"],
+        "source_evaluation_head": source_evaluation_head,
+        "original_neural_artifact_id": original_neural_artifact_id,
+        "original_neural_dataset_id": original_neural_dataset_id,
+        "original_neural_dataset_fingerprint_sha256": original_neural_dataset_fingerprint,
         "source_model_fingerprint_sha256": source_manifest.get("fingerprint_sha256"),
         "source_training_dataset_id": source_manifest.get("dataset_id") or source_config.get("dataset", {}).get("dataset_id"),
         "source_training_dataset_fingerprint_sha256": source_manifest.get("dataset_fingerprint_sha256") or source_config.get("dataset", {}).get("fingerprint_sha256"),
@@ -129,9 +138,9 @@ def fit_existing_model_posthoc(
             shutil.copytree(source / "metrics", output / "metrics", dirs_exist_ok=True)
         metrics_provenance = {
             "kind": "source_neural_training",
-            "source_model_artifact_id": source_manifest["artifact_id"],
-            "source_dataset_id": lineage["source_training_dataset_id"],
-            "source_dataset_fingerprint_sha256": lineage["source_training_dataset_fingerprint_sha256"],
+            "source_model_artifact_id": original_neural_artifact_id,
+            "source_dataset_id": original_neural_dataset_id,
+            "source_dataset_fingerprint_sha256": original_neural_dataset_fingerprint,
         }
         (output / "metrics").mkdir(exist_ok=True)
         (output / "metrics" / "provenance.json").write_text(
@@ -141,6 +150,11 @@ def fit_existing_model_posthoc(
             source_directory = source / dirname
             if source_directory.is_dir():
                 shutil.copytree(source_directory, output / "provenance" / "source_model" / dirname)
+        neural_evidence = source / "provenance" / "neural" / "evaluation"
+        if not neural_evidence.is_dir() and source_evaluation_head == "neural":
+            neural_evidence = source / "evaluation"
+        if neural_evidence.is_dir():
+            shutil.copytree(neural_evidence, output / "provenance" / "neural" / "evaluation")
         source_posthoc = source_model / "posthoc"
         if (source_posthoc / "report.json").is_file():
             target = output / "provenance" / "source_model" / "posthoc"
@@ -171,7 +185,7 @@ def fit_existing_model_posthoc(
         attach_split_manifest(fit_config, split)
         report("posthoc_embedding", "Exporting model embeddings and tuning the classifier", {})
         model = load_model_for_run(source, source_config)
-        result = train_posthoc_classifier(model, dataset, fit_config, output)
+        result = train_posthoc_classifier(model, dataset, fit_config, output, progress=report)
         result["training_dataset"] = {"dataset_id": info["dataset_id"], "fingerprint_sha256": fingerprint, "labels": labels}
         result["source_model_artifact_id"] = source_manifest["artifact_id"]
         (output / "model" / "posthoc" / "report.json").write_text(

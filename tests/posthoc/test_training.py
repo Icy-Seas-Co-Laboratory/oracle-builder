@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 
 import numpy as np
 import pytest
@@ -8,7 +9,20 @@ import pytest
 pytest.importorskip("sklearn")
 
 from oracle_builder.posthoc.cache import export_embedding_cache
-from oracle_builder.posthoc.training import fit_posthoc_from_caches
+from oracle_builder.posthoc.training import _report_long_step, fit_posthoc_from_caches
+
+
+def test_long_fit_reports_elapsed_time_without_advancing_fraction():
+    events = []
+    with _report_long_step(
+        lambda event, message, data: events.append((event, message, data)),
+        "posthoc_candidate_running", "Fitting classifier candidate 1 of 3",
+        {"stage_fraction": 0.75}, interval_seconds=0.01,
+    ):
+        time.sleep(0.04)
+    assert events
+    assert all(event == "posthoc_candidate_running" and "elapsed" in message
+               and data["stage_fraction"] == 0.75 for event, message, data in events)
 
 
 def _cache(path, features, labels):
@@ -24,7 +38,11 @@ def test_posthoc_tunes_on_validation_and_records_held_out_metrics(tmp_path):
     validation = _cache(tmp_path / "validation", [[-1.2], [1.2]], [0, 1])
     test = _cache(tmp_path / "test", [[-1.8], [1.8]], [0, 1])
 
-    report = fit_posthoc_from_caches(train, validation, test, tmp_path / "posthoc")
+    events = []
+    report = fit_posthoc_from_caches(
+        train, validation, test, tmp_path / "posthoc",
+        progress=lambda event, message, data: events.append((event, message, data)),
+    )
 
     assert report["selected_C"] in {0.1, 1.0, 10.0}
     assert {key: report["metrics"][key] for key in ("accuracy", "balanced_accuracy", "macro_f1", "micro_f1")} == {
@@ -38,6 +56,11 @@ def test_posthoc_tunes_on_validation_and_records_held_out_metrics(tmp_path):
     assert (tmp_path / "posthoc" / "evaluation" / "classification_report.json").is_file()
     assert (tmp_path / "posthoc" / "evaluation" / "confusion_matrix.csv").is_file()
     assert (tmp_path / "posthoc" / "evaluation" / "metrics_long.csv").is_file()
+    assert [event for event, _, _ in events if event == "posthoc_candidate_completed"] == [
+        "posthoc_candidate_completed"
+    ] * 3
+    assert events[-1][0] == "posthoc_evaluation_completed"
+    assert events[-1][2]["stage_fraction"] == 1.0
 
 
 def test_posthoc_rejects_missing_labels(tmp_path):

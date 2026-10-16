@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import io
+from concurrent.futures import ThreadPoolExecutor
+import threading
+import time
 import uuid
 import zipfile
 
@@ -9,6 +12,7 @@ from fastapi.testclient import TestClient
 
 from oracle_builder.orchestration.api import create_app
 from oracle_builder.orchestration.service import Orchestrator
+from oracle_builder.orchestration.storage import LocalArtifactStore, S3ReplicatedArtifactStore
 from oracle_data_contracts.artifacts import ArtifactRef
 from oracle_data_contracts.work_units import WorkUnit
 
@@ -21,8 +25,8 @@ def _archive(files: dict[str, bytes]) -> bytes:
     return output.getvalue()
 
 
-def _leased(tmp_path):
-    orch = Orchestrator(tmp_path / "control.sqlite", workspace_root=tmp_path)
+def _leased(tmp_path, *, artifact_store=None):
+    orch = Orchestrator(tmp_path / "control.sqlite", workspace_root=tmp_path, artifact_store=artifact_store)
     pool = orch.create_worker_pool(name="Remote", allowed_actions=["train"])
     worker = orch.register_worker(
         pool_id=pool["pool_id"], name="worker", registration_token=pool["registration_token"],
@@ -93,6 +97,162 @@ def test_spooled_archive_upload_streams_from_control_plane_file(tmp_path):
     spool.write_bytes(_archive({"result.txt": b"spooled"}))
     result = orch.upload_worker_lease_output_archive(**credentials, archive=spool)
     assert result["bytes"] == spool.stat().st_size
+
+
+def test_archive_extraction_does_not_block_worker_heartbeats(tmp_path, monkeypatch):
+    orch, worker, lease = _leased(tmp_path)
+    credentials = {"lease_id": lease["lease_id"], "worker_id": worker["worker_id"],
+                   "worker_token": worker["worker_token"], "lease_token": lease["lease_token"]}
+    orch.acknowledge_worker_lease(**credentials)
+    extracting, release = threading.Event(), threading.Event()
+    original = orch._extract_worker_output_archive
+
+    def slow_extract(archive, destination):
+        extracting.set()
+        assert release.wait(5)
+        return original(archive, destination)
+
+    monkeypatch.setattr(orch, "_extract_worker_output_archive", slow_extract)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending = pool.submit(orch.upload_worker_lease_output_archive, **credentials,
+                              archive=_archive({"result.json": b"{}"}))
+        try:
+            assert extracting.wait(5)
+            started = time.monotonic()
+            orch.heartbeat_worker_lease(**credentials, ttl_seconds=60)
+            assert time.monotonic() - started < 1
+        finally:
+            release.set()
+        assert pending.result(timeout=5)["idempotent"] is False
+
+
+def test_large_output_validation_does_not_block_worker_heartbeats(tmp_path, monkeypatch):
+    orch, worker, lease = _leased(tmp_path)
+    credentials = {"lease_id": lease["lease_id"], "worker_id": worker["worker_id"],
+                   "worker_token": worker["worker_token"], "lease_token": lease["lease_token"]}
+    orch.acknowledge_worker_lease(**credentials)
+    orch.upload_worker_lease_output_archive(**credentials, archive=_archive({"result.json": b"{}"}))
+    validating, release = threading.Event(), threading.Event()
+    original = orch.artifact_store.validate
+
+    def slow_validate(staging, validator):
+        validating.set()
+        assert release.wait(5)
+        return original(staging, validator)
+
+    monkeypatch.setattr(orch.artifact_store, "validate", slow_validate)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending = pool.submit(orch.complete_worker_lease, **credentials, success=True)
+        try:
+            assert validating.wait(5)
+            started = time.monotonic()
+            orch.heartbeat_worker_lease(**credentials, ttl_seconds=60)
+            assert time.monotonic() - started < 1
+        finally:
+            release.set()
+        assert pending.result(timeout=5)["outcome"] == "completed"
+
+
+def test_slow_local_publish_does_not_hold_sqlite_write_lock(tmp_path, monkeypatch):
+    orch, worker, lease = _leased(tmp_path)
+    credentials = {"lease_id": lease["lease_id"], "worker_id": worker["worker_id"],
+                   "worker_token": worker["worker_token"], "lease_token": lease["lease_token"]}
+    orch.acknowledge_worker_lease(**credentials)
+    orch.upload_worker_lease_output_archive(**credentials, archive=_archive({"result.json": b"{}"}))
+    sealing, release = threading.Event(), threading.Event()
+    original = orch.artifact_store.seal
+
+    def slow_seal(staging):
+        sealing.set()
+        assert release.wait(5)
+        original(staging)
+
+    monkeypatch.setattr(orch.artifact_store, "seal", slow_seal)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending = pool.submit(orch.complete_worker_lease, **credentials, success=True)
+        try:
+            assert sealing.wait(5)
+            assert orch.job(lease["job_id"])["status"] == "publication_pending"
+            started = time.monotonic()
+            assert orch.heartbeat_worker_lease(**credentials, ttl_seconds=60)["ttl_seconds"] == 60
+            assert orch.poll_worker_commands(**credentials, wait_seconds=0)["commands"] == []
+            with orch._connection() as db:
+                db.execute("UPDATE registered_workers SET updated_at=updated_at WHERE worker_id=?", (worker["worker_id"],))
+            assert time.monotonic() - started < 1
+        finally:
+            release.set()
+        assert pending.result(timeout=5)["outcome"] == "completed"
+
+
+def test_interrupted_publish_retries_sealed_candidate(tmp_path, monkeypatch):
+    orch, worker, lease = _leased(tmp_path)
+    credentials = {"lease_id": lease["lease_id"], "worker_id": worker["worker_id"],
+                   "worker_token": worker["worker_token"], "lease_token": lease["lease_token"]}
+    orch.acknowledge_worker_lease(**credentials)
+    orch.upload_worker_lease_output_archive(**credentials, archive=_archive({"result.json": b"{}"}))
+    original = orch.artifact_store.publish
+    calls = 0
+
+    def interrupted_publish(staging, ref):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError("temporary disk interruption")
+        return original(staging, ref)
+
+    monkeypatch.setattr(orch.artifact_store, "publish", interrupted_publish)
+    with pytest.raises(OSError, match="temporary disk"):
+        orch.complete_worker_lease(**credentials, success=True)
+    assert orch.job(lease["job_id"])["status"] == "publication_pending"
+    resumed = orch.resume_worker_output_publication(
+        lease_id=lease["lease_id"], worker_id=worker["worker_id"], worker_token=worker["worker_token"])
+    assert orch.complete_worker_lease(**{**credentials, "lease_token": resumed["lease_token"]}, success=True)["outcome"] == "completed"
+
+
+def test_slow_remote_replication_is_queued_after_local_completion(tmp_path):
+    class Remote:
+        def upload_file(self, *_args):
+            raise AssertionError("remote upload must run after completion")
+
+        def put_object(self, **_kwargs):
+            raise AssertionError("remote marker must run after completion")
+
+    store = S3ReplicatedArtifactStore(LocalArtifactStore(tmp_path / "artifacts"), bucket="test", client=Remote())
+    orch, worker, lease = _leased(tmp_path, artifact_store=store)
+    credentials = {"lease_id": lease["lease_id"], "worker_id": worker["worker_id"],
+                   "worker_token": worker["worker_token"], "lease_token": lease["lease_token"]}
+    orch.acknowledge_worker_lease(**credentials)
+    orch.upload_worker_lease_output_archive(**credentials, archive=_archive({"result.json": b"{}"}))
+    completed = orch.complete_worker_lease(**credentials, success=True)
+    assert completed["outcome"] == "completed"
+    assert orch.artifact_replications(status="pending")[0]["artifact_ref"] == completed["output_ref"]
+    assert any(op["operation_type"] == "artifact_replication" for op in orch.operations(status="queued"))
+
+
+def test_published_output_recovers_after_database_commit_interruption(tmp_path, monkeypatch):
+    orch, worker, lease = _leased(tmp_path)
+    credentials = {"lease_id": lease["lease_id"], "worker_id": worker["worker_id"],
+                   "worker_token": worker["worker_token"], "lease_token": lease["lease_token"]}
+    orch.acknowledge_worker_lease(**credentials)
+    orch.upload_worker_lease_output_archive(**credentials, archive=_archive({"result.json": b"{}"}))
+    original = orch._finish_execution_attempt_in_connection
+    calls = 0
+
+    def interrupted_commit(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError("database commit interrupted")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(orch, "_finish_execution_attempt_in_connection", interrupted_commit)
+    with pytest.raises(OSError, match="database commit interrupted"):
+        orch.complete_worker_lease(**credentials, success=True)
+    resumed = orch.resume_worker_output_publication(
+        lease_id=lease["lease_id"], worker_id=worker["worker_id"], worker_token=worker["worker_token"])
+    recovered = orch.complete_worker_lease(**{**credentials, "lease_token": resumed["lease_token"]}, success=True)
+    assert recovered["outcome"] == "completed"
+    assert orch.job(lease["job_id"])["status"] == "completed"
 
 
 def test_output_archive_rejects_traversal_and_other_worker_credentials(tmp_path):

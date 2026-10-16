@@ -3,8 +3,10 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 from collections import defaultdict, deque
 from hashlib import sha256
+import errno
 import hmac
 import re
+import sqlite3
 from typing import Any, Mapping
 import uuid
 import asyncio
@@ -697,6 +699,15 @@ def create_app(
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
+    @app.post("/v1/jobs/{job_id}:restart", status_code=202)
+    def restart_failed_training_unit(job_id: str) -> dict[str, Any]:
+        try:
+            return {"job": orchestrator.restart_failed_training_unit(job_id)}
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Job was not found") from exc
+        except (OSError, ValueError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
     async def worker_control_request(lease_id, authorization, body, method):
         try:
             lease = required(orchestrator.worker_lease(lease_id), "Worker lease")
@@ -708,6 +719,10 @@ def create_app(
             raise HTTPException(status_code=403, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).lower() and "busy" not in str(exc).lower():
+                raise
+            raise HTTPException(status_code=503, detail="Control database is busy; retry the lease request", headers={"Retry-After": "1"}) from exc
 
     @app.post("/v1/worker-leases/{lease_id}:heartbeat")
     async def worker_lease_heartbeat(lease_id: str, body: WorkerHeartbeatRequest, authorization: str | None = Header(default=None)):
@@ -745,6 +760,10 @@ def create_app(
             raise HTTPException(status_code=403, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).lower() and "busy" not in str(exc).lower():
+                raise
+            raise HTTPException(status_code=503, detail="Control database is busy; retry the lease request", headers={"Retry-After": "1"}) from exc
 
     @app.post("/v1/worker-leases/{lease_id}:release")
     def release_worker_lease(
@@ -1132,6 +1151,10 @@ def create_app(
             raise HTTPException(status_code=403, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except OSError as exc:
+            if exc.errno == errno.ENOSPC:
+                raise HTTPException(status_code=507, detail="Insufficient disk space to stage worker output; the retained upload can be retried") from exc
+            raise
 
     @app.post("/v1/worker-leases/{lease_id}:defer-output")
     def defer_worker_output_publication(

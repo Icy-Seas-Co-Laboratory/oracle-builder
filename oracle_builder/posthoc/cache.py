@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 import json
 from pathlib import Path
 import shutil
-from typing import Any, Iterable, Iterator, Mapping, Sequence
+from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 
 import numpy as np
 
@@ -163,6 +163,7 @@ def export_embedding_cache_stream(
     representation: str = "fused_embedding",
     provenance: Mapping[str, Any] | None = None,
     overwrite: bool = False,
+    progress: Callable[[int, int], None] | None = None,
 ) -> EmbeddingCache:
     """Write a cache incrementally, using a writable NPY memmap.
 
@@ -213,9 +214,13 @@ def export_embedding_cache_stream(
             expected_position += 1
 
     write(first_values, first_positions, first_records)
+    if progress is not None:
+        progress(expected_position, count)
     try:
         for values, positions, records in iterator:
             write(values, positions, records)
+            if progress is not None:
+                progress(expected_position, count)
     finally:
         records_handle.close()
     mmap.flush()

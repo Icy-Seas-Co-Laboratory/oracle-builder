@@ -39,7 +39,8 @@ class PostTrainingProgress:
             self.stopped_early = self.stopped_early or self.completed_epochs < self.planned_epochs
 
     def _publish(self, label: str, status: str, *, completed_items: int | None = None,
-                 total_items: int | None = None, force: bool = True) -> None:
+                 total_items: int | None = None, activity: str | None = None,
+                 stage_fraction: float | None = None, force: bool = True) -> None:
         if self._writer is None:
             return
         detail = {
@@ -48,15 +49,26 @@ class PostTrainingProgress:
             "planned_epochs": self.planned_epochs, "stopped_early": self.stopped_early,
             "elapsed_seconds": round(time.perf_counter() - self._started, 1),
             "completed_items": completed_items, "total_items": total_items,
+            "activity": activity, "stage_fraction": stage_fraction,
         }
         self._snapshot.update(state="running", phase="Post-training", message=label,
                               post_training=detail)
         self._writer.write(self._snapshot, force=force)
 
-    def update_items(self, completed: int, total: int) -> None:
+    def update_items(self, completed: int, total: int, *, activity: str | None = None,
+                     stage_fraction: float | None = None) -> None:
         if self.current:
             self._publish(self._snapshot.get("post_training", {}).get("stage", "Generating artifacts"),
-                          "running", completed_items=completed, total_items=total, force=False)
+                          "running", completed_items=completed, total_items=total,
+                          activity=activity, stage_fraction=stage_fraction, force=False)
+
+    def update_activity(self, activity: str, *, completed_items: int | None = None,
+                        total_items: int | None = None, stage_fraction: float | None = None,
+                        force: bool = True) -> None:
+        if self.current:
+            self._publish(self._snapshot.get("post_training", {}).get("stage", "Generating artifacts"),
+                          "running", completed_items=completed_items, total_items=total_items,
+                          activity=activity, stage_fraction=stage_fraction, force=force)
 
     def complete_current(self) -> None:
         if self.current:

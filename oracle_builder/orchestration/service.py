@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import csv
+import errno
+import fcntl
 import hmac
 import hashlib
 import io
@@ -11,12 +13,15 @@ import secrets
 import sqlite3
 import shutil
 import tempfile
+import time
 import urllib.error
 import urllib.request
 import uuid
 import threading
 import tarfile
 import zipfile
+from contextlib import contextmanager
+from functools import wraps
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -38,6 +43,7 @@ from oracle_builder.config import (
 )
 from oracle_builder.config_schema import configuration_schema as v2_configuration_schema
 from oracle_builder.orchestration.database import connect
+from oracle_builder.awake_clock import awake_monotonic
 from oracle_builder.orchestration.lifecycle import (
     LocalProcessWorkerProvider,
     LocalWorkerSpec,
@@ -58,6 +64,16 @@ def _now() -> str:
 
 def _json(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def _serialized_output_completion(method):
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        lease_id = str(uuid.UUID(kwargs["lease_id"]))
+        lock_path = self._worker_output_upload_root() / f"lease-{lease_id}.lock"
+        with self._worker_output_file_lock(lock_path):
+            return method(self, *args, **kwargs)
+    return wrapped
 
 
 def _row(row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -163,15 +179,54 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
                 self.training_catalog_roots[f"catalog-{len(self.training_catalog_roots) + 1}"] = location
             if not any(location.is_relative_to(allowed) for allowed in self.browse_roots.values()):
                 self.browse_roots[f"catalog-{len(self.browse_roots) + 1}"] = location
+        # Browser uploads live outside datasets_root. Include their completed
+        # SQLite files in the catalog so working revisions can be frozen there.
+        uploaded_datasets = (self.artifact_root / "uploads" / "datasets").resolve()
+        uploaded_datasets.mkdir(parents=True, exist_ok=True)
+        if not any(uploaded_datasets.is_relative_to(root) for root in self.training_catalog_roots.values()):
+            self.training_catalog_roots["uploads"] = uploaded_datasets
         with connect(self.database):
             pass
+        self._lease_sleep_lock = threading.Lock()
+        self._lease_last_wall = datetime.now(timezone.utc)
+        self._lease_last_awake = awake_monotonic()
         self._operation_stop: threading.Event | None = None
         self._operation_thread: threading.Thread | None = None
         for name, base_url in compute_endpoints or []:
             self.register_compute_endpoint(name=name, base_url=base_url)
 
     def _connection(self) -> sqlite3.Connection:
-        return connect(self.database)
+        db = connect(self.database)
+        try:
+            # A host suspend stops the worker and this control plane together.
+            # Extend their active leases before any request or reconciliation
+            # can mistake that shared pause for worker loss. Keep the clock
+            # sample behind the DB commit so a failed write can be retried.
+            with self._lease_sleep_lock:
+                wall = datetime.now(timezone.utc)
+                awake = awake_monotonic()
+                slept = (wall - self._lease_last_wall).total_seconds() - (awake - self._lease_last_awake)
+                if slept > 5:
+                    db.execute("BEGIN IMMEDIATE")
+                    # A lease already expired at the last awake sample was
+                    # abandoned before suspend and must not be revived.
+                    rows = db.execute(
+                        "SELECT lease_id,expires_at FROM worker_leases WHERE status='active' AND expires_at>?",
+                        (self._lease_last_wall.isoformat(),),
+                    ).fetchall()
+                    for lease in rows:
+                        expires_at = (datetime.fromisoformat(lease["expires_at"]) + timedelta(seconds=slept)).isoformat()
+                        db.execute("UPDATE worker_leases SET expires_at=? WHERE lease_id=?", (expires_at, lease["lease_id"]))
+                        self._record_worker_lease_event(db, str(lease["lease_id"]), "host_resumed",
+                                                        "Lease extended after control-plane host sleep",
+                                                        {"sleep_seconds": round(slept, 1), "expires_at": expires_at})
+                    db.commit()
+                self._lease_last_wall = wall
+                self._lease_last_awake = awake
+            return db
+        except BaseException:
+            db.close()
+            raise
 
     def server_logs(self, *, tail_lines: int = 400) -> dict[str, Any]:
         """Return bounded service tails plus the scheduler's cached diagnosis.
@@ -410,7 +465,24 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
 
     def start_operation_runner(self, *, interval_seconds: float = 0.25, reconciliation_seconds: float = 15.0) -> None:
         if self._operation_thread and self._operation_thread.is_alive(): return
+        # A process can exit during a slow object-store upload. The local
+        # artifact remains published and retrying replication is idempotent.
+        with self._connection() as connection:
+            connection.execute("UPDATE operations SET status='queued',started_at=NULL,updated_at=? WHERE operation_type='artifact_replication' AND status='running'", (_now(),))
         self._operation_stop = threading.Event()
+        def clean_finalized_uploads() -> None:
+            with self._connection() as connection:
+                finalized_uploads = connection.execute("SELECT * FROM worker_output_uploads WHERE status='finalized'").fetchall()
+            for upload in finalized_uploads:
+                if self._operation_stop.is_set():
+                    return
+                try:
+                    self._cleanup_finalized_worker_upload(upload)
+                except (OSError, ValueError):
+                    pass
+        self._upload_cleanup_thread = threading.Thread(target=clean_finalized_uploads,
+                                                       name="oracle-upload-cleanup", daemon=True)
+        self._upload_cleanup_thread.start()
         def loop() -> None:
             last_reconciliation = 0.0
             while not self._operation_stop.is_set():
@@ -435,6 +507,7 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
     def stop_operation_runner(self) -> None:
         if self._operation_stop: self._operation_stop.set()
         if self._operation_thread: self._operation_thread.join(timeout=5)
+        if getattr(self, "_upload_cleanup_thread", None): self._upload_cleanup_thread.join(timeout=5)
 
     # Artifact replica ledger -----------------------------------------
     # Replica implementation details stay inside the injected artifact store;
@@ -956,6 +1029,19 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
                 "SELECT job_id,status,error,work_unit_json FROM jobs WHERE queued_run_id=? ORDER BY submitted_at DESC, rowid DESC",
                 (row["queued_run_id"],),
             ).fetchall()
+            restartable = False
+            restart_epoch = None
+            if jobs and jobs[0]["status"] == "failed":
+                latest_attempt = db.execute(
+                    "SELECT classification FROM execution_attempts WHERE job_id=? ORDER BY ordinal DESC LIMIT 1",
+                    (jobs[0]["job_id"],),
+                ).fetchone()
+                restart_run = db.execute(
+                    "SELECT completed_epoch FROM execution_runs WHERE current_job_id=?", (jobs[0]["job_id"],)
+                ).fetchone()
+                restartable = bool(latest_attempt and latest_attempt["classification"] == "infrastructure" and restart_run)
+                if restartable:
+                    restart_epoch = int(restart_run["completed_epoch"])
             active_execution = db.execute(
                 "SELECT 1 FROM execution_runs WHERE queued_run_id=? AND status NOT IN ('failed','cancelled','indexed') LIMIT 1",
                 (row["queued_run_id"],),
@@ -980,6 +1066,8 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
             "latest_job_error": jobs[0]["error"] if jobs else None,
             "latest_job_id": latest.get("job_id") if latest else None,
             "latest_job_resumable": isinstance(segment, dict) and segment.get("phase") == "train",
+            "can_restart": restartable,
+            "restart_epoch": restart_epoch,
         }
 
     def validate_and_queue_model_definition(
@@ -2193,7 +2281,7 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
             raise ValueError("Worker or work unit already has an active lease") from exc
         db.execute("UPDATE registered_workers SET state='leased',last_seen_at=?,updated_at=? WHERE worker_id=?", (now, now, worker["worker_id"]))
         if job_id is not None:
-            db.execute("UPDATE jobs SET status='leased',remote_status='leased',worker_id=?,updated_at=? WHERE job_id=? AND status='queued'", (worker["worker_id"], now, job_id))
+            db.execute("UPDATE jobs SET status='leased',remote_status='leased',worker_id=?,error=NULL,updated_at=? WHERE job_id=? AND status='queued'", (worker["worker_id"], now, job_id))
             job = db.execute("SELECT work_unit_sha256 FROM jobs WHERE job_id=?", (job_id,)).fetchone()
             ordinal = int(db.execute("SELECT COALESCE(MAX(ordinal),0)+1 FROM execution_attempts WHERE job_id=?", (job_id,)).fetchone()[0])
             db.execute(
@@ -2656,6 +2744,8 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
         worker_id: str,
         worker_token: str,
         lease_token: str,
+        allow_publication_pending: bool = False,
+        received_at: str | None = None,
     ) -> tuple[sqlite3.Row, sqlite3.Row, sqlite3.Row]:
         worker = self._authenticate_registered_worker(db, worker_id, worker_token)
         lease = db.execute("SELECT * FROM worker_leases WHERE lease_id=?", (lease_id,)).fetchone()
@@ -2665,8 +2755,9 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
             raise PermissionError("Lease does not belong to this worker")
         if not hmac.compare_digest(str(lease["token_sha256"]), self._token_digest(lease_token)):
             raise PermissionError("Lease token is invalid")
-        now = _now()
-        if lease["status"] != "active" or str(lease["expires_at"]) <= now:
+        now = received_at or _now()
+        pending_publication = allow_publication_pending and lease["status"] == "publication_pending"
+        if not pending_publication and (lease["status"] != "active" or str(lease["expires_at"]) <= now):
             self._expire_worker_leases_in_connection(db, now)
             raise ValueError("Lease is no longer active")
         if lease["job_id"] is None:
@@ -2920,39 +3011,64 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
         the same acknowledged attempt is rejected.
         """
         digest, archive_size = self._archive_digest(archive)
-        with self._connection() as db:
-            db.execute("BEGIN IMMEDIATE")
-            lease, _worker, job = self._authenticate_active_worker_lease(
-                db, lease_id=lease_id, worker_id=worker_id, worker_token=worker_token, lease_token=lease_token,
-            )
-            if lease["acknowledged_at"] is None or lease["output_attempt_id"] is None:
-                raise ValueError("Lease must be acknowledged before uploading output")
-            if lease["output_archive_sha256"] is not None:
-                if hmac.compare_digest(str(lease["output_archive_sha256"]), digest):
-                    return {"lease_id": lease_id, "archive_sha256": digest, "idempotent": True}
-                raise ValueError("Output archive has already been uploaded for this lease")
-            staging = self.artifact_store.staging(str(job["job_id"]), str(lease["output_attempt_id"]))
-            # The store verifies/reconstructs its own canonical path; obtain it
-            # through staging_path rather than deriving a storage-root path.
+        # The lease lock serializes duplicate publication requests across
+        # server processes. Never hold a SQLite write transaction while a
+        # multi-gigabyte archive is extracted on a slow or mounted filesystem.
+        lock_path = self._worker_output_upload_root() / f"lease-{uuid.UUID(lease_id)}.lock"
+        with self._worker_output_file_lock(lock_path):
+            with self._connection() as db:
+                lease, _worker, job = self._authenticate_active_worker_lease(
+                    db, lease_id=lease_id, worker_id=worker_id, worker_token=worker_token, lease_token=lease_token,
+                )
+                if lease["acknowledged_at"] is None or lease["output_attempt_id"] is None:
+                    raise ValueError("Lease must be acknowledged before uploading output")
+                if lease["output_archive_sha256"] is not None:
+                    if hmac.compare_digest(str(lease["output_archive_sha256"]), digest):
+                        return {"lease_id": lease_id, "archive_sha256": digest, "idempotent": True}
+                    raise ValueError("Output archive has already been uploaded for this lease")
+                job_id, attempt_id = str(job["job_id"]), str(lease["output_attempt_id"])
+            staging = self.artifact_store.staging(job_id, attempt_id)
             destination = self.artifact_store.staging_path(staging)
-            try:
-                self._extract_worker_output_archive(archive, destination)
-            except Exception:
-                # The digest is not recorded until extraction succeeds.  Clear
-                # only this store-owned, lease-specific staging candidate so a
-                # transient or malformed upload cannot poison a safe retry.
+            def clear_candidate() -> None:
                 for child in destination.iterdir():
                     if child.is_dir() and not child.is_symlink():
                         shutil.rmtree(child)
                     else:
                         child.unlink()
+            try:
+                clear_candidate()
+                self._extract_worker_output_archive(archive, destination)
+                with self._connection() as db:
+                    db.execute("BEGIN IMMEDIATE")
+                    current, _worker, current_job = self._authenticate_active_worker_lease(
+                        db, lease_id=lease_id, worker_id=worker_id, worker_token=worker_token, lease_token=lease_token,
+                    )
+                    if str(current_job["job_id"]) != job_id or str(current["output_attempt_id"]) != attempt_id:
+                        raise ValueError("Output attempt changed during archive extraction")
+                    if current["output_archive_sha256"] is not None:
+                        if hmac.compare_digest(str(current["output_archive_sha256"]), digest):
+                            return {"lease_id": lease_id, "archive_sha256": digest, "idempotent": True}
+                        raise ValueError("Output archive has already been uploaded for this lease")
+                    now = _now()
+                    db.execute("UPDATE worker_leases SET output_archive_sha256=?,updated_at=? WHERE lease_id=?", (digest, now, lease_id))
+                    db.execute("UPDATE registered_workers SET last_seen_at=?,updated_at=? WHERE worker_id=?", (now, now, worker_id))
+                    self._record_worker_lease_event(db, lease_id, "output_uploaded", "Worker output archive staged", {"archive_sha256": digest, "bytes": archive_size})
+                    self._record_job_event_in_connection(db, job_id, "output_uploaded", "Pull worker output archive staged", {"lease_id": lease_id, "archive_sha256": digest})
+            except Exception:
+                clear_candidate()
                 raise
-            now = _now()
-            db.execute("UPDATE worker_leases SET output_archive_sha256=?,updated_at=? WHERE lease_id=?", (digest, now, lease_id))
-            db.execute("UPDATE registered_workers SET last_seen_at=?,updated_at=? WHERE worker_id=?", (now, now, worker_id))
-            self._record_worker_lease_event(db, lease_id, "output_uploaded", "Worker output archive staged", {"archive_sha256": digest, "bytes": archive_size})
-            self._record_job_event_in_connection(db, str(job["job_id"]), "output_uploaded", "Pull worker output archive staged", {"lease_id": lease_id, "archive_sha256": digest})
             return {"lease_id": lease_id, "archive_sha256": digest, "bytes": archive_size, "idempotent": False}
+
+    @staticmethod
+    @contextmanager
+    def _worker_output_file_lock(path: Path):
+        descriptor = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+        with os.fdopen(descriptor, "rb+") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
     # Resumable worker-output publication --------------------------------
     # Do not share the browser upload-session tables here.  The worker
@@ -2972,6 +3088,14 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
         root = (self.artifact_root / "worker-output-uploads").resolve()
         root.mkdir(parents=True, exist_ok=True)
         return root
+
+    def _cleanup_finalized_worker_upload(self, row: sqlite3.Row) -> None:
+        """Remove redundant transfer bytes after the extracted candidate is durable."""
+        root = self._worker_output_upload_root()
+        directory = Path(str(row["archive_path"])).parent.resolve()
+        if directory.parent != root or directory.name != str(row["upload_id"]):
+            raise ValueError("Invalid worker output spool path")
+        shutil.rmtree(directory, ignore_errors=True)
 
     @staticmethod
     def _worker_output_upload_public(db: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]:
@@ -3100,12 +3224,14 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
 
     def finalize_worker_output_upload(self, *, upload_id: str, worker_id: str, worker_token: str, lease_token: str) -> dict[str, Any]:
         """Assemble verified parts and stage output; completion remains separate."""
+        completed_receipt = None
         with self._connection() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute("SELECT * FROM worker_output_uploads WHERE upload_id=?", (upload_id,)).fetchone()
             if row is None: raise KeyError(upload_id)
             lease, _worker, _job = self._authenticate_active_worker_lease(db, lease_id=str(row["lease_id"]), worker_id=worker_id, worker_token=worker_token, lease_token=lease_token)
-            if row["status"] == "finalized": return {**self._worker_output_upload_public(db, row), "idempotent": True}
+            if row["status"] == "finalized":
+                completed_receipt = {**self._worker_output_upload_public(db, row), "idempotent": True}
             if row["status"] == "assembling":
                 # A process can die after the archive was staged but before it
                 # recorded this session as finalized. The lease's digest is
@@ -3115,16 +3241,21 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
                     now = _now()
                     db.execute("UPDATE worker_output_uploads SET status='finalized',finalized_at=COALESCE(finalized_at,?),updated_at=? WHERE upload_id=?", (now, now, upload_id))
                     recovered = db.execute("SELECT * FROM worker_output_uploads WHERE upload_id=?", (upload_id,)).fetchone()
-                    return {**self._worker_output_upload_public(db, recovered), "idempotent": True}
+                    completed_receipt = {**self._worker_output_upload_public(db, recovered), "idempotent": True}
                 # No receipt means an interrupted assembly; it is safe to
                 # recreate the archive deterministically from immutable parts.
-                db.execute("UPDATE worker_output_uploads SET status='uploading',updated_at=? WHERE upload_id=?", (_now(), upload_id))
+                if completed_receipt is None:
+                    db.execute("UPDATE worker_output_uploads SET status='uploading',updated_at=? WHERE upload_id=?", (_now(), upload_id))
+                    row = db.execute("SELECT * FROM worker_output_uploads WHERE upload_id=?", (upload_id,)).fetchone()
+            if completed_receipt is None:
+                parts = db.execute("SELECT * FROM worker_output_upload_parts WHERE upload_id=? ORDER BY part_number", (upload_id,)).fetchall()
+                if len(parts) != int(row["part_count"]) or [int(part["part_number"]) for part in parts] != list(range(int(row["part_count"]))):
+                    raise ValueError("Output upload is incomplete")
+                db.execute("UPDATE worker_output_uploads SET status='assembling',updated_at=? WHERE upload_id=?", (_now(), upload_id))
                 row = db.execute("SELECT * FROM worker_output_uploads WHERE upload_id=?", (upload_id,)).fetchone()
-            parts = db.execute("SELECT * FROM worker_output_upload_parts WHERE upload_id=? ORDER BY part_number", (upload_id,)).fetchall()
-            if len(parts) != int(row["part_count"]) or [int(part["part_number"]) for part in parts] != list(range(int(row["part_count"]))):
-                raise ValueError("Output upload is incomplete")
-            db.execute("UPDATE worker_output_uploads SET status='assembling',updated_at=? WHERE upload_id=?", (_now(), upload_id))
-            row = db.execute("SELECT * FROM worker_output_uploads WHERE upload_id=?", (upload_id,)).fetchone()
+        if completed_receipt is not None:
+            self._cleanup_finalized_worker_upload(row)
+            return completed_receipt
         archive_path = Path(str(row["archive_path"]))
         assembling = archive_path.with_suffix(".assembling")
         try:
@@ -3142,10 +3273,13 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
                 lease_id=str(row["lease_id"]), worker_id=worker_id, worker_token=worker_token,
                 lease_token=lease_token, archive=archive_path,
             )
-        except Exception:
+        except Exception as exc:
             assembling.unlink(missing_ok=True)
             with self._connection() as db:
                 db.execute("UPDATE worker_output_uploads SET status='uploading',updated_at=? WHERE upload_id=? AND status='assembling'", (_now(), upload_id))
+                if isinstance(exc, OSError) and exc.errno == errno.ENOSPC:
+                    db.execute("UPDATE jobs SET error=?,updated_at=? WHERE job_id=?",
+                               ("Insufficient disk space to stage worker output; retained archive will retry when space is available", _now(), row["job_id"]))
             raise
         with self._connection() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -3153,7 +3287,9 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
             db.execute("UPDATE worker_output_uploads SET status='finalized',finalized_at=?,updated_at=? WHERE upload_id=?", (now, now, upload_id))
             final = db.execute("SELECT * FROM worker_output_uploads WHERE upload_id=?", (upload_id,)).fetchone()
             self._record_worker_lease_event(db, str(row["lease_id"]), "output_upload_finalized", "Worker output upload verified and staged", {"upload_id": upload_id, "bytes": int(row["archive_size"])})
-            return {**self._worker_output_upload_public(db, final), "idempotent": bool(result.get("idempotent", False))}
+            response = {**self._worker_output_upload_public(db, final), "idempotent": bool(result.get("idempotent", False))}
+        self._cleanup_finalized_worker_upload(final)
+        return response
 
     def defer_worker_output_publication(
         self, *, lease_id: str, worker_id: str, worker_token: str, lease_token: str,
@@ -3189,6 +3325,7 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
             self._record_job_event_in_connection(db, str(job["job_id"]), "output_publication_deferred", message, {"lease_id": lease_id})
             return self._worker_lease_public(db.execute("SELECT * FROM worker_leases WHERE lease_id=?", (lease_id,)).fetchone()) or {}
 
+    @_serialized_output_completion
     def resume_worker_output_publication(
         self, *, lease_id: str, worker_id: str, worker_token: str, ttl_seconds: int = 60,
     ) -> dict[str, Any]:
@@ -3202,7 +3339,14 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
                 raise KeyError(lease_id)
             if str(lease["worker_id"]) != str(worker["worker_id"]):
                 raise PermissionError("Output recovery does not belong to this worker")
-            if lease["status"] != "publication_pending" or lease["job_id"] is None:
+            if lease["status"] == "released" and lease["outcome"] == "completed":
+                return {
+                    "status": "released", "outcome": "completed",
+                    "output_archive_sha256": lease["output_archive_sha256"],
+                }
+            if lease["status"] == "active" and lease["expires_at"] <= now:
+                raise ValueError("Lease expired before output recovery")
+            if lease["status"] not in {"publication_pending", "active"} or lease["job_id"] is None:
                 raise ValueError("Lease is not awaiting output recovery")
             lease_token = secrets.token_urlsafe(32)
             db.execute(
@@ -3271,6 +3415,7 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
             db.execute("UPDATE queued_runs SET start_authorized=0,failure_reason=? WHERE queued_run_id=?",
                        ("Verification passed; pool no longer allows training. Enable the pool, then start explicitly.", job["queued_run_id"]))
 
+    @_serialized_output_completion
     def complete_worker_lease(
         self, *, lease_id: str, worker_id: str, worker_token: str, lease_token: str,
         success: bool, message: str = "Worker completed execution",
@@ -3315,12 +3460,25 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
                 raise ValueError("Verification was cancelled; training cannot be authorized")
             output_ref: ArtifactRef | None = None
             if success:
+                # Validation can hash gigabytes on a slow filesystem. The
+                # lease-scoped file lock prevents a second completion request
+                # while SQLite remains available for worker heartbeats.
+                db.commit()
                 if lease["output_attempt_id"] is None or lease["output_archive_sha256"] is None:
                     raise ValueError("Successful completion requires a staged output archive")
+                published_ref = getattr(self.artifact_store, "published_ref", None)
+                if callable(published_ref) and published_ref(str(job["job_id"]), str(lease["output_attempt_id"])) is not None:
+                    self.reconcile_worker_publications()
+                    recovered = db.execute("SELECT * FROM worker_leases WHERE lease_id=?", (lease_id,)).fetchone()
+                    if recovered is not None and recovered["status"] == "released" and recovered["outcome"] == "completed":
+                        return self._worker_lease_public(recovered) or {}
+                    raise RuntimeError("Published output could not be reconciled")
                 staging = self.artifact_store.staging(str(job["job_id"]), str(lease["output_attempt_id"]))
+                staging_status = self.artifact_store.staging_status(staging)
+                candidate_path = self.artifact_store.candidate_path(staging)
                 validator = self._valid_worker_output
                 if verifying:
-                    candidate = self.artifact_store.staging_path(staging) / "verification.json"
+                    candidate = candidate_path / "verification.json"
                     if not candidate.is_file() or candidate.stat().st_size > 65536:
                         raise ValueError("Verification output requires a bounded verification report")
                     verification_report = json.loads(candidate.read_text(encoding="utf-8"))
@@ -3346,7 +3504,7 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
                         raise ValueError("Verification changed the manually selected batch size")
                 if verifying and verification_report.get('execution_contract_version') == 2:
                     from oracle_data_contracts.artifacts.splits import read_split_manifest
-                    pinned_split = read_split_manifest(self.artifact_store.staging_path(staging))
+                    pinned_split = read_split_manifest(candidate_path)
                     dataset_ref = sealed_unit['inputs']['input']
                     recorded = pinned_split.get('dataset', {})
                     if recorded.get('dataset_id') != dataset_ref['artifact_id'] or (dataset_ref.get('revision') and recorded.get('revision_id') != dataset_ref['revision']):
@@ -3357,14 +3515,14 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
                 # non-model output for a train-capable pool smoke test. Only
                 # a candidate that actually presents a run manifest enters
                 # the stricter model-run publication and catalog path.
-                is_model_run = not verifying and not checkpointing and job["action"] == "train" and (self.artifact_store.staging_path(staging) / "artifact.json").is_file()
+                is_model_run = not verifying and not checkpointing and job["action"] == "train" and (candidate_path / "artifact.json").is_file()
                 is_inference_result = job["action"] == "infer"
                 if sealed_unit.get('schema', {}).get('version') == 2:
-                    self._validate_training_output_inputs(self.artifact_store.staging_path(staging), sealed_unit)
+                    self._validate_training_output_inputs(candidate_path, sealed_unit)
                 if checkpointing:
                     from oracle_builder.artifacts import validate_run_artifact
                     validator = validate_run_artifact
-                    segment_result = self._read_segment_result(self.artifact_store.staging_path(staging), sealed_unit)
+                    segment_result = self._read_segment_result(candidate_path, sealed_unit)
                 elif is_model_run:
                     from oracle_builder.artifacts import validate_run_artifact
                     validator = validate_run_artifact
@@ -3372,13 +3530,13 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
                     validator = self._valid_inference_output
                     if sealed_unit.get('parameters', {}).get('shard_id'):
                         from oracle_data_contracts.work_units import WorkUnit
-                        self._validate_inference_shard_output(self.artifact_store.staging_path(staging), WorkUnit.from_dict(sealed_unit))
+                        self._validate_inference_shard_output(candidate_path, WorkUnit.from_dict(sealed_unit))
                     elif sealed_unit.get('parameters', {}).get('merge_item_ids'):
                         from oracle_data_contracts.work_units import WorkUnit
-                        self._validate_inference_merge_output(self.artifact_store.staging_path(staging), WorkUnit.from_dict(sealed_unit))
+                        self._validate_inference_merge_output(candidate_path, WorkUnit.from_dict(sealed_unit))
                 if is_model_run:
                     try:
-                        manifest = json.loads((self.artifact_store.staging_path(staging) / "artifact.json").read_text(encoding="utf-8"))
+                        manifest = json.loads((candidate_path / "artifact.json").read_text(encoding="utf-8"))
                         published_model_artifact_id = str(uuid.UUID(str(manifest["artifact_id"])))
                     except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
                         raise ValueError(f"Staged training artifact has no valid identity: {exc}") from exc
@@ -3388,7 +3546,7 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
                     )
                 elif is_inference_result:
                     try:
-                        manifest = json.loads((self.artifact_store.staging_path(staging) / "artifact.json").read_text(encoding="utf-8"))
+                        manifest = json.loads((candidate_path / "artifact.json").read_text(encoding="utf-8"))
                         published_inference_artifact_id = str(uuid.UUID(str(manifest["artifact_id"])))
                     except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
                         raise ValueError(f"Staged inference artifact has no valid identity: {exc}") from exc
@@ -3396,14 +3554,46 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
                 else:
                     from oracle_data_contracts.artifacts import directory_content_digest
                     output_ref = ArtifactRef("job_output", str(job["job_id"]), revision=str(lease["output_attempt_id"]),
-                        fingerprint_sha256=directory_content_digest(self.artifact_store.staging_path(staging)))
+                        fingerprint_sha256=directory_content_digest(candidate_path))
                 # Resolve the identity while staging is still readable through
                 # the writable-handle API. Validation and sealing close it.
-                result = self.artifact_store.validate(staging, validator)
-                if not result.valid:
-                    raise ValueError("Staged output did not pass publication validation")
-                self.artifact_store.seal(staging)
-                published_path = self.artifact_store.publish(staging, output_ref)
+                if staging_status != "sealed":
+                    result = self.artifact_store.validate(staging, validator)
+                    if not result.valid:
+                        raise ValueError("Staged output did not pass publication validation")
+                db.execute("BEGIN IMMEDIATE")
+                current, _worker, current_job = self._authenticate_active_worker_lease(
+                    db, lease_id=lease_id, worker_id=worker_id,
+                    worker_token=worker_token, lease_token=lease_token,
+                )
+                if (str(current_job["job_id"]) != str(job["job_id"])
+                        or current["output_attempt_id"] != lease["output_attempt_id"]
+                        or current["output_archive_sha256"] != lease["output_archive_sha256"]):
+                    raise ValueError("Output attempt changed during publication validation")
+                if current_job["cancel_requested_at"] is not None or db.execute(
+                    "SELECT 1 FROM worker_commands WHERE lease_id=? AND action IN ('stop_now','restart') AND status IN ('pending','received','accepted')",
+                    (lease_id,),
+                ).fetchone():
+                    raise ValueError("Attempt was stopped or restarted; output cannot be committed")
+                lease, job, now = current, current_job, _now()
+                # This is the commit decision. Publication may take minutes
+                # on a slow disk; its filesystem ledger recovers a crash.
+                db.execute("UPDATE worker_leases SET status='publication_pending',outcome='publication_pending',updated_at=? WHERE lease_id=?", (now, lease_id))
+                db.execute("UPDATE jobs SET status='publication_pending',remote_status='publication_pending',updated_at=? WHERE job_id=?", (now, job["job_id"]))
+                db.commit()
+                if staging_status != "sealed":
+                    self.artifact_store.seal(staging)
+                publish_local = getattr(self.artifact_store, "publish_local", None)
+                published_path = publish_local(staging, output_ref) if callable(publish_local) else self.artifact_store.publish(staging, output_ref)
+                db.execute("BEGIN IMMEDIATE")
+                committed = db.execute("SELECT * FROM worker_leases WHERE lease_id=?", (lease_id,)).fetchone()
+                if committed is not None and committed["status"] == "released" and committed["outcome"] == "completed":
+                    return self._worker_lease_public(committed) or {}
+                if (committed is None or committed["status"] != "publication_pending"
+                        or committed["worker_id"] != worker_id
+                        or not hmac.compare_digest(committed["token_sha256"], self._token_digest(lease_token))):
+                    raise RuntimeError("Publication lease changed before its database commit")
+                now = _now()
                 # Publication is local and atomic.  A replica failure must
                 # never invalidate it; record the store's immediate outcome
                 # so a background operator retry can recover it later.
@@ -3417,6 +3607,15 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
                         manifest_sha256=replica_report.get("manifest_sha256") if isinstance(replica_report, dict) else None,
                         error=replica_report.get("error") if isinstance(replica_report, dict) else None,
                     )
+                    if replica_status == "pending":
+                        operation_id = str(uuid.uuid4())
+                        replication_parameters = {"action": "retry", "refs": [output_ref.to_dict()]}
+                        db.execute("""INSERT INTO operations(operation_id,operation_type,status,parameters_json,created_at,updated_at)
+                            VALUES(?, 'artifact_replication', 'queued', ?, ?, ?)""",
+                            (operation_id, _json(replication_parameters), now, now))
+                        db.execute("""INSERT INTO operation_events(operation_id,timestamp,event_type,message,data_json)
+                            VALUES(?, ?, 'queued', 'Artifact replication queued', ?)""",
+                            (operation_id, now, _json({"status": "queued"})))
             outcome = "completed" if success else "failed"
             db.execute(
                 "UPDATE worker_leases SET status='released',outcome=?,released_at=?,output_ref_json=?,updated_at=? WHERE lease_id=?",
@@ -3485,7 +3684,8 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
         return response
 
     def renew_worker_lease(self, *, lease_id: str, lease_token: str, ttl_seconds: int = 60) -> dict[str, Any]:
-        expires_at, now = self._lease_expiry(ttl_seconds), _now()
+        received_at = _now()
+        self._lease_expiry(ttl_seconds)
         expired = False
         with self._connection() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -3494,10 +3694,11 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
                 raise KeyError(lease_id)
             if not hmac.compare_digest(str(lease["token_sha256"]), self._token_digest(lease_token)):
                 raise PermissionError("Lease token is invalid")
-            if lease["status"] != "active" or lease["expires_at"] <= now:
-                self._expire_worker_leases_in_connection(db, now)
+            if lease["status"] != "active" or lease["expires_at"] <= received_at:
+                self._expire_worker_leases_in_connection(db, _now())
                 expired = True
             else:
+                now, expires_at = _now(), self._lease_expiry(ttl_seconds)
                 db.execute("UPDATE worker_leases SET expires_at=?,updated_at=? WHERE lease_id=?", (expires_at, now, lease_id))
                 db.execute("UPDATE registered_workers SET last_seen_at=?,updated_at=? WHERE worker_id=?", (now, now, lease["worker_id"]))
                 self._record_worker_lease_event(db, lease_id, "renewed", "Worker lease renewed", {"expires_at": expires_at})
@@ -4269,8 +4470,12 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
         with sqlite3.connect(source) as dataset_connection:
             info = read_dataset_info(dataset_connection)
             fingerprint = dataset_fingerprint(dataset_connection)
-        if info["lifecycle"] != "frozen":
-            raise ValueError("Only frozen dataset revisions can be registered for training")
+        if info["lifecycle"] not in {"working", "frozen"}:
+            raise ValueError("Only working or frozen dataset revisions can be registered")
+        if info["lifecycle"] == "working" and not any(
+            source.is_relative_to(root) for root in self.training_catalog_roots.values()
+        ):
+            raise ValueError("Working datasets must be stored under a training catalog root before registration")
         now = _now()
         payload = (info["dataset_id"], info.get("revision_id"), info.get("name") or source.stem,
                    info.get("dataset_type"), info.get("lifecycle"), fingerprint, str(source), _json(info), now, now)
@@ -4491,39 +4696,68 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
         if not callable(published_ref):
             return 0
         recovered = 0
-        now = _now()
         with self._connection() as db:
-            db.execute("BEGIN IMMEDIATE")
             rows = db.execute(
                 "SELECT worker_leases.lease_id,worker_leases.job_id,worker_leases.output_attempt_id,jobs.action FROM worker_leases "
                 "JOIN jobs ON jobs.job_id=worker_leases.job_id "
                 "WHERE output_attempt_id IS NOT NULL AND output_ref_json IS NULL AND worker_leases.job_id IS NOT NULL"
             ).fetchall()
-            for lease in rows:
-                try:
-                    ref = published_ref(str(lease["job_id"]), str(lease["output_attempt_id"]))
-                except (OSError, ValueError):
-                    continue
-                if ref is None:
-                    continue
+        for lease in rows:
+            try:
+                ref = published_ref(str(lease["job_id"]), str(lease["output_attempt_id"]))
+            except (OSError, ValueError):
+                continue
+            if ref is None:
+                continue
+            # Reading a checkpoint can hash a model on a network mount. Do
+            # that work before taking SQLite's single writer slot.
+            with self._connection() as db:
                 recovered_job = db.execute("SELECT * FROM jobs WHERE job_id=?", (lease["job_id"],)).fetchone()
+            if recovered_job is None:
+                continue
+            recovered_unit = json.loads(recovered_job["work_unit_json"] or "{}")
+            execution = recovered_unit.get("parameters", {}).get("queue_execution", {})
+            verification_report = None
+            segment = None
+            try:
+                if execution.get("phase") == "verify" and recovered_job["queued_run_id"]:
+                    verification_report = json.loads((self.artifact_store.resolve(ref) / "verification.json").read_text(encoding="utf-8"))
+                if recovered_unit.get('schema', {}).get('version') == 2 and recovered_unit.get('phase') == 'train':
+                    segment = self._read_segment_result(self.artifact_store.resolve(ref), recovered_unit)
+            except (OSError, ValueError, KeyError, json.JSONDecodeError):
+                continue
+            with self._connection() as db:
+                db.execute("BEGIN IMMEDIATE")
+                current_lease = db.execute("SELECT * FROM worker_leases WHERE lease_id=?", (lease["lease_id"],)).fetchone()
+                recovered_job = db.execute("SELECT * FROM jobs WHERE job_id=?", (lease["job_id"],)).fetchone()
+                if (current_lease is None or current_lease["output_ref_json"] is not None
+                        or current_lease["output_attempt_id"] != lease["output_attempt_id"] or recovered_job is None):
+                    continue
                 latest = db.execute('SELECT lease_id FROM execution_attempts WHERE job_id=? ORDER BY ordinal DESC LIMIT 1', (lease['job_id'],)).fetchone()
                 if (latest and latest[0] != lease['lease_id']) or recovered_job['cancel_requested_at'] is not None:
                     continue
                 stopped = db.execute("SELECT 1 FROM worker_commands WHERE lease_id=? AND action IN ('stop_now','restart') AND status!='superseded'", (lease['lease_id'],)).fetchone()
                 if stopped:
                     continue
-                recovered_unit = json.loads(recovered_job["work_unit_json"] or "{}")
-                execution = recovered_unit.get("parameters", {}).get("queue_execution", {})
+                now = _now()
+                if callable(getattr(self.artifact_store, "publish_local", None)):
+                    existing_replica = db.execute("SELECT status FROM artifact_replications WHERE artifact_ref_uri=?", (ref.uri,)).fetchone()
+                    if existing_replica is None:
+                        self._record_artifact_replica_in_connection(db, ref, status="pending")
+                        operation_id = str(uuid.uuid4())
+                        db.execute("""INSERT INTO operations(operation_id,operation_type,status,parameters_json,created_at,updated_at)
+                            VALUES(?, 'artifact_replication', 'queued', ?, ?, ?)""",
+                            (operation_id, _json({"action": "retry", "refs": [ref.to_dict()]}), now, now))
+                        db.execute("""INSERT INTO operation_events(operation_id,timestamp,event_type,message,data_json)
+                            VALUES(?, ?, 'queued', 'Artifact replication queued', ?)""",
+                            (operation_id, now, _json({"status": "queued"})))
                 db.execute('UPDATE worker_leases SET output_ref_json=? WHERE lease_id=?', (_json(ref.to_dict()), lease['lease_id']))
-                if execution.get("phase") == "verify" and recovered_job["queued_run_id"]:
-                    report = json.loads((self.artifact_store.resolve(ref) / "verification.json").read_text(encoding="utf-8"))
+                if verification_report is not None:
                     owner = db.execute("SELECT worker_id FROM worker_leases WHERE lease_id=?", (lease["lease_id"],)).fetchone()[0]
-                    self._record_verification_in_connection(db, recovered_job, owner, report, now, str(lease["lease_id"]))
-                if recovered_unit.get('schema', {}).get('version') == 2 and recovered_unit.get('phase') == 'train':
+                    self._record_verification_in_connection(db, recovered_job, owner, verification_report, now, str(lease["lease_id"]))
+                if segment is not None:
                     run = db.execute('SELECT current_job_id FROM execution_runs WHERE run_id=?', (recovered_unit['run_id'],)).fetchone()
                     if run and run[0] == recovered_job['job_id']:
-                        segment = self._read_segment_result(self.artifact_store.resolve(ref), recovered_unit)
                         self._commit_segment_in_connection(db, job=recovered_job, lease_id=lease['lease_id'], output_ref=ref, result=segment, now=now)
                 db.execute("UPDATE worker_leases SET status='released',outcome='completed',released_at=COALESCE(released_at,?),output_ref_json=?,updated_at=? WHERE lease_id=?", (now, _json(ref.to_dict()), now, lease["lease_id"]))
                 db.execute("UPDATE jobs SET status='completed',remote_status='completed',completed_at=COALESCE(completed_at,?),updated_at=? WHERE job_id=? AND status NOT IN ('indexed','cancelled')", (now, now, lease["job_id"]))
@@ -4604,6 +4838,7 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
         contract = self._json_file(root / "model" / "contract.json") or {}
         history = self._evidence_csv(root / "metrics" / "history.csv", limit=2_000)
         final_history = history[-1] if history else {}
+        evaluation_head = "posthoc" if summary.get("evaluation_head") == "posthoc" or (manifest.get("lineage") or {}).get("source_model_artifact_id") else "neural"
         model = manifest.get("model") if isinstance(manifest.get("model"), dict) else {}
         dataset = manifest.get("dataset") if isinstance(manifest.get("dataset"), dict) else {}
         model_config = config.get("model") if isinstance(config.get("model"), dict) else {}
@@ -4649,9 +4884,10 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
         metric_values = {key: value for key, value in evaluation.items() if isinstance(value, (int, float)) and not isinstance(value, bool)}
         # A history value is operational evidence, not a substitute for a
         # held-out evaluation; mark it inferred when it fills an old catalog.
-        for key, value in final_history.items():
-            if isinstance(value, (int, float)) and not isinstance(value, bool):
-                metric_values.setdefault(key.removeprefix("val_"), value)
+        if evaluation_head == "neural":
+            for key, value in final_history.items():
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    metric_values.setdefault(key.removeprefix("val_"), value)
         evaluation_source = "sealed_manifest" if manifest_evaluation else "evaluation_summary"
         classifier_type = choose(
             "classifier_type",
@@ -4665,11 +4901,12 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
         variant = choose("variant", (model.get("variant"), "sealed_manifest", "recorded"), (model_config.get("variant"), "resolved_config", "recorded"), (contract.get("variant") if isinstance(contract, dict) else None, "model_contract", "inferred"))
         epochs_from_history = max((int(row["epoch"]) + 1 for row in history if isinstance(row.get("epoch"), (int, float)) and not isinstance(row.get("epoch"), bool)), default=None)
         facts = {
+            "evaluation_head": evaluation_head,
             "training_set": choose("training_set", (dataset.get("dataset_id") or dataset.get("name"), "sealed_manifest", "recorded"), (self._nested(config, "data", "dataset_id"), "resolved_config", "recorded")),
             "classifier_type": classifier_type,
             "stem_size": choose("stem_size", (stem.get("filters", stem.get("kernel_size", stem.get("size"))) if isinstance(stem, dict) else None, "resolved_config", "recorded"), (self._nested(contract, "stem", "filters") if isinstance(contract, dict) else None, "model_contract", "inferred")),
-            "macro_f1": choose("macro_f1", (manifest_evaluation.get("macro_f1", manifest_evaluation.get("f1_macro")), "sealed_manifest", "recorded"), (summary_evaluation.get("macro_f1", summary_evaluation.get("f1_macro")) if isinstance(summary_evaluation, dict) else None, "evaluation_summary", "recorded"), (final_history.get("val_macro_f1", final_history.get("macro_f1")), "training_history", "inferred")),
-            "loss": choose("loss", (manifest_evaluation.get("loss", summary.get("loss")), "sealed_manifest", "recorded"), (summary_evaluation.get("loss") if isinstance(summary_evaluation, dict) else None, "evaluation_summary", "recorded"), (final_history.get("val_loss", final_history.get("loss")), "training_history", "inferred")),
+            "macro_f1": choose("macro_f1", (manifest_evaluation.get("macro_f1", manifest_evaluation.get("f1_macro")), "sealed_manifest", "recorded"), (summary_evaluation.get("macro_f1", summary_evaluation.get("f1_macro")) if isinstance(summary_evaluation, dict) else None, "evaluation_summary", "recorded"), (final_history.get("val_macro_f1", final_history.get("macro_f1")) if evaluation_head == "neural" else None, "training_history", "inferred")),
+            "loss": choose("loss", (manifest_evaluation.get("loss", summary.get("loss") if evaluation_head == "neural" else None), "sealed_manifest", "recorded"), (summary_evaluation.get("loss") if isinstance(summary_evaluation, dict) else None, "evaluation_summary", "recorded"), (final_history.get("val_loss", final_history.get("loss")) if evaluation_head == "neural" else None, "training_history", "inferred")),
             "training_seconds": seconds,
             "created_at": choose("created_at", (manifest.get("created_at"), "sealed_manifest", "recorded")), "completed_at": choose("completed_at", (manifest.get("completed_at"), "sealed_manifest", "recorded")),
             "modified_at": choose("modified_at", (datetime.fromtimestamp(root.stat().st_mtime, timezone.utc).isoformat() if root.exists() else None, "filesystem_metadata", "inferred")),
@@ -4887,6 +5124,7 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
         manifest = artifact["manifest"]
         root = Path(artifact["path"])
         summary = manifest.get("summary") or {}
+        evaluation_head = "posthoc" if summary.get("evaluation_head") == "posthoc" or (manifest.get("lineage") or {}).get("source_model_artifact_id") else "neural"
         evaluation = summary.get("evaluation") if isinstance(summary.get("evaluation"), dict) else None
         if evaluation is None:
             summary_path = root / "evaluation" / "evaluation_summary.json"
@@ -4931,7 +5169,7 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
             "path": artifact["path"], "fingerprint_sha256": artifact.get("fingerprint_sha256"),
             "dataset_id": artifact.get("dataset_id"),
             "dataset_fingerprint_sha256": artifact.get("dataset_fingerprint_sha256"),
-            "metrics": metrics, "primary_metrics": primary,
+            "metrics": metrics, "primary_metrics": primary, "evaluation_head": evaluation_head,
             "protocol": {
                 "task": task, "dataset_fingerprint_sha256": artifact.get("dataset_fingerprint_sha256"),
                 "split": split, "split_source": split_source, "metric_schema": metric_schema,
@@ -5201,10 +5439,40 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
         if inspection is None:
             inspection = self._legacy_model_inspection(root / "model", model_summary)
         posthoc = self._json_file(root / "model" / "posthoc" / "report.json")
-        return {"artifact": self._artifact_result(artifact), "facts": self._artifact_facts(artifact_id), "manifest": artifact["manifest"],
+        neural_source = artifact
+        visited = {artifact_id}
+        for _ in range(32):
+            source_id = (neural_source["manifest"].get("lineage") or {}).get("source_model_artifact_id")
+            if not source_id:
+                break
+            if source_id in visited:
+                neural_source = None
+                break
+            visited.add(source_id)
+            neural_source = self.artifact(source_id)
+            if neural_source is None:
+                break
+        if neural_source and (neural_source["manifest"].get("summary") or {}).get("evaluation_head") == "posthoc":
+            neural_source = None
+        neural_evaluation = None
+        neural_dataset_id = None
+        if neural_source:
+            neural_evaluation = self._json_file(Path(neural_source["path"]) / "evaluation" / "evaluation_summary.json")
+            if not neural_evaluation:
+                neural_evaluation = (neural_source["manifest"].get("summary") or {}).get("evaluation")
+            neural_dataset_id = neural_source.get("dataset_id") or (neural_source["manifest"].get("dataset") or {}).get("dataset_id")
+        else:
+            neural_evaluation = self._json_file(root / "provenance" / "neural" / "evaluation" / "evaluation_summary.json")
+            neural_dataset_id = (artifact["manifest"].get("lineage") or {}).get("original_neural_dataset_id")
+        artifact_result = self._artifact_result(artifact)
+        return {"artifact": artifact_result, "facts": self._artifact_facts(artifact_id, artifact_result), "manifest": artifact["manifest"],
                 "runtime": runtime, "config": config, "model_contract": contract, "model_inspection": inspection, "posthoc": posthoc,
                 "history_provenance": self._json_file(root / "metrics" / "provenance.json"),
-                "source_neural_evaluation": self._json_file(root / "provenance" / "source_model" / "evaluation" / "evaluation_summary.json"),
+                "neural_evaluation": neural_evaluation,
+                "neural_dataset_id": neural_dataset_id,
+                "neural_artifact_id": neural_source["artifact_id"] if neural_source else (artifact["manifest"].get("lineage") or {}).get("original_neural_artifact_id"),
+                "source_neural_evaluation": neural_evaluation,
+                "source_model_evaluation": self._json_file(root / "provenance" / "source_model" / "evaluation" / "evaluation_summary.json"),
                 "source_posthoc": self._json_file(root / "provenance" / "source_model" / "posthoc" / "report.json"),
                 "architecture": {"summary": model_summary, "available": model_summary is not None},
                 "history_url": f"/api/v1/artifacts/{artifact_id}/history",
@@ -5356,13 +5624,39 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
         """A compact, display-ready global run/artifact catalog for selection UIs."""
         return self.artifact_catalog_query()["artifacts"]
 
-    def _artifact_facts(self, artifact_id: str) -> dict[str, Any]:
+    @staticmethod
+    def _scoped_metric_facts(facts: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:
+        if result["evaluation_head"] != "posthoc":
+            return facts
+        scoped = dict(facts)
+        metrics = result["metrics"]
+        sources = dict(scoped.get("field_sources") or {})
+        availability = dict(scoped.get("field_availability") or {})
+        for metric in (scoped.get("metrics") or {}):
+            if metric not in metrics and (sources.get(metric) or {}).get("source") == "training_history":
+                scoped.pop(metric, None)
+                sources[metric] = {"source": "unavailable", "status": "not_recorded"}
+                availability[metric] = "not_recorded"
+        scoped.update(metrics)
+        scoped["metrics"] = dict(metrics)
+        scoped["field_sources"] = sources
+        scoped["field_availability"] = availability
+        scoped["evaluation_head"] = "posthoc"
+        for metric in ("macro_f1", "loss", "accuracy", "balanced_accuracy", "macro_precision", "macro_recall", "macro_average_precision"):
+            scoped[metric] = metrics.get(metric)
+        return scoped
+
+    def _artifact_facts(self, artifact_id: str, result: dict[str, Any] | None = None) -> dict[str, Any]:
         with self._connection() as db:
             row = db.execute("SELECT training_set,classifier_type,stem_size,macro_f1,loss,training_seconds,facts_json FROM artifact_facts WHERE artifact_id=?", (artifact_id,)).fetchone()
         if row is None:
             return {}
         raw = dict(row)
-        raw["facts"] = json.loads(raw.pop("facts_json"))
+        stored = json.loads(raw.pop("facts_json"))
+        raw["facts"] = self._scoped_metric_facts(stored, result) if result else stored
+        if result and result["evaluation_head"] == "posthoc":
+            raw["macro_f1"] = result["metrics"].get("macro_f1")
+            raw["loss"] = result["metrics"].get("loss")
         return raw
 
     _CATALOG_COLUMNS = {
@@ -5371,6 +5665,7 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
         "lifecycle": "artifacts.lifecycle", "dataset_id": "artifacts.dataset_id", "updated_at": "artifacts.updated_at",
         "discovered_at": "artifacts.discovered_at", "training_set": "artifact_facts.training_set",
         "classifier_type": "artifact_facts.classifier_type", "stem_size": "artifact_facts.stem_size",
+        "evaluation_head": "json_extract(artifact_facts.facts_json, '$.evaluation_head')",
         "macro_f1": "artifact_facts.macro_f1", "loss": "artifact_facts.loss", "training_seconds": "artifact_facts.training_seconds",
         "created_at": "json_extract(artifact_facts.facts_json, '$.created_at')",
         "completed_at": "json_extract(artifact_facts.facts_json, '$.completed_at')",
@@ -5401,7 +5696,7 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
             for key in self._CATALOG_COLUMNS
         ]
         fields.append({"key": "tag", "label": "Tag", "type": "text", "operators": ["eq", "in"]})
-        return {"fields": fields, "default_columns": ["name", "status", "architecture", "variant", "classifier_type", "training_set", "macro_f1", "accuracy", "epochs", "artifact_size_bytes", "created_at", "tags"]}
+        return {"fields": fields, "default_columns": ["name", "status", "architecture", "variant", "classifier_type", "evaluation_head", "training_set", "macro_f1", "accuracy", "epochs", "artifact_size_bytes", "created_at", "tags"]}
 
     def artifact_catalog_query(self, *, filters: dict[str, Any] | None = None, sort: str = "updated_at", order: str = "desc", offset: int = 0, limit: int = 100) -> dict[str, Any]:
         """Server-side catalog paging with a deliberately small, typed filter language.
@@ -5449,7 +5744,9 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
             artifact = _row(row)
             if artifact:
                 facts = {**(artifact.get("facts") if isinstance(artifact.get("facts"), dict) else {}), **{key: artifact.get(key) for key in ("training_set", "classifier_type", "stem_size", "macro_f1", "loss", "training_seconds")}}
-                values.append({**self._artifact_result(artifact), **facts, "timing": self._artifact_runtime(artifact["artifact_id"]), "tags": self.tags_for_artifact(artifact["artifact_id"])})
+                result = self._artifact_result(artifact)
+                facts = self._scoped_metric_facts(facts, result)
+                values.append({**result, **facts, "evaluation_head": result["evaluation_head"], "timing": self._artifact_runtime(artifact["artifact_id"]), "tags": self.tags_for_artifact(artifact["artifact_id"])})
         return {"artifacts": values, "total": total, "offset": offset, "limit": limit, "sort": sort, "order": direction.lower()}
 
     def tags(self) -> list[dict[str, Any]]:

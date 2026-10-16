@@ -247,6 +247,41 @@ def test_pause_commits_checkpoint_then_requires_explicit_resume(tmp_path):
     assert orch.job(successor["job_id"])["status"] == "queued"
 
 
+def test_manual_restart_requeues_failed_unit_from_committed_checkpoint(tmp_path):
+    orch, worker, unit, _lease, credentials = _sequential_lease(tmp_path)
+    artifact = _segment_artifact(tmp_path / "artifact", run_id=unit.run_id, completed_epoch=1, stop_epoch=1)
+    _complete_segment(orch, credentials, artifact)
+    committed = orch.execution_run(unit.run_id)["checkpoint_ref"]
+    successor = _units_for_run(orch, unit.run_id)[-1]
+    job_id = successor["job_id"]
+    for _ in range(2):
+        attempt = orch.acquire_next_worker_lease(worker_id=worker["worker_id"], worker_token=worker["worker_token"])
+        assert attempt["job_id"] == job_id
+        with orch._connection() as db:
+            db.execute("UPDATE worker_leases SET expires_at='2000-01-01T00:00:00+00:00' WHERE lease_id=?", (attempt["lease_id"],))
+        assert orch.expire_worker_leases() == 1
+    assert orch.job(job_id)["status"] == "failed"
+
+    from fastapi.testclient import TestClient
+    from oracle_builder.orchestration.api import create_app
+    with TestClient(create_app(orch)) as client:
+        response = client.post(f"/v1/jobs/{job_id}:restart")
+        assert response.status_code == 202
+        restarted = response.json()["job"]
+
+    assert restarted["status"] == "queued"
+    assert restarted["retry_count"] == 0
+    assert orch.execution_run(unit.run_id)["checkpoint_ref"] == committed
+    assert orch.execution_run(unit.run_id)["completed_epoch"] == 1
+    assert successor["work_unit"]["inputs"]["checkpoint"] == committed
+    assert len(_units_for_run(orch, unit.run_id)) == 2
+    new_lease = orch.acquire_next_worker_lease(worker_id=worker["worker_id"], worker_token=worker["worker_token"])
+    assert new_lease["job_id"] == job_id
+    with orch._connection() as db:
+        attempts = db.execute("SELECT ordinal FROM execution_attempts WHERE job_id=? ORDER BY ordinal", (job_id,)).fetchall()
+    assert [row[0] for row in attempts] == [1, 2, 3]
+
+
 def test_pending_restart_fences_segment_commit_before_any_successor_is_created(tmp_path):
     orch, _worker, unit, lease, credentials = _sequential_lease(tmp_path)
     orch.acknowledge_worker_lease(**credentials)

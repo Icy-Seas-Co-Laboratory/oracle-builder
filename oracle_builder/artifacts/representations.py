@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 
@@ -31,6 +31,8 @@ def write_representation_artifacts(
     index,
     config: dict[str, Any],
     run_dir: str | Path,
+    *,
+    progress: Callable[[int, int], None] | None = None,
 ) -> dict[str, Any]:
     """Export named representations from an indexed streaming dataset.
 
@@ -99,6 +101,7 @@ def write_representation_artifacts(
             count=len(index.refs),
             representation=representation,
             provenance=provenance,
+            progress=progress,
         )
         reports.append({
             "representation": representation,

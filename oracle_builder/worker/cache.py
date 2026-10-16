@@ -28,9 +28,11 @@ class ArtifactCacheError(RuntimeError):
 
 
 class WorkerArtifactCache:
-    def __init__(self, root: str | Path, *, max_entries: int = 32) -> None:
+    def __init__(self, root: str | Path, *, max_entries: int = 32,
+                 max_bytes: int = 8 * 1024**3) -> None:
         self.root = Path(root).expanduser().resolve()
         self.max_entries = max(1, int(max_entries))
+        self.max_bytes = max(1, int(max_bytes))
         self.entries = self.root / "entries"; self.quarantine = self.root / "quarantine"
         self.entries.mkdir(parents=True, exist_ok=True); self.quarantine.mkdir(parents=True, exist_ok=True)
 
@@ -99,7 +101,7 @@ class WorkerArtifactCache:
     def _materialize_locked(self, key: str, entry: Path, expected: str, download: Callable[[Path], Path]) -> Path:
             if entry.exists():
                 if self._valid(entry, expected):
-                    os.utime(entry, None); return entry / "payload"
+                    os.utime(entry, None); self._evict(); return entry / "payload"
                 self._quarantine(entry)
                 raise ArtifactCacheError("cached artifact content digest mismatch; entry quarantined")
             temporary = self.entries / f".{key}.{time.time_ns()}.tmp"; temporary.mkdir()
@@ -136,10 +138,18 @@ class WorkerArtifactCache:
 
     def _evict(self) -> None:
         candidates = sorted((path for path in self.entries.iterdir() if path.is_dir() and not path.name.startswith(".")), key=lambda path: path.stat().st_mtime)
-        for path in candidates[:-self.max_entries]:
+        sizes = {path: sum(file.stat(follow_symlinks=False).st_size for directory, _dirs, files in os.walk(path)
+                           for file in (Path(directory) / name for name in files)) for path in candidates}
+        total = sum(sizes.values())
+        count = len(candidates)
+        for path in candidates:
+            if count <= self.max_entries and total <= self.max_bytes:
+                break
             lock = self._lock(path.name, blocking=False)
             if lock is None: continue
             try:
                 shutil.rmtree(path, ignore_errors=True)
+                count -= 1
+                total -= sizes[path]
             finally:
                 self._unlock(lock)

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+import threading
 import time
 
 import pytest
@@ -48,6 +49,22 @@ def test_watchdog_revokes_execution_after_renewal_deadline_when_transport_is_off
             control.check()
     finally:
         control.stop()
+
+
+def test_watchdog_does_not_count_host_sleep_against_lease(tmp_path, monkeypatch):
+    awake = [0.0]
+    monkeypatch.setattr("oracle_builder.worker.control.awake_monotonic", lambda: awake[0])
+    control = _control(tmp_path, _TransientlyOfflineClient(), ttl_seconds=1)
+    watchdog = threading.Thread(target=control._watchdog, daemon=True)
+    watchdog.start()
+    try:
+        time.sleep(0.2)  # Wall time passes while the host uptime clock is still.
+        assert not control.halt.is_set()
+        awake[0] = 1.0
+        assert control.halt.wait(0.5)
+    finally:
+        control.stop()
+        watchdog.join(timeout=1)
 
 
 def test_control_file_is_atomic_and_urgent_commands_supersede_safe_boundary_commands(tmp_path):

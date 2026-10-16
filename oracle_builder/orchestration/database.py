@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
 from pathlib import Path
 
 
@@ -452,13 +453,11 @@ CREATE INDEX IF NOT EXISTS comparison_group_members_artifact_idx ON comparison_g
 """
 
 
-def connect(path: str | Path) -> sqlite3.Connection:
-    database = Path(path).expanduser().resolve()
-    database.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(database)
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA journal_mode = WAL")
-    connection.execute("PRAGMA foreign_keys = ON")
+_schema_lock = threading.Lock()
+_schema_ready: dict[Path, tuple[int, int]] = {}
+
+
+def _initialize_schema(connection: sqlite3.Connection) -> None:
     connection.executescript(SCHEMA)
     from oracle_builder.orchestration.inference_sharding import INFERENCE_SHARD_TABLE_SQL
     connection.executescript(INFERENCE_SHARD_TABLE_SQL)
@@ -520,4 +519,31 @@ def connect(path: str | Path) -> sqlite3.Connection:
             "INSERT INTO schema_metadata(key,value,updated_at) VALUES('schema_version','5',?) "
             "ON CONFLICT(key) DO UPDATE SET value='5',updated_at=excluded.updated_at", (now,),
         )
-    return connection
+    connection.commit()
+
+
+def connect(path: str | Path) -> sqlite3.Connection:
+    database = Path(path).expanduser().resolve()
+    database.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(database, timeout=15)
+    connection.row_factory = sqlite3.Row
+    try:
+        connection.execute("PRAGMA busy_timeout = 15000")
+        connection.execute("PRAGMA foreign_keys = ON")
+        identity = (database.stat().st_dev, database.stat().st_ino)
+        with _schema_lock:
+            ready = _schema_ready.get(database) == identity
+            if ready:
+                try:
+                    version = connection.execute("SELECT value FROM schema_metadata WHERE key='schema_version'").fetchone()
+                    ready = version is not None and int(version[0]) >= 5
+                except (sqlite3.DatabaseError, ValueError):
+                    ready = False
+            if not ready:
+                connection.execute("PRAGMA journal_mode = WAL")
+                _initialize_schema(connection)
+                _schema_ready[database] = identity
+        return connection
+    except BaseException:
+        connection.close()
+        raise

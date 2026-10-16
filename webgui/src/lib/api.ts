@@ -89,6 +89,7 @@ export const api = {
 	jobEvents: (id: string) => request<{ events: RecordValue[] }>(`/v1/jobs/${id}/events`),
 	jobCommands: (id: string) => request<{ commands: RecordValue[] }>(`/v1/jobs/${encodeURIComponent(id)}/commands`),
 	issueJobCommand: (id: string, body: { action: 'pause' | 'yield' | 'stop_now' | 'restart' | 'resume'; reason?: string; command_id?: string }) => request<{ command: RecordValue }>(`/v1/jobs/${encodeURIComponent(id)}/commands`, { method: 'POST', body: JSON.stringify(body) }),
+	restartFailedJob: (id: string) => request<{ job: RecordValue }>(`/v1/jobs/${encodeURIComponent(id)}:restart`, { method: 'POST' }),
 	cancelJob: (id: string) => request<RecordValue>(`/v1/jobs/${encodeURIComponent(id)}:cancel`, { method: 'POST' }),
 	workerHeartbeat: (id: string) => request<{ heartbeat: RecordValue | null }>(`/v1/workers/${encodeURIComponent(id)}/heartbeat`),
 	jobTiming: (id: string) => request<RecordValue>(`/v1/jobs/${id}/timing`),

@@ -420,16 +420,37 @@ for LOCAL_POOL_ID in "${LOCAL_POOL_IDS[@]}"; do
   else
     unset ORACLE_BUILDER_WORKER_REGISTRATION_TOKEN
   fi
-  exec uv run --extra api oracle-worker \
-    --orchestrator-url "$ORCHESTRATOR_URL" \
-    --pool-id "$LOCAL_POOL_ID" \
-    --name "local-$HOST" \
-    --credentials-file "$RUNTIME_DIR/workers/${LOCAL_POOL_ID}.json" \
-    --scratch-root "$RUNTIME_DIR/worker-scratch" \
-    --artifact-timeout-seconds "$WORKER_ARTIFACT_TIMEOUT_SECONDS" \
-    --executor train \
-    --executor infer \
-    "${WORKER_CAPABILITIES[@]}"
+  worker_child=""
+  stop_local_worker() {
+    trap - TERM INT
+    if [[ -n "$worker_child" ]]; then
+      kill "$worker_child" 2>/dev/null || true
+      wait "$worker_child" 2>/dev/null || true
+    fi
+    exit 0
+  }
+  trap stop_local_worker TERM INT
+  while true; do
+    uv run --extra api oracle-worker \
+      --orchestrator-url "$ORCHESTRATOR_URL" \
+      --pool-id "$LOCAL_POOL_ID" \
+      --name "local-$HOST" \
+      --credentials-file "$RUNTIME_DIR/workers/${LOCAL_POOL_ID}.json" \
+      --scratch-root "$RUNTIME_DIR/worker-scratch" \
+      --artifact-timeout-seconds "$WORKER_ARTIFACT_TIMEOUT_SECONDS" \
+      --executor train \
+      --executor infer \
+      "${WORKER_CAPABILITIES[@]}" &
+    worker_child=$!
+    if wait "$worker_child"; then
+      echo "Local worker exited; restarting in 5 seconds to recover pending work."
+    else
+      echo "Local worker exited with status $?; restarting in 5 seconds to recover pending work."
+    fi
+    sleep 5 &
+    worker_child=$!
+    wait "$worker_child" || true
+  done
 ) >"$LOG_DIR/oracle-worker-${LOCAL_POOL_ID}.log" 2>&1 &
 WORKER_PID=$!
 WORKER_PIDS+=("$WORKER_PID")

@@ -3,6 +3,7 @@
 	import { api, type RecordValue } from '$lib/api';
 	import ArtifactEvidence from '$lib/ArtifactEvidence.svelte';
 	import EmptyState from '$lib/EmptyState.svelte';
+	import PairedMetricPlot from '$lib/PairedMetricPlot.svelte';
 
 	export let artifacts: RecordValue[] = [];
 	export let onfailure: (message: string) => void;
@@ -29,14 +30,10 @@
 		const haystack = [item.name, item.task, item.architecture, item.variant, item.dataset_id].join(' ').toLowerCase();
 		return (!query || haystack.includes(query.toLowerCase())) && (!task || item.task === task);
 	});
-	const historyNumbers = () => history.map((row, index) => ({ x: number(row.epoch) ?? number(row.step) ?? index, y: number(row.loss) ?? number(row.val_loss) }));
-	const chartPoints = () => {
-		const points = historyNumbers().filter((point) => point.y != null) as { x: number; y: number }[];
-		if (points.length < 2) return '';
-		const minX = Math.min(...points.map((point) => point.x)); const maxX = Math.max(...points.map((point) => point.x));
-		const minY = Math.min(...points.map((point) => point.y)); const maxY = Math.max(...points.map((point) => point.y));
-		return points.map((point) => `${8 + ((point.x - minX) / (maxX - minX || 1)) * 284},${112 - ((point.y - minY) / (maxY - minY || 1)) * 96}`).join(' ');
-	};
+	const finite = (value: unknown) => typeof value === 'number' && Number.isFinite(value) ? value : null;
+	$: lossHistory = history
+		.map((row, index): RecordValue => ({ ...row, epoch: finite(row.epoch) ?? finite(row.step) ?? index + 1 }))
+		.filter((row) => finite(row.loss) !== null || finite(row.val_loss) !== null);
 
 	async function inspect(id: string) {
 		selectedId = id; detail = null; history = []; loadingDetail = true;
@@ -61,7 +58,7 @@
 
 {#if selectedId}<section class="panel run-inspector"><div class="panel-head"><div><p class="eyebrow">RUN INSPECTOR</p><h2>{text(run()?.name ?? filtered().find((item) => item.artifact_id === selectedId)?.name)}</h2><p>{text(run()?.architecture)} · {text(run()?.task)} · immutable artifact evidence</p></div><button class="secondary small" on:click={() => { selectedId = ''; detail = null; }}>Close</button></div>
 	{#if loadingDetail}<p class="empty">Loading run details…</p>{:else if detail}<div class="metrics compact-metrics">{#each Object.entries(asRecord(run()?.metrics) ?? {}).filter(([, value]) => number(value) != null).slice(0, 4) as metric}<div><span>{metric[0].replaceAll('_', ' ')}</span><strong>{Number(metric[1]).toFixed(4)}</strong></div>{/each}</div>
-		<div class="two-col"><section><h3>Training loss</h3>{#if chartPoints()}<svg class="history-chart" viewBox="0 0 300 120" role="img" aria-label="Training loss history"><line x1="8" y1="112" x2="292" y2="112" /><polyline points={chartPoints()} /></svg>{:else}<p class="empty">No history was recorded for this artifact.</p>{/if}</section><section><h3>Model & protocol</h3><dl class="detail-list"><div><dt>Architecture</dt><dd>{text(run()?.architecture)}</dd></div><div><dt>Dataset</dt><dd>{text(run()?.dataset_id)}</dd></div><div><dt>Split</dt><dd>{text(asRecord(run()?.protocol)?.split)}</dd></div><div><dt>Runtime</dt><dd>{run()?.runtime_seconds == null ? '—' : `${text(run()?.runtime_seconds)} s`}</dd></div></dl></section></div>
+		<div class="two-col"><section><h3>Training and validation loss</h3>{#if lossHistory.length}<PairedMetricPlot points={lossHistory} metric="loss" title="Loss" mode="epoch" />{:else}<p class="empty">No history was recorded for this artifact.</p>{/if}</section><section><h3>Model & protocol</h3><dl class="detail-list"><div><dt>Architecture</dt><dd>{text(run()?.architecture)}</dd></div><div><dt>Dataset</dt><dd>{text(run()?.dataset_id)}</dd></div><div><dt>Split</dt><dd>{text(asRecord(run()?.protocol)?.split)}</dd></div><div><dt>Runtime</dt><dd>{run()?.runtime_seconds == null ? '—' : `${text(run()?.runtime_seconds)} s`}</dd></div></dl></section></div>
 		{#if history.length}<div class="table-scroll"><table><thead><tr>{#each Object.keys(history[0]).slice(0, 8) as field}<th>{field.replaceAll('_', ' ')}</th>{/each}</tr></thead><tbody>{#each history.slice(0, 50) as row}<tr>{#each Object.keys(history[0]).slice(0, 8) as field}<td>{text(row[field])}</td>{/each}</tr>{/each}</tbody></table></div>{/if}
 		<div class="row-actions"><button on:click={() => evidenceId = selectedId}>View outputs & evidence</button></div>
 	{/if}</section>{/if}

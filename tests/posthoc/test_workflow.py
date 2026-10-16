@@ -9,6 +9,7 @@ from oracle_builder.data.sqlite_dataset import create_synthetic_classification
 from oracle_builder.datasets.schema import read_dataset_info, set_dataset_lifecycle
 from oracle_builder.environment import write_environment
 from oracle_builder.inference.bundle import InferenceBundle
+from oracle_builder.orchestration.service import Orchestrator
 from oracle_builder.posthoc.workflow import fit_existing_model_posthoc
 from oracle_builder.saving.load_test import run_load_tests
 from oracle_builder.saving.save_model import save_model_artifacts, write_load_test_report
@@ -51,7 +52,15 @@ def test_existing_model_can_fit_separate_posthoc_head_on_new_classes(tmp_path):
         dataset_id = read_dataset_info(connection)["dataset_id"]
 
     product = tmp_path / "fitted"
-    result = fit_existing_model_posthoc(source, dataset, product, split_strategy="class_stratified")
+    events = []
+    result = fit_existing_model_posthoc(
+        source, dataset, product, split_strategy="class_stratified",
+        progress=lambda event, message, data: events.append((event, message, data)),
+    )
+    extraction = [data for event, _, data in events if event == "posthoc_embedding_progress"]
+    assert {data["split"] for data in extraction} == {"train", "validation", "test"}
+    assert all(data["completed"] <= data["total"] for data in extraction)
+    assert any(event == "posthoc_candidate_completed" for event, _, _ in events)
     assert result["artifact_id"] != source_manifest["artifact_id"]
     assert read_run_manifest(source)["fingerprint_sha256"] == source_fingerprint
     validation = validate_run_artifact(product)
@@ -69,3 +78,49 @@ def test_existing_model_can_fit_separate_posthoc_head_on_new_classes(tmp_path):
     assert result["summary"]["evaluation_head"] == "posthoc"
     bundle = InferenceBundle.load(product)
     assert bundle.posthoc_head is not None
+    orchestrator = Orchestrator(tmp_path / "orchestrator.sqlite", workspace_root=tmp_path, artifact_root=tmp_path)
+    orchestrator.scan(source)
+    orchestrator.scan(product)
+    source_detail = orchestrator.artifact_detail(source_manifest["artifact_id"])
+    derived_detail = orchestrator.artifact_detail(result["artifact_id"])
+    assert source_detail["artifact"]["evaluation_head"] == "neural"
+    assert source_detail["artifact"]["metrics"]["accuracy"] == 0.01
+    assert derived_detail["artifact"]["evaluation_head"] == "posthoc"
+    assert derived_detail["artifact"]["metrics"]["accuracy"] == report["metrics"]["accuracy"]
+    assert derived_detail["source_neural_evaluation"]["accuracy"] == 0.01
+    assert derived_detail["neural_evaluation"]["accuracy"] == 0.01
+    assert derived_detail["neural_artifact_id"] == source_manifest["artifact_id"]
+    assert derived_detail["posthoc"]["metrics"]["accuracy"] == report["metrics"]["accuracy"]
+    catalog = {row["artifact_id"]: row for row in orchestrator.artifact_catalog_query()["artifacts"]}
+    assert catalog[source_manifest["artifact_id"]]["evaluation_head"] == "neural"
+    assert catalog[result["artifact_id"]]["evaluation_head"] == "posthoc"
+    assert catalog[result["artifact_id"]]["loss"] is None
+    with sqlite3.connect(tmp_path / "orchestrator.sqlite") as connection:
+        stored = json.loads(connection.execute(
+            "SELECT facts_json FROM artifact_facts WHERE artifact_id=?", (result["artifact_id"],)
+        ).fetchone()[0])
+        stored["metrics"]["loss"] = 0.8
+        stored["loss"] = 0.8
+        stored["field_sources"]["loss"] = {"source": "training_history", "status": "inferred"}
+        connection.execute(
+            "UPDATE artifact_facts SET facts_json=?,loss=? WHERE artifact_id=?",
+            (json.dumps(stored), 0.8, result["artifact_id"]),
+        )
+    assert orchestrator.artifact_detail(result["artifact_id"])["facts"]["facts"]["loss"] is None
+    assert next(row for row in orchestrator.artifact_catalog_query()["artifacts"]
+                if row["artifact_id"] == result["artifact_id"])["loss"] is None
+
+    second_product = tmp_path / "second-fit"
+    second = fit_existing_model_posthoc(product, dataset, second_product, split_strategy="class_stratified")
+    orchestrator.scan(second_product)
+    second_detail = orchestrator.artifact_detail(second["artifact_id"])
+    assert second_detail["neural_artifact_id"] == source_manifest["artifact_id"]
+    assert second_detail["neural_evaluation"]["accuracy"] == 0.01
+    assert second_detail["source_model_evaluation"]["accuracy"] == report["metrics"]["accuracy"]
+    assert second_detail["artifact"]["evaluation_head"] == "posthoc"
+    assert (second_product / "provenance" / "neural" / "evaluation" / "evaluation_summary.json").is_file()
+    portable_catalog = Orchestrator(tmp_path / "portable.sqlite", workspace_root=tmp_path, artifact_root=tmp_path)
+    portable_catalog.scan(second_product)
+    portable_detail = portable_catalog.artifact_detail(second["artifact_id"])
+    assert portable_detail["neural_evaluation"]["accuracy"] == 0.01
+    assert portable_detail["neural_artifact_id"] == source_manifest["artifact_id"]

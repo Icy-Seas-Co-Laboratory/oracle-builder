@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import hashlib
 import json
 from pathlib import Path
 import tarfile
@@ -15,6 +16,8 @@ from oracle_builder.worker.pull import (
     extract_tar_safely, load_worker_credentials, save_worker_credentials,
     training_progress_payload, archive_directory_to_file, upload_output_archive,
     recover_output_upload, OutputPublicationError,
+    recover_retained_output,
+    _LeaseKeepalive,
 )
 from oracle_data_contracts.artifacts import ArtifactRef
 from oracle_data_contracts.work_units import WorkUnit
@@ -159,6 +162,55 @@ def test_recovery_metadata_contains_no_tokens_and_resumes(tmp_path):
     assert not root.exists()
 
 
+def test_worker_recovers_retained_output_before_polling_for_more_work(tmp_path):
+    recovery = tmp_path / "scratch" / "recovery" / "saved"
+    recovery.mkdir(parents=True)
+    archive = recovery / "output.tar"
+    archive.write_bytes(b"x" * 70_000)
+    (recovery / "recovery.json").write_text(json.dumps({
+        "version": 1, "lease_id": "lease", "worker_id": "worker",
+        "archive": "output.tar", "archive_sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
+        "archive_size": archive.stat().st_size, "part_size": 64 * 1024,
+    }))
+
+    class Client:
+        base_url = "https://orch"
+        def __init__(self): self.calls = []
+        def resume_output_publication(self, **kwargs):
+            self.calls.append("resume")
+            return {"status": "active", "lease_token": "fresh-token"}
+        def start_output_upload(self, **kwargs):
+            self.calls.append("start")
+            return {"upload_id": "upload", "part_size": 64 * 1024, "uploaded_parts": []}
+        def upload_output_part(self, **kwargs): self.calls.append("part"); return {}
+        def finalize_output_upload(self, **kwargs): self.calls.append("finalize"); return {}
+        def complete(self, **kwargs): self.calls.append("complete"); return {}
+        def poll(self, **kwargs): raise AssertionError("worker polled before recovering output")
+
+    client = Client()
+    credentials = tmp_path / "credentials.json"
+    save_worker_credentials(credentials, WorkerCredentials("worker", "secret", "pool", client.base_url))
+    runtime = type("Runtime", (), {"scratch_root": tmp_path / "scratch"})()
+    loop = PullWorkerLoop(client, runtime=runtime, pool_id="pool", name="worker",
+                          credentials_path=credentials, registration_token=None,
+                          capabilities={}, poll_interval_seconds=.001)
+    assert loop.run(max_jobs=1) == 1
+    assert client.calls == ["resume", "start", "part", "part", "finalize", "complete"]
+    assert not recovery.exists()
+
+
+def test_recovery_discards_a_matching_already_completed_receipt(tmp_path):
+    recovery = tmp_path / "recovery"; recovery.mkdir()
+    (recovery / "recovery.json").write_text(json.dumps({
+        "lease_id": "lease", "archive_sha256": "a" * 64,
+    }))
+    class Client:
+        def resume_output_publication(self, **kwargs):
+            return {"status": "released", "outcome": "completed", "output_archive_sha256": "a" * 64}
+    assert recover_retained_output(Client(), recovery_dir=recovery, worker_id="worker", worker_token="secret")["idempotent"]
+    assert not recovery.exists()
+
+
 def test_runtime_retains_output_for_recovery_when_multipart_publication_fails(tmp_path):
     class FailingMultipart(_Client):
         def start_output_upload(self, **kwargs):
@@ -174,6 +226,21 @@ def test_runtime_retains_output_for_recovery_when_multipart_publication_fails(tm
     assert "token" not in json.dumps(metadata).lower()
     assert (retained[0] / "output.tar").is_file()
     assert not any(name == "complete" for name, _ in client.calls)
+
+
+def test_runtime_retains_output_when_completion_response_is_lost(tmp_path):
+    class LostReceipt(_Client):
+        def complete(self, **kwargs):
+            raise TimeoutError("completion response lost")
+
+    runtime = PullWorkerRuntime(LostReceipt(), scratch_root=tmp_path / "scratch", executor=_Executor())
+    with pytest.raises(OutputPublicationError, match="completion receipt"):
+        runtime.run_lease(worker_id="worker-1", worker_token="worker-token", lease_response=_lease())
+    retained = list((tmp_path / "scratch" / "recovery").iterdir())
+    assert len(retained) == 1
+    metadata = json.loads((retained[0] / "recovery.json").read_text())
+    assert metadata["worker_id"] == "worker-1"
+    assert (retained[0] / "output.tar").is_file()
 
 
 def test_client_assigns_event_ids_for_idempotent_receipts(monkeypatch):
@@ -233,6 +300,27 @@ def test_client_uses_a_separate_long_timeout_for_artifact_transfers(monkeypatch)
     }
 
 
+def test_client_allows_archive_finalization_to_exceed_control_timeout(monkeypatch):
+    client = OrchestratorPullClient(
+        "https://orchestrator.example", timeout_seconds=3, artifact_timeout_seconds=123,
+    )
+    captured = {}
+
+    def request(method, path, body, **kwargs):
+        captured.update({"method": method, "path": path, "body": body, **kwargs})
+        return {"status": "finalized"}
+
+    monkeypatch.setattr(client, "_request", request)
+    assert client.finalize_output_upload(upload_id="upload", worker_token="worker", lease_token="lease") == {"status": "finalized"}
+    assert captured == {
+        "method": "POST", "path": "/v1/worker-output-uploads/upload:finalize",
+        "body": {"lease_token": "lease"}, "worker_token": "worker", "timeout_seconds": 123,
+    }
+    captured.clear()
+    assert client.complete(lease_id="lease", worker_token="worker", lease_token="token", outcome="succeeded") == {"status": "finalized"}
+    assert captured["timeout_seconds"] == 123
+
+
 def test_training_progress_payload_is_path_free_and_bounded(tmp_path):
     status = tmp_path / "training-status.json"
     status.write_text(json.dumps({
@@ -285,6 +373,31 @@ def test_runtime_renews_lease_while_executor_runs(tmp_path):
     runtime.run_lease(worker_id="worker", worker_token="token", lease_response=_lease(),
                       lease_ttl_seconds=2, renew_interval_seconds=.01)
     assert any(name == "renew" for name, _ in client.calls)
+
+
+def test_keepalive_retries_transient_renewal_failure():
+    class BusyClient:
+        calls = 0
+
+        def renew(self, **_kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                error = PullProtocolError("orchestrator returned 503: database busy")
+                error.status_code = 503
+                raise error
+            return {}
+
+    client = BusyClient()
+    keepalive = _LeaseKeepalive(client, lease_id="lease", worker_token="worker", lease_token="token", ttl_seconds=2, interval_seconds=.01)
+    keepalive.start()
+    try:
+        deadline = time.monotonic() + 1.5
+        while client.calls < 2 and time.monotonic() < deadline:
+            time.sleep(.01)
+        assert client.calls >= 2
+        keepalive.raise_if_failed()
+    finally:
+        keepalive.stop()
 
 
 def test_archive_extraction_rejects_parent_paths_and_links(tmp_path):

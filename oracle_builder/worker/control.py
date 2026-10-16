@@ -7,6 +7,8 @@ from pathlib import Path
 import threading
 import time
 
+from oracle_builder.awake_clock import awake_monotonic
+
 
 class ExecutionInterrupted(RuntimeError):
     def __init__(self, action, command=None):
@@ -22,7 +24,7 @@ class WorkerControl:
         self.telemetry = {'generation': generation, 'phase': 'materializing'}
         if worker_boot_id is not None:
             self.telemetry['worker_boot_id'] = worker_boot_id
-        self.deadline = time.monotonic() + ttl_seconds - min(5, ttl_seconds / 4)
+        self.deadline = awake_monotonic() + ttl_seconds - min(5, ttl_seconds / 4)
         self.halt = threading.Event()
         self.done = threading.Event()
         self.command = None
@@ -60,7 +62,7 @@ class WorkerControl:
 
     def _heartbeat(self):
         while not self.done.is_set():
-            started = time.monotonic()
+            started = awake_monotonic()
             try:
                 with self._lock:
                     telemetry = dict(self.telemetry)
@@ -84,7 +86,7 @@ class WorkerControl:
 
     def _watchdog(self):
         while not self.done.wait(0.1):
-            if time.monotonic() >= self.deadline:
+            if awake_monotonic() >= self.deadline:
                 self._interrupt('lease_lost')
                 return
 

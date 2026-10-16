@@ -5,7 +5,10 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import shutil
-from typing import Any
+import threading
+import time
+from contextlib import contextmanager
+from typing import Any, Callable, Mapping
 
 import numpy as np
 
@@ -21,6 +24,37 @@ from .cache import open_embedding_cache
 from .pipelines import build_posthoc_pipeline
 
 
+PosthocProgress = Callable[[str, str, Mapping[str, Any] | None], None]
+
+
+def _emit(progress: PosthocProgress | None, event: str, message: str, data: Mapping[str, Any] | None = None) -> None:
+    if progress is not None:
+        progress(event, message, data)
+
+
+@contextmanager
+def _report_long_step(progress: PosthocProgress | None, event: str, description: str,
+                      data: Mapping[str, Any], *, interval_seconds: float = 15.0):
+    """Keep a long-running sklearn operation visible without claiming measured progress."""
+    if progress is None:
+        yield
+        return
+    finished = threading.Event()
+    started = time.monotonic()
+
+    def heartbeat() -> None:
+        while not finished.wait(interval_seconds):
+            _emit(progress, event, f"{description} · {int(time.monotonic() - started)}s elapsed", data)
+
+    reporter = threading.Thread(target=heartbeat, name="posthoc-progress", daemon=True)
+    reporter.start()
+    try:
+        yield
+    finally:
+        finished.set()
+        reporter.join()
+
+
 def _labeled_data(path: Path) -> tuple[np.ndarray, np.ndarray]:
     cache = open_embedding_cache(path)
     labels = [row.get("label") for row in cache.iter_records()]
@@ -33,6 +67,7 @@ def fit_posthoc_from_caches(
     train_path: Path, validation_path: Path, test_path: Path, output: Path,
     *, representation: str = "fused_embedding", estimator: str = "logistic_regression",
     class_names: dict[int, str] | None = None,
+    progress: PosthocProgress | None = None,
 ) -> dict[str, Any]:
     """Tune on validation only, then score once on the held-out test split."""
     import joblib
@@ -50,19 +85,35 @@ def fit_posthoc_from_caches(
 
     candidates = []
     best = None
-    for strength in (0.1, 1.0, 10.0):
+    strengths = (0.1, 1.0, 10.0)
+    for candidate_index, strength in enumerate(strengths, start=1):
+        _emit(progress, "posthoc_candidate_started", f"Fitting classifier candidate {candidate_index} of {len(strengths)} (C={strength:g})", {
+            "candidate_index": candidate_index, "candidate_count": len(strengths), "C": strength,
+            "stage_fraction": 0.75 + 0.2 * (candidate_index - 1) / len(strengths),
+        })
         pipeline = build_posthoc_pipeline({
             "transforms": ("standard",),
             "classifier": estimator,
             "classifier_options": {"C": strength, "max_iter": 1000},
         })
-        pipeline.fit(train_x, train_y)
+        with _report_long_step(progress, "posthoc_candidate_running",
+                               f"Fitting classifier candidate {candidate_index} of {len(strengths)}",
+                               {"candidate_index": candidate_index, "candidate_count": len(strengths),
+                                "C": strength, "stage_fraction": 0.75 + 0.2 * (candidate_index - 1) / len(strengths)}):
+            pipeline.fit(train_x, train_y)
         prediction = pipeline.predict(val_x)
         score = float(f1_score(val_y, prediction, average="macro", zero_division=0))
         candidates.append({"C": strength, "validation_macro_f1": score})
+        _emit(progress, "posthoc_candidate_completed", f"Candidate {candidate_index} of {len(strengths)} scored {score:.4f} validation macro F1", {
+            "candidate_index": candidate_index, "candidate_count": len(strengths), "C": strength,
+            "validation_macro_f1": score, "stage_fraction": 0.75 + 0.2 * candidate_index / len(strengths),
+        })
         if best is None or score > best[0]:
             best = (score, strength, pipeline)
     assert best is not None
+    _emit(progress, "posthoc_evaluation_started", "Calculating validation and held-out test metrics", {
+        "selected_C": best[1], "stage_fraction": 0.95,
+    })
     validation_probabilities = best[2].predict_proba(val_x)
     validation_metrics = {
         row["metric"]: row["value"]
@@ -119,10 +170,14 @@ def fit_posthoc_from_caches(
     best[2].oracle_posthoc_labels_ = dict(class_names or {})
     joblib.dump(best[2], output / "estimator.joblib")
     (output / "report.json").write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    _emit(progress, "posthoc_evaluation_completed", "Classifier metrics and held-out test evidence are ready", {
+        "selected_C": best[1], "validation_macro_f1": best[0], "stage_fraction": 1.0,
+    })
     return report
 
 
-def train_posthoc_classifier(model: Any, sqlite_path: str | Path, config: dict[str, Any], run_dir: str | Path) -> dict[str, Any]:
+def train_posthoc_classifier(model: Any, sqlite_path: str | Path, config: dict[str, Any], run_dir: str | Path,
+                             *, progress: PosthocProgress | None = None) -> dict[str, Any]:
     """Export only the configured representation for each labeled split."""
     settings = config.get("posthoc", {})
     representation = str(settings.get("representation", "fused_embedding"))
@@ -134,11 +189,16 @@ def train_posthoc_classifier(model: Any, sqlite_path: str | Path, config: dict[s
         for row in config.get("dataset", {}).get("labels", [])
     }
     cache_paths = {}
-    for split in ("train", "validation", "test"):
+    splits = ("train", "validation", "test")
+    for split_index, split in enumerate(splits):
         index = build_classification_index(sqlite_path, config, split, labeled_only=True)
         if not index.refs:
             raise ValueError(f"Enabled post-hoc classifier requires a labeled {split} split")
         cache_path = root / "intermediates" / "representations" / split / representation
+        _emit(progress, "posthoc_embedding_started", f"Extracting {split} embeddings from {len(index.refs):,} examples", {
+            "split": split, "split_index": split_index + 1, "total_splits": len(splits),
+            "completed": 0, "total": len(index.refs), "stage_fraction": 0.75 * split_index / len(splits),
+        })
         if cache_path.exists():
             try:
                 cached = open_embedding_cache(cache_path)
@@ -160,16 +220,36 @@ def train_posthoc_classifier(model: Any, sqlite_path: str | Path, config: dict[s
                     },
                 },
             }
+            last_reported_at = 0.0
+
+            def report_embedding(completed: int, total: int) -> None:
+                nonlocal last_reported_at
+                now = time.monotonic()
+                if completed != total and now - last_reported_at < 2.0:
+                    return
+                last_reported_at = now
+                _emit(progress, "posthoc_embedding_progress", f"Extracted {completed:,} of {total:,} {split} embeddings", {
+                    "split": split, "split_index": split_index + 1, "total_splits": len(splits),
+                    "completed": completed, "total": total,
+                    "stage_fraction": 0.75 * (split_index + completed / total) / len(splits),
+                })
+
             write_representation_artifacts(
                 model,
                 source.indexed_image_dataset(index, batch_size=export_config["output"]["intermediate_artifacts"]["batch_size"]),
-                index, export_config, root,
+                index, export_config, root, progress=report_embedding,
             )
+        else:
+            _emit(progress, "posthoc_embedding_progress", f"Reusing {len(index.refs):,} cached {split} embeddings", {
+                "split": split, "split_index": split_index + 1, "total_splits": len(splits),
+                "completed": len(index.refs), "total": len(index.refs),
+                "stage_fraction": 0.75 * (split_index + 1) / len(splits),
+            })
         cache_paths[split] = cache_path
     report = fit_posthoc_from_caches(
         cache_paths["train"], cache_paths["validation"], cache_paths["test"],
         root / "model" / "posthoc", representation=representation, estimator=estimator,
-        class_names=class_names,
+        class_names=class_names, progress=progress,
     )
     # The neural outputs remain the primary contract; this adds an optional
     # head to the same portable bundle after fitting has completed.

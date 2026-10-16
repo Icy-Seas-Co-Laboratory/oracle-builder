@@ -30,6 +30,7 @@ from typing import Any, Mapping, Protocol
 
 from oracle_data_contracts.work_units import WorkUnit, WorkUnitError, parse_work_unit
 from oracle_builder.worker.control import ExecutionInterrupted
+from oracle_builder.awake_clock import awake_monotonic
 
 
 class PullProtocolError(RuntimeError):
@@ -445,10 +446,10 @@ def training_progress_payload(status_path: Path) -> dict[str, Any] | None:
     post = raw.get("post_training")
     post_training = {}
     if isinstance(post, Mapping):
-        for key in ("stage", "status"):
+        for key in ("stage", "status", "activity"):
             if isinstance(post.get(key), str):
                 post_training[key] = post[key][:160]
-        for key in ("stage_index", "total_stages", "completed_epochs", "planned_epochs", "completed_items", "total_items", "elapsed_seconds"):
+        for key in ("stage_index", "total_stages", "completed_epochs", "planned_epochs", "completed_items", "total_items", "elapsed_seconds", "stage_fraction"):
             value = _finite_number(post.get(key))
             if value is not None:
                 post_training[key] = value
@@ -745,6 +746,7 @@ class OrchestratorPullClient:
             body["error"] = error
         return self._request(
             "POST", f"/v1/worker-leases/{lease_id}:complete", body, worker_token=worker_token,
+            timeout_seconds=self.artifact_timeout_seconds if outcome == "succeeded" else None,
         ) or {}
 
     def defer_output_publication(self, *, lease_id: str, worker_token: str, lease_token: str) -> dict[str, Any]:
@@ -849,7 +851,7 @@ class OrchestratorPullClient:
     def finalize_output_upload(self, *, upload_id: str, worker_token: str, lease_token: str) -> dict[str, Any]:
         return self._request(
             "POST", f"/v1/worker-output-uploads/{upload_id}:finalize", {"lease_token": lease_token},
-            worker_token=worker_token,
+            worker_token=worker_token, timeout_seconds=self.artifact_timeout_seconds,
         ) or {}
 
 
@@ -1036,6 +1038,33 @@ def recover_output_upload(
     return result
 
 
+def recover_retained_output(client: Any, *, recovery_dir: str | Path,
+                            worker_id: str, worker_token: str) -> dict[str, Any]:
+    """Publish a retained archive with rotated credentials, then remove it."""
+    root = Path(recovery_dir).resolve()
+    metadata = json.loads((root / "recovery.json").read_text(encoding="utf-8"))
+    lease_id = metadata.get("lease_id") if isinstance(metadata, dict) else None
+    if not isinstance(lease_id, str) or not lease_id:
+        raise PullProtocolError("output recovery metadata is invalid")
+    resumed = client.resume_output_publication(
+        lease_id=lease_id, worker_id=worker_id, worker_token=worker_token,
+    )
+    if resumed.get("status") == "released" and resumed.get("outcome") == "completed":
+        if resumed.get("output_archive_sha256") != metadata.get("archive_sha256"):
+            raise PullProtocolError("completed output receipt does not match retained archive")
+        shutil.rmtree(root)
+        return {"status": "completed", "idempotent": True}
+    lease_token = resumed.get("lease_token")
+    if not isinstance(lease_token, str) or not lease_token:
+        raise PullProtocolError("output recovery did not receive a fresh lease token")
+    recover_output_upload(client, recovery_dir=root, worker_token=worker_token,
+                          lease_token=lease_token, remove_on_success=False)
+    result = client.complete(lease_id=lease_id, worker_token=worker_token,
+                             lease_token=lease_token, outcome="succeeded")
+    shutil.rmtree(root)
+    return result
+
+
 class PullWorkerRuntime:
     """One acknowledged lease from materialization through staged publication."""
 
@@ -1049,14 +1078,14 @@ class PullWorkerRuntime:
             from oracle_builder.worker.cache import WorkerArtifactCache
             self.artifact_cache = WorkerArtifactCache(self.scratch_root / 'artifact-cache')
 
-    def _retain_output_recovery(self, *, scratch: Path, lease_id: str, archive_name: str,
+    def _retain_output_recovery(self, *, scratch: Path, lease_id: str, worker_id: str, archive_name: str,
                                 archive_size: int, archive_sha256: str, part_size: int) -> Path:
         """Move failed publication material below a worker-owned recovery root."""
         recovery_root = self.scratch_root / "recovery"
         recovery_root.mkdir(parents=True, exist_ok=True)
         destination = recovery_root / uuid.uuid4().hex
         metadata = {
-            "version": 1, "lease_id": lease_id, "archive": archive_name,
+            "version": 1, "lease_id": lease_id, "worker_id": worker_id, "archive": archive_name,
             "archive_size": archive_size, "archive_sha256": archive_sha256, "part_size": part_size,
         }
         metadata_path = scratch / "recovery.json"
@@ -1240,7 +1269,7 @@ class PullWorkerRuntime:
                 )
             except OutputPublicationError:
                 recovery = self._retain_output_recovery(
-                    scratch=scratch, lease_id=lease_id, archive_name=archive_path.name,
+                    scratch=scratch, lease_id=lease_id, worker_id=worker_id, archive_name=archive_path.name,
                     archive_size=archive_size, archive_sha256=archive_sha256, part_size=8 * 1024 * 1024,
                 )
                 retained_recovery = True
@@ -1254,7 +1283,27 @@ class PullWorkerRuntime:
             stage_timing("worker_total", lease_started, "Worker execution and output publication completed", outcome="succeeded")
             if control:
                 control.check()
-            self.client.complete(lease_id=lease_id, worker_token=worker_token, lease_token=lease_token, outcome="succeeded")
+            try:
+                self.client.complete(lease_id=lease_id, worker_token=worker_token,
+                                     lease_token=lease_token, outcome="succeeded")
+            except Exception as exc:
+                # A lost completion response does not prove the server failed
+                # to publish. Keep the exact archive until its durable receipt
+                # can be checked with the worker's registered identity.
+                if getattr(exc, "status_code", None) in {400, 401, 403, 404, 409, 422}:
+                    raise
+                recovery = self._retain_output_recovery(
+                    scratch=scratch, lease_id=lease_id, worker_id=worker_id,
+                    archive_name=archive_path.name, archive_size=archive_size,
+                    archive_sha256=archive_sha256, part_size=8 * 1024 * 1024,
+                )
+                retained_recovery = True
+                try:
+                    emit("output_publication_deferred", "Completion receipt was lost; retained for recovery",
+                         {"recovery_id": recovery.name})
+                except Exception:
+                    pass
+                raise OutputPublicationError(f"completion receipt was not confirmed: {exc}") from exc
             return {"status": "succeeded", "result": dict(result or {})}
         except ExecutionInterrupted as exc:
             if exc.command and exc.action in {'stop_now', 'restart'}:
@@ -1317,16 +1366,28 @@ class _LeaseKeepalive:
         self._thread.start()
 
     def _run(self) -> None:
-        while not self._stop.wait(self.interval_seconds):
+        next_attempt = self.interval_seconds
+        deadline = awake_monotonic() + self.ttl_seconds - min(5, self.ttl_seconds / 4)
+        while not self._stop.wait(next_attempt):
+            started = awake_monotonic()
             try:
                 self.client.renew(
                     lease_id=self.lease_id, worker_token=self.worker_token,
                     lease_token=self.lease_token, ttl_seconds=self.ttl_seconds,
                 )
-            except Exception as exc:  # the foreground code reports/finishes safely
-                self._failure = exc
-                self._stop.set()
-                return
+                deadline = started + self.ttl_seconds - min(5, self.ttl_seconds / 4)
+                next_attempt = self.interval_seconds
+            except Exception as exc:
+                # A busy database or brief network interruption must not
+                # discard an otherwise healthy training attempt. Only a
+                # definitive lease rejection or an elapsed renewal deadline
+                # is terminal.
+                terminal = getattr(exc, "status_code", None) in {401, 403, 404, 409, 422}
+                if terminal or awake_monotonic() >= deadline:
+                    self._failure = exc
+                    self._stop.set()
+                    return
+                next_attempt = min(1.0, max(0.1, deadline - awake_monotonic()))
 
     def raise_if_failed(self) -> None:
         if self._failure is not None:
@@ -1420,6 +1481,26 @@ class PullWorkerLoop:
         save_worker_credentials(self.credentials_path, current)
         return current
 
+    def _retained_outputs(self, worker_id: str) -> list[Path]:
+        scratch_root = getattr(self.runtime, "scratch_root", None)
+        if scratch_root is None:
+            return []
+        root = Path(scratch_root) / "recovery"
+        if not root.is_dir():
+            return []
+        retained = []
+        for directory in sorted(root.iterdir()):
+            metadata_path = directory / "recovery.json"
+            if not directory.is_dir() or directory.is_symlink() or metadata_path.is_symlink():
+                continue
+            try:
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if isinstance(metadata, dict) and metadata.get("worker_id") == worker_id:
+                retained.append(directory)
+        return retained
+
     def run(self, *, max_jobs: int | None = None, once: bool = False,
             stop_event: threading.Event | None = None) -> int:
         if max_jobs is not None and max_jobs < 1:
@@ -1429,7 +1510,26 @@ class PullWorkerLoop:
         stop = stop_event or threading.Event()
         credentials = self.credentials()
         completed = 0
+        recovery_retry_seconds = 5.0
         while not stop.is_set() and (max_jobs is None or completed < max_jobs):
+            retained = self._retained_outputs(credentials.worker_id)
+            if retained:
+                try:
+                    recover_retained_output(
+                        self.client, recovery_dir=retained[0],
+                        worker_id=credentials.worker_id, worker_token=credentials.worker_token,
+                    )
+                    completed += 1
+                    recovery_retry_seconds = 5.0
+                except (OSError, ValueError, PullProtocolError) as exc:
+                    # Keep the archive and retry with fresh credentials. Never
+                    # accept another lease while prior output awaits publication.
+                    print(f"Output publication recovery will retry: {exc}", file=sys.stderr, flush=True)
+                    stop.wait(recovery_retry_seconds)
+                    recovery_retry_seconds = min(60.0, recovery_retry_seconds * 2)
+                if once:
+                    break
+                continue
             lease = self.client.poll(worker_id=credentials.worker_id, worker_token=credentials.worker_token,
                                      ttl_seconds=self.lease_ttl_seconds, capabilities=self.capabilities)
             if lease is None:
@@ -1441,11 +1541,9 @@ class PullWorkerLoop:
                 self.runtime.run_lease(worker_id=credentials.worker_id, worker_token=credentials.worker_token,
                                        lease_response=lease, lease_ttl_seconds=self.lease_ttl_seconds)
             except OutputPublicationError:
-                # The control plane now owns a publication-pending lease for
-                # this worker. Do not poll again and accidentally overwrite
-                # its visible ``publishing`` worker state with ``idle``; a
-                # supervisor/operator resumes the retained archive explicitly.
-                break
+                # run_lease retained the archive. The next loop iteration
+                # recovers it before this worker is allowed to poll again.
+                continue
             except Exception:
                 # run_lease reports a failed completion when connectivity
                 # permits.  Continue so a single bad unit cannot kill a fleet.

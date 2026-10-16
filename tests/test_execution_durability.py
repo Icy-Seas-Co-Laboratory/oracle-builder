@@ -2,10 +2,15 @@ from __future__ import annotations
 
 import io
 import json
+import sqlite3
+import threading
+import time
 import uuid
 import zipfile
+from datetime import datetime, timedelta, timezone
 
 from oracle_builder.orchestration.service import Orchestrator
+from oracle_builder.orchestration.database import connect
 from oracle_data_contracts.artifacts import ArtifactRef
 from oracle_data_contracts.work_units import WorkUnit
 
@@ -60,6 +65,39 @@ def test_expiry_gets_exactly_one_infrastructure_retry_with_attempt_history(tmp_p
     ]
 
 
+def test_host_sleep_extends_active_lease_without_spending_retry(tmp_path):
+    orch, _worker, lease, credentials = _leased(tmp_path)
+    lease_id = lease["lease_id"]
+    with orch._connection() as db:
+        before = datetime.fromisoformat(db.execute(
+            "SELECT expires_at FROM worker_leases WHERE lease_id=?", (lease_id,)
+        ).fetchone()[0])
+        db.execute("UPDATE worker_leases SET expires_at=? WHERE lease_id=?",
+                   ((datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat(), lease_id))
+    # Simulate ten minutes of wall time passing while the host's awake clock
+    # advanced by less than a second. Reconciliation must preserve the lease.
+    orch._lease_last_wall -= timedelta(minutes=10)
+    assert orch.expire_worker_leases() == 0
+    with orch._connection() as db:
+        current = db.execute("SELECT status,expires_at FROM worker_leases WHERE lease_id=?", (lease_id,)).fetchone()
+        events = db.execute("SELECT event_type FROM worker_lease_events WHERE lease_id=?", (lease_id,)).fetchall()
+    assert current["status"] == "active"
+    assert datetime.fromisoformat(current["expires_at"]) > before
+    assert any(event["event_type"] == "host_resumed" for event in events)
+    assert orch.job(lease["job_id"])["retry_count"] == 0
+    assert orch.authenticate_active_worker_lease(**credentials)
+
+
+def test_host_sleep_does_not_revive_lease_expired_before_suspend(tmp_path):
+    orch, _worker, lease, _credentials = _leased(tmp_path)
+    with orch._connection() as db:
+        db.execute("UPDATE worker_leases SET expires_at=? WHERE lease_id=?",
+                   ((datetime.now(timezone.utc) - timedelta(minutes=11)).isoformat(), lease["lease_id"]))
+    orch._lease_last_wall -= timedelta(minutes=10)
+    assert orch.expire_worker_leases() == 1
+    assert orch.job(lease["job_id"])["retry_count"] == 1
+
+
 def test_scientific_failure_is_terminal_and_never_retried(tmp_path):
     orch, _worker, lease, credentials = _leased(tmp_path)
     orch.acknowledge_worker_lease(**credentials)
@@ -93,6 +131,36 @@ def test_startup_reconciles_a_store_publication_left_between_filesystem_and_db_c
     assert orch.reconcile_worker_publications() == 1
     assert orch.worker_lease(lease["lease_id"])["output_ref"] == expected.to_dict()
     assert orch.job(lease["job_id"])["status"] == "completed"
+
+
+def test_publication_lookup_does_not_block_lease_heartbeat(tmp_path, monkeypatch):
+    orch, _worker, lease, credentials = _leased(tmp_path)
+    acknowledged = orch.acknowledge_worker_lease(**credentials)
+    orch.upload_worker_lease_output_archive(**credentials, archive=_archive())
+    staging = orch.artifact_store.staging(lease["job_id"], acknowledged["output_attempt_id"])
+    assert orch.artifact_store.validate(staging, orch._valid_worker_output).valid
+    orch.artifact_store.seal(staging)
+    orch.artifact_store.publish(staging, ArtifactRef("job_output", lease["job_id"], revision=acknowledged["output_attempt_id"]))
+    original = orch.artifact_store.published_ref
+    entered, release = threading.Event(), threading.Event()
+
+    def slow_lookup(*args):
+        entered.set()
+        assert release.wait(5)
+        return original(*args)
+
+    monkeypatch.setattr(orch.artifact_store, "published_ref", slow_lookup)
+    thread = threading.Thread(target=orch.reconcile_worker_publications)
+    thread.start()
+    try:
+        assert entered.wait(5)
+        started = time.monotonic()
+        orch.heartbeat_worker_lease(**credentials, telemetry={})
+        assert time.monotonic() - started < 2
+    finally:
+        release.set()
+        thread.join(timeout=5)
+    assert not thread.is_alive()
 
 
 def test_publication_reconciliation_finishes_model_catalog_promotion(tmp_path, monkeypatch):
@@ -143,3 +211,22 @@ def test_one_way_schema_migration_keeps_legacy_job_as_history_not_executable(tmp
     historical = upgraded.job("legacy-job")
     assert historical["status"] == "historical"
     assert historical["execution_generation"] == "historical"
+
+
+def test_normal_connection_does_not_request_schema_write_lock(tmp_path):
+    database = tmp_path / "control.sqlite"
+    first = connect(database)
+    first.close()
+    writer = sqlite3.connect(database)
+    writer.execute("BEGIN IMMEDIATE")
+    try:
+        started = time.monotonic()
+        reader = connect(database)
+        try:
+            assert reader.execute("SELECT count(*) FROM jobs").fetchone()[0] == 0
+        finally:
+            reader.close()
+        assert time.monotonic() - started < 2
+    finally:
+        writer.rollback()
+        writer.close()

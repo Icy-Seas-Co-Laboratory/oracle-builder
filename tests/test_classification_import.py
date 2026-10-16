@@ -499,6 +499,36 @@ def test_duplicate_content_is_skipped_within_a_class(tmp_path):
         assert connection.execute("SELECT count(*) FROM dataset_items").fetchone()[0] == 1
 
 
+def test_skip_excludes_all_copies_with_conflicting_class_labels(tmp_path):
+    source = tmp_path / "library"
+    write_image(source / "cod" / "shared.png", (10, 20, 30))
+    write_image(source / "salmon" / "shared.png", (10, 20, 30))
+    write_image(source / "cod" / "unique.png", (20, 30, 40))
+    write_image(source / "salmon" / "unique.png", (30, 40, 50))
+    output = tmp_path / "duplicates.sqlite"
+
+    summary = import_folders(options_for(source, output, "--duplicate-policy", "skip"))
+
+    assert summary["status_counts"] == {"ready": 2, "skipped_conflict": 2}
+    assert {item["path"] for item in summary["skipped_conflicts"]} == {
+        "cod/shared.png", "salmon/shared.png"
+    }
+    with sqlite3.connect(output) as connection:
+        assert connection.execute("SELECT count(*) FROM dataset_items").fetchone()[0] == 2
+
+
+def test_import_ignores_non_image_top_level_directory(tmp_path):
+    source = tmp_path / "library"
+    write_image(source / "cod" / "one.png", (10, 20, 30))
+    (source / "courier-metadata").mkdir(parents=True)
+    (source / "courier-metadata" / "README.txt").write_text("metadata")
+
+    summary = import_folders(options_for(source, tmp_path / "library.sqlite"))
+
+    assert summary["class_labels"] == {"cod": 0}
+    assert any("courier-metadata" in warning for warning in summary["warnings"])
+
+
 def test_new_classes_require_explicit_permission_when_appending(tmp_path):
     source = tmp_path / "library"
     write_image(source / "cod" / "one.jpg", (1, 2, 3))

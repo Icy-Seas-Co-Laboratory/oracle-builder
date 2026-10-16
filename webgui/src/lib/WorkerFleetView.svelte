@@ -63,6 +63,19 @@
 		} catch (error) { onfailure(error instanceof Error ? error.message : 'Could not control this run.'); }
 		finally { queueAction = false; await load(); }
 	}
+	async function restartFailedRun(run: RecordValue) {
+		if (queueAction || !run.can_restart || !run.latest_job_id) return;
+		if (!window.confirm(`Restart ${text(run.name)} from committed epoch ${text(run.restart_epoch, '0')}? The failed unit will run again.`)) return;
+		queueAction = true; queueActionMessage = '';
+		try {
+			const result = await api.restartFailedJob(String(run.latest_job_id));
+			queueActionMessage = ['completed', 'indexed'].includes(String(result.job.status))
+				? 'Published output was recovered; this unit did not need to run again.'
+				: 'Failed unit queued from its last committed checkpoint.';
+			onchanged(queueActionMessage);
+		} catch (error) { onfailure(error instanceof Error ? error.message : 'Could not restart this unit.'); }
+		finally { queueAction = false; await load(); }
+	}
 	async function removeRun(run: RecordValue) {
 		if (queueAction || !canRemoveRun(run) || !window.confirm(`Remove ${text(run.name)} from the queue? Its execution history will be retained.`)) return;
 		queueAction = true; queueActionMessage = '';
@@ -359,9 +372,10 @@
 			{#if canStartRun(run)}<button class="secondary small" disabled={queueAction} on:click={() => actOnRuns([run], 'start')}><QueueActionIcon name="start" />Start</button>{/if}
 			{#if canPauseRun(run)}<button class="secondary small" disabled={queueAction} on:click={() => controlRun(run, 'pause')}><QueueActionIcon name="pause" />Pause</button>{/if}
 			{#if canResumeRun(run)}<button class="secondary small" disabled={queueAction} on:click={() => controlRun(run, 'resume')}><QueueActionIcon name="resume" />Resume</button>{/if}
+			{#if run.can_restart}<button class="secondary small" disabled={queueAction} title={`Restart from committed epoch ${text(run.restart_epoch, '0')}`} on:click={() => restartFailedRun(run)}><QueueActionIcon name="restart" />Restart</button>{/if}
 			{#if canStopRun(run)}<button class="secondary small queue-danger" disabled={queueAction} on:click={() => controlRun(run, 'stop_now')}><QueueActionIcon name="stop" />Stop</button>{/if}
 			{#if canRemoveRun(run)}<button class="secondary small queue-danger" disabled={queueAction} on:click={() => removeRun(run)}><QueueActionIcon name="delete" />Delete</button>{/if}
-			{#if !run.can_edit && !selectable(run) && !canStartRun(run) && !canPauseRun(run) && !canResumeRun(run) && !canStopRun(run) && !canRemoveRun(run)}<small>—</small>{/if}
+			{#if !run.can_edit && !selectable(run) && !canStartRun(run) && !canPauseRun(run) && !canResumeRun(run) && !run.can_restart && !canStopRun(run) && !canRemoveRun(run)}<small>—</small>{/if}
 		</div></td></tr>
 	{/each}</tbody></table></div>{:else}<p class="empty">Your queue is empty. Add a training run above to get started.</p>{/if}
 </section>
