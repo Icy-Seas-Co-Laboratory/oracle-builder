@@ -11,6 +11,7 @@ import argparse
 import copy
 import gc
 import json
+import multiprocessing
 from pathlib import Path
 from typing import Any
 
@@ -32,8 +33,13 @@ def _arguments() -> argparse.Namespace:
 
 
 def _is_memory_error(error: BaseException) -> bool:
-    message = str(error).lower()
-    return any(token in message for token in ("resourceexhausted", "out of memory", "oom", "cuda_error_out_of_memory"))
+    # TensorFlow's ResourceExhaustedError often says only "failed to allocate
+    # memory". Its class name is not included in str(error).
+    message = " ".join([*(cls.__name__ for cls in type(error).__mro__), str(error)]).lower()
+    return any(token in message for token in (
+        "resourceexhausted", "memoryerror", "out of memory", "oom",
+        "cuda_error_out_of_memory", "failed to allocate memory",
+    ))
 
 
 def _first_tensor(value: Any):
@@ -45,10 +51,47 @@ def _first_tensor(value: Any):
     return tf.cast(tensors[0], tf.float32)
 
 
+def _probe_child(config: dict[str, Any], input_path: str, batch_size: int, connection) -> None:
+    try:
+        from oracle_builder.training.distribution import gpu_lease_scope
+        with gpu_lease_scope():
+            result = _probe_batch(config, input_path, batch_size)
+        connection.send({"result": result})
+    except Exception as error:
+        connection.send({"error": f"{type(error).__name__}: {error}", "memory_error": _is_memory_error(error)})
+    finally:
+        connection.close()
+
+
 def _probe(config: dict[str, Any], input_path: str, batch_size: int) -> dict[str, Any]:
-    from oracle_builder.training.distribution import gpu_lease_scope
-    with gpu_lease_scope():
-        return _probe_batch(config, input_path, batch_size)
+    # A new spawned process per candidate releases all TensorFlow/CUDA state,
+    # including retained allocations after failed forward/backward passes.
+    context = multiprocessing.get_context("spawn")
+    receiver, sender = context.Pipe(duplex=False)
+    process = context.Process(target=_probe_child, args=(config, input_path, batch_size, sender))
+    process.start()
+    sender.close()
+    try:
+        if not receiver.poll(180):
+            raise TimeoutError(f"Batch {batch_size} probe exceeded its 3-minute limit")
+        try:
+            report = receiver.recv()
+        except EOFError as error:
+            process.join(timeout=5)
+            raise RuntimeError(f"Batch {batch_size} probe exited without a result (status {process.exitcode})") from error
+        process.join(timeout=10)
+        if "error" in report:
+            exception = MemoryError if report["memory_error"] else RuntimeError
+            raise exception(report["error"])
+        return report["result"]
+    finally:
+        if process.is_alive():
+            process.terminate()
+        process.join(timeout=5)
+        if process.is_alive():
+            process.kill()
+            process.join()
+        receiver.close()
 
 
 def _probe_batch(config: dict[str, Any], input_path: str, batch_size: int) -> dict[str, Any]:

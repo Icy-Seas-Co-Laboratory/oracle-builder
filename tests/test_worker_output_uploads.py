@@ -132,14 +132,22 @@ def test_output_recovery_handles_a_lost_defer_or_completion_response(tmp_path):
     assert receipt == {"status": "released", "outcome": "completed", "output_archive_sha256": hashlib.sha256(archive).hexdigest()}
 
 
-def test_resumable_output_upload_api_contract(tmp_path):
+@pytest.mark.parametrize("role_tokens", [None, {"operator": hashlib.sha256(b"test-operator-role").hexdigest()}])
+def test_resumable_output_upload_api_contract(tmp_path, role_tokens):
     orch, worker, lease, _credentials = _leased(tmp_path)
     archive, part_size = _archive(), 31
     headers = {"Authorization": f"Bearer {worker['worker_token']}"}
-    with TestClient(create_app(orch)) as client:
+    with TestClient(create_app(orch, role_tokens=role_tokens)) as client:
         created = client.post(f"/v1/worker-leases/{lease['lease_id']}/output-uploads", headers=headers, json={"lease_token": lease["lease_token"], "archive_size": len(archive), "archive_sha256": hashlib.sha256(archive).hexdigest(), "part_size": part_size})
         assert created.status_code == 201
         upload_id = created.json()["upload_id"]
+        value = archive[:part_size]
+        denied = client.put(f"/v1/worker-output-uploads/{upload_id}/parts/0", headers={
+            "Authorization": "Bearer invalid-worker-token", "X-Oracle-Lease-Token": lease["lease_token"],
+            "X-Oracle-Part-SHA256": hashlib.sha256(value).hexdigest(),
+            "Content-Range": f"bytes 0-{len(value) - 1}/{len(archive)}",
+        }, content=value)
+        assert denied.status_code == 403
         for number in range(created.json()["part_count"]):
             value = archive[number * part_size:(number + 1) * part_size]
             start = number * part_size

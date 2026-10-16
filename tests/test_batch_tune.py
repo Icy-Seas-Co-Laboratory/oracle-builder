@@ -1,6 +1,44 @@
 from __future__ import annotations
 
 from oracle_builder.training import batch_tune
+import pytest
+
+
+def test_memory_errors_recognized_without_oom_in_message():
+    class ResourceExhaustedError(Exception):
+        pass
+
+    assert batch_tune._is_memory_error(ResourceExhaustedError("Exception in BatchNormalization.call()"))
+    assert batch_tune._is_memory_error(RuntimeError("failed to allocate memory [Op:SquaredDifference]"))
+    assert batch_tune._is_memory_error(MemoryError())
+    assert not batch_tune._is_memory_error(ValueError("Invalid input shape"))
+
+
+def test_auto_tune_recovers_from_tensorflow_allocation_error(monkeypatch):
+    class ResourceExhaustedError(Exception):
+        pass
+
+    monkeypatch.setattr("oracle_builder.config.resolve_config", lambda *args: {})
+    def probe(config, input_path, batch_size):
+        if batch_size > 4:
+            raise ResourceExhaustedError("Exception encountered when calling BatchNormalization.call().")
+        return {"status": "passed", "observed_batch_size": batch_size}
+
+    monkeypatch.setattr(batch_tune, "_probe", probe)
+    report = batch_tune.tune("config.toml", "data.sqlite", maximum=32)
+    assert report["ready"]
+    assert report["largest_verified_batch_size"] == 4
+    assert report["recommended_batch_size"] == 3
+    assert any(attempt["status"] == "out_of_memory" for attempt in report["attempts"])
+
+
+def test_auto_tune_does_not_hide_non_memory_failures(monkeypatch):
+    monkeypatch.setattr("oracle_builder.config.resolve_config", lambda *args: {})
+    def probe(*args):
+        raise ValueError("Invalid input shape")
+    monkeypatch.setattr(batch_tune, "_probe", probe)
+    with pytest.raises(RuntimeError, match="Invalid input shape"):
+        batch_tune.tune("config.toml", "data.sqlite")
 
 
 def test_auto_tune_binary_searches_memory_boundary_and_verifies_safe_result(monkeypatch):

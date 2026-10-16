@@ -439,7 +439,7 @@ def create_app(
     def is_worker_boundary(path: str) -> bool:
         # Worker credentials are scoped and validated by their dedicated lease
         # handlers.  Never interpret one as an operator browser/CLI token.
-        return path == "/v1/workers:register" or path.startswith("/v1/workers/") or path.startswith("/v1/worker-leases/") or path.startswith("/v1/worker-artifacts/")
+        return path == "/v1/workers:register" or path.startswith("/v1/workers/") or path.startswith("/v1/worker-leases/") or path.startswith("/v1/worker-artifacts/") or path.startswith("/v1/worker-output-uploads/")
 
     def is_analytical_request(path: str) -> bool:
         return path in {"/v1/model-previews", "/v1/artifacts/catalog/query"} or path.endswith(":preflight") or path.startswith("/v2/inference/models/")
