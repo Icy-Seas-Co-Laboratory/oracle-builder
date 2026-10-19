@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import Any
 
 from tensorflow import keras
@@ -12,10 +13,38 @@ from oracle_builder.classification.features import (
 )
 
 
+def _filter_counts(model_config: dict[str, Any]) -> list[int]:
+    """Resolve the width of each Simple CNN convolutional block.
+
+    ``filter_multiplier`` makes the small baseline model useful across a wider
+    range of image sizes while retaining its original 32, 64, 128 default.
+    Rounding is applied per block so non-integer multipliers still produce a
+    valid number of convolution filters.
+    """
+    try:
+        layers_count = int(model_config.get("conv_layers", 3))
+        base_filters = int(model_config.get("base_filters", 32))
+        multiplier = float(model_config.get("filter_multiplier", 2.0))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "Simple CNN conv_layers, base_filters, and filter_multiplier must be numeric"
+        ) from exc
+
+    if layers_count < 1:
+        raise ValueError("Simple CNN conv_layers must be at least 1")
+    if base_filters < 1:
+        raise ValueError("Simple CNN base_filters must be at least 1")
+    if not math.isfinite(multiplier) or multiplier <= 0:
+        raise ValueError("Simple CNN filter_multiplier must be a finite value greater than 0")
+
+    return [max(1, round(base_filters * multiplier**index)) for index in range(layers_count)]
+
+
 def build_model(config: dict[str, Any]):
     input_shape = tuple(config["data"]["input_shape"])
     num_classes = int(config["data"]["num_classes"])
-    base = int(config.get("model", {}).get("base_filters", 32))
+    model_config = config.get("model", {})
+    filters_by_layer = _filter_counts(model_config)
 
     inputs, metadata = classifier_inputs(input_shape, config)
     stratum_dimension = stratum_conditioning_input(config)
@@ -32,17 +61,13 @@ def build_model(config: dict[str, Any]):
     def normalize(value, channels: int, name: str):
         return classifier_normalization(config, channels, name)(value) if uses_configurable_norm else value
 
-    x = layers.Conv2D(base, 3, padding="same", use_bias=not uses_configurable_norm)(inputs)
-    x = normalize(x, base, "conv1_norm")
-    x = layers.Activation("relu")(x)
-    x = layers.MaxPooling2D()(x)
-    x = layers.Conv2D(base * 2, 3, padding="same", use_bias=not uses_configurable_norm)(x)
-    x = normalize(x, base * 2, "conv2_norm")
-    x = layers.Activation("relu")(x)
-    x = layers.MaxPooling2D()(x)
-    x = layers.Conv2D(base * 4, 3, padding="same", use_bias=not uses_configurable_norm)(x)
-    x = normalize(x, base * 4, "conv3_norm")
-    x = layers.Activation("relu")(x)
+    x = inputs
+    for index, filters in enumerate(filters_by_layer, start=1):
+        x = layers.Conv2D(filters, 3, padding="same", use_bias=not uses_configurable_norm)(x)
+        x = normalize(x, filters, f"conv{index}_norm")
+        x = layers.Activation("relu")(x)
+        if index < len(filters_by_layer):
+            x = layers.MaxPooling2D()(x)
     if uses_composable_graph(config):
         return build_composable_classification_model(
             image=inputs, feature_map=x, metadata=metadata, num_classes=num_classes,

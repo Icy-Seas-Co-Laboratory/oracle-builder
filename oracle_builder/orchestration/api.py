@@ -86,6 +86,11 @@ class ArtifactTagRequest(BaseModel):
     tags: list[str] = Field(default_factory=list)
 
 
+class RunNameRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: str = Field(min_length=1, max_length=240)
+
+
 class ArtifactCatalogQueryRequest(BaseModel):
     filters: dict[str, Any] = Field(default_factory=dict)
     sort: str = "updated_at"
@@ -1549,6 +1554,12 @@ def create_app(
     @app.get("/v1/artifacts/{artifact_id}")
     def artifact(artifact_id: str) -> dict[str, Any]: return required(orchestrator.artifact(artifact_id), "Artifact")
 
+    @app.patch("/v1/artifacts/{artifact_id}")
+    def rename_artifact(artifact_id: str, body: RunNameRequest) -> dict[str, Any]:
+        try: return orchestrator.rename_artifact(artifact_id, body.name)
+        except KeyError as exc: raise HTTPException(status_code=404, detail="Artifact was not found") from exc
+        except ValueError as exc: raise HTTPException(status_code=422, detail=str(exc)) from exc
+
     @app.get("/v1/artifacts/{artifact_id}/detail")
     def artifact_detail(artifact_id: str) -> dict[str, Any]:
         try: return orchestrator.artifact_detail(artifact_id)
@@ -1663,6 +1674,12 @@ def create_app(
     @app.get("/v1/queued-runs")
     def queued_runs() -> dict[str, Any]:
         return {"queued_runs": orchestrator.queued_runs()}
+
+    @app.patch("/v1/queued-runs/{queued_run_id}")
+    def rename_queued_run(queued_run_id: str, body: RunNameRequest) -> dict[str, Any]:
+        try: return orchestrator.rename_queued_run(queued_run_id, body.name)
+        except KeyError as exc: raise HTTPException(status_code=404, detail="Queued run was not found") from exc
+        except ValueError as exc: raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.post("/v1/queued-runs/{queued_run_id}:replace", status_code=201)
     def replace_queued_run(queued_run_id: str, body: QueuedRunReplacementRequest) -> dict[str, Any]:

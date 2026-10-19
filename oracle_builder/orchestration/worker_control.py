@@ -132,7 +132,7 @@ class WorkerControlMixin:
                     raise ValueError('Restart this worker with directive support before sending commands')
             unit = json.loads(job['work_unit_json'])
             segment = unit.get('parameters', {}).get('execution_segment', {})
-            if action in {'pause', 'yield'} and segment.get('phase') != 'train':
+            if action in {'pause', 'yield'} and segment.get('phase') not in {'train', 'initialize'}:
                 raise ValueError('This work unit has no supported resumable boundary')
             pending = db.execute("SELECT * FROM worker_commands WHERE job_id=? AND status NOT IN ('applied','failed','expired','superseded')", (job_id,)).fetchall()
             if pending and action != 'stop_now':

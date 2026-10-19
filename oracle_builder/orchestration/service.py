@@ -1077,7 +1077,11 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
             "latest_job_status": jobs[0]["status"] if jobs else None,
             "latest_job_error": jobs[0]["error"] if jobs else None,
             "latest_job_id": latest.get("job_id") if latest else None,
-            "latest_job_resumable": isinstance(segment, dict) and segment.get("phase") == "train",
+            "latest_job_resumable": isinstance(segment, dict) and segment.get("phase") in {"initialize", "train"},
+            "pause_boundary": (
+                "self_supervised_phase" if isinstance(segment, dict) and segment.get("phase") == "initialize"
+                else ("training_segment" if isinstance(segment, dict) and segment.get("phase") == "train" else None)
+            ),
             "can_restart": restartable,
             "restart_epoch": restart_epoch,
             "restart_phase": restart_phase,
@@ -1105,8 +1109,8 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
                 operation_progress(event_type, message, data)
 
         progress("validating", "Validating definition, frozen dataset, and requested resources")
-        if not name.strip():
-            raise ValueError("A queued run requires a name")
+        if not isinstance(name, str) or not name.strip() or len(name.strip()) > 240 or any(ord(char) < 32 or ord(char) == 127 for char in name.strip()):
+            raise ValueError("A queued run name must be 1–240 visible characters")
         definition = self.model_definition(definition_id, revision=revision)
         dataset = self.dataset(dataset_id)
         if definition is None:
@@ -1187,6 +1191,7 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
             {
                 "config": str(config_path), "input": dataset["path"], "dataset_id": dataset_id,
                 "definition_id": definition_id, "definition_revision": int(definition["revision"]),
+                "run_name": name.strip(),
                 "initialization": dict(initialization or {}),
                 "queue_execution": {**batch_execution, "epochs": epochs},
             },
@@ -1331,8 +1336,8 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
                 operation_progress(event_type, message, data)
 
         progress("validating", "Sealing definition, frozen dataset, and portable inputs")
-        if not name.strip():
-            raise ValueError("A queued run requires a name")
+        if not isinstance(name, str) or not name.strip() or len(name.strip()) > 240 or any(ord(char) < 32 or ord(char) == 127 for char in name.strip()):
+            raise ValueError("A queued run name must be 1–240 visible characters")
         if batch_size_mode not in {"manual", "auto"}:
             raise ValueError("batch_size_mode must be 'manual' or 'auto'")
         if batch_size is not None and (isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1):
@@ -1410,6 +1415,7 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
             "dataset_id": dataset_id,
             "definition_id": definition_id,
             "definition_revision": int(definition["revision"]),
+            "run_name": name.strip(),
             "initialization": dict(initialization or {}),
             "queue_execution": execution,
         }
@@ -2716,19 +2722,19 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
         job_id, attempt_id = str(uuid.uuid4()), str(uuid.uuid4())
         dataset_id = spec["parameters"].get("dataset_id")
         dataset = self.dataset(str(dataset_id), connection=db) if dataset_id else None
+        queued_run = db.execute(
+            "SELECT queued_run_id,name FROM queued_runs WHERE specification_id=?", (specification_id,)
+        ).fetchone()
         work_unit = build_work_unit(
             work_unit_id=job_id,
             attempt_id=attempt_id,
             specification_id=specification_id,
             action=spec["action"],
-            parameters=spec["parameters"],
+            parameters={**spec["parameters"], **({"run_name": queued_run["name"]} if queued_run else {})},
             resources=spec["resources"],
             dataset=dataset,
             require_portable=True,
         )
-        queued_run = db.execute(
-            "SELECT queued_run_id FROM queued_runs WHERE specification_id=?", (specification_id,)
-        ).fetchone()
         if spec['parameters'].get('queue_execution', {}).get('execution_contract_version') == 2:
             work_unit = self._begin_sequential_in_connection(db, unit=work_unit,
                 queued_run_id=queued_run['queued_run_id'] if queued_run else None, pool_id=pool_id, now=now)
@@ -3406,6 +3412,20 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
             if (isinstance(unit_epochs, bool) or not isinstance(unit_epochs, int) or unit_epochs < 1
                     or isinstance(unit_steps, bool) or not isinstance(unit_steps, int) or unit_steps < 0):
                 raise ValueError("Verification report has invalid V2 work-unit bounds")
+            if not isinstance(report.get('self_supervised_whole_phase', False), bool):
+                raise ValueError("Verification report has invalid self-supervised phase indicator")
+            sealed = json.loads(job["work_unit_json"])
+            from oracle_builder.config import load_toml
+            configured = load_toml(
+                self.artifact_store.resolve(ArtifactRef.from_dict(sealed["configuration"])) / "payload"
+            )
+            expected_ssl_phase = bool(
+                configured.get("run", {}).get("task") == "classification"
+                and isinstance(configured.get("self_supervised"), dict)
+                and configured["self_supervised"].get("enabled", False)
+            )
+            if report.get('self_supervised_whole_phase', False) != expected_ssl_phase:
+                raise ValueError("Verification self-supervised phase does not match the sealed configuration")
         spec = self.specification(job["specification_id"], connection=db)
         parameters = dict(spec["parameters"])
         requested = dict(execution)
@@ -3428,6 +3448,7 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
             parameters['queue_execution']['execution_contract_version'] = 2
             parameters['queue_execution']['unit_epochs'] = report.get('unit_epochs', 1)
             parameters['queue_execution']['unit_steps'] = report.get('unit_steps', 0)
+            parameters['queue_execution']['self_supervised_whole_phase'] = report.get('self_supervised_whole_phase', False)
         evidence = {**report, "worker_id": worker_id, "environment_sha256": environment_digest, "verified_at": now, "job_id": job["job_id"]}
         db.execute("UPDATE run_specifications SET parameters_json=?,config_hash=?,status='planned',updated_at=? WHERE specification_id=?",
                    (_json(parameters), hashlib.sha256(_json(parameters).encode()).hexdigest(), now, job["specification_id"]))
@@ -3477,7 +3498,7 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
             execution = (json.loads(job["work_unit_json"]).get("parameters") or {}).get("queue_execution") or {}
             verifying = execution.get("phase") == "verify"
             sealed_unit = json.loads(job['work_unit_json'])
-            checkpointing = sealed_unit.get('schema', {}).get('version') == 2 and sealed_unit.get('phase') == 'train'
+            checkpointing = sealed_unit.get('schema', {}).get('version') == 2 and sealed_unit.get('phase') in {'initialize', 'train'}
             segment_result = None
             verification_report = None
             pending_stop = db.execute("SELECT action FROM worker_commands WHERE lease_id=? AND action IN ('stop_now','restart') AND status IN ('pending','received','accepted')", (lease_id,)).fetchone()
@@ -3696,6 +3717,8 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
             report = self.scan(published_path)
             if published_model_artifact_id not in report["artifacts"]:
                 raise RuntimeError("Published training artifact could not be indexed: " + "; ".join(item["reason"] for item in report["skipped"]))
+            if job["queued_run_id"]:
+                self._inherit_queued_run_name(str(job["queued_run_id"]), published_model_artifact_id)
             with self._connection() as db:
                 now = _now()
                 db.execute("UPDATE jobs SET status='indexed',remote_status='indexed',updated_at=? WHERE job_id=?", (now, job["job_id"]))
@@ -4642,7 +4665,9 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
                           facts.get("task") or model.get("task"), facts.get("architecture") or model.get("architecture"), facts.get("variant") or model.get("variant"), manifest.get("status"), manifest.get("lifecycle"), dataset.get("dataset_id"), dataset.get("fingerprint_sha256"), manifest.get("fingerprint_sha256"), str(manifest_path.parent), _json(manifest), now, now)
                 with self._connection() as db:
                     db.execute("""INSERT INTO artifacts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                      ON CONFLICT(artifact_id) DO UPDATE SET run_id=excluded.run_id,artifact_type=excluded.artifact_type,name=excluded.name,task=excluded.task,architecture=excluded.architecture,variant=excluded.variant,status=excluded.status,lifecycle=excluded.lifecycle,dataset_id=excluded.dataset_id,dataset_fingerprint_sha256=excluded.dataset_fingerprint_sha256,fingerprint_sha256=excluded.fingerprint_sha256,path=excluded.path,manifest_json=excluded.manifest_json,updated_at=excluded.updated_at""", values)
+                      ON CONFLICT(artifact_id) DO UPDATE SET run_id=excluded.run_id,artifact_type=excluded.artifact_type,
+                      name=COALESCE((SELECT name FROM artifact_name_overrides WHERE artifact_id=excluded.artifact_id),excluded.name),
+                      task=excluded.task,architecture=excluded.architecture,variant=excluded.variant,status=excluded.status,lifecycle=excluded.lifecycle,dataset_id=excluded.dataset_id,dataset_fingerprint_sha256=excluded.dataset_fingerprint_sha256,fingerprint_sha256=excluded.fingerprint_sha256,path=excluded.path,manifest_json=excluded.manifest_json,updated_at=excluded.updated_at""", values)
                     db.execute("""INSERT INTO artifact_facts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                         ON CONFLICT(artifact_id) DO UPDATE SET training_set=excluded.training_set,classifier_type=excluded.classifier_type,stem_size=excluded.stem_size,macro_f1=excluded.macro_f1,loss=excluded.loss,training_seconds=excluded.training_seconds,facts_json=excluded.facts_json,updated_at=excluded.updated_at""",
                         (artifact_id, facts.get("training_set"), facts.get("classifier_type"), facts.get("stem_size"), facts.get("macro_f1"), facts.get("loss"), facts.get("training_seconds"), _json(facts), now))
@@ -4829,6 +4854,8 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
                     continue
             except (OSError, TypeError, ValueError, json.JSONDecodeError):
                 continue
+            if row["queued_run_id"]:
+                self._inherit_queued_run_name(str(row["queued_run_id"]), ref.artifact_id)
             with self._connection() as db:
                 db.execute("BEGIN IMMEDIATE")
                 indexed_at = _now()
@@ -6614,6 +6641,70 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
         with self._connection() as db: return _row(db.execute("SELECT * FROM datasets WHERE dataset_id=?", (value,)).fetchone())
     def artifact(self, value: str) -> dict[str, Any] | None:
         with self._connection() as db: return _row(db.execute("SELECT * FROM artifacts WHERE artifact_id=?", (value,)).fetchone())
+    def rename_artifact(self, artifact_id: str, name: str) -> dict[str, Any]:
+        """Change the catalog display name without modifying sealed evidence."""
+        display_name = name.strip()
+        if not display_name or len(display_name) > 240 or any(ord(char) < 32 or ord(char) == 127 for char in display_name):
+            raise ValueError("Model run name must be 1–240 visible characters")
+        now = _now()
+        with self._connection() as db:
+            updated = db.execute("UPDATE artifacts SET name=?, updated_at=? WHERE artifact_id=?", (display_name, now, artifact_id))
+            if updated.rowcount == 0:
+                raise KeyError(artifact_id)
+            db.execute("""INSERT INTO artifact_name_overrides (artifact_id,name,updated_at) VALUES (?,?,?)
+                ON CONFLICT(artifact_id) DO UPDATE SET name=excluded.name,updated_at=excluded.updated_at""",
+                (artifact_id, display_name, now))
+            specifications = db.execute("SELECT specification_id,experiment_id FROM run_specifications WHERE artifact_id=?", (artifact_id,)).fetchall()
+            for specification in specifications:
+                db.execute("UPDATE run_specifications SET name=?,updated_at=? WHERE specification_id=?",
+                           (display_name, now, specification["specification_id"]))
+                db.execute("UPDATE experiments SET name=?,updated_at=? WHERE experiment_id=?",
+                           (display_name, now, specification["experiment_id"]))
+                db.execute("UPDATE queued_runs SET name=?,updated_at=? WHERE specification_id=?",
+                           (display_name, now, specification["specification_id"]))
+        return self.artifact(artifact_id)  # type: ignore[return-value]
+    def rename_queued_run(self, queued_run_id: str, name: str) -> dict[str, Any]:
+        """Rename a run at any stage without replacing its sealed work."""
+        display_name = name.strip() if isinstance(name, str) else ""
+        if not display_name or len(display_name) > 240 or any(ord(char) < 32 or ord(char) == 127 for char in display_name):
+            raise ValueError("Model run name must be 1–240 visible characters")
+        now = _now()
+        with self._connection() as db:
+            queued = db.execute("SELECT specification_id FROM queued_runs WHERE queued_run_id=?", (queued_run_id,)).fetchone()
+            if queued is None:
+                raise KeyError(queued_run_id)
+            db.execute("UPDATE queued_runs SET name=?,updated_at=? WHERE queued_run_id=?", (display_name, now, queued_run_id))
+            if queued["specification_id"]:
+                specification = db.execute("SELECT artifact_id,experiment_id FROM run_specifications WHERE specification_id=?",
+                                           (queued["specification_id"],)).fetchone()
+                if specification:
+                    db.execute("UPDATE run_specifications SET name=?,updated_at=? WHERE specification_id=?",
+                               (display_name, now, queued["specification_id"]))
+                    db.execute("UPDATE experiments SET name=?,updated_at=? WHERE experiment_id=?",
+                               (display_name, now, specification["experiment_id"]))
+                    if specification["artifact_id"]:
+                        artifact_id = str(specification["artifact_id"])
+                        updated = db.execute("UPDATE artifacts SET name=?,updated_at=? WHERE artifact_id=?", (display_name, now, artifact_id))
+                        if updated.rowcount:
+                            db.execute("""INSERT INTO artifact_name_overrides (artifact_id,name,updated_at) VALUES (?,?,?)
+                                ON CONFLICT(artifact_id) DO UPDATE SET name=excluded.name,updated_at=excluded.updated_at""",
+                                (artifact_id, display_name, now))
+        return self.queued_run(queued_run_id)  # type: ignore[return-value]
+    def _inherit_queued_run_name(self, queued_run_id: str, artifact_id: str) -> None:
+        """Keep a queued run's label on output from older workers named 'run'."""
+        with self._connection() as db:
+            row = db.execute("""SELECT queued_runs.name AS run_name, artifacts.name AS artifact_name
+                FROM queued_runs JOIN artifacts ON artifacts.artifact_id=?
+                WHERE queued_runs.queued_run_id=?""", (artifact_id, queued_run_id)).fetchone()
+            if row is None or row["run_name"] == row["artifact_name"]:
+                return
+            # A user's catalog rename takes precedence over automatic inheritance.
+            if db.execute("SELECT 1 FROM artifact_name_overrides WHERE artifact_id=?", (artifact_id,)).fetchone():
+                return
+            now = _now()
+            db.execute("UPDATE artifacts SET name=?,updated_at=? WHERE artifact_id=?", (row["run_name"], now, artifact_id))
+            db.execute("INSERT INTO artifact_name_overrides (artifact_id,name,updated_at) VALUES (?,?,?)",
+                       (artifact_id, row["run_name"], now))
     def recipe(self, value: str) -> dict[str, Any] | None:
         with self._connection() as db: return _row(db.execute("SELECT * FROM recipes WHERE recipe_id=?", (value,)).fetchone())
     def experiment(self, value: str) -> dict[str, Any] | None:

@@ -120,6 +120,7 @@ code, pre, .code { font-family: 'SFMono-Regular', Consolas, ui-monospace, monosp
 .panel, .stat-grid article { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; box-shadow: var(--shadow); }
 .panel { margin-bottom: 1rem; padding: 1.25rem; }
 .panel-head, .queue-intro, .results-selector { display: flex; align-items: center; justify-content: space-between; gap: 1rem; margin-bottom: 1rem; }
+.metadata-actions { display:flex; flex-wrap:wrap; gap:.4rem; }
 .panel-head p, .queue-intro p, .results-selector p { margin-bottom: 0; font-size: .85rem; }
 .panel-head h2 { margin-bottom: .2rem; }
 .count { display: grid; place-items: center; min-width: 1.8rem; height: 1.8rem; padding: 0 .45rem; border-radius: 99px; color: #17675d; background: var(--teal-soft); font-size: .75rem; font-weight: 700; }

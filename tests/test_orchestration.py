@@ -653,6 +653,35 @@ def test_model_catalog_tags_and_versioned_v2_drafts(tmp_path):
     assert revised["revision"] == 2
 
 
+def test_model_run_rename_survives_scan_without_changing_sealed_artifact(tmp_path):
+    from fastapi.testclient import TestClient
+    from oracle_builder.orchestration.api import create_app
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    source = workspace / "source.toml"
+    source.write_text("[run]\ntask = 'classification'\n")
+    root = tmp_path / "artifacts" / "baseline"
+    orchestrator = Orchestrator(tmp_path / "orchestrator.sqlite", workspace_root=workspace, artifact_root=root.parent)
+    artifact = _create_sealed_product(root, source)
+    artifact_id = artifact["artifact_id"]
+    original_manifest = (root / "artifact.json").read_bytes()
+    orchestrator.scan(root)
+
+    with TestClient(create_app(orchestrator)) as client:
+        response = client.patch(f"/v1/artifacts/{artifact_id}", json={"name": "  Best baseline  "})
+        assert response.status_code == 200, response.text
+        assert response.json()["name"] == "Best baseline"
+        assert client.patch(f"/v1/artifacts/{artifact_id}", json={"name": "   "}).status_code == 422
+        assert client.patch("/v1/artifacts/missing", json={"name": "New name"}).status_code == 404
+        assert client.get(f"/v1/artifacts/{artifact_id}/detail").json()["artifact"]["name"] == "Best baseline"
+        assert client.post("/v1/artifacts/catalog/query", json={"filters": {"search": "Best baseline"}}).json()["total"] == 1
+
+    orchestrator.scan(root)
+    assert orchestrator.artifact(artifact_id)["name"] == "Best baseline"
+    assert (root / "artifact.json").read_bytes() == original_manifest
+
+
 def test_catalog_reindex_backfills_metadata_with_provenance_without_writing_artifact(tmp_path):
     from fastapi.testclient import TestClient
     from oracle_builder.orchestration.api import create_app

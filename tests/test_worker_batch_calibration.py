@@ -33,6 +33,8 @@ def test_training_executor_calibrates_on_worker_and_uses_the_resolved_config(tmp
 
     def run_training(request):
         captured["config"] = request.config
+        captured["display_name"] = request.display_name
+        captured["output"] = request.output
         run_dir = Path(request.runs_dir) / request.output
         run_dir.mkdir()
         (run_dir / "artifact.json").write_text("{}\n", encoding="utf-8")
@@ -40,7 +42,7 @@ def test_training_executor_calibrates_on_worker_and_uses_the_resolved_config(tmp
 
     monkeypatch.setattr("oracle_builder.training.workflow.run_training", run_training)
     result = TrainingExecutor().execute(
-        work_unit={"action": "train", "parameters": {"queue_execution": {
+        work_unit={"action": "train", "parameters": {"run_name": "North slope baseline", "queue_execution": {
             "mode": "auto", "minimum_batch_size": 1, "maximum_batch_size": 64,
             "target_vram_fraction": {"minimum": 0.3, "maximum": 0.8},
         }}},
@@ -50,6 +52,8 @@ def test_training_executor_calibrates_on_worker_and_uses_the_resolved_config(tmp
 
     assert result == {"artifact_root": "."}
     assert Path(captured["config"]).parent == tmp_path
+    assert captured["display_name"] == "North slope baseline"
+    assert captured["output"] == "run"
     assert "batch_size = 24" in Path(captured["config"]).read_text(encoding="utf-8")
     assert ("batch_calibration_started", {"minimum_batch_size": 1, "maximum_batch_size": 64}) in events
     assert any(event == "batch_size_resolved" and data["batch_size"] == 24 for event, data in events)

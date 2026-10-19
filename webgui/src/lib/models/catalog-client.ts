@@ -34,6 +34,7 @@ export const modelCatalogClient = {
 		method: 'POST', body: JSON.stringify({ artifact_ids: artifactIds, tags })
 	}),
 	artifactDetail: (id: string) => call<RecordValue>(`/v1/artifacts/${encodeURIComponent(id)}/detail`),
+	renameArtifact: (id: string, name: string) => call<RecordValue>(`/v1/artifacts/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify({ name }) }),
 	artifactArchitectureView: (id: string) => call<RecordValue>(`/v1/artifacts/${encodeURIComponent(id)}/architecture-view`),
 	comparisonGroups: () => call<{ comparison_groups: RecordValue[] }>('/v1/comparison-groups'),
 	comparisonGroup: (id: string) => call<RecordValue>(`/v1/comparison-groups/${encodeURIComponent(id)}`),

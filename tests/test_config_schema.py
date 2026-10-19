@@ -10,11 +10,15 @@ from typing import Any
 import pytest
 
 from oracle_builder.config import (
+    DEFAULT_CONFIG,
     STANDARD_DISTRIBUTION_STRATEGIES,
     STANDARD_TRAINING_LOSSES_BY_TASK,
     STANDARD_TRAINING_METRICS_BY_TASK,
     STANDARD_TRAINING_OPTIMIZERS,
     load_toml,
+    deep_merge,
+    normalize_component_config,
+    validate_config,
     resolve_v2_config,
     v2_validation_errors,
 )
@@ -54,6 +58,11 @@ def test_catalog_covers_every_runtime_default_and_exposes_v2_metadata():
     assert fields["data.num_classes"]["exposure"] == "internal"
     assert fields["data.batch_size"]["exposure"] == "internal"
     assert fields["stem.kernel_size"]["minimum"] == 1
+    assert fields["encoder.num_layers"]["visible_when"] == {"encoder.family": "simple_cnn"}
+    assert fields["encoder.num_layers"]["minimum"] == 1
+    assert fields["encoder.base_filters"]["default"] == 32
+    assert fields["encoder.filter_multiplier"]["default"] == 2.0
+    assert {"none", "log", "sqrt", "inverse"} <= set(fields["metadata.fields[].transform"]["choices"])
     assert fields["training.learning_rate"]["exposure"] == "standard"
     assert fields["training.epochs"]["control"] == "number"
     assert fields["training.epochs"]["minimum"] == 1
@@ -138,6 +147,49 @@ def test_v2_resolver_rejects_runtime_compatibility_paths_and_derives_dataset_fac
     }]
     with pytest.raises(ValueError, match="data.num_classes is not authorable"):
         resolve_v2_config({**authoring, "data": {"input_shape": [128, 128], "num_classes": 3}})
+
+
+def test_simple_cnn_v2_topology_maps_to_runtime_and_rejects_invalid_schedule():
+    authored = {"architecture": {"version": 2}, "encoder": {
+        "family": "simple_cnn", "variant": "simple_cnn",
+        "num_layers": 4, "base_filters": 16, "filter_multiplier": 1.5,
+    }}
+    resolved = deep_merge(DEFAULT_CONFIG, authored)
+    normalize_component_config(resolved, authored)
+    assert resolved["model"]["conv_layers"] == 4
+    assert resolved["model"]["base_filters"] == 16
+    assert resolved["model"]["filter_multiplier"] == 1.5
+    resolved["run"]["task"] = "classification"
+    resolved["data"]["num_classes"] = 2
+    resolved["data"]["input_shape"] = [32, 32]
+    resolved["training"]["loss"] = "sparse_categorical_crossentropy"
+    resolved["preprocessing"]["invert"] = False
+    resolved["model"]["filter_multiplier"] = 0
+    with pytest.raises(ValueError, match="filter_multiplier"):
+        validate_config(resolved)
+
+
+def test_ssl_classification_accepts_roi_context_but_embedding_rejects_it():
+    authored = {
+        "architecture": {"version": 2},
+        "run": {"task": "classification"},
+        "data": {"input_shape": [32, 32], "num_classes": 2},
+        "encoder": {"family": "simple_cnn", "variant": "simple_cnn"},
+        "metadata": {"fields": [{"name": "roi_area", "source": "roi.bounding_box_area_px", "transform": "log"}]},
+        "self_supervised": {"enabled": True, "method": "simclr"},
+        "training": {"loss": "sparse_categorical_crossentropy"},
+        "preprocessing": {"invert": False},
+    }
+    resolved = deep_merge(DEFAULT_CONFIG, authored)
+    normalize_component_config(resolved, authored)
+    validate_config(resolved)
+    resolved["classification"] = {"stratification": {"enabled": True, "dimensions": [32]}}
+    with pytest.raises(ValueError, match="not yet compatible with self-supervised|does not support resolution stratification"):
+        validate_config(resolved)
+    resolved.pop("classification")
+    resolved["run"]["task"] = "embedding"
+    with pytest.raises(ValueError, match="Embedding artifacts do not yet support"):
+        validate_config(resolved)
 
 
 def test_v2_preset_generator_is_idempotent_and_recipes_parse(tmp_path: Path):

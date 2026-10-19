@@ -141,10 +141,12 @@ dropout = 0.0
 [metadata]
 # A field is a name or inline table. Names resolve as metadata.<name>.
 fields = []
-# fields = [{ name = "roi_area", source = "roi.bounding_box_area_px", transform = "log1p", missing = "error", standardize = true, kind = "continuous", augment = true }]
+# fields = [{ name = "roi_area", source = "roi.bounding_box_area_px", transform = "log", missing = "error", standardize = true, kind = "continuous", augment = true }, { name = "roi_aspect_ratio", source = "roi.aspect_ratio", transform = "none" }]
 # Supported sources: roi.original_width_px | roi.original_height_px |
-# roi.bounding_box_area_px | metadata.<dataset-defined dotted path>.
-# Transform: identity | log | log1p | sqrt. Missing: error | mean | zero.
+# roi.bounding_box_area_px | roi.aspect_ratio (width/height) |
+# metadata.<dataset-defined dotted path>.
+# Transform: none | log | sqrt | inverse (identity/log1p also accepted for compatibility).
+# Missing: error | mean | zero.
 scaling = "standard"
 
 [metadata.encoder]

@@ -27,6 +27,10 @@ CREATE TABLE IF NOT EXISTS artifacts (
 );
 CREATE INDEX IF NOT EXISTS artifacts_dataset_idx ON artifacts(dataset_id);
 -- UI-owned annotations deliberately live outside sealed artifact manifests.
+CREATE TABLE IF NOT EXISTS artifact_name_overrides (
+  artifact_id TEXT PRIMARY KEY REFERENCES artifacts(artifact_id) ON DELETE CASCADE,
+  name TEXT NOT NULL, updated_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS artifact_tags (
   tag_id TEXT PRIMARY KEY, name TEXT NOT NULL COLLATE NOCASE UNIQUE,
   color TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
@@ -519,6 +523,18 @@ def _initialize_schema(connection: sqlite3.Connection) -> None:
             "INSERT INTO schema_metadata(key,value,updated_at) VALUES('schema_version','5',?) "
             "ON CONFLICT(key) DO UPDATE SET value='5',updated_at=excluded.updated_at", (now,),
         )
+    # Older workers used their internal 'run' staging directory as the model
+    # name. Restore the queued display name for already indexed outputs while
+    # preserving any explicit catalog rename.
+    connection.execute("""INSERT INTO artifact_name_overrides (artifact_id,name,updated_at)
+        SELECT artifacts.artifact_id,queued_runs.name,?
+        FROM artifacts JOIN run_specifications ON run_specifications.artifact_id=artifacts.artifact_id
+        JOIN queued_runs ON queued_runs.specification_id=run_specifications.specification_id
+        WHERE artifacts.name='run' AND TRIM(queued_runs.name)<>''
+        ON CONFLICT(artifact_id) DO NOTHING""", (now,))
+    connection.execute("""UPDATE artifacts SET name=(SELECT name FROM artifact_name_overrides
+        WHERE artifact_name_overrides.artifact_id=artifacts.artifact_id),updated_at=?
+        WHERE name='run' AND artifact_id IN (SELECT artifact_id FROM artifact_name_overrides)""", (now,))
     connection.commit()
 
 

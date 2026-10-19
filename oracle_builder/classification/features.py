@@ -399,11 +399,29 @@ def build_self_supervised_embedding_model(model: keras.Model) -> keras.Model:
     the configured (usually L2-normalized) embedding contract.  SSL projection
     heads instead need access to the learned embedding values before that
     normalization, both to preserve magnitude information and to make variance
-    regularization meaningful.
+    regularization meaningful.  When a classifier also accepts scalar context,
+    its projection is downstream of scalar fusion and cannot consume an
+    image-only SSL batch.  In that case, train the image encoder through its
+    image-only representation and leave scalar fusion and the classifier head
+    for supervised fitting.
     """
-    inputs = model.inputs if getattr(model, "inputs", None) and len(model.inputs) > 1 else model.inputs[0] if getattr(model, "inputs", None) else model.input
+    model_inputs = model.inputs if getattr(model, "inputs", None) else [model.input]
+    if len(model_inputs) > 1:
+        image_embedding = _optional_layer_output(
+            model, IMAGE_EMBEDDING_LAYER_NAME, "global_pool"
+        )
+        if image_embedding is None:
+            raise ValueError(
+                "Self-supervised training with scalar context requires an "
+                "image_embedding or global_pool encoder layer"
+            )
+        return keras.Model(
+            model_inputs[0],
+            image_embedding,
+            name=f"{model.name}_self_supervised_image_encoder",
+        )
     return keras.Model(
-        inputs,
+        model_inputs[0],
         model.get_layer("embedding_projection").output,
         name=f"{model.name}_self_supervised_encoder",
     )

@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { api, type RecordValue } from '$lib/api';
+	import { formatNumber } from '$lib/number-format';
 	import ArtifactEvidence from '$lib/ArtifactEvidence.svelte';
 	import EmptyState from '$lib/EmptyState.svelte';
 
@@ -36,7 +37,7 @@
 	const experiment = () => asRecord(results?.experiment);
 	const metricValue = (artifact: RecordValue, metric: string) => Number(asRecord(artifact.metrics)?.[metric]);
 	const metricPercent = (artifact: RecordValue, metric: string) => Math.max(0, Math.min(100, metricValue(artifact, metric) * 100));
-	const formatMetric = (value: number) => Number.isFinite(value) ? value.toFixed(4) : '—';
+	const formatMetric = (value: number) => formatNumber(value);
 	const artifactCount = (comparison: RecordValue) => {
 		const ids = asRecord(comparison.selection)?.artifact_ids;
 		return Array.isArray(ids) ? ids.length : 0;

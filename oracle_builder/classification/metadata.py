@@ -32,7 +32,9 @@ def enabled(config: dict[str, Any]) -> bool:
 
 def validate_feature_specs(config: dict[str, Any]) -> None:
     names: set[str] = set()
-    allowed_transforms = {"identity", "log", "log1p", "sqrt"}
+    # ``none`` is the user-facing spelling for an unchanged value.  Keep
+    # ``identity`` for compatibility with existing saved configurations.
+    allowed_transforms = {"identity", "none", "log", "log1p", "sqrt", "inverse"}
     for spec in feature_specs(config):
         name = str(spec.get("name", "")).strip()
         source = str(spec.get("source", "")).strip()
@@ -42,14 +44,17 @@ def validate_feature_specs(config: dict[str, Any]) -> None:
             raise ValueError(f"Duplicate auxiliary feature name {name!r}")
         names.add(name)
         if source not in {
-            "roi.original_width_px", "roi.original_height_px", "roi.bounding_box_area_px"
+            "roi.original_width_px", "roi.original_height_px", "roi.bounding_box_area_px",
+            "roi.aspect_ratio",
         } and not source.startswith("metadata."):
             raise ValueError(
                 f"Unsupported auxiliary feature source {source!r}; use an roi.* source "
                 "or metadata.<dotted path>"
             )
         if str(spec.get("transform", "identity")).lower() not in allowed_transforms:
-            raise ValueError("Auxiliary feature transform must be identity, log, log1p, or sqrt")
+            raise ValueError(
+                "Auxiliary feature transform must be none, identity, log, log1p, sqrt, or inverse"
+            )
         if str(spec.get("missing", "error")).lower() not in {"error", "mean", "zero"}:
             raise ValueError("Auxiliary feature missing must be error, mean, or zero")
 
@@ -79,6 +84,8 @@ def raw_value(spec: dict[str, Any], metadata: dict[str, Any], original_shape: An
         value = height
     elif source == "roi.bounding_box_area_px":
         value = height * width
+    elif source == "roi.aspect_ratio":
+        value = width / height
     else:
         value = _nested(metadata, source.removeprefix("metadata."))
     try:
@@ -92,7 +99,7 @@ def raw_value(spec: dict[str, Any], metadata: dict[str, Any], original_shape: An
 
 def transform(value: float, spec: dict[str, Any]) -> float:
     kind = str(spec.get("transform", "identity")).lower()
-    if kind == "identity":
+    if kind in {"identity", "none"}:
         return value
     if kind == "log":
         if value <= 0:
@@ -106,6 +113,10 @@ def transform(value: float, spec: dict[str, Any]) -> float:
         if value < 0:
             raise ValueError(f"Auxiliary feature {spec['name']!r} requires a non-negative value for sqrt")
         return math.sqrt(value)
+    if kind == "inverse":
+        if value == 0:
+            raise ValueError(f"Auxiliary feature {spec['name']!r} requires a non-zero value for inverse")
+        return 1.0 / value
     raise ValueError(f"Unsupported auxiliary feature transform {kind!r}")
 
 

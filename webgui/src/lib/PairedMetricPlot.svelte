@@ -1,6 +1,7 @@
 <script lang="ts">
 	import type { RecordValue } from '$lib/api';
 	import { metricBounds } from '$lib/metric-scale';
+	import { formatNumber } from '$lib/number-format';
 
 	export let points: RecordValue[] = [];
 	export let metric = 'loss';
@@ -11,8 +12,8 @@
 	let hoveredX: number | null = null;
 
 	const numeric = (value: unknown): number | null => typeof value === 'number' && Number.isFinite(value) ? value : null;
-	const format = (value: number) => value.toLocaleString(undefined, { maximumSignificantDigits: 4 });
-	const precise = (value: number | null) => value === null ? '—' : value.toLocaleString(undefined, { maximumSignificantDigits: 7 });
+	const format = (value: number) => formatNumber(value);
+	const precise = (value: number | null) => formatNumber(value);
 	function inspectAtPointer(event: PointerEvent) {
 		const rect = event.currentTarget instanceof SVGSVGElement ? event.currentTarget.getBoundingClientRect() : null;
 		if (!rect?.width || !hoverable.length) return;

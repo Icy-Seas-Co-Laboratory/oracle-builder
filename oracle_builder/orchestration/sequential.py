@@ -50,7 +50,7 @@ class SequentialExecutionMixin:
                 return self.job(job_id) or {}
             unit = json.loads(job['work_unit_json'] or '{}')
             run = db.execute('SELECT * FROM execution_runs WHERE current_job_id=?', (job_id,)).fetchone()
-            if run is None or unit.get('schema', {}).get('version') != 2 or unit.get('phase') not in {'train', 'finalize'}:
+            if run is None or unit.get('schema', {}).get('version') != 2 or unit.get('phase') not in {'initialize', 'train', 'finalize'}:
                 raise ValueError('Only the current sequential training unit can be restarted')
             checkpoint = json.loads(run['checkpoint_ref_json']) if run['checkpoint_ref_json'] else None
             attempt = db.execute('SELECT classification FROM execution_attempts WHERE job_id=? ORDER BY ordinal DESC LIMIT 1', (job_id,)).fetchone()
@@ -102,10 +102,17 @@ class SequentialExecutionMixin:
         if isinstance(steps, bool) or not isinstance(steps, int) or steps < 0:
             raise ValueError('Work unit steps must be a non-negative integer')
         step_fields = {'max_steps': steps, 'start_step': 0, 'start_global_step': 0} if steps else {}
-        work = WorkUnitV2(run_id=run_id, work_unit_id=unit.work_unit_id, sequence=0, phase='train', predecessor_work_unit_id=None,
+        whole_phase_ssl = execution.get('self_supervised_whole_phase') is True
+        initial_phase = 'initialize' if whole_phase_ssl else 'train'
+        initial_segment = (
+            {'phase': 'initialize', 'total_epochs': total}
+            if whole_phase_ssl else
+            {'phase': 'train', 'start_epoch': 0, 'stop_epoch': min(size, total), 'total_epochs': total, **step_fields}
+        )
+        work = WorkUnitV2(run_id=run_id, work_unit_id=unit.work_unit_id, sequence=0, phase=initial_phase, predecessor_work_unit_id=None,
             inputs=unit.inputs, configuration=unit.configuration, resources=unit.resources,
-            parameters={**unit.parameters, 'queue_execution': {**execution, 'revalidate_fixed_batch': True}, 'execution_segment': {'phase': 'train', 'start_epoch': 0, 'stop_epoch': min(size, total), 'total_epochs': total, **step_fields}},
-            start_cursor={'completed_epoch': 0, **({'batch_offset': 0, 'global_step': 0} if steps else {})}, stop_boundary={'completed_epoch': min(size, total), **({'max_steps': steps} if steps else {})},
+            parameters={**unit.parameters, 'queue_execution': {**execution, 'revalidate_fixed_batch': True}, 'execution_segment': initial_segment},
+            start_cursor={'completed_epoch': 0, **({} if whole_phase_ssl else ({'batch_offset': 0, 'global_step': 0} if steps else {}))}, stop_boundary=({'completed_epoch': 0} if whole_phase_ssl else {'completed_epoch': min(size, total), **({'max_steps': steps} if steps else {})}),
             output_contract={'kind': 'training_checkpoint', 'schema_version': 1},
             compatibility={'work_unit_v2': True, 'worker_control_v1': True, 'training_segments_v1': True})
         db.execute('INSERT INTO execution_runs VALUES(?,?,?,?,?,?,0,?,?,NULL,?,?)',
@@ -156,7 +163,7 @@ class SequentialExecutionMixin:
         if not candidate.is_file() or candidate.stat().st_size > 65536:
             raise ValueError('Training segment must provide a bounded result manifest')
         result = json.loads(candidate.read_text())
-        if result.get('schema') != 'oracle_builder_training_segment_result/v1' or result.get('phase') != 'train':
+        if result.get('schema') != 'oracle_builder_training_segment_result/v1' or result.get('phase') != unit.get('phase'):
             raise ValueError('Unsupported training segment result schema or phase')
         cursor = result.get('cursor', {}).get('completed_epoch')
         if isinstance(cursor, bool) or not isinstance(cursor, int):
@@ -190,7 +197,10 @@ class SequentialExecutionMixin:
         if result.get('stopped_early') and not early_stop:
             raise ValueError('Early stop is not supported by checkpoint state')
         segment = unit['parameters']['execution_segment']
-        if unit['phase'] == 'train':
+        if unit['phase'] == 'initialize':
+            if cursor != 0 or state.get('pretraining_completed') is not True or result.get('next_phase') != 'train':
+                raise ValueError('Self-supervised initialization did not produce a valid supervised handoff')
+        elif unit['phase'] == 'train':
             if segment.get('max_steps'):
                 global_step = result['cursor'].get('global_step')
                 start_step = segment.get('start_global_step', 0)
@@ -208,7 +218,7 @@ class SequentialExecutionMixin:
                 raise ValueError('Training segment did not reach its sealed stop boundary')
         if result.get('next_phase') not in {'train', 'finalize', 'complete'}:
             raise ValueError('Training segment next phase is invalid')
-        expected_phase = 'finalize' if cursor >= segment['total_epochs'] or early_stop else 'train'
+        expected_phase = 'train' if unit['phase'] == 'initialize' else ('finalize' if cursor >= segment['total_epochs'] or early_stop else 'train')
         if result.get('next_phase') != expected_phase:
             raise ValueError('Worker next phase disagrees with authoritative training progress')
         return result
@@ -222,7 +232,8 @@ class SequentialExecutionMixin:
         pending = db.execute("SELECT * FROM worker_commands WHERE lease_id=? AND status IN ('pending','received','accepted') ORDER BY sequence DESC LIMIT 1", (lease_id,)).fetchone()
         if pending and pending['action'] in {'stop_now', 'restart'}:
             raise ValueError('Stopped attempt cannot advance training')
-        phase = 'finalize' if cursor >= run['total_epochs'] or result.get('stopped_early') else 'train'
+        phase = ('train' if unit['phase'] == 'initialize'
+                 else ('finalize' if cursor >= run['total_epochs'] or result.get('stopped_early') else 'train'))
         paused = bool(pending and pending['action'] == 'pause')
         next_id = str(uuid.uuid4())
         inputs = {key: ArtifactRef.from_dict(ref) for key, ref in unit['inputs'].items()}

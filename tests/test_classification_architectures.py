@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 from tensorflow import keras
 
-from oracle_builder.classification.features import build_feature_model
+from oracle_builder.classification.features import build_feature_model, build_self_supervised_embedding_model
 from oracle_builder.registry import get_model_builder
 from oracle_builder.training.train import build_and_compile_model
 
@@ -21,6 +21,28 @@ def classification_config(model_name: str, model_options: dict | None = None):
             "metrics": ["accuracy"],
         },
     }
+
+
+@pytest.mark.parametrize(("family", "variant", "options"), [
+    ("simple_cnn", "simple_cnn", {"base_filters": 4}),
+    ("resnet_like", "resnet_like", {"base_filters": 4}),
+    ("densenet_like", "densenet_like", {"growth_rate": 2, "initial_filters": 4}),
+    ("resnet", "resnet18", {"base_filters": 4, "block_counts": [1, 1, 1, 1]}),
+    ("densenet", "densenet121", {"growth_rate": 2, "initial_filters": 4, "block_config": [1, 1, 1, 1]}),
+    ("efficientnet", "efficientnet_b0", {"width_coefficient": 0.25, "depth_coefficient": 0.25, "stem_filters": 4, "top_filters": 8}),
+    ("efficientnet_v2", "efficientnet_v2_b0", {"width_coefficient": 0.25, "depth_coefficient": 0.25, "stem_filters": 4, "top_filters": 8}),
+    ("convnext", "convnext_tiny", {"stage_depths": [1, 1, 1, 1], "stage_widths": [4, 8, 16, 32]}),
+    ("mobilenet", "mobilenet_v3_small", {"stage_repeats": [1, 1, 1, 1, 1], "stage_widths": [4, 8, 12, 16, 24]}),
+])
+def test_every_classification_family_exposes_ssl_image_encoder(family, variant, options):
+    config = classification_config(family, {"variant": variant, "embedding_dim": 8, **options})
+    config["architecture"] = {"version": 2}
+    classifier = get_model_builder(family)(config)
+    encoder = build_self_supervised_embedding_model(classifier)
+    assert len(encoder.inputs) == 1
+    output = encoder(np.ones((2, 32, 32, 3), dtype="float32"), training=False)
+    assert output.shape[0] == 2
+    assert np.all(np.isfinite(output.numpy()))
 
 
 @pytest.mark.parametrize(

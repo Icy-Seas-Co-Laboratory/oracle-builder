@@ -291,6 +291,34 @@ def test_ssl_encoder_uses_unnormalized_embedding_projection():
     np.testing.assert_allclose(pretrainer_embeddings.numpy(), ssl_embeddings.numpy())
 
 
+@pytest.mark.parametrize("pretrainer_type", [StudentTeacherPretrainer, SimCLRPretrainer])
+def test_ssl_with_scalar_context_trains_only_the_image_encoder(pretrainer_type):
+    config = pretraining_config()
+    config["model"]["auxiliary_features"] = [
+        {"name": "roi_area", "source": "roi.bounding_box_area_px", "transform": "log"}
+    ]
+    classifier = build_and_compile_model(config)
+    pretrainer = pretrainer_type(classifier, config)
+    images = np.random.default_rng(123).random((2, 16, 16, 1), dtype=np.float32)
+    scalar_context = np.array([[0.1], [0.2]], dtype="float32")
+
+    assert len(classifier.inputs) == 2
+    encoder = (
+        pretrainer.student_encoder
+        if hasattr(pretrainer, "student_encoder")
+        else pretrainer.encoder
+    )
+    assert len(encoder.inputs) == 1
+    assert encoder.inputs[0].name.startswith("image")
+    assert encoder.output.shape[-1] == 8
+
+    pretrainer.compile(optimizer="adam")
+    result = pretrainer.train_on_batch({"image": images, "metadata": scalar_context})
+    assert np.all(np.isfinite(np.asarray(result)))
+    probabilities = classifier({"image": images, "metadata": scalar_context}, training=False)
+    assert probabilities.shape == (2, 3)
+
+
 def test_vicreg_regularization_detects_collapsed_representations():
     collapsed = tf.ones((4, 3), dtype=tf.float32)
     varied = tf.constant(

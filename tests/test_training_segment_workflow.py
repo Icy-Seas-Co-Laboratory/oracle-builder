@@ -13,6 +13,77 @@ from oracle_builder.training import TrainingRequest, run_training
 from oracle_builder.training.recovery import validate_recovery_state
 
 
+def test_ssl_initialization_handoff_starts_resumable_supervised_segments(tmp_path):
+    database = tmp_path / "ssl.sqlite"
+    create_synthetic_classification(database, n=4, shape=(16, 16, 1), classes=2)
+    with sqlite3.connect(database) as connection:
+        set_dataset_lifecycle(connection, "frozen")
+        connection.commit()
+    recipe = tmp_path / "ssl.toml"
+    recipe.write_text(
+        """
+[run]
+task = "classification"
+model = "simple_cnn"
+
+[data]
+input_shape = [16, 16, 1]
+batch_size = 2
+validation_split = 0.0
+test_split = 0.0
+
+[training]
+epochs = 1
+loss = "sparse_categorical_crossentropy"
+display = "off"
+
+[self_supervised]
+enabled = true
+method = "byol"
+epochs = 1
+projection_dim = 8
+projection_hidden_dim = 16
+
+[distribution]
+strategy = "cpu"
+
+[augmentation]
+enabled = false
+
+[callbacks]
+early_stopping = false
+reduce_lr_on_plateau = false
+
+[evidence]
+enabled = false
+
+[output]
+save_predictions = false
+"""
+    )
+    runs = tmp_path / "runs"
+    handoff_path = tmp_path / "handoff.json"
+    assert run_training(TrainingRequest(
+        config=str(recipe), input=str(database), output="ssl", runs_dir=str(runs),
+        pretrain_only=True, segment_result_path=str(handoff_path),
+    )) == 0
+    run_dir = runs / "ssl"
+    handoff = json.loads(handoff_path.read_text())
+    assert handoff["phase"] == "initialize"
+    assert handoff["next_phase"] == "train"
+    state = validate_recovery_state(run_dir, read_run_config(run_dir),
+                                    artifact_id=read_run_manifest(run_dir)["artifact_id"],
+                                    run_id=read_run_manifest(run_dir)["run_id"])
+    assert state["pretraining_completed"] is True
+
+    segment_path = tmp_path / "supervised.json"
+    assert run_training(TrainingRequest(
+        resume=str(run_dir), input=str(database), segment_start_epoch=0,
+        segment_stop_epoch=1, segment_result_path=str(segment_path),
+    )) == 0
+    assert json.loads(segment_path.read_text())["next_phase"] == "finalize"
+
+
 def test_real_workflow_commits_and_resumes_an_ordered_batch_segment(tmp_path):
     database = tmp_path / "data.sqlite"
     create_synthetic_classification(database, n=4, shape=(16, 16, 1), classes=2)
@@ -63,7 +134,7 @@ save_predictions = false
     runs = tmp_path / "runs"
     result = tmp_path / "first-result.json"
     assert run_training(TrainingRequest(
-        config=str(recipe), input=str(database), output="step", runs_dir=str(runs),
+        config=str(recipe), input=str(database), output="step", display_name="North slope baseline", runs_dir=str(runs),
         segment_start_epoch=0, segment_max_steps=1, segment_result_path=str(result),
     )) == 0
     run_dir = runs / "step"
@@ -71,6 +142,8 @@ save_predictions = false
     assert first["cursor"]["batch_offset"] == 1
     assert first["next_phase"] == "train"
     assert read_run_manifest(run_dir)["status"] == "interrupted"
+    assert read_run_manifest(run_dir)["name"] == "North slope baseline"
+    assert read_run_config(run_dir)["run"]["run_name"] == "North slope baseline"
     assert validate_run_artifact(run_dir)["valid"]
 
     second_result = tmp_path / "second-result.json"

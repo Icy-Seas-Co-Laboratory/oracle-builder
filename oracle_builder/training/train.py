@@ -140,6 +140,7 @@ def train_model(
     require_recovery: bool = False,
     segment_max_steps: int | None = None,
     segment_start_step: int | None = None,
+    pretrain_only: bool = False,
 ):
     set_seed(int(config["run"].get("seed", 123)))
     strategy, distribution_info = select_distribution_strategy(config)
@@ -240,6 +241,16 @@ def train_model(
                 if values
             },
         )
+        if pretrain_only:
+            from oracle_builder.training.recovery import save_pretraining_handoff
+
+            save_pretraining_handoff(
+                model, run_dir, config, training_log, run_id,
+                config.get("artifact", {}).get("artifact_id", ""),
+            )
+            history = keras.callbacks.History()
+            history.history = {}
+            return model, history
     elif self_supervised.get("enabled", False):
         log_event(
             training_log,

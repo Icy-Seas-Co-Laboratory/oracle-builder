@@ -181,6 +181,40 @@ def save_step_recovery_snapshot(
     return state
 
 
+def save_pretraining_handoff(
+    model: keras.Model,
+    run_dir: str | Path,
+    config: dict[str, Any],
+    training_log: str | Path,
+    run_id: str,
+    artifact_id: str,
+) -> dict[str, Any]:
+    """Save SSL-updated weights as the epoch-zero supervised handoff.
+
+    The snapshot deliberately preserves the compiled model but does not claim
+    the SSL teacher, optimizer, or input iterator can resume.  Queue workers
+    only pause after this whole initialization phase has completed.
+    """
+    callback = RollingRecoveryCallback(
+        run_dir, config, training_log, run_id, artifact_id, force_every_epoch=True,
+    )
+    callback.set_model(model)
+    callback.on_epoch_end(-1)
+    layout = RunLayout(run_dir)
+    state = read_recovery_state(run_dir)
+    state["pretraining_completed"] = True
+    state["pretraining_handoff"] = {
+        "boundary": "whole_phase",
+        "ssl_continuation": "not_portable",
+        "supervised_epoch": 0,
+    }
+    _write_json(layout.recovery_state, state)
+    _write_json(
+        Path(run_dir) / str(state["generation"]["path"]) / "state.json", state,
+    )
+    return state
+
+
 def clear_recovery_snapshot(run_dir: str | Path) -> None:
     layout = RunLayout(run_dir)
     layout.recovery_model.unlink(missing_ok=True)

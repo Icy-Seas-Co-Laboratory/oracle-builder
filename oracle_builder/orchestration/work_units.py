@@ -124,6 +124,12 @@ def build_work_unit(
             raise ValueError("queue_execution must be an object")
         if raw_execution:
             action_parameters = {"queue_execution": dict(raw_execution)}
+        run_name = parameters.get("run_name")
+        if run_name is not None:
+            if (not isinstance(run_name, str) or not run_name.strip() or len(run_name.strip()) > 240
+                    or any(ord(char) < 32 or ord(char) == 127 for char in run_name.strip())):
+                raise ValueError("run_name must be a non-empty display label of at most 240 characters")
+            action_parameters["run_name"] = run_name.strip()
         raw_posthoc = parameters.get("posthoc_fit")
         if raw_posthoc is not None:
             if not isinstance(raw_posthoc, Mapping) or action_parameters:

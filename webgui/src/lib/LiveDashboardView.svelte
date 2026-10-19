@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { onMount, tick } from 'svelte';
 	import { api, type RecordValue } from '$lib/api';
+	import { formatNumber } from '$lib/number-format';
 	import { subscribeOperationalRefresh } from '$lib/operational-refresh';
 	import PairedMetricPlot from '$lib/PairedMetricPlot.svelte';
 	import SplitMetricPlot from '$lib/SplitMetricPlot.svelte';
@@ -39,7 +40,7 @@
 	const number = (value: unknown): number | null => typeof value === 'number' && Number.isFinite(value) ? value : null;
 	const text = (value: unknown, fallback = '—') => value === undefined || value === null || value === '' ? fallback : String(value);
 	const label = (value: string) => value.replaceAll('_', ' ').replace(/\b\w/g, (letter) => letter.toUpperCase());
-	const format = (value: unknown) => number(value)?.toLocaleString(undefined, { maximumSignificantDigits: 5 }) ?? '—';
+	const format = (value: unknown) => formatNumber(number(value));
 	const date = (value: unknown) => value && Number.isFinite(Date.parse(String(value))) ? new Date(String(value)).toLocaleString() : 'Not yet';
 	const duration = (value: unknown) => { const seconds = number(value); return seconds === null ? '—' : seconds < 60 ? `${seconds.toFixed(1)}s` : `${Math.floor(seconds / 60)}m ${Math.round(seconds % 60)}s`; };
 	const bytes = (value: unknown) => { const n = number(value); return n === null ? '—' : n < 1048576 ? `${(n / 1024).toFixed(1)} KB` : `${(n / 1048576).toFixed(1)} MB`; };
@@ -56,6 +57,7 @@
 	const latest = (job: RecordValue) => events[String(job.job_id)]?.at(-1);
 	const progressSnapshot = (job: RecordValue, sourceEvents: Record<string, RecordValue[]>) => object(sourceEvents[String(job.job_id)]?.filter((event) => ['worker.training_progress', 'training_progress'].includes(String(event.event_type))).at(-1)?.data);
 	const segment = (job: RecordValue) => object(object(object(job.work_unit).parameters).execution_segment);
+	const isSslInitialize = (job: RecordValue) => String(segment(job).phase) === 'initialize' && Boolean(object(object(object(job.work_unit).parameters).queue_execution).self_supervised_whole_phase);
 	function completedEpochHistory(runJobs: RecordValue[], sourceEvents: Record<string, RecordValue[]>): RecordValue[] {
 		const byEpoch = new Map<number, RecordValue>();
 		for (const job of runJobs) {
@@ -260,7 +262,7 @@
 			const result = await api.issueJobCommand(String(focusedJob.job_id), { action, command_id: crypto.randomUUID() });
 			const command = result.command;
 			commands = { ...commands, [String(focusedJob.job_id)]: [...focusedCommands, command] };
-			commandMessage = command.status === 'applied' ? `${label(action)} applied.` : `${label(action)} requested. Waiting for worker acknowledgement.`;
+			commandMessage = action === 'pause' && isSslInitialize(focusedJob) ? 'Pause requested after self-supervised pretraining finishes.' : command.status === 'applied' ? `${label(action)} applied.` : `${label(action)} requested. Waiting for worker acknowledgement.`;
 			await load(true);
 		} catch (error) { commandMessage = error instanceof Error ? error.message : 'Could not request worker control.'; }
 		finally { commandAction = ''; }
@@ -306,7 +308,7 @@
 				<div class="run-context"><span>Worker <strong>{workerName(focusedJob.worker_id)}</strong></span><span>Telemetry <strong>{snapshot.updated_at ? date(snapshot.updated_at) : 'Not yet available'}</strong></span><span>Heartbeat <strong>{focusedHeartbeat.received_at ? date(focusedHeartbeat.received_at) : 'Not reported'}</strong></span></div>
 				{#if !isPosthocFit(focusedJob)}<div class="unit-context"><span>Run <strong>{text(focusedRunId)}</strong></span><span>Unit <strong>{text(object(focusedJob.work_unit).sequence)} · {label(text(object(focusedJob.work_unit).phase))}</strong></span><span>Attempt <strong>{text(focusedLease.generation ?? focusedLease.attempt_id, 'Not leased')}</strong></span><span>Committed cursor <strong>{text(focusedExecutionRun.completed_epoch, 'Not committed')}</strong></span><span>Checkpoint <strong>{text(committedCheckpoint.artifact_id, 'None committed')}</strong></span></div>{/if}
 				{#if isFinalizing}<section class="post-training-status" aria-label="Post-training activity"><strong>{stoppedEarly ? 'Training ended early' : 'Training epochs complete'}</strong><p>{completedTrainingEpochs === null ? 'Training has ended.' : `${completedTrainingEpochs} of ${format(plannedTrainingEpochs)} planned epochs completed.`} {postActivityDone ? 'Final artifacts were generated.' : stoppedEarly ? 'The early-stopping rule ended training; the worker is now generating final artifacts.' : 'The worker is now generating final artifacts.'}</p><div><span>{postTraining.stage ? `Stage ${format(postTraining.stage_index)} of ${format(postTraining.total_stages)} · ${text(postTraining.stage)}` : postActivityDone ? 'Final artifacts complete' : 'Waiting for the worker to report its artifact stage'}</span>{#if number(postTraining.total_items)}<small>{format(postTraining.completed_items)} / {format(postTraining.total_items)} items</small>{:else if postTraining.status}<small>{label(text(postTraining.status))} · {duration(postTraining.elapsed_seconds)}</small>{/if}</div>{#if postTraining.activity}<p class="post-activity" role="status">{text(postTraining.activity)}</p>{/if}{#if number(postTraining.total_stages)}<progress max={Number(postTraining.total_stages)} value={Math.min(Number(postTraining.total_stages), postStageFraction)} aria-label="Post-training artifact progress"></progress>{/if}</section>{/if}
-				<section class="command-strip" aria-label="Worker controls"><div><strong>Worker control</strong><small>{commandLabel(latestCommand)}</small></div><div class="command-actions"><button class="secondary small" disabled={!canCommand('pause', focusedJob) || Boolean(commandAction)} on:click={() => issueCommand('pause')}>Pause safely</button><button class="secondary small" disabled={!canCommand('yield', focusedJob) || Boolean(commandAction)} on:click={() => issueCommand('yield')}>Yield</button><button class="secondary small" disabled={!canCommand('restart', focusedJob) || Boolean(commandAction)} on:click={() => issueCommand('restart')}>Restart unit</button>{#if canRestartFailed(focusedJob)}<button class="secondary small" disabled={Boolean(commandAction)} on:click={() => restartFailed(focusedJob)}>{restartPhase(focusedJob) === 'finalize' ? 'Retry finalization' : 'Restart failed unit'}</button>{/if}<button class="secondary small" disabled={!canCommand('resume', focusedJob) || Boolean(commandAction)} on:click={() => issueCommand('resume')}>{focusedJob.status === 'publication_pending' ? 'Retry publication' : 'Resume'}</button><button class="secondary danger small" disabled={!canCommand('stop_now', focusedJob) || Boolean(commandAction)} on:click={() => issueCommand('stop_now')}>Stop now</button></div>{#if commandMessage}<p role="status">{commandMessage}</p>{/if}</section>
+				<section class="command-strip" aria-label="Worker controls"><div><strong>Worker control</strong><small>{commandLabel(latestCommand)}</small></div><div class="command-actions"><button class="secondary small" disabled={!canCommand('pause', focusedJob) || Boolean(commandAction)} on:click={() => issueCommand('pause')}>{isSslInitialize(focusedJob) ? 'Pause after pretraining' : 'Pause safely'}</button><button class="secondary small" disabled={!canCommand('yield', focusedJob) || Boolean(commandAction)} on:click={() => issueCommand('yield')}>Yield</button><button class="secondary small" disabled={!canCommand('restart', focusedJob) || Boolean(commandAction)} on:click={() => issueCommand('restart')}>Restart unit</button>{#if canRestartFailed(focusedJob)}<button class="secondary small" disabled={Boolean(commandAction)} on:click={() => restartFailed(focusedJob)}>{restartPhase(focusedJob) === 'finalize' ? 'Retry finalization' : 'Restart failed unit'}</button>{/if}<button class="secondary small" disabled={!canCommand('resume', focusedJob) || Boolean(commandAction)} on:click={() => issueCommand('resume')}>{focusedJob.status === 'publication_pending' ? 'Retry publication' : 'Resume'}</button><button class="secondary danger small" disabled={!canCommand('stop_now', focusedJob) || Boolean(commandAction)} on:click={() => issueCommand('stop_now')}>Stop now</button></div>{#if commandMessage}<p role="status">{commandMessage}</p>{/if}</section>
 				{#if isPosthocFit(focusedJob)}
 					<section class="post-training-status" aria-label="Post-hoc fitting activity">
 						<strong>Post-hoc classifier fit</strong>

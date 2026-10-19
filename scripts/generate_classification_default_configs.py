@@ -131,6 +131,8 @@ def render(recipe: Recipe) -> str:
         "encoder": {"family": recipe.family, "variant": recipe.variant},
         "stem": {"type": "native", "kernel_size": recipe.stem_kernel, "stride": recipe.stem_stride, "pool": recipe.stem_pool},
     })
+    if recipe.family == "simple_cnn":
+        config["encoder"].update({"num_layers": 3, "base_filters": 32, "filter_multiplier": 2.0})
     if recipe.family_baseline:
         config = deep_merge(config, classification_stratification_preset())
         config["training"].update({"learning_rate": 0.0003, "weight_decay": 0.0001})

@@ -13,6 +13,10 @@
 	let startAfterVerification = false;
 	let queueAction = false;
 	let queueActionMessage = '';
+	let renamingRunId = '';
+	let renamedRunName = '';
+	let renameRunBusy = false;
+	let renameRunError = '';
 	const selectable = (run: RecordValue) => ['pending_verification', 'ready', 'needs_attention'].includes(String(run.status)) && !run.start_authorized;
 	const canStartRun = (run: RecordValue) => run.status === 'ready' && run.preflight_status === 'valid' && !run.start_authorized;
 	const activeJobStatuses = new Set(['queued', 'leased', 'acknowledged', 'running', 'uploading', 'publishing', 'publication_pending', 'publication_paused', 'cancel_requested', 'paused']);
@@ -26,6 +30,23 @@
 	$: canVerify = selectedRuns.length > 0 && selectedRuns.every(selectable);
 	$: canStart = selectedRuns.length > 0 && selectedRuns.every(canStartRun);
 	function toggleRun(id: string, checked: boolean) { selectedRunIds = checked ? [...selectedRunIds, id] : selectedRunIds.filter((value) => value !== id); }
+	function beginRunRename(run: RecordValue) {
+		renamingRunId = String(run.queued_run_id);
+		renamedRunName = String(run.name ?? '');
+		renameRunError = '';
+	}
+	async function saveRunName() {
+		const name = renamedRunName.trim();
+		if (!name || name.length > 240) { renameRunError = 'Enter a name between 1 and 240 characters.'; return; }
+		renameRunBusy = true; renameRunError = '';
+		try {
+			await api.renameQueuedRun(renamingRunId, name);
+			renamingRunId = '';
+			await load();
+			onchanged('Run name updated.');
+		} catch (error) { renameRunError = error instanceof Error ? error.message : 'Could not rename this run.'; }
+		finally { renameRunBusy = false; }
+	}
 	async function actOnSelection(action: 'verify' | 'start') {
 		await actOnRuns(selectedRuns, action, startAfterVerification);
 	}
@@ -60,7 +81,7 @@
 			} else {
 				await api.issueJobCommand(String(run.latest_job_id), { action, reason: 'Requested from Queue', command_id: crypto.randomUUID() });
 			}
-			queueActionMessage = action === 'stop_now' ? 'Stop requested.' : action === 'pause' ? 'Pause requested at the next safe boundary.' : 'Resume requested.';
+			queueActionMessage = action === 'stop_now' ? 'Stop requested.' : action === 'pause' ? run.pause_boundary === 'self_supervised_phase' ? 'Pause requested after self-supervised pretraining finishes.' : 'Pause requested at the next safe boundary.' : 'Resume requested.';
 			onchanged(queueActionMessage);
 		} catch (error) { onfailure(error instanceof Error ? error.message : 'Could not control this run.'); }
 		finally { queueAction = false; await load(); }
@@ -382,8 +403,8 @@
 		{@const report = object(run.preflight_report)}
 		{@const splitManifest = object(report.split_manifest)}
 		{@const coverage = object(splitManifest.coverage)}
-		<tr><td><input type="checkbox" aria-label={`Select ${text(run.name)}`} disabled={queueAction || !selectable(run)} checked={selectedRunIds.includes(String(run.queued_run_id))} on:change={(event) => toggleRun(String(run.queued_run_id), event.currentTarget.checked)} /></td><td><strong>{text(run.name)}</strong><small>{text(run.definition_name)} · rev {text(run.definition_revision)}</small><small>{text(pools.find((pool) => pool.pool_id === run.worker_pool_id)?.name)}</small></td><td><span class="status {text(run.status)}">{runStatus(run)}</span>{#if run.status === 'verifying'}<small>{run.start_authorized ? 'Will start if verification passes' : 'Will wait for your start command'}</small>{/if}</td><td><strong>{policy.mode === 'auto' ? 'Automatic · pending' : `${text(run.batch_size)} / batch`}</strong><small>{text(run.epochs)} epochs</small></td><td>{#if run.latest_job_error && run.can_edit}<small class="queue-problem">{text(run.latest_job_error)}</small>{:else if run.failure_reason}<small class="queue-problem">{text(run.failure_reason)}</small>{:else if run.status === 'verifying'}<small>{verificationWaitMessage(run)}</small>{:else if report.ready}<strong>Preflight passed{actions(coverage.warnings).length ? ' with split warnings' : ''}</strong><small>{text(workers.find((worker) => worker.worker_id === report.worker_id)?.name, text(report.worker_id))}</small>{#if actions(coverage.warnings).length}<small class="queue-problem">{actions(coverage.warnings).slice(0, 3).join('; ')}{actions(coverage.warnings).length > 3 ? `; and ${actions(coverage.warnings).length - 3} more` : ''}</small>{/if}{:else}<small>{actions(report.reasons).join('; ') || 'Select this run to verify.'}</small>{/if}{#if report.ready}<details><summary>View checks</summary><ul>{#each actions(report.checks) as check}<li>{check.replaceAll('_', ' ')}</li>{/each}</ul>{#if Object.keys(coverage).length}<strong>Split coverage {coverage.valid === false ? 'warning' : 'verified'}</strong><small>Minimum per class: {text(coverage.minimum_per_class)}</small><dl class="split-coverage">{#each Object.entries(object(coverage.class_counts)) as [classId, counts]}<dt>Class {classId}</dt><dd>{#each Object.entries(object(counts)) as [split, count], index}{index ? ' · ' : ''}{split}: {count}{/each}</dd>{/each}</dl>{/if}<small>Verified {text(report.verified_at)}</small></details>{/if}</td><td><div class="queue-row-actions">
-			{#if run.can_edit}<button class="secondary small" disabled={enqueuing || queueAction} on:click={() => editRun(run)}><QueueActionIcon name="edit" />Edit</button>{/if}
+		<tr><td><input type="checkbox" aria-label={`Select ${text(run.name)}`} disabled={queueAction || !selectable(run)} checked={selectedRunIds.includes(String(run.queued_run_id))} on:change={(event) => toggleRun(String(run.queued_run_id), event.currentTarget.checked)} /></td><td>{#if renamingRunId === String(run.queued_run_id)}<form class="run-rename-form" on:submit|preventDefault={saveRunName}><input aria-label={`Name for ${text(run.name)}`} maxlength="240" bind:value={renamedRunName} disabled={renameRunBusy} /><button class="secondary small" type="submit" disabled={renameRunBusy || !renamedRunName.trim()}>{renameRunBusy ? 'Saving…' : 'Save'}</button><button class="secondary small" type="button" disabled={renameRunBusy} on:click={() => { renamingRunId = ''; renameRunError = ''; }}>Cancel</button></form>{#if renameRunError}<small class="queue-problem" role="alert">{renameRunError}</small>{/if}{:else}<strong>{text(run.name)}</strong>{/if}<small>{text(run.definition_name)} · rev {text(run.definition_revision)}</small><small>{text(pools.find((pool) => pool.pool_id === run.worker_pool_id)?.name)}</small></td><td><span class="status {text(run.status)}">{runStatus(run)}</span>{#if run.status === 'verifying'}<small>{run.start_authorized ? 'Will start if verification passes' : 'Will wait for your start command'}</small>{/if}</td><td><strong>{policy.mode === 'auto' ? 'Automatic · pending' : `${text(run.batch_size)} / batch`}</strong><small>{text(run.epochs)} epochs</small></td><td>{#if run.latest_job_error && run.can_edit}<small class="queue-problem">{text(run.latest_job_error)}</small>{:else if run.failure_reason}<small class="queue-problem">{text(run.failure_reason)}</small>{:else if run.status === 'verifying'}<small>{verificationWaitMessage(run)}</small>{:else if report.ready}<strong>Preflight passed{actions(coverage.warnings).length ? ' with split warnings' : ''}</strong><small>{text(workers.find((worker) => worker.worker_id === report.worker_id)?.name, text(report.worker_id))}</small>{#if actions(coverage.warnings).length}<small class="queue-problem">{actions(coverage.warnings).slice(0, 3).join('; ')}{actions(coverage.warnings).length > 3 ? `; and ${actions(coverage.warnings).length - 3} more` : ''}</small>{/if}{:else}<small>{actions(report.reasons).join('; ') || 'Select this run to verify.'}</small>{/if}{#if report.ready}<details><summary>View checks</summary><ul>{#each actions(report.checks) as check}<li>{check.replaceAll('_', ' ')}</li>{/each}</ul>{#if Object.keys(coverage).length}<strong>Split coverage {coverage.valid === false ? 'warning' : 'verified'}</strong><small>Minimum per class: {text(coverage.minimum_per_class)}</small><dl class="split-coverage">{#each Object.entries(object(coverage.class_counts)) as [classId, counts]}<dt>Class {classId}</dt><dd>{#each Object.entries(object(counts)) as [split, count], index}{index ? ' · ' : ''}{split}: {count}{/each}</dd>{/each}</dl>{/if}<small>Verified {text(report.verified_at)}</small></details>{/if}</td><td><div class="queue-row-actions">
+			<button class="secondary small" disabled={queueAction || renameRunBusy} on:click={() => beginRunRename(run)}>Rename</button>{#if run.can_edit}<button class="secondary small" disabled={enqueuing || queueAction} on:click={() => editRun(run)}><QueueActionIcon name="edit" />Edit</button>{/if}
 			{#if selectable(run)}<button class="secondary small" disabled={queueAction} on:click={() => actOnRuns([run], 'verify')}><QueueActionIcon name="verify" />Verify</button>{/if}
 			{#if canStartRun(run)}<button class="secondary small" disabled={queueAction} on:click={() => actOnRuns([run], 'start')}><QueueActionIcon name="start" />Start</button>{/if}
 			{#if canPauseRun(run)}<button class="secondary small" disabled={queueAction} on:click={() => controlRun(run, 'pause')}><QueueActionIcon name="pause" />Pause</button>{/if}
@@ -409,6 +430,7 @@
 {/if}
 
 <style>
+	.run-rename-form{display:flex;flex-wrap:wrap;gap:.3rem;margin-bottom:.3rem}.run-rename-form input{min-width:10rem;max-width:16rem;min-height:2rem}
 	.queue-toolbar { display:flex; flex-wrap:wrap; align-items:center; gap:.75rem; padding:.9rem 0; border-block:1px solid var(--line); margin-bottom:1rem; }
 	.queue-toolbar > span { font-size:.8rem; color:var(--muted); margin-right:auto; }
 	.verify-start { display:flex; align-items:center; gap:.5rem; font-size:.8rem; }

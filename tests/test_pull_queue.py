@@ -90,6 +90,7 @@ def test_queue_verify_then_explicit_start(queue_setup):
     assert not queued["start_authorized"]
     assert orch.jobs() == []
     spec = orch.specification(queued["specification_id"])
+    assert spec["parameters"]["run_name"] == "portable run"
     assert str(orch.workspace_root) not in str(spec["parameters"])
     assert orch.artifact_store.resolve(ArtifactRef.from_dict(spec["parameters"]["artifact_inputs"]["input"])).joinpath("payload").is_file()
     with pytest.raises(ValueError, match="verified"):
@@ -105,12 +106,38 @@ def test_queue_verify_then_explicit_start(queue_setup):
     assert not verified["start_authorized"]
     assert len(orch.jobs()) == 1
     assert orch.acquire_next_worker_lease(worker_id=worker["worker_id"], worker_token=worker["worker_token"]) is None
+    orch.rename_queued_run(queued["queued_run_id"], "renamed before training")
     started = orch.authorize_queued_runs_for_pool(queued_run_ids=[queued["queued_run_id"]], worker_pool_id=pool["pool_id"])
     assert len(started["dispatched"]) == 1
     unit = started["dispatched"][0]["work_unit"]
+    assert unit["parameters"]["run_name"] == "renamed before training"
     assert unit["parameters"]["queue_execution"]["mode"] == "verified"
     assert unit["parameters"]["queue_execution"]["batch_size"] == 4
     assert str(orch.workspace_root) not in str(unit)
+
+
+def test_ssl_verification_schedules_a_whole_initialization_phase(queue_setup):
+    """SSL gets one durable boundary before ordinary supervised segments."""
+    orch, pool, worker, _queue = queue_setup
+    definition = orch.create_model_definition(
+        name="portable-resnet-with-ssl", template_id="resnet18",
+        config={"self_supervised": {"enabled": True}},
+    )
+    dataset = next(item for item in orch.datasets() if item["lifecycle"] == "frozen")
+    queued = orch.queue_model_definition_for_pool(
+        definition["definition_id"], name="ssl portable run", dataset_id=dataset["dataset_id"],
+        worker_pool_id=pool["pool_id"], resources={"gpu_count": 0}, epochs=2, batch_size=4,
+    )
+    orch.verify_queued_runs_for_pool(queued_run_ids=[queued["queued_run_id"]])
+    finish_verification(orch, worker, report_overrides={"self_supervised_whole_phase": True})
+    orch.authorize_queued_runs_for_pool(queued_run_ids=[queued["queued_run_id"]], worker_pool_id=pool["pool_id"])
+
+    lease = orch.acquire_next_worker_lease(worker_id=worker["worker_id"], worker_token=worker["worker_token"])
+    assert lease is not None
+    unit = lease["work_unit"]
+    assert unit["phase"] == "initialize"
+    assert unit["parameters"]["execution_segment"] == {"phase": "initialize", "total_epochs": 2}
+    assert unit["output_contract"]["kind"] == "training_checkpoint"
 
 
 def test_legacy_verified_training_publishes_and_indexes_real_manifest(queue_setup, tmp_path):
@@ -138,7 +165,7 @@ def test_legacy_verified_training_publishes_and_indexes_real_manifest(queue_setu
     run = tmp_path / "real-manifest"
     source = tmp_path / "source.toml"
     source.write_text('[run]\ntask = "classification"\nmodel = "simple_cnn"\n')
-    create_run_artifact(run, run_id=str(uuid.uuid4()), name="publication fixture", source_config=source, config={
+    create_run_artifact(run, run_id=str(uuid.uuid4()), name="run", source_config=source, config={
         "run": {"task": "classification", "model": "simple_cnn"},
         "data": {"input_shape": [16, 16, 1], "num_classes": 3},
         "dataset": {"dataset_id": str(uuid.uuid4()), "lifecycle": "frozen"},
@@ -156,6 +183,26 @@ def test_legacy_verified_training_publishes_and_indexes_real_manifest(queue_setu
     completion = orch.complete_worker_lease(**credentials, success=True)
     assert completion["output_ref"]["kind"] == "model_run"
     assert orch.queued_run(queued["queued_run_id"])["status"] == "indexed"
+    artifact_id = completion["output_ref"]["artifact_id"]
+    assert orch.artifact(artifact_id)["name"] == "portable run"
+    assert orch.artifact(artifact_id)["manifest"]["name"] == "run"
+    orch.scan(orch.artifact(artifact_id)["path"])
+    assert orch.artifact(artifact_id)["name"] == "portable run"
+    # Existing installations may already have indexed the old 'run' label.
+    from oracle_builder.orchestration.database import _initialize_schema
+    with orch._connection() as db:
+        db.execute("DELETE FROM artifact_name_overrides WHERE artifact_id=?", (artifact_id,))
+        db.execute("UPDATE artifacts SET name='run' WHERE artifact_id=?", (artifact_id,))
+        _initialize_schema(db)
+    assert orch.artifact(artifact_id)["name"] == "portable run"
+    with TestClient(create_app(orch)) as client:
+        renamed_run = client.patch(f"/v1/queued-runs/{queued['queued_run_id']}", json={"name": "New display name"})
+        assert renamed_run.status_code == 200, renamed_run.text
+        assert orch.artifact(artifact_id)["name"] == "New display name"
+        renamed_model = client.patch(f"/v1/artifacts/{artifact_id}", json={"name": "Final display name"})
+        assert renamed_model.status_code == 200, renamed_model.text
+        assert orch.queued_run(queued["queued_run_id"])["name"] == "Final display name"
+    assert orch.artifact(artifact_id)["manifest"]["name"] == "run"
 
 
 def test_auto_batch_is_resolved_before_start_and_pinned_to_verifying_worker(queue_setup):

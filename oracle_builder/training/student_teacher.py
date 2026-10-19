@@ -61,8 +61,11 @@ def make_self_supervised_dataset(x: np.ndarray, config: dict[str, Any]):
     batch_size = int(config["data"].get("batch_size", 16))
     buffer_size = int(config["data"].get("shuffle_buffer", 512))
     seed = int(config["run"].get("seed", 123))
+    # Supervised loaders return image plus scalar context as a mapping. SSL
+    # deliberately trains only the visual encoder, so retain the image tensor.
+    images = x["image"] if isinstance(x, dict) and "image" in x else x
     return (
-        tf.data.Dataset.from_tensor_slices(np.asarray(x, dtype="float32"))
+        tf.data.Dataset.from_tensor_slices(np.asarray(images, dtype="float32"))
         .shuffle(buffer_size, seed=seed)
         .batch(batch_size)
         .prefetch(tf.data.AUTOTUNE)
@@ -545,6 +548,19 @@ def _self_supervised_optimizer(settings: dict[str, Any]) -> keras.optimizers.Opt
     raise ValueError("self_supervised.ssl_optimizer must be 'adam' or 'adamw'")
 
 
+def _self_supervised_images(data):
+    """Extract images from an SSL batch that may include supervised context."""
+    value = data[0] if isinstance(data, (tuple, list)) else data
+    if isinstance(value, dict):
+        try:
+            return value["image"]
+        except KeyError as exc:
+            raise ValueError(
+                "Self-supervised batches with mappings require an 'image' input"
+            ) from exc
+    return value
+
+
 class StudentTeacherPretrainer(keras.Model):
     """BYOL-style student predictor trained against an EMA teacher."""
 
@@ -553,7 +569,8 @@ class StudentTeacherPretrainer(keras.Model):
         settings = self_supervised_settings(config)
         self.view_config = _view_config(config)
         self.momentum = float(settings.get("teacher_momentum", 0.99))
-        embedding_dim = int(classifier.get_layer("embedding_projection").output.shape[-1])
+        self.student_encoder = build_self_supervised_embedding_model(classifier)
+        embedding_dim = int(self.student_encoder.output.shape[-1])
         projection_dim = int(settings.get("projection_dim", 128))
         hidden_dim = int(settings.get("projection_hidden_dim", max(embedding_dim, 256)))
         self.vicreg_variance_weight = float(settings.get("vicreg_variance_weight", 25.0))
@@ -576,7 +593,6 @@ class StudentTeacherPretrainer(keras.Model):
         if self.collapse_std_threshold <= 0:
             raise ValueError("collapse_std_threshold must be greater than zero")
 
-        self.student_encoder = build_self_supervised_embedding_model(classifier)
         self.teacher_encoder = keras.models.clone_model(self.student_encoder)
         self.teacher_encoder.set_weights(self.student_encoder.get_weights())
         self.teacher_encoder.trainable = False
@@ -655,7 +671,7 @@ class StudentTeacherPretrainer(keras.Model):
         return 2.0 - 2.0 * tf.reduce_mean(tf.reduce_sum(prediction * target, axis=-1))
 
     def train_step(self, data):
-        x = data[0] if isinstance(data, (tuple, list)) else data
+        x = _self_supervised_images(data)
         view_one = self._augment(tf.cast(x, tf.float32))
         view_two = self._augment(tf.cast(x, tf.float32))
         with tf.GradientTape() as tape:
@@ -792,12 +808,12 @@ class SimCLRPretrainer(keras.Model):
         settings = self_supervised_settings(config)
         self.view_config = _view_config(config)
         self.temperature = float(settings.get("temperature", 0.1))
-        embedding_dim = int(classifier.get_layer("embedding_projection").output.shape[-1])
+        self.encoder = build_self_supervised_embedding_model(classifier)
+        embedding_dim = int(self.encoder.output.shape[-1])
         projection_dim = int(settings.get("projection_dim", 128))
         hidden_dim = int(
             settings.get("projection_hidden_dim", max(embedding_dim, 256))
         )
-        self.encoder = build_self_supervised_embedding_model(classifier)
         self.projector = _projection_head(
             embedding_dim,
             hidden_dim,
@@ -935,7 +951,7 @@ class SimCLRPretrainer(keras.Model):
         return loss, accuracy
 
     def train_step(self, data):
-        x = data[0] if isinstance(data, (tuple, list)) else data
+        x = _self_supervised_images(data)
         view_one = self._augment(tf.cast(x, tf.float32))
         view_two = self._augment(tf.cast(x, tf.float32))
         with tf.GradientTape() as tape:

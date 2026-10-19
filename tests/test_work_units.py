@@ -95,12 +95,14 @@ def test_portable_work_unit_uses_explicit_artifacts_and_rejects_path_fallback(tm
         work_unit_id=str(uuid.uuid4()), attempt_id=str(uuid.uuid4()), specification_id=str(uuid.uuid4()),
         action="train", parameters={
             "input": str(dataset), "config": str(config),
+            "run_name": "North slope baseline",
             "artifact_inputs": {"input": dataset_ref.to_dict()},
             "configuration_artifact": config_ref.to_dict(),
         }, resources={}, require_portable=True,
     )
     assert unit.inputs == {"input": dataset_ref}
     assert unit.configuration == config_ref
+    assert unit.parameters["run_name"] == "North slope baseline"
     assert str(tmp_path) not in unit.canonical_json()
     assert (store.resolve(dataset_ref) / "payload").read_bytes() == dataset.read_bytes()
     assert (store.resolve(config_ref) / "manifest.json").is_file()

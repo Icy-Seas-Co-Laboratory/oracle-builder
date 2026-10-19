@@ -26,9 +26,9 @@ from oracle_builder.config import (
 
 
 # Bump whenever clients need to understand a new catalog contract attribute.
-# Version 7 adds explicit split-policy and coverage configuration. Clients must
+# Version 8 adds Simple CNN topology and scalar-context transforms. Clients must
 # treat this as an authoring contract, not a dump of internal runtime defaults.
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 EXPOSURES: tuple[dict[str, Any], ...] = (
     {
@@ -431,6 +431,9 @@ _EXTRA_FIELDS: tuple[FieldSpec, ...] = (
     FieldSpec("input.geometry.type", "enum", "preserve_aspect_pad", choices=("preserve_aspect_pad", "center_roi_pad", "resize_crop", "center_crop", "direct_resize"), help="V2 geometry declaration; it resolves the preprocessing resize mode."),
     FieldSpec("encoder.family", "enum", "simple_cnn", choices=ARCHITECTURE_FAMILIES),
     FieldSpec("encoder.variant", "enum", "simple_cnn", choices=ARCHITECTURE_VARIANTS, help="Concrete supported topology for the selected encoder family.", allowed_values_by=ARCHITECTURE_VARIANTS_BY_FAMILY, allowed_values_path="encoder.family"),
+    FieldSpec("encoder.num_layers", "integer", 3, minimum=1, maximum=8, visible_when={"encoder.family": "simple_cnn"}, help="Number of convolution layers in Simple CNN."),
+    FieldSpec("encoder.base_filters", "integer", 32, minimum=1, visible_when={"encoder.family": "simple_cnn"}, help="Filters in the first Simple CNN layer."),
+    FieldSpec("encoder.filter_multiplier", "number", 2.0, label="Filter schedule multiplier", minimum=1, visible_when={"encoder.family": "simple_cnn"}, help="Geometric filter schedule: 1 keeps widths constant; 2 doubles each layer."),
     FieldSpec("stem.type", "enum", "native", choices=("native",), help="Native family stem; its parameters are explicit below."),
     FieldSpec("stem.kernel_size", "integer", 3, minimum=1),
     FieldSpec("stem.stride", "integer", 1, minimum=1),
@@ -470,7 +473,7 @@ _EXTRA_FIELDS: tuple[FieldSpec, ...] = (
     FieldSpec("posthoc.enabled", "boolean", False, advanced=True, help="After neural training, fit a separate classifier on training embeddings and evaluate it on held-out data."),
     FieldSpec("posthoc.representation", "enum", "fused_embedding", choices=("fused_embedding",), advanced=True, help="Neural feature vector used by the downstream classifier."),
     FieldSpec("posthoc.estimator", "enum", "logistic_regression", choices=("logistic_regression",), advanced=True, help="Logistic regression regularization is selected using validation macro F1; the test split is used only for final scoring."),
-    FieldSpec("metadata.fields[].transform", "enum", "identity", choices=("identity", "log1p", "sqrt"), help="Per-field transform applied before fitting metadata scaling."),
+    FieldSpec("metadata.fields[].transform", "enum", "none", choices=("none", "log", "sqrt", "inverse", "identity", "log1p"), help="Per-field transform applied before fitting scalar scaling."),
     *(
         FieldSpec(
             path,

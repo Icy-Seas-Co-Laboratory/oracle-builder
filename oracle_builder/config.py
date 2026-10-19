@@ -511,6 +511,15 @@ def normalize_component_config(
             config.setdefault("run", {})["model"] = str(family)
         if variant:
             config.setdefault("model", {})["variant"] = str(variant)
+        if family == "simple_cnn":
+            model = config.setdefault("model", {})
+            for source, destination in (
+                ("num_layers", "conv_layers"),
+                ("base_filters", "base_filters"),
+                ("filter_multiplier", "filter_multiplier"),
+            ):
+                if source in encoder:
+                    model[destination] = encoder[source]
     stem = config.get("stem", {})
     if isinstance(stem, dict):
         model = config.setdefault("model", {})
@@ -646,6 +655,17 @@ def validate_config(config: dict[str, Any]) -> None:
         )
     if task in {"classification", "embedding"} and int(config.get("model", {}).get("embedding_dim", 256)) < 1:
         raise ValueError("model.embedding_dim must be a positive integer")
+    if task in {"classification", "embedding"} and config.get("run", {}).get("model") == "simple_cnn":
+        model_settings = config.get("model", {})
+        for key in ("conv_layers", "base_filters"):
+            value = model_settings.get(key, 3 if key == "conv_layers" else 32)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"model.{key} must be a positive integer")
+        if model_settings.get("conv_layers", 3) > 8:
+            raise ValueError("model.conv_layers must be at most 8")
+        multiplier = float(model_settings.get("filter_multiplier", 2.0))
+        if not np.isfinite(multiplier) or multiplier < 1:
+            raise ValueError("model.filter_multiplier must be finite and at least 1")
     architecture = config.get("architecture", {})
     if architecture and (not isinstance(architecture, dict) or int(architecture.get("version", 1)) not in {1, 2}):
         raise ValueError("architecture.version must be 1 or 2")
@@ -708,11 +728,16 @@ def validate_config(config: dict[str, Any]) -> None:
         raise ValueError("metadata.augmentation.fields must be a list of feature names")
     if metadata_variance and task != "classification":
         raise ValueError("metadata Gaussian augmentation is supported only for classification training")
-    if task == "classification":
+    if task in {"classification", "embedding"}:
         from oracle_builder.classification.metadata import validate_feature_specs
+        validate_feature_specs(config)
+        if task == "embedding" and config.get("model", {}).get("auxiliary_features"):
+            raise ValueError(
+                "Embedding artifacts do not yet support auxiliary scalar features at inference"
+            )
+    if task == "classification":
         from oracle_builder.classification.stratification import architecture_supported, enabled as stratification_enabled, validate as validate_stratification
 
-        validate_feature_specs(config)
         if metadata_variance and not config.get("model", {}).get("auxiliary_features"):
             raise ValueError(
                 "metadata Gaussian augmentation requires configured metadata fields"
@@ -720,10 +745,8 @@ def validate_config(config: dict[str, Any]) -> None:
         validate_stratification(config)
         if stratification_enabled(config) and not architecture_supported(config):
             raise ValueError("The selected classifier architecture does not support resolution stratification")
-        if config.get("model", {}).get("auxiliary_features") and self_supervised_settings(config).get("enabled", False):
-            raise ValueError(
-                "Auxiliary classifier features are not yet compatible with self-supervised pretraining"
-            )
+        if stratification_enabled(config) and self_supervised_settings(config).get("enabled", False):
+            raise ValueError("Self-supervised pretraining does not support resolution stratification")
     if int(config.get("evidence", {}).get("knn_k", 5)) < 1:
         raise ValueError("evidence.knn_k must be at least 1")
     inference = config.get("inference", {})

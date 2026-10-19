@@ -275,8 +275,13 @@ class TrainingExecutor:
             from oracle_data_contracts.artifacts.splits import create_split_manifest
             config = resolve_config(resolved, dataset / 'payload', staging)
             from oracle_builder.config import self_supervised_settings
-            if self_supervised_settings(config).get('enabled', False):
-                raise PullProtocolError('Resumable queued execution does not yet support self-supervised training; use the explicit whole-phase training workflow')
+            # The initialization handoff feeds segmented *classification*
+            # fine-tuning. Embedding runs own their complete SSL lifecycle
+            # and do not have a supervised continuation phase.
+            whole_phase_ssl = bool(
+                config.get('run', {}).get('task') == 'classification'
+                and self_supervised_settings(config).get('enabled', False)
+            )
             split = create_split_manifest(staging, dataset / 'payload', config)
             split_warnings = list(split.get('coverage', {}).get('warnings', []))
             if split_warnings:
@@ -290,6 +295,7 @@ class TrainingExecutor:
                       "checks": ["configuration_resolution", "dataset_loading", "model_forward_backward", "split_coverage"],
                       "execution_contract_version": 2, "unit_epochs": unit_epochs,
                       "unit_steps": unit_steps,
+                      "self_supervised_whole_phase": whole_phase_ssl,
                       "warnings": split_warnings[:10], "warning_count": len(split_warnings),
                       "split_manifest": {key: value for key,value in split.items() if key != 'assignments'},
                       "work_unit_id": work_unit.get("work_unit_id")}
@@ -316,7 +322,7 @@ class TrainingExecutor:
                 scratch=staging.parent, emit_event=emit_event,
             )
             emit_event('resume_capacity_verified', 'Worker verified the frozen training batch', {'batch_size': batch_size})
-        run_name = "run"
+        staging_dir_name = "run"
         emit_event("training_starting", "Starting packaged training action", {"action": "train"})
         # This is an in-process typed boundary: the worker never mutates
         # process-global argv and the lease cannot select an executable or a
@@ -333,24 +339,34 @@ class TrainingExecutor:
             work_unit=work_unit, config=configuration / "payload", dataset=dataset / "payload",
             scratch=staging.parent, emit_event=emit_event,
         )
-        reporter = _TrainingProgressReporter(staging / run_name / "training-status.json", emit_event)
+        reporter = _TrainingProgressReporter(staging / staging_dir_name / "training-status.json", emit_event)
         reporter.start()
         workflow_started = time.perf_counter()
         segment = work_unit.get('parameters', {}).get('execution_segment')
         checkpoint = inputs.get('checkpoint')
         request_options = {}
+        display_name = work_unit.get('parameters', {}).get('run_name')
+        if display_name is not None and (not isinstance(display_name, str) or not display_name.strip() or len(display_name.strip()) > 240
+                                         or any(ord(char) < 32 or ord(char) == 127 for char in display_name.strip())):
+            raise PullProtocolError('train run_name must be a non-empty display label of at most 240 characters')
+        if display_name is not None and not checkpoint:
+            request_options['display_name'] = display_name.strip()
         if segment:
             if checkpoint:
-                shutil.copytree(checkpoint, staging / run_name)
+                shutil.copytree(checkpoint, staging / staging_dir_name)
                 # A prior segment's result is provenance, not this attempt's
                 # completion report. The workflow writes a fresh one.
-                request_options['resume'] = str(staging / run_name)
+                request_options['resume'] = str(staging / staging_dir_name)
             else:
-                request_options.update(config=str(execution_config), output=run_name)
+                request_options.update(config=str(execution_config), output=staging_dir_name)
                 pinned = inputs.get('split_manifest')
                 if pinned:
                     request_options['split_manifest'] = str(pinned / 'protocol' / 'splits.json')
-            if segment['phase'] == 'finalize':
+            if segment['phase'] == 'initialize':
+                if checkpoint:
+                    raise PullProtocolError('Self-supervised initialization must not receive a supervised checkpoint')
+                request_options['pretrain_only'] = True
+            elif segment['phase'] == 'finalize':
                 request_options['finalize_only'] = True
             else:
                 request_options.update(segment_start_epoch=segment['start_epoch'], segment_stop_epoch=segment['stop_epoch'])
@@ -358,7 +374,7 @@ class TrainingExecutor:
                     request_options.update(segment_max_steps=segment['max_steps'], segment_start_step=segment.get('start_step', 0))
             request_options['control_file'] = getattr(self, 'control_file', None)
         else:
-            request_options.update(config=str(execution_config), output=run_name)
+            request_options.update(config=str(execution_config), output=staging_dir_name)
         try:
             result = run_training(
                 TrainingRequest(
@@ -381,7 +397,7 @@ class TrainingExecutor:
         })
         if result not in {None, 0}:
             raise PullProtocolError(f"training action exited with status {result}")
-        run_dir = staging / run_name
+        run_dir = staging / staging_dir_name
         if not run_dir.is_dir():
             raise PullProtocolError("training action did not create a run artifact")
         # A staging archive represents one artifact root, not a wrapper folder.

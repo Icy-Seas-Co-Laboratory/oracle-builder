@@ -82,6 +82,7 @@ def _run_training(request: TrainingRequest) -> int:
         config=request.config,
         input=request.input,
         output=request.output,
+        display_name=request.display_name,
         runs_dir=request.runs_dir,
         overwrite=request.overwrite,
         resume=request.resume,
@@ -96,6 +97,7 @@ def _run_training(request: TrainingRequest) -> int:
         split_manifest=request.split_manifest,
         segment_max_steps=request.segment_max_steps,
         segment_start_step=request.segment_start_step,
+        pretrain_only=request.pretrain_only,
     )
     resume_state = None
     is_resume = bool(args.resume)
@@ -107,6 +109,7 @@ def _run_training(request: TrainingRequest) -> int:
         or args.segment_result_path
         or args.segment_max_steps is not None
         or args.segment_start_step is not None
+        or args.pretrain_only
     )
     if is_resume:
         if args.dry_run or args.preflight:
@@ -210,11 +213,18 @@ def _run_training(request: TrainingRequest) -> int:
     config["debug"] = bool(args.debug)
     total_epochs = int(config.get("training", {}).get("epochs", 10))
     finalize_stopped_early = False
-    if is_segment and self_supervised_settings(config).get("enabled", False):
+    if (is_segment and self_supervised_settings(config).get("enabled", False)
+            and not args.pretrain_only
+            and not (resume_state and resume_state.get("pretraining_completed") is True)):
         raise ValueError(
             "Segmented execution is unsupported for self-supervised training; "
             "run it as a whole phase because its continuation state is not yet portable"
         )
+    if args.pretrain_only:
+        if resume_state is not None:
+            raise ValueError("pretrain_only must start a new run")
+        if not self_supervised_settings(config).get("enabled", False):
+            raise ValueError("pretrain_only requires self_supervised.enabled = true")
     if args.finalize_only:
         if resume_state is None:
             raise ValueError("finalize_only requires a completed training checkpoint")
@@ -271,12 +281,13 @@ def _run_training(request: TrainingRequest) -> int:
         print("[startup] Creating versioned run artifact...", flush=True)
         run_dir = create_run_dir(args.runs_dir, args.output)
         run_id = str(uuid.uuid4())
+        display_name = args.display_name.strip() if args.display_name else args.output
         config["run"]["run_id"] = run_id
-        config["run"]["run_name"] = args.output
+        config["run"]["run_name"] = display_name
         manifest = create_run_artifact(
             run_dir,
             run_id=run_id,
-            name=args.output,
+            name=display_name,
             config=config,
             source_config=args.config,
         )
@@ -711,7 +722,26 @@ def _run_training(request: TrainingRequest) -> int:
             require_recovery=is_segment and not args.finalize_only,
             segment_max_steps=args.segment_max_steps,
             segment_start_step=args.segment_start_step,
+            pretrain_only=args.pretrain_only,
         )
+        if args.pretrain_only:
+            from oracle_builder.training.control import FileSegmentControl, write_segment_result
+
+            decision = FileSegmentControl(args.control_file).poll()
+            result = {
+                "schema": "oracle_builder_training_segment_result/v1",
+                "phase": "initialize",
+                "cursor": {"completed_epoch": 0},
+                "checkpoint": "model/recovery/recovery.json",
+                "next_phase": "train",
+                "interrupted": decision.command in {"pause", "yield", "stop", "restart"},
+                "command": decision.command,
+            }
+            write_segment_result(args.segment_result_path or (run_dir / "segment-result.json"), result)
+            mark_run_complete(training_log, run_id, "interrupted")
+            update_run_artifact(run_dir, status="interrupted", summary={"segment": result})
+            seal_run_artifact(run_dir)
+            return 0
         if is_segment and not args.finalize_only:
             from oracle_builder.training.control import FileSegmentControl, write_segment_result
             from oracle_builder.training.recovery import (

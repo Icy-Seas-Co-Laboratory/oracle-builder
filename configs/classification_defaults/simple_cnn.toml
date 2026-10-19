@@ -47,6 +47,9 @@ channel_mode = "grayscale"
 # V2 separates encoder family from its concrete topology.
 family = "simple_cnn"
 variant = "simple_cnn"
+num_layers = 3
+base_filters = 32
+filter_multiplier = 2.0
 
 [stem]
 # Explicit native stem. Smaller stride/pool preserves fine detail at higher cost.
