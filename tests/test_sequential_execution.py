@@ -335,6 +335,30 @@ def test_failed_finalization_can_retry_from_committed_checkpoint(tmp_path):
     assert next_lease["work_unit"]["phase"] == "finalize"
 
 
+def test_failed_legacy_finalization_uses_checkpoint_pinned_on_unit(tmp_path):
+    orch, worker, unit, finalizer, checkpoint = _failed_finalization(tmp_path)
+    # Older persisted execution runs may lack this index even though the
+    # immutable finalizer still pins its committed training checkpoint.
+    with orch._connection() as db:
+        db.execute("UPDATE execution_runs SET checkpoint_ref_json=NULL WHERE run_id=?", (unit.run_id,))
+
+    queue_id = str(uuid.uuid4())
+    with orch._connection() as db:
+        db.execute("UPDATE jobs SET queued_run_id=? WHERE job_id=?", (queue_id, finalizer["job_id"]))
+        db.execute("UPDATE execution_runs SET queued_run_id=? WHERE run_id=?", (queue_id, unit.run_id))
+    edit_state = orch._queued_run_edit_state({"queued_run_id": queue_id, "status": "failed", "start_authorized": 0})
+    assert edit_state["can_restart"] is True
+    assert edit_state["restart_phase"] == "finalize"
+
+    restarted = orch.restart_failed_training_unit(finalizer["job_id"])
+    assert restarted["status"] == "queued"
+    assert orch.execution_run(unit.run_id)["checkpoint_ref"] is None
+    next_lease = orch.acquire_next_worker_lease(
+        worker_id=worker["worker_id"], worker_token=worker["worker_token"],
+    )
+    assert next_lease["work_unit"]["inputs"]["checkpoint"] == checkpoint
+
+
 def test_failed_finalization_rejects_a_damaged_checkpoint(tmp_path):
     orch, _worker, unit, finalizer, checkpoint = _failed_finalization(tmp_path)
     path = orch.artifact_store.resolve(ArtifactRef.from_dict(checkpoint))

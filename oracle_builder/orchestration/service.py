@@ -1043,8 +1043,11 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
                 failed_unit = json.loads(jobs[0]["work_unit_json"] or '{}')
                 phase = failed_unit.get('phase')
                 checkpoint = json.loads(restart_run['checkpoint_ref_json']) if restart_run and restart_run['checkpoint_ref_json'] else None
+                if checkpoint is None and phase == 'finalize':
+                    checkpoint = failed_unit.get('inputs', {}).get('checkpoint')
                 finalization_checkpoint = bool(
-                    checkpoint is not None and failed_unit.get('inputs', {}).get('checkpoint') == checkpoint
+                    restart_run is not None and checkpoint is not None
+                    and failed_unit.get('inputs', {}).get('checkpoint') == checkpoint
                     and failed_unit.get('start_cursor', {}).get('completed_epoch') == restart_run['completed_epoch']
                 )
                 restartable = bool(latest_attempt and restart_run and (

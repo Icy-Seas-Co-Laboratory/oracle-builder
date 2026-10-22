@@ -53,6 +53,10 @@ class SequentialExecutionMixin:
             if run is None or unit.get('schema', {}).get('version') != 2 or unit.get('phase') not in {'initialize', 'train', 'finalize'}:
                 raise ValueError('Only the current sequential training unit can be restarted')
             checkpoint = json.loads(run['checkpoint_ref_json']) if run['checkpoint_ref_json'] else None
+            # Older execution-run rows may not have retained the checkpoint
+            # reference even though the immutable finalizer unit did.
+            if checkpoint is None and unit.get('phase') == 'finalize':
+                checkpoint = unit.get('inputs', {}).get('checkpoint')
             attempt = db.execute('SELECT classification FROM execution_attempts WHERE job_id=? ORDER BY ordinal DESC LIMIT 1', (job_id,)).fetchone()
             finalization_retry = bool(unit.get('phase') == 'finalize' and attempt is not None and attempt['classification'] == 'scientific')
         if checkpoint is not None:
@@ -71,7 +75,8 @@ class SequentialExecutionMixin:
                 raise ValueError('Only a failed current training unit can be restarted')
             unit = json.loads(job['work_unit_json'] or '{}')
             expected = json.loads(run['checkpoint_ref_json']) if run['checkpoint_ref_json'] else None
-            if (expected != checkpoint or unit.get('inputs', {}).get('checkpoint') != checkpoint
+            if ((expected is not None and expected != checkpoint)
+                    or unit.get('inputs', {}).get('checkpoint') != checkpoint
                     or int(unit.get('start_cursor', {}).get('completed_epoch', -1)) != int(run['completed_epoch'])):
                 raise ValueError('The failed unit no longer matches the committed checkpoint')
             attempt = db.execute('SELECT classification FROM execution_attempts WHERE job_id=? ORDER BY ordinal DESC LIMIT 1', (job_id,)).fetchone()
