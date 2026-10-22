@@ -63,3 +63,22 @@ def test_auto_probe_starts_within_verified_training_capacity():
 
     assert plan.batch_size == 3
     assert plan.attempts == (3,)
+
+
+def test_probe_supplies_named_auxiliary_metadata_input():
+    settings = config(4)
+    settings["model"] = {
+        "auxiliary_features_fitted": [{"name": "roi_area"}, {"name": "aspect_ratio"}]
+    }
+
+    class MetadataModel:
+        def __call__(self, values, training=False):
+            assert training is False
+            assert set(values) == {"image", "metadata"}
+            assert tuple(values["image"].shape) == (4, 16, 16, 1)
+            assert tuple(values["metadata"].shape) == (4, 2)
+            return values["image"]
+
+    plan = resolve_inference_batch_size(MetadataModel(), settings, announce=None)
+
+    assert plan.batch_size == 4

@@ -91,7 +91,19 @@ def resolve_inference_batch_size(
                 (candidate, *config["data"]["input_shape"]),
                 dtype="float32",
             )
-            model(sample, training=False)
+            model_inputs: Any = sample
+            model_config = config.get("model", {})
+            metadata_specs = model_config.get(
+                "auxiliary_features_fitted",
+                model_config.get("auxiliary_features", []),
+            )
+            if metadata_specs:
+                metadata = np.zeros(
+                    (candidate, len(metadata_specs)),
+                    dtype="float32",
+                )
+                model_inputs = {"image": sample, "metadata": metadata}
+            model(model_inputs, training=False)
             break
         except Exception as exc:
             try:

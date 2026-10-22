@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
+	import TransientBanner from '$lib/TransientBanner.svelte';
 	import { api, type RecordValue } from '$lib/api';
 	import { OperationalRefreshCoordinator, type RefreshReason, publishOperationalRefresh } from '$lib/operational-refresh';
 	import ModelRunsView from '$lib/models/ModelRunsView.svelte';
@@ -105,8 +106,8 @@
 	<div class="app-frame">
 		<header class="topbar"><div><p class="eyebrow">{pageMeta.find((page) => page.id === activePage)?.number} · {pageMeta.find((page) => page.id === activePage)?.title}</p><h1>{pageMeta.find((page) => page.id === activePage)?.detail}</h1></div><div class="topbar-actions"><span class:online={serviceReady()} class="system-pill"><i></i>{loading ? 'Connecting…' : serviceReady() ? 'Orchestrator ready' : 'Orchestrator unavailable'}</span><button class="quiet-button" on:click={() => void coordinator?.trigger('manual', true)} disabled={loading}>{loading ? 'Refreshing…' : 'Refresh'}</button></div></header>
 		<main class="workspace">
-			{#if failure}<div class="banner error" role="alert"><strong>Action needed</strong><span>{failure}</span><button aria-label="Dismiss" on:click={() => failure = ''}>×</button></div>{/if}
-			{#if notice}<div class="banner notice" role="status"><strong>Updated</strong><span>{notice}</span><button aria-label="Dismiss" on:click={() => notice = ''}>×</button></div>{/if}
+			{#if failure}<TransientBanner message={failure} title="Action needed" tone="error" ondismiss={() => failure = ''} />{/if}
+			{#if notice}<TransientBanner message={notice} title="Updated" tone="notice" ondismiss={() => notice = ''} />{/if}
 			{#if activePage === 'models'}<ModelRunsView oncompare={compared} onfailure={(message) => failure = message} />
 			{:else if activePage === 'comparison'}<ModelComparisonView artifactIds={comparisonIds} onback={() => navigate('models')} onfailure={(message) => failure = message} />
 			{:else if activePage === 'datasets'}<TrainingSetCatalogView onuse={() => { changed('Frozen revision is registered and ready in Queue.'); navigate('queue'); }} onchanged={changed} onfailure={(message) => failure = message} />
