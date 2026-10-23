@@ -410,6 +410,12 @@ def v2_validation_errors(config: dict[str, Any]) -> list[dict[str, str]]:
                     "code": "invalid_variant_for_family",
                     "message": f"{variant!r} is not a variant of encoder family {family!r}.",
                 })
+    if "posthoc" in config:
+        from oracle_builder.posthoc.pipelines import normalize_posthoc_settings
+        try:
+            normalize_posthoc_settings(config["posthoc"])
+        except (TypeError, ValueError) as exc:
+            errors.append({"path": "posthoc", "code": "invalid_posthoc", "message": str(exc)})
     return errors
 
 
@@ -669,16 +675,15 @@ def validate_config(config: dict[str, Any]) -> None:
     architecture = config.get("architecture", {})
     if architecture and (not isinstance(architecture, dict) or int(architecture.get("version", 1)) not in {1, 2}):
         raise ValueError("architecture.version must be 1 or 2")
-    posthoc = config.get("posthoc", {})
+    from oracle_builder.posthoc.pipelines import normalize_posthoc_settings
+    posthoc = normalize_posthoc_settings(config.get("posthoc", {}))
+    if "posthoc" in config:
+        config["posthoc"] = posthoc
     if posthoc.get("enabled", False):
         if task != "classification" or int(architecture.get("version", 1)) < 2:
             raise ValueError("posthoc.enabled requires a V2 classification model")
         if config.get("classification", {}).get("stratification", {}).get("enabled", False):
             raise ValueError("posthoc.enabled is not yet supported for stratified classification runs")
-        if posthoc.get("representation", "fused_embedding") != "fused_embedding":
-            raise ValueError("posthoc.representation must be fused_embedding")
-        if posthoc.get("estimator", "logistic_regression") != "logistic_regression":
-            raise ValueError("posthoc.estimator must be logistic_regression")
     if isinstance(architecture, dict) and int(architecture.get("version", 1)) >= 2:
         pooling = config.get("pooling", {})
         if not isinstance(pooling, dict) or str(pooling.get("type", "avg")).lower() not in {"avg", "max", "avg_max", "gem"}:

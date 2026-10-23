@@ -5,7 +5,9 @@ from collections import defaultdict, deque
 from hashlib import sha256
 import errno
 import hmac
+import os
 import re
+import socket
 import sqlite3
 from typing import Any, Mapping
 import uuid
@@ -212,6 +214,7 @@ class PosthocRunRequest(BaseModel):
     test_split: float = Field(default=0.1, gt=0, lt=1)
     split_strategy: str = "auto"
     resources: dict[str, Any] = Field(default_factory=dict)
+    posthoc: dict[str, Any] | None = None
 
 
 class QueueStartRequest(BaseModel):
@@ -534,6 +537,7 @@ def create_app(
         return {
             "status": "ready" if active else "degraded",
             "database": "ready",
+            "computer_name": os.getenv("ORACLE_BUILDER_COMPUTER_NAME", "").strip() or socket.gethostname(),
             "worker_pools": {"configured": len(pools), "workers": len(workers), "active": active},
             "startup_reconciliation": getattr(app.state, "startup_reconciliation", None),
         }
@@ -1432,6 +1436,12 @@ def create_app(
     @app.get("/v1/datasets/{dataset_id}/detail")
     def dataset_detail(dataset_id: str) -> dict[str, Any]:
         try: return orchestrator.dataset_detail(dataset_id)
+        except KeyError as exc: raise HTTPException(status_code=404, detail="Dataset was not found") from exc
+        except (OSError, ValueError) as exc: raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.get("/v1/datasets/{dataset_id}/scalar-fields")
+    def dataset_scalar_fields(dataset_id: str) -> dict[str, Any]:
+        try: return orchestrator.dataset_scalar_fields(dataset_id)
         except KeyError as exc: raise HTTPException(status_code=404, detail="Dataset was not found") from exc
         except (OSError, ValueError) as exc: raise HTTPException(status_code=422, detail=str(exc)) from exc
 

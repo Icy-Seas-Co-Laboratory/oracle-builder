@@ -183,6 +183,48 @@ def test_posthoc_fit_can_be_created_and_started_for_frozen_dataset(tmp_path):
     assert orchestrator.job(created["posthoc_run_id"])["status"] == "queued"
 
 
+def test_posthoc_settings_are_persisted_and_scalar_fields_are_discovered(tmp_path):
+    import json, sqlite3
+    from oracle_builder.data.sqlite_dataset import create_synthetic_classification
+    from oracle_builder.datasets.schema import set_dataset_lifecycle
+    workspace = tmp_path / "workspace"; workspace.mkdir()
+    source_config = workspace / "source.toml"; source_config.write_text("[run]\ntask = 'classification'\n")
+    product = workspace / "source-model"
+    manifest = _create_sealed_product(product, source_config, metrics={"accuracy": 0.8})
+    dataset_path = workspace / "frozen.sqlite"; create_synthetic_classification(dataset_path, n=6, shape=(4, 8, 1), classes=2)
+    with sqlite3.connect(dataset_path) as db:
+        db.execute("UPDATE dataset_items SET metadata_json=? WHERE rowid=1", (json.dumps({"depth": 3.5, "flag": True, "label": "x", "nested": {"score": 2}, "invalid": float("nan"), "infinite": float("inf"), "dotted.key": 4}),))
+        db.commit()
+        set_dataset_lifecycle(db, "frozen")
+    orchestrator = Orchestrator(tmp_path / "orchestrator.sqlite", workspace_root=workspace, artifact_root=tmp_path / "artifacts")
+    orchestrator.scan(product); dataset = orchestrator.ingest_dataset(dataset_path)
+    fields = orchestrator.dataset_scalar_fields(dataset["dataset_id"])
+    sources = {field["source"] for field in fields["fields"]}
+    assert {"metadata.depth", "metadata.nested.score", "roi.original_width_px", "roi.original_height_px", "roi.bounding_box_area_px", "roi.aspect_ratio"} <= sources
+    assert "metadata.flag" not in sources and "metadata.label" not in sources
+    assert not {"metadata.invalid", "metadata.infinite", "metadata.dotted.key"} & sources
+    assert fields["item_count"] == 6
+    assert next(field["count"] for field in fields["fields"] if field["source"] == "metadata.depth") == 1
+    from fastapi.testclient import TestClient
+    from oracle_builder.orchestration.api import create_app
+    with TestClient(create_app(orchestrator)) as client:
+        assert client.get(f"/v1/datasets/{dataset['dataset_id']}/scalar-fields").status_code == 200
+        assert client.get("/v1/datasets/missing/scalar-fields").status_code == 404
+    pool = orchestrator.create_worker_pool(name="Training", allowed_actions=["train"])
+    run = orchestrator.create_posthoc_run(name="svm", model_artifact_id=manifest["artifact_id"], dataset_id=dataset["dataset_id"], worker_pool_id=pool["pool_id"], posthoc={"estimator": "linear_svm", "seed": 7, "pca_enabled": True, "pca_components": 3})
+    assert run["parameters"]["posthoc"]["estimator"] == "linear_svm"
+    assert run["parameters"]["posthoc"]["seed"] == 7
+    assert run["parameters"]["posthoc"]["pca_components"] == 3
+    assert run["work_unit"]["parameters"]["posthoc_fit"]["posthoc"]["seed"] == 7
+    with TestClient(create_app(orchestrator)) as client:
+        invalid = client.post("/v1/posthoc-runs", json={
+            "name": "invalid", "model_artifact_id": manifest["artifact_id"],
+            "dataset_id": dataset["dataset_id"], "worker_pool_id": pool["pool_id"],
+            "posthoc": {"estimator": []},
+        })
+        assert invalid.status_code == 422
+
+
 def test_dispatch_and_reconcile_keeps_orchestrator_job_identity(tmp_path, monkeypatch):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -1214,6 +1256,7 @@ def test_startup_reconciles_project_runs_and_frozen_datasets(tmp_path):
 
     with TestClient(create_app(orchestrator)) as client:
         ready = client.get("/health/ready").json()
+        assert ready["computer_name"]
         reconciliation = ready["startup_reconciliation"]
         assert artifact["artifact_id"] in reconciliation["artifacts"]["indexed"]
         assert len(reconciliation["datasets"]["registered"]) == 1

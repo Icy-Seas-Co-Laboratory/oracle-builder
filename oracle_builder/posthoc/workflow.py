@@ -9,6 +9,8 @@ import sqlite3
 import uuid
 from typing import Any, Callable, Mapping
 
+import numpy as np
+
 from oracle_builder.artifacts import (
     attach_split_manifest,
     create_run_artifact,
@@ -22,8 +24,56 @@ from oracle_builder.artifacts import (
 from oracle_builder.datasets.schema import dataset_fingerprint, read_dataset_info
 from oracle_builder.environment import write_environment
 from oracle_builder.posthoc.training import train_posthoc_classifier
+from oracle_builder.posthoc.shared_cache import reusable_representation_cache
+from oracle_builder.posthoc.cache import open_embedding_cache
+from oracle_builder.data.sqlite_stream import SQLiteClassificationSource, build_classification_index
+from oracle_builder.classification.features import predict_classification_outputs
+from oracle_builder.evaluation.classification import ClassificationMetricAccumulator, classification_epoch_metric_records, write_classification_evaluation
 from oracle_builder.saving.load_test import load_model_for_run, run_load_tests
 from oracle_builder.saving.save_model import write_load_test_report
+
+
+def _label_signature(labels: list[Mapping[str, Any]]) -> list[tuple[int, str]]:
+    return [(int(row["class_index"]), str(row["name"])) for row in labels]
+
+
+def _neural_baseline(model: Any, dataset: Path, config: dict[str, Any], source_config: Mapping[str, Any],
+                     posthoc_root: Path, labels: list[Mapping[str, Any]], fingerprint: str) -> dict[str, Any]:
+    """Evaluate the original neural output on exactly the post-hoc test items."""
+    neural_labels = source_config.get("neural_labels", source_config.get("dataset", {}).get("labels", []))
+    if _label_signature(list(neural_labels)) != _label_signature(labels):
+        return {"status": "incompatible", "reason": "source neural label vocabulary differs from target dataset"}
+    index = build_classification_index(dataset, config, "test", labeled_only=True)
+    cache = open_embedding_cache(posthoc_root.parent.parent / "intermediates" / "representations" / "test" / "fused_embedding")
+    records = list(cache.iter_records())
+    targets = np.asarray([row["label"] for row in records], dtype="int64")
+    source = SQLiteClassificationSource(dataset, config)
+    probabilities = []
+    for images in source.image_dataset(index, batch_size=int(config.get("data", {}).get("batch_size", 16))).as_numpy_iterator():
+        probabilities.append(np.asarray(predict_classification_outputs(model, images)["probabilities"], dtype="float64"))
+    values = np.concatenate(probabilities)
+    if values.shape != (len(targets), len(labels)):
+        return {"status": "incompatible", "reason": "source neural output dimension differs from target vocabulary"}
+    predicted = np.argmax(values, axis=1)
+    names = {int(row["class_index"]): str(row["name"]) for row in labels}
+    metrics = {row["metric"]: row["value"] for row in classification_epoch_metric_records(targets, values, class_names=names)
+               if "label" not in row and "bin_index" not in row and row.get("value") is not None and np.isfinite(row["value"])}
+    accumulator = ClassificationMetricAccumulator(values.shape[1]); accumulator.update(targets, values)
+    sample_rows = [{**record, "y_true": int(target), "y_pred": int(pred), "confidence": float(row[int(pred)])}
+                   for record, target, pred, row in zip(records, targets, predicted, values, strict=True)]
+    evidence = posthoc_root / "neural_baseline"
+    write_classification_evaluation(targets, predicted, sample_rows, evidence, class_names=names,
+                                    probability_metrics=accumulator.result(), probabilities=values,
+                                    calibration_rows=accumulator.calibration_rows(),
+                                    evaluation_context={"split": "test", "head": "source_neural_baseline"})
+    signature = {"dataset_fingerprint_sha256": fingerprint,
+                 "samples": [{"id": row.get("sample_id", row.get("item_id", row.get("source_key", str(i)))), "label": int(label)}
+                             for i, (row, label) in enumerate(zip(records, targets, strict=True))],
+                 "classes": {str(key): value for key, value in names.items()}}
+    import hashlib
+    return {"status": "complete", "metrics": metrics,
+            "evaluation_signature": hashlib.sha256(json.dumps(signature, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
+            "path": "model/posthoc/neural_baseline/evaluation"}
 
 
 def fit_existing_model_posthoc(
@@ -35,6 +85,8 @@ def fit_existing_model_posthoc(
     validation_split: float = 0.2,
     test_split: float = 0.1,
     split_strategy: str = "auto",
+    posthoc_settings: Mapping[str, Any] | None = None,
+    embedding_cache_root: str | Path | None = None,
     progress: Callable[[str, str, Mapping[str, Any] | None], None] | None = None,
 ) -> dict[str, Any]:
     """Produce a separate sealed model product; never alter the source model."""
@@ -82,8 +134,11 @@ def fit_existing_model_posthoc(
     product_config.pop("_split_manifest", None)
     product_config.setdefault("run", {})["run_id"] = run_id
     product_config["run"]["run_name"] = name or f"{source_manifest.get('name', source.name)} + post-hoc"
+    from oracle_builder.posthoc.pipelines import normalize_posthoc_settings
+    selected_posthoc = normalize_posthoc_settings(posthoc_settings or {})
     product_config["posthoc"] = {
-        "enabled": True, "representation": "fused_embedding", "estimator": "logistic_regression",
+        **selected_posthoc,
+        "enabled": True, "representation": "fused_embedding",
         "training_dataset_id": info["dataset_id"],
         "training_dataset_fingerprint_sha256": fingerprint,
     }
@@ -117,6 +172,7 @@ def fit_existing_model_posthoc(
     fit_config["data"]["validation_split"] = validation_split
     fit_config["data"]["test_split"] = test_split
     fit_config["data"]["split_strategy"] = split_strategy
+    fit_config.setdefault("run", {})["seed"] = selected_posthoc["seed"]
     product_config["neural_labels"] = source_config.get("dataset", {}).get("labels", [])
     product_config["dataset"] = fit_config["dataset"]
 
@@ -185,7 +241,20 @@ def fit_existing_model_posthoc(
         attach_split_manifest(fit_config, split)
         report("posthoc_embedding", "Exporting model embeddings and tuning the classifier", {})
         model = load_model_for_run(source, source_config)
-        result = train_posthoc_classifier(model, dataset, fit_config, output, progress=report)
+        cache_identity = {
+            "source_model_artifact_id": source_manifest["artifact_id"],
+            "source_model_fingerprint_sha256": source_manifest["fingerprint_sha256"],
+            "dataset_fingerprint_sha256": fingerprint,
+            # Assignments, rather than this derived product's random run id,
+            # make reuse valid only for precisely the same three split sets.
+            "split_assignments": split["assignments"],
+            "representation": selected_posthoc["representation"],
+        }
+        with reusable_representation_cache(output, embedding_cache_root, cache_identity):
+            result = train_posthoc_classifier(model, dataset, fit_config, output, progress=report)
+        result["neural_baseline"] = _neural_baseline(
+            model, dataset, fit_config, source_config, output / "model" / "posthoc", labels, fingerprint,
+        )
         result["training_dataset"] = {"dataset_id": info["dataset_id"], "fingerprint_sha256": fingerprint, "labels": labels}
         result["source_model_artifact_id"] = source_manifest["artifact_id"]
         (output / "model" / "posthoc" / "report.json").write_text(

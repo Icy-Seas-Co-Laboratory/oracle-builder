@@ -7,6 +7,7 @@ import hmac
 import hashlib
 import io
 import json
+import math
 import os
 import re
 import secrets
@@ -2594,6 +2595,7 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
         worker_pool_id: str, validation_split: float = 0.2,
         test_split: float = 0.1, split_strategy: str = "auto",
         resources: dict[str, Any] | None = None,
+        posthoc: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Seal a model-plus-dataset request without starting neural training."""
         if not isinstance(name, str) or not (name := name.strip()) or len(name) > 240:
@@ -2615,6 +2617,8 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
             raise ValueError("Post-hoc fitting requires a frozen classification dataset")
         if not pool["enabled"] or "train" not in set(pool["allowed_actions"]):
             raise ValueError("Worker pool is not enabled for train work")
+        from oracle_builder.posthoc.pipelines import normalize_posthoc_settings
+        normalized_posthoc = normalize_posthoc_settings(posthoc)
         model_ref = self._model_artifact_ref_for_inference(artifact)
         from oracle_builder.orchestration.storage import artifact_ref_for_file
         input_ref = artifact_ref_for_file("dataset", dataset_id, dataset["path"], revision=str(dataset.get("revision_id") or "frozen"))
@@ -2623,6 +2627,7 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
         parameters = {
             "name": name, "validation_split": validation_split,
             "test_split": test_split, "split_strategy": split_strategy,
+            "posthoc": normalized_posthoc,
         }
         run_id, attempt_id, now = str(uuid.uuid4()), str(uuid.uuid4()), _now()
         unit = build_work_unit(
@@ -5423,6 +5428,68 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
                     item["candidate_mask_url"] = f"/api/v1/datasets/{dataset_id}/previews/{item['item_id']}?kind=candidate_mask"
                 items.append(item)
         return {"dataset_id": dataset_id, "offset": offset, "limit": limit, "total": total, "items": items}
+
+    def dataset_scalar_fields(self, dataset_id: str) -> dict[str, Any]:
+        """Discover scalar choices without loading the dataset into memory."""
+        dataset = self.dataset(dataset_id)
+        if dataset is None:
+            raise KeyError(dataset_id)
+        if dataset.get("dataset_type") != "classification":
+            raise ValueError("Scalar fields require a classification dataset")
+        builtins = {
+            "roi.original_width_px": "ROI original width (px)",
+            "roi.original_height_px": "ROI original height (px)",
+            "roi.bounding_box_area_px": "ROI bounding-box area (px²)",
+            "roi.aspect_ratio": "ROI aspect ratio",
+        }
+        counts: dict[str, int] = {source: 0 for source in builtins}
+        item_count = 0
+
+        def add(source: str, value: Any) -> None:
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                return
+            try:
+                finite = math.isfinite(value)
+            except OverflowError:
+                finite = False
+            if finite:
+                counts[source] = counts.get(source, 0) + 1
+
+        def walk(value: Any, path: str = "") -> None:
+            if isinstance(value, dict):
+                for key, child in value.items():
+                    # Dots are path separators in the scalar extraction contract.
+                    if key and "." not in key:
+                        walk(child, f"{path}.{key}" if path else key)
+            elif path:
+                add("metadata." + path, value)
+
+        with sqlite3.connect(dataset["path"]) as db:
+            rows = db.execute("""SELECT di.metadata_json, a.shape_json FROM dataset_items di
+                LEFT JOIN classification_items ci ON ci.item_id=di.item_id
+                LEFT JOIN assets a ON a.asset_id=ci.image_asset_id""")
+            for metadata_json, shape_json in rows:
+                item_count += 1
+                try:
+                    metadata = json.loads(metadata_json or "{}")
+                except (TypeError, json.JSONDecodeError):
+                    metadata = {}
+                try:
+                    shape = json.loads(shape_json) if shape_json else None
+                    if isinstance(shape, list) and len(shape) >= 2:
+                        h, w = int(shape[0]), int(shape[1])
+                        if h > 0 and w > 0:
+                            add("roi.original_width_px", w)
+                            add("roi.original_height_px", h)
+                            add("roi.bounding_box_area_px", h * w)
+                            add("roi.aspect_ratio", w / h)
+                except (TypeError, ValueError, OverflowError):
+                    pass
+                walk(metadata)
+        fields = [{"source": source, "label": builtins.get(source, source.removeprefix("metadata.")), "count": count,
+                   "kind": "roi" if source.startswith("roi.") else "metadata"}
+                  for source, count in sorted(counts.items())]
+        return {"dataset_id": dataset_id, "item_count": item_count, "fields": fields}
 
     @staticmethod
     def _sqlite_preview_image(path: Path, item_id: str, *, kind: str = "image", max_size: int = 320) -> bytes:

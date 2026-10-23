@@ -230,3 +230,39 @@ def test_checked_in_classification_defaults_match_the_generator():
         capture_output=True,
     )
     assert "Verified 36" in result.stdout
+
+
+def test_posthoc_catalog_exposes_models_and_dimensionality_controls():
+    fields = {field['path']: field for field in configuration_schema()['fields']}
+    assert fields['posthoc.estimator']['choices'] == [
+        'logistic_regression', 'linear_svm', 'gradient_boosting', 'shallow_mlp',
+    ]
+    assert fields['posthoc.scaling']['choices'] == ['standard', 'robust', 'none']
+    assert fields['posthoc.pca_components']['minimum'] == 1
+    assert fields['posthoc.pca_components']['visible_when'] == {'posthoc.pca_enabled': True}
+    assert fields['posthoc.calibration_folds']['minimum'] == 2
+
+
+@pytest.mark.parametrize('settings', [
+    {'estimator': 'unknown'}, {'pca_enabled': True, 'pca_components': 0},
+    {'estimator': 'linear_svm', 'classifier_options': {'kernel': 'rbf'}},
+    {'estimator': 'shallow_mlp', 'classifier_options': {'hidden_layer_sizes': [32, 16, 8]}},
+])
+def test_v2_authoring_rejects_invalid_posthoc_settings(settings):
+    config = v2_defaults()
+    config['posthoc'] = settings
+    assert any(error['path'] == 'posthoc' for error in v2_validation_errors(config))
+
+
+@pytest.mark.parametrize('estimator', ['logistic_regression', 'linear_svm', 'gradient_boosting', 'shallow_mlp'])
+def test_v2_authoring_accepts_posthoc_models(estimator):
+    config = v2_defaults()
+    config['posthoc'] = {'enabled': True, 'estimator': estimator, 'pca_enabled': True, 'pca_components': 8}
+    assert not any(error['path'] == 'posthoc' for error in v2_validation_errors(config))
+
+
+@pytest.mark.parametrize('settings', [False, [], 'invalid', {'estimator': []}, {'scaling': {}}, {'estimator': 'shallow_mlp', 'classifier_options': {'early_stopping': 'false'}}])
+def test_posthoc_invalid_json_types_return_authoring_errors(settings):
+    config = v2_defaults()
+    config['posthoc'] = settings
+    assert any(error['path'] == 'posthoc' for error in v2_validation_errors(config))

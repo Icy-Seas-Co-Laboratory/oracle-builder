@@ -244,6 +244,22 @@ def build_parser() -> argparse.ArgumentParser:
         if name == "start":
             command.add_argument("--wait", action="store_true")
             command.add_argument("--poll-seconds", type=float, default=2.0)
+    posthoc = commands.add_parser("posthoc", help="Fit and inspect post-hoc classifier heads.")
+    phs = posthoc.add_subparsers(dest="command", required=True)
+    phs.add_parser("list")
+    submit = phs.add_parser("submit")
+    submit.add_argument("--name", required=True)
+    submit.add_argument("--model", required=True, dest="model_artifact_id")
+    submit.add_argument("--dataset", required=True, dest="dataset_id")
+    submit.add_argument("--worker-pool", required=True, dest="worker_pool_id")
+    submit.add_argument("--validation-split", type=float, default=0.2)
+    submit.add_argument("--test-split", type=float, default=0.1)
+    submit.add_argument("--split-strategy", default="auto")
+    submit.add_argument("--settings", default="{}", help="JSON post-hoc settings object.")
+    submit.add_argument("--resources", default="{}")
+    for name in ("show", "start", "cancel"):
+        command = phs.add_parser(name)
+        command.add_argument("posthoc_run_id")
     return parser
 
 
@@ -351,6 +367,23 @@ def _request_for(args: argparse.Namespace, client: OrchestratorClient) -> Any:
         if command == "start":
             started = client.request("POST", f"/v1/inference-runs/{quote(args.inference_run_id)}:start")
             return _wait_for_inference(client, args.inference_run_id, args.poll_seconds) if args.wait else started
+    if area == "posthoc":
+        if command == "list": return client.request("GET", "/v1/posthoc-runs")
+        if command == "show": return client.request("GET", f"/v1/posthoc-runs/{quote(args.posthoc_run_id)}")
+        if command == "start": return client.request("POST", f"/v1/posthoc-runs/{quote(args.posthoc_run_id)}:start")
+        if command == "cancel": return client.request("POST", f"/v1/posthoc-runs/{quote(args.posthoc_run_id)}:cancel")
+        try:
+            settings, resources = json.loads(args.settings), json.loads(args.resources)
+        except json.JSONDecodeError as exc:
+            raise ValueError("--settings and --resources must be JSON objects") from exc
+        if not isinstance(settings, dict) or not isinstance(resources, dict):
+            raise ValueError("--settings and --resources must be JSON objects")
+        return client.request("POST", "/v1/posthoc-runs", body={
+            "name": args.name, "model_artifact_id": args.model_artifact_id,
+            "dataset_id": args.dataset_id, "worker_pool_id": args.worker_pool_id,
+            "validation_split": args.validation_split, "test_split": args.test_split,
+            "split_strategy": args.split_strategy, "posthoc": settings, "resources": resources,
+        })
     raise AssertionError(f"Unsupported command: {area} {command}")
 
 

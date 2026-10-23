@@ -325,3 +325,71 @@ adds prediction sets/results. It never changes the source database.
   source of truth for evaluation.
 - Use [model products](model-products.md) to ingest an externally trained
   classifier instead of retraining it.
+
+## Compare post-hoc classifiers
+
+Post-hoc heads can be submitted against a sealed classification model and a
+frozen dataset. The request accepts `posthoc` settings with `estimator`
+(`logistic_regression`, `linear_svm`, `gradient_boosting`, or `shallow_mlp`),
+optional PCA (`pca_enabled` and `pca_components`), `scaling`, `classifier_options`,
+`tune`, `seed`, and `calibration_folds`. Omitted settings preserve the logistic
+regression defaults. All heads expose an ordered class-probability vector and
+selected-label confidence. Linear SVM probabilities use cross-validated
+sigmoid calibration; tree and MLP heads use their fitted probability
+estimators. Compare heads only when they use the same frozen examples, split
+assignments, and label vocabulary.
+
+In the model inspector, **Fit post-hoc head** exposes the estimator, scaling,
+PCA output dimensions, and estimator-specific controls. **Compare all four
+classifiers** queues four fits with shared split settings and seeds. It uses
+estimator defaults with bounded tuning; configure a single fit to pin specific
+hyperparameters. Explicitly supplied values remain fixed during tuning.
+The comparison view checks the exact test-population signature, frozen dataset
+fingerprint, and vocabulary before identifying results as directly comparable.
+
+For example, a reusable model definition can request:
+
+```toml
+[posthoc]
+enabled = true
+estimator = "shallow_mlp"
+scaling = "standard"
+pca_enabled = true
+pca_components = 32
+tune = true
+seed = 42
+
+[posthoc.classifier_options]
+hidden_layer_sizes = [128, 64]
+activation = "relu"
+max_iter = 300
+early_stopping = true
+```
+
+Scaling and PCA fit on training data only. Linear SVM wraps the complete
+preprocessing pipeline in sigmoid calibration folds within training data;
+PCA dimensions must also fit the smallest training fold. MLP early stopping
+uses a reserved portion of training data. Validation selects hyperparameters;
+held-out test data never fits preprocessing, calibration, or the classifier.
+Probability confidence is the probability of the selected class, with log loss,
+Brier score, and reliability evidence available to assess confidence quality.
+
+Existing-model fits also evaluate the neural baseline on the same test examples
+when the source and target class vocabularies match. Historical neural scores
+remain recorded separately. Workers reuse raw embeddings locally for the same
+sealed model, dataset fingerprint, and exact split assignments; each fitted
+classifier and its preprocessing are saved independently. A cold cache is
+populated under a lock, and later fits can reuse it concurrently.
+
+Scalar sources are selected from ROI measurements and discovered finite numeric
+metadata fields. Transform choices include domain restrictions in their labels;
+saved fields unavailable in the connected datasets remain visible for review.
+
+The CLI supports the same settings as a JSON object:
+
+```sh
+oracle posthoc submit --name "Linear SVM + PCA" --model MODEL_ID \
+  --dataset DATASET_ID --worker-pool POOL_ID \
+  --settings '{"estimator":"linear_svm","pca_enabled":true,"pca_components":32}'
+oracle posthoc start RUN_ID
+```

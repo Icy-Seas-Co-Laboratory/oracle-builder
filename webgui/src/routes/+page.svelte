@@ -16,6 +16,7 @@
 	let artifacts: RecordValue[] = [];
 	let jobs: RecordValue[] = [];
 	let systemHealth: RecordValue | null = null;
+	let computerName = '';
 	let activePage: Page = 'models';
 	let comparisonIds: string[] = [];
 	let loading = true;
@@ -52,6 +53,7 @@
 				api.datasets({ signal }), api.artifacts({ signal }), api.jobs(true, { signal }), api.health({ signal })
 			]);
 			datasets = datasetResult.datasets; artifacts = artifactResult.artifacts; jobs = jobResult.jobs; systemHealth = healthResult;
+			computerName = typeof healthResult.computer_name === 'string' ? healthResult.computer_name : '';
 		publishOperationalRefresh(reason);
 		} catch (error) {
 			if (!(error instanceof DOMException && error.name === 'AbortError')) failure = error instanceof Error ? error.message : 'Could not reach the Oracle Builder control plane.';
@@ -104,7 +106,7 @@
 		<div class="sidebar-bottom"><div class="side-foot"><span class:offline={!serviceReady()} class="pulse"></span>{loading ? 'Updating workspace…' : serviceReady() ? 'Control plane connected' : 'Control plane unavailable'}<button class="server-logs-button" on:click={openServerLogs}>Service logs</button></div></div>
 	</aside>
 	<div class="app-frame">
-		<header class="topbar"><div><p class="eyebrow">{pageMeta.find((page) => page.id === activePage)?.number} · {pageMeta.find((page) => page.id === activePage)?.title}</p><h1>{pageMeta.find((page) => page.id === activePage)?.detail}</h1></div><div class="topbar-actions"><span class:online={serviceReady()} class="system-pill"><i></i>{loading ? 'Connecting…' : serviceReady() ? 'Orchestrator ready' : 'Orchestrator unavailable'}</span><button class="quiet-button" on:click={() => void coordinator?.trigger('manual', true)} disabled={loading}>{loading ? 'Refreshing…' : 'Refresh'}</button></div></header>
+		<header class="topbar"><div><p class="eyebrow">{pageMeta.find((page) => page.id === activePage)?.number} · {pageMeta.find((page) => page.id === activePage)?.title}</p><h1>{pageMeta.find((page) => page.id === activePage)?.detail}</h1></div><div class="topbar-actions"><span class="computer-pill" title={`Computer: ${computerName || 'Unavailable'}`}><span>Computer</span><strong>{computerName || 'Unavailable'}</strong></span><span class:online={serviceReady()} class="system-pill"><i></i>{loading ? 'Connecting…' : serviceReady() ? 'Orchestrator ready' : 'Orchestrator unavailable'}</span><button class="quiet-button" on:click={() => void coordinator?.trigger('manual', true)} disabled={loading}>{loading ? 'Refreshing…' : 'Refresh'}</button></div></header>
 		<main class="workspace">
 			{#if failure}<TransientBanner message={failure} title="Action needed" tone="error" ondismiss={() => failure = ''} />{/if}
 			{#if notice}<TransientBanner message={notice} title="Updated" tone="notice" ondismiss={() => notice = ''} />{/if}

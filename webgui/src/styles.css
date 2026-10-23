@@ -110,6 +110,8 @@ code, pre, .code { font-family: 'SFMono-Regular', Consolas, ui-monospace, monosp
 .topbar { min-height: 112px; display: flex; align-items: center; justify-content: space-between; gap: 1rem; padding: 1.65rem clamp(1.2rem, 3.5vw, 3.5rem); background: rgba(255,255,255,.88); border-bottom: 1px solid var(--line); backdrop-filter: blur(12px); }
 .topbar .eyebrow { margin-bottom: .35rem; }
 .topbar-actions { display: flex; align-items: center; gap: .65rem; }
+.computer-pill { display: inline-flex; align-items: center; gap: .35rem; padding: .43rem .62rem; border: 1px solid var(--line); border-radius: 99px; color: var(--muted); background: var(--surface); font-size: .72rem; white-space: nowrap; }
+.computer-pill strong { max-width: 12rem; overflow: hidden; color: var(--ink); text-overflow: ellipsis; }
 .system-pill { display: inline-flex; align-items: center; gap: .42rem; padding: .45rem .65rem; border-radius: 99px; color: #8b464a; background: #f9e8e8; font-size: .72rem; font-weight: 700; }
 .system-pill i { width: .45rem; height: .45rem; border-radius: 50%; background: #c85b62; }
 .system-pill.online { color: #17675d; background: #e4f3ef; }

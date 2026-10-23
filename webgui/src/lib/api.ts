@@ -47,6 +47,7 @@ export const api = {
 	modelSetup: (architecture: string) => request<RecordValue>(`/v1/model-setups/${encodeURIComponent(architecture)}`),
 	modelPreview: (body: RecordValue) => request<RecordValue>('/v1/model-previews', { method: 'POST', body: JSON.stringify(body) }),
 	datasetDetail: (id: string) => request<RecordValue>(`/v1/datasets/${id}/detail`),
+	datasetScalarFields: (id: string) => request<{ fields: RecordValue[]; item_count: number }>(`/v1/datasets/${encodeURIComponent(id)}/scalar-fields`),
 	datasetPreviews: (id: string, options: { offset?: number; limit?: number; split?: string; label?: string } = {}) => {
 		const search = new URLSearchParams();
 		for (const [key, value] of Object.entries(options)) if (value !== undefined && value !== '') search.set(key, String(value));

@@ -16,7 +16,7 @@ from oracle_builder.saving.save_model import save_model_artifacts, write_load_te
 from oracle_builder.training.train import build_and_compile_model
 
 
-def test_existing_model_can_fit_separate_posthoc_head_on_new_classes(tmp_path):
+def test_existing_model_can_fit_separate_posthoc_head_on_new_classes(tmp_path, monkeypatch):
     source = tmp_path / "source"
     config_file = tmp_path / "source.toml"
     config_file.write_text("[run]\ntask = 'classification'\nmodel = 'simple_cnn'\n")
@@ -28,7 +28,7 @@ def test_existing_model_can_fit_separate_posthoc_head_on_new_classes(tmp_path):
         "training": {"optimizer": "adam", "learning_rate": 0.001,
                      "loss": "sparse_categorical_crossentropy", "metrics": ["accuracy"]},
         "output": {"export_savedmodel": False},
-        "dataset": {"labels": [{"class_index": 0, "name": "old-a"}, {"class_index": 1, "name": "old-b"}]},
+        "dataset": {"labels": [{"class_index": 0, "name": "0"}, {"class_index": 1, "name": "1"}]},
     }
     source_manifest = create_run_artifact(source, run_id=config["run"]["run_id"], name="source",
                                           config=config, source_config=config_file, artifact_type="model_product")
@@ -68,6 +68,8 @@ def test_existing_model_can_fit_separate_posthoc_head_on_new_classes(tmp_path):
     report = json.loads((product / "model" / "posthoc" / "report.json").read_text())
     assert report["training_dataset"]["dataset_id"] == dataset_id
     assert len(report["class_names"]) == 3
+    assert report["neural_baseline"]["status"] == "incompatible"
+    assert "vocabulary" in report["neural_baseline"]["reason"]
     assert (product / "model" / "posthoc" / "estimator.joblib").is_file()
     assert (product / "model" / "weights.weights.h5").read_bytes() == (source / "model" / "weights.weights.h5").read_bytes()
     assert (product / "metrics" / "history.csv").read_text() == "epoch,loss,val_loss\n1,0.7,0.8\n"
@@ -109,6 +111,28 @@ def test_existing_model_can_fit_separate_posthoc_head_on_new_classes(tmp_path):
     assert orchestrator.artifact_detail(result["artifact_id"])["facts"]["facts"]["loss"] is None
     assert next(row for row in orchestrator.artifact_catalog_query()["artifacts"]
                 if row["artifact_id"] == result["artifact_id"])["loss"] is None
+
+    compatible_dataset = tmp_path / "compatible.sqlite"
+    create_synthetic_classification(compatible_dataset, n=30, shape=(12, 12, 1), classes=2)
+    with sqlite3.connect(compatible_dataset) as connection:
+        set_dataset_lifecycle(connection, "frozen")
+    compatible_product = tmp_path / "compatible-fit"
+    shared_embeddings = tmp_path / "shared-embeddings"
+    fit_existing_model_posthoc(source, compatible_dataset, compatible_product, split_strategy="class_stratified",
+                               embedding_cache_root=shared_embeddings)
+    compatible_report = json.loads((compatible_product / "model" / "posthoc" / "report.json").read_text())
+    assert compatible_report["neural_baseline"]["status"] == "complete"
+    assert compatible_report["neural_baseline"]["evaluation_signature"] == compatible_report["evaluation_signature"]
+    assert (compatible_product / "model" / "posthoc" / "neural_baseline" / "evaluation" / "evaluation_summary.json").is_file()
+    # Same source, frozen dataset, and exact deterministic assignments can
+    # reuse only raw representations even when the estimator changes.
+    monkeypatch.setattr("oracle_builder.posthoc.training.write_representation_artifacts",
+                        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("embeddings were recomputed")))
+    cached_product = tmp_path / "cached-fit"
+    fit_existing_model_posthoc(source, compatible_dataset, cached_product, split_strategy="class_stratified",
+                               posthoc_settings={"estimator": "gradient_boosting"}, embedding_cache_root=shared_embeddings)
+    assert json.loads((cached_product / "model" / "posthoc" / "report.json").read_text())["estimator"] == "gradient_boosting"
+    monkeypatch.undo()
 
     second_product = tmp_path / "second-fit"
     second = fit_existing_model_posthoc(product, dataset, second_product, split_strategy="class_stratified")

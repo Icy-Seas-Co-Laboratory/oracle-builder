@@ -29,7 +29,11 @@ def posthoc_output(estimator: Any, embedding: np.ndarray, num_classes: int | Non
     values = np.asarray(embedding, dtype="float32").reshape(1, -1)
     raw = np.asarray(estimator.predict_proba(values)[0], dtype="float64")
     if num_classes is None:
-        num_classes = max(int(value) for value in estimator.classes_) + 1
+        num_classes = int(getattr(estimator, "oracle_posthoc_class_count_", 0))
+        if num_classes < 1:
+            labels = getattr(estimator, "oracle_posthoc_labels_", {})
+            label_indices = [int(value) for value in labels] if labels else []
+            num_classes = max([int(value) for value in estimator.classes_] + label_indices) + 1
     probabilities = np.zeros(num_classes, dtype="float64")
     for class_index, probability in zip(estimator.classes_, raw, strict=True):
         index = int(class_index)
@@ -43,6 +47,8 @@ def posthoc_output(estimator: Any, embedding: np.ndarray, num_classes: int | Non
         "representation": "fused_embedding",
         "class_index": selected,
         "label_name": labels.get(selected) or labels.get(str(selected)),
-        "classes": [int(value) for value in estimator.classes_],
+        "classes": list(range(num_classes)),
+        "trained_classes": [int(value) for value in estimator.classes_],
         "probabilities": probabilities.tolist(),
+        "confidence": float(probabilities[selected]),
     }

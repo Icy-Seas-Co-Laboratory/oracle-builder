@@ -26,9 +26,9 @@ from oracle_builder.config import (
 
 
 # Bump whenever clients need to understand a new catalog contract attribute.
-# Version 8 adds Simple CNN topology and scalar-context transforms. Clients must
+# Version 9 adds configurable post-hoc estimators and dimensionality reduction. Clients must
 # treat this as an authoring contract, not a dump of internal runtime defaults.
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 EXPOSURES: tuple[dict[str, Any], ...] = (
     {
@@ -472,7 +472,30 @@ _EXTRA_FIELDS: tuple[FieldSpec, ...] = (
     FieldSpec("output.prediction_commit_batches", "integer", 20, minimum=1, advanced=True),
     FieldSpec("posthoc.enabled", "boolean", False, advanced=True, help="After neural training, fit a separate classifier on training embeddings and evaluate it on held-out data."),
     FieldSpec("posthoc.representation", "enum", "fused_embedding", choices=("fused_embedding",), advanced=True, help="Neural feature vector used by the downstream classifier."),
-    FieldSpec("posthoc.estimator", "enum", "logistic_regression", choices=("logistic_regression",), advanced=True, help="Logistic regression regularization is selected using validation macro F1; the test split is used only for final scoring."),
+    FieldSpec("posthoc.estimator", "enum", "logistic_regression", choices=("logistic_regression", "linear_svm", "gradient_boosting", "shallow_mlp"), choice_labels=("Logistic regression", "Linear SVM", "Gradient boosted trees", "Shallow MLP"), advanced=True, help="Candidates are selected using validation macro F1; the test split is used only for final scoring."),
+    FieldSpec("posthoc.scaling", "enum", "standard", choices=("standard", "robust", "none"), help="Embedding scaling fitted on training data only."),
+    FieldSpec("posthoc.pca_enabled", "boolean", False, label="Enable PCA"),
+    FieldSpec("posthoc.pca_components", "integer", 32, minimum=1, label="PCA output dimensions", visible_when={"posthoc.pca_enabled": True}),
+    FieldSpec("posthoc.tune", "boolean", True, label="Tune classifier", help="Compare up to three bounded candidates on validation macro F1; explicit option values remain fixed."),
+    FieldSpec("posthoc.seed", "integer", 42, minimum=0),
+    FieldSpec("posthoc.calibration_folds", "integer", 3, minimum=2, maximum=10, visible_when={"posthoc.estimator": "linear_svm"}),
+    FieldSpec("posthoc.classifier_options", "object", {}, control="json", help="Validated estimator-specific options; edited with the post-hoc controls."),
+    FieldSpec("posthoc.classifier_options.C", "number", 1.0, minimum=0.000001, visible_when={"posthoc.estimator": ("logistic_regression", "linear_svm")}),
+    FieldSpec("posthoc.classifier_options.class_weight", "enum", None, choices=(None, "balanced"), choice_labels=("None", "Balanced"), visible_when={"posthoc.estimator": ("logistic_regression", "linear_svm")}),
+    FieldSpec("posthoc.classifier_options.max_iter", "integer", 1000, minimum=1, visible_when={"posthoc.estimator": ("logistic_regression", "linear_svm", "shallow_mlp")}, help="Iteration limit; shallow MLP defaults to 300 epochs when omitted."),
+    FieldSpec("posthoc.classifier_options.tol", "number", 0.0001, minimum=0.000001, visible_when={"posthoc.estimator": ("logistic_regression", "linear_svm")}),
+    FieldSpec("posthoc.classifier_options.n_estimators", "integer", 100, minimum=1, visible_when={"posthoc.estimator": "gradient_boosting"}),
+    FieldSpec("posthoc.classifier_options.learning_rate", "number", 0.1, minimum=0.000001, visible_when={"posthoc.estimator": "gradient_boosting"}),
+    FieldSpec("posthoc.classifier_options.max_depth", "integer", 3, minimum=1, visible_when={"posthoc.estimator": "gradient_boosting"}),
+    FieldSpec("posthoc.classifier_options.min_samples_leaf", "integer", 1, minimum=1, visible_when={"posthoc.estimator": "gradient_boosting"}),
+    FieldSpec("posthoc.classifier_options.subsample", "number", 1.0, minimum=0.000001, maximum=1, visible_when={"posthoc.estimator": "gradient_boosting"}),
+    FieldSpec("posthoc.classifier_options.hidden_layer_sizes", "list", [100], item_type="integer", visible_when={"posthoc.estimator": "shallow_mlp"}, help="One or two hidden-layer widths, each a positive integer."),
+    FieldSpec("posthoc.classifier_options.activation", "enum", "relu", choices=("relu", "tanh", "logistic", "identity"), visible_when={"posthoc.estimator": "shallow_mlp"}),
+    FieldSpec("posthoc.classifier_options.alpha", "number", 0.0001, minimum=0, visible_when={"posthoc.estimator": "shallow_mlp"}),
+    FieldSpec("posthoc.classifier_options.learning_rate_init", "number", 0.001, minimum=0.000001, visible_when={"posthoc.estimator": "shallow_mlp"}),
+    FieldSpec("posthoc.classifier_options.batch_size", "integer", 200, minimum=1, visible_when={"posthoc.estimator": "shallow_mlp"}, help="When omitted, uses min(200, number of training examples)."),
+    FieldSpec("posthoc.classifier_options.early_stopping", "boolean", False, visible_when={"posthoc.estimator": "shallow_mlp"}, help="Reserve part of the training split for early stopping."),
+    FieldSpec("posthoc.classifier_options.validation_fraction", "number", 0.1, minimum=0.000001, maximum=0.999999, visible_when={"posthoc.estimator": "shallow_mlp"}),
     FieldSpec("metadata.fields[].transform", "enum", "none", choices=("none", "log", "sqrt", "inverse", "identity", "log1p"), help="Per-field transform applied before fitting scalar scaling."),
     *(
         FieldSpec(

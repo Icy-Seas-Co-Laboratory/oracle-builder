@@ -231,7 +231,7 @@ class TrainingExecutor:
         if posthoc is not None:
             if configuration is not None or set(inputs) != {"model", "input"} or not isinstance(posthoc, Mapping):
                 raise PullProtocolError("Post-hoc fitting requires exactly a model and frozen dataset")
-            if set(posthoc) - {"name", "validation_split", "test_split", "split_strategy"}:
+            if set(posthoc) - {"name", "validation_split", "test_split", "split_strategy", "posthoc"}:
                 raise PullProtocolError("Post-hoc fitting contains unsupported parameters")
             model, dataset = inputs["model"], inputs["input"]
             if not (model / "artifact.json").is_file() or not (dataset / "payload").is_file():
@@ -244,6 +244,8 @@ class TrainingExecutor:
                 validation_split=posthoc.get("validation_split", 0.2),
                 test_split=posthoc.get("test_split", 0.1),
                 split_strategy=posthoc.get("split_strategy", "auto"),
+                posthoc_settings=posthoc.get("posthoc"),
+                embedding_cache_root=staging.parent.parent / "posthoc-embeddings",
                 progress=emit_event,
             )
             for child in (staging / "product").iterdir():
