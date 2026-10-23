@@ -8,6 +8,7 @@ HOST="${ORACLE_HOST:-127.0.0.1}"
 ORCHESTRATOR_PORT="${ORACLE_ORCHESTRATOR_PORT:-8110}"
 INFERENCE_PORT="${ORACLE_INFERENCE_PORT:-8111}"
 WEBGUI_PORT="${ORACLE_WEBGUI_PORT:-5111}"
+STARTUP_TIMEOUT_SECONDS="${ORACLE_STARTUP_TIMEOUT_SECONDS:-300}"
 ORCHESTRATOR_URL="http://${HOST}:${ORCHESTRATOR_PORT}"
 LOG_DIR="$RUNTIME_DIR/logs"
 WORKER_PIDS=()
@@ -134,8 +135,8 @@ PY
 wait_for() {
   local name="$1" url="$2" pid="$3"
   local attempt
-  for attempt in $(seq 1 60); do
-    if curl --fail --silent --show-error "$url" >/dev/null 2>&1; then
+  for attempt in $(seq 1 "$STARTUP_TIMEOUT_SECONDS"); do
+    if curl --noproxy '*' --fail --silent --show-error "$url" >/dev/null 2>&1; then
       echo "$name is ready at ${url%/health/*}"
       return 0
     fi
@@ -145,16 +146,16 @@ wait_for() {
     fi
     sleep 1
   done
-  echo "$name did not become ready within 60 seconds. See $LOG_DIR/${name}.log" >&2
+  echo "$name did not become ready within ${STARTUP_TIMEOUT_SECONDS} seconds. See $LOG_DIR/${name}.log" >&2
   return 1
 }
 
 is_online() {
-  curl --fail --silent --show-error "$1" >/dev/null 2>&1
+  curl --noproxy '*' --fail --silent --show-error "$1" >/dev/null 2>&1
 }
 
 has_startup_reconciliation() {
-  curl --fail --silent --show-error "$ORCHESTRATOR_URL/health/ready" | python3 -c '
+  curl --noproxy '*' --fail --silent --show-error "$ORCHESTRATOR_URL/health/ready" | python3 -c '
 import json
 import sys
 try:
@@ -180,7 +181,12 @@ cleanup() {
   stop_process "$WEBGUI_PID"
   stop_process "$ORCHESTRATOR_PID"
   stop_process "$INFERENCE_PID"
-  for worker_pid in "${WORKER_PIDS[@]}"; do stop_process "$worker_pid"; done
+  # Bash 3.2 (the system Bash on macOS) treats expansion of an empty indexed
+  # array as an unset variable under `set -u`. The startup can fail before any
+  # workers are launched, so guard the expansion used by the cleanup trap.
+  if [[ -n "${WORKER_PIDS[*]-}" ]]; then
+    for worker_pid in "${WORKER_PIDS[@]}"; do stop_process "$worker_pid"; done
+  fi
   if [[ -n "$LOCAL_JOIN_TOKEN_FILE" && -f "$LOCAL_JOIN_TOKEN_FILE" ]]; then rm -f "$LOCAL_JOIN_TOKEN_FILE"; fi
   exit "$exit_code"
 }
@@ -192,6 +198,7 @@ require_command npm
 require_command curl
 require_command python3
 require_positive_integer "ORACLE_LOCAL_WORKER_SLOTS" "$LOCAL_WORKER_SLOTS"
+require_positive_integer "ORACLE_STARTUP_TIMEOUT_SECONDS" "$STARTUP_TIMEOUT_SECONDS"
 require_positive_integer "ORACLE_INFERENCE_PORT" "$INFERENCE_PORT"
 require_positive_integer "ORACLE_WORKER_ARTIFACT_TIMEOUT_SECONDS" "$WORKER_ARTIFACT_TIMEOUT_SECONDS"
 if [[ -n "$LOCAL_WORKER_CPU_CAPACITY" ]]; then
@@ -381,7 +388,7 @@ done <<< "$LOCAL_POOL_IDS_OUTPUT"
 if (( ${#LOCAL_POOL_IDS[@]} )); then
   echo "Reusing local worker pools: ${LOCAL_POOL_IDS[*]}"
 else
-  POOL_RESPONSE="$(curl --fail --silent --show-error \
+  POOL_RESPONSE="$(curl --noproxy '*' --fail --silent --show-error \
     "${ORCHESTRATOR_CURL_ARGS[@]}" \
     -d "{\"name\":\"${LOCAL_POOL_NAME}\",\"allowed_actions\":[\"train\",\"infer\"]}" \
     "${ORCHESTRATOR_URL}/v1/worker-pools")"
@@ -455,7 +462,7 @@ for LOCAL_POOL_ID in "${LOCAL_POOL_IDS[@]}"; do
 WORKER_PID=$!
 WORKER_PIDS+=("$WORKER_PID")
 for attempt in $(seq 1 20); do
-  if curl --fail --silent "$ORCHESTRATOR_URL/v1/workers?pool_id=$LOCAL_POOL_ID" | python3 -c '
+  if curl --noproxy '*' --fail --silent "$ORCHESTRATOR_URL/v1/workers?pool_id=$LOCAL_POOL_ID" | python3 -c '
 import json, sys
 from datetime import datetime, timezone
 workers = json.load(sys.stdin).get("workers", [])
