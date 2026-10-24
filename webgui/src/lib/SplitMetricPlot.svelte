@@ -8,6 +8,7 @@
 	export let metric = 'loss';
 	export let title = 'Loss';
 	export let currentEpoch: number | null = null;
+	export let validationExpected = true;
 	let hovered: { section: 'epoch' | 'batch'; x: number } | null = null;
 
 	const numeric = (value: unknown): number | null => typeof value === 'number' && Number.isFinite(value) ? value : null;
@@ -72,7 +73,7 @@
 </script>
 
 <div class="split-plot">
-	<svg viewBox="0 0 900 213" role="img" aria-label={`${title}: ${epochTraining.length} completed epoch training values, ${epochValidation.length} validation values, and ${batchTraining.length} training batches from ${currentEpoch === null ? 'the current epoch' : `epoch ${currentEpoch}`}. Training is blue; validation is orange. Both sections share one metric scale.`} on:pointermove={inspectAtPointer} on:pointerleave={() => hovered = null}>
+	<svg viewBox="0 0 900 213" role="img" aria-label={`${title}: ${epochTraining.length} completed epoch training values, ${epochValidation.length} validation values, and ${batchTraining.length} training batches from ${currentEpoch === null ? 'the current epoch' : `epoch ${currentEpoch}`}. ${validationExpected ? 'Training is blue; validation is orange.' : 'SSL training is blue; this phase has no validation pass.'} Both sections share one metric scale.`} on:pointermove={inspectAtPointer} on:pointerleave={() => hovered = null}>
 		{#each [low, (low + high) / 2, high].filter((value, index, list) => list.indexOf(value) === index) as tick}
 			<line class="grid" x1="70" x2="884" y1={yAt(tick)} y2={yAt(tick)} />
 			<text class="y-tick" x="60" y={yAt(tick) + 4} text-anchor="end">{format(tick)}</text>
@@ -96,8 +97,8 @@
 		<text class="axis-title" x="330" y="197" text-anchor="middle">Epoch</text>
 		<text class="axis-title" x="772" y="197" text-anchor="middle">Batch within current epoch</text>
 	</svg>
-	<div class="hover-values" aria-live="off">{#if hovered}<strong>{hovered.section === 'epoch' ? 'Epoch' : 'Batch'} {hovered.x}</strong>{#if hovered.section === 'epoch'}<span>Training: {precise(hoveredTraining)}</span><span>Validation: {precise(hoveredValidation)}</span>{:else}<span>Training average: {precise(hoveredSmoothed)}</span><span>Raw training: {precise(hoveredBatch)}</span>{#if lastValidation !== null}<span>Latest validation (epoch {lastValidationEpoch}): {precise(lastValidation)}</span>{/if}{/if}{:else}<span>Hover over either section to inspect recorded values.</span>{/if}</div>
-	<div class="legend"><span><i class="training-key"></i>Training</span><span><i class="validation-key"></i>Validation · epoch end</span>{#if batchTraining.length}<span><i class="average-key"></i>Current epoch · 7 batch average</span>{/if}{#if lastValidation !== null}<span><i class="reference-key"></i>Latest validation reference</span>{/if}</div>
+	<div class="hover-values" aria-live="off">{#if hovered}<strong>{hovered.section === 'epoch' ? 'Epoch' : 'Batch'} {hovered.x}</strong>{#if hovered.section === 'epoch'}<span>Training: {precise(hoveredTraining)}</span>{#if validationExpected}<span>Validation: {precise(hoveredValidation)}</span>{/if}{:else}<span>Training average: {precise(hoveredSmoothed)}</span><span>Raw training: {precise(hoveredBatch)}</span>{#if lastValidation !== null}<span>Latest validation (epoch {lastValidationEpoch}): {precise(lastValidation)}</span>{/if}{/if}{:else}<span>Hover over either section to inspect recorded values.</span>{/if}</div>
+	<div class="legend"><span><i class="training-key"></i>Training</span>{#if validationExpected}<span><i class="validation-key"></i>Validation · epoch end</span>{/if}{#if batchTraining.length}<span><i class="average-key"></i>Current epoch · 7 batch average</span>{/if}{#if lastValidation !== null}<span><i class="reference-key"></i>Latest validation reference</span>{/if}</div>
 </div>
 
 <style>

@@ -152,6 +152,7 @@ def build_parser() -> argparse.ArgumentParser:
     queue.add_argument("--auto-batch-size", action="store_true")
     queue.add_argument("--maximum-batch-size", type=_positive, default=256)
     queue.add_argument("--epochs", type=_positive, default=10)
+    queue.add_argument("--ssl-epochs", type=_positive)
 
     queue_control = commands.add_parser("queue", help="Verify queued runs, then explicitly start training.")
     qs = queue_control.add_subparsers(dest="command", required=True)
@@ -297,6 +298,8 @@ def _request_for(args: argparse.Namespace, client: OrchestratorClient) -> Any:
             "resources": {"gpu_count": args.gpu_count},
             "epochs": args.epochs,
         }
+        if args.ssl_epochs is not None:
+            body["ssl_epochs"] = args.ssl_epochs
         if args.revision is not None:
             body["revision"] = args.revision
         if args.auto_batch_size:

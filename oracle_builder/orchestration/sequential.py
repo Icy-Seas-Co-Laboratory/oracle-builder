@@ -110,7 +110,7 @@ class SequentialExecutionMixin:
         whole_phase_ssl = execution.get('self_supervised_whole_phase') is True
         initial_phase = 'initialize' if whole_phase_ssl else 'train'
         initial_segment = (
-            {'phase': 'initialize', 'total_epochs': total}
+            {'phase': 'initialize', 'total_epochs': execution.get('ssl_epochs') or total, 'supervised_epochs': total}
             if whole_phase_ssl else
             {'phase': 'train', 'start_epoch': 0, 'stop_epoch': min(size, total), 'total_epochs': total, **step_fields}
         )

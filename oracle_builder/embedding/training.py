@@ -148,6 +148,10 @@ def train_embedding_run(
         from oracle_builder.saving.save_model import save_model_artifacts, write_load_test_report
 
         embedding_model = build_embedding_model(classifier)
+        from oracle_builder.embedding.health import inspect_embedding_health
+        health = inspect_embedding_health(embedding_model, source, index, config)
+        health_path = layout.self_supervised_metrics / "embedding_health.json"
+        health_path.write_text(json.dumps(health, indent=2, sort_keys=True) + "\n")
         history_path = layout.metrics_json.parent / "history.json"
         history_path.parent.mkdir(parents=True, exist_ok=True)
         history_payload = json.dumps(history.history, indent=2, default=float) + "\n"
@@ -165,6 +169,7 @@ def train_embedding_run(
                 "source_reference_count": len(index.refs),
             },
             "training": {key: values[-1] for key, values in history.history.items() if values},
+            "self_supervised_health": health,
             "distribution": {
                 "requested_strategy": distribution_info.requested_strategy,
                 "resolved_strategy": distribution_info.resolved_strategy,

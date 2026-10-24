@@ -133,6 +133,10 @@
 	let showOtherPoolChoices = false;
 	let leases: RecordValue[] = [];
 	let definitions: RecordValue[] = [];
+	let selectedDefinitionDetail: RecordValue | null = null;
+	let selectedDefinitionRequest = '';
+	let definitionLoading = false;
+	let definitionError = '';
 	let datasets: RecordValue[] = [];
 	let loading = true;
 	let creating = false;
@@ -156,6 +160,7 @@
 	let batchSize = 16;
 	let maximumBatchSize = 256;
 	let epochs = 10;
+	let sslEpochs = 10;
 	let gpuCount = 0;
 	let queueFeedback: { state: 'working' | 'success' | 'error'; message: string; queueId?: string } | null = null;
 
@@ -217,6 +222,11 @@
 	const workersForPool = (poolId: unknown) => activeWorkers.filter((worker) => String(worker.pool_id) === String(poolId));
 	$: workerCountFor = (poolId: unknown) => activeWorkers.filter((worker) => String(worker.pool_id) === String(poolId)).length;
 	$: selectedPool = pools.find((pool) => String(pool.pool_id) === selectedPoolId);
+	$: selectedDefinition = definitions.find((definition) => String(definition.definition_id) === selectedDefinitionId);
+	$: selectedDefinitionConfig = object(selectedDefinitionDetail?.config ?? selectedDefinition?.config);
+	$: selectedTask = String(object(selectedDefinitionConfig.run).task ?? selectedDefinition?.task ?? 'classification');
+	$: sslEnabled = Boolean(object(selectedDefinitionConfig.self_supervised).enabled);
+	$: sslOnly = selectedTask === 'embedding';
 	$: selectedPoolWorkers = workers.filter((worker) => String(worker.pool_id) === selectedPoolId);
 	$: poolAllowsTraining = selectedPool?.enabled !== false && actions(selectedPool?.allowed_actions).includes('train');
 	$: trainingWorkers = selectedPoolWorkers.filter((worker) => isCurrentWorker(worker) && actions(object(worker.capabilities).actions).includes('train'));
@@ -232,6 +242,22 @@
 				: gpuCount > 0 && !gpuWorkers.length
 					? `No registered training worker in this pool currently advertises ${gpuCount} GPU${gpuCount === 1 ? '' : 's'}. The job can be queued, but cannot start until compatible capacity registers.`
 					: `${gpuWorkers.length} compatible worker${gpuWorkers.length === 1 ? '' : 's'} can claim this run when idle.`;
+	$: chosenDefinitionRevision = editingRunId && selectedDefinitionId === editingOriginalDefinitionId && !useLatestRevision ? editingRevision : Number(selectedDefinition?.revision);
+    $: definitionKey = `${selectedDefinitionId}:${chosenDefinitionRevision}`;
+    async function loadQueueDefinition(id: string, revision: number, key: string) {
+        selectedDefinitionRequest = key;
+        selectedDefinitionDetail = null;
+        definitionLoading = true;
+        definitionError = '';
+        try {
+            const result = await api.modelDefinition(id, revision);
+            if (selectedDefinitionRequest === key) selectedDefinitionDetail = result;
+        } catch (cause) {
+            if (selectedDefinitionRequest === key) definitionError = cause instanceof Error ? cause.message : 'Could not load selected definition.';
+        } finally { if (selectedDefinitionRequest === key) definitionLoading = false; }
+    }
+    $: if (selectedDefinitionId && selectedDefinitionRequest !== definitionKey) void loadQueueDefinition(selectedDefinitionId, chosenDefinitionRevision, definitionKey);
+
 
 	async function load() {
 		loading = true;
@@ -255,7 +281,7 @@
 	}
 
 	async function queueDefinition() {
-		if (!selectedDefinitionId || !selectedDatasetId || !selectedPoolId || !queueName.trim()) return;
+		if (!selectedDefinitionId || !selectedDatasetId || !selectedPoolId || !queueName.trim() || definitionLoading || definitionError || !selectedDefinitionDetail) return;
 		if (!poolAllowsTraining) {
 			const message = 'Choose a worker pool that permits the train action before queueing training work.';
 			queueFeedback = { state: 'error', message };
@@ -264,7 +290,7 @@
 		}
 		if ((batchSizeMode === 'manual' && (!Number.isInteger(batchSize) || batchSize < 1))
 			|| (batchSizeMode === 'auto' && (!Number.isInteger(maximumBatchSize) || maximumBatchSize < 1))
-			|| !Number.isInteger(epochs) || epochs < 1 || !Number.isInteger(gpuCount) || gpuCount < 0) {
+			|| (!sslOnly && (!Number.isInteger(epochs) || epochs < 1)) || (sslEnabled && (!Number.isInteger(sslEpochs) || sslEpochs < 1)) || !Number.isInteger(gpuCount) || gpuCount < 0) {
 			onfailure('Batch settings and epochs must be positive whole numbers; GPU count cannot be negative.');
 			return;
 		}
@@ -273,8 +299,8 @@
 		try {
 			const payload = {
 				name: queueName.trim(), dataset_id: selectedDatasetId, worker_pool_id: selectedPoolId,
-				resources: { gpu_count: gpuCount }, batch_size_mode: batchSizeMode, epochs,
-				...(editingRunId ? { definition_id: selectedDefinitionId, ...(selectedDefinitionId === editingOriginalDefinitionId && !useLatestRevision ? { definition_revision: editingRevision } : {}) } : {}),
+				resources: { gpu_count: gpuCount }, batch_size_mode: batchSizeMode, ...(!sslOnly ? { epochs } : {}), ...(sslEnabled ? { ssl_epochs: sslEpochs } : {}),
+				...(editingRunId ? { definition_id: selectedDefinitionId, definition_revision: chosenDefinitionRevision } : { revision: chosenDefinitionRevision }),
 				...(batchSizeMode === 'manual' ? { batch_size: batchSize } : { maximum_batch_size: maximumBatchSize })
 			};
 			const queued = editingRunId ? await api.replaceQueuedRun(editingRunId, payload) : await api.queueDefinition(selectedDefinitionId, payload);
@@ -300,7 +326,7 @@
 		selectedDefinitionId = String(definitions[0]?.definition_id ?? '');
 		selectedDatasetId = String(datasets[0]?.dataset_id ?? '');
 		selectedPoolId = preferredPoolId();
-		batchSizeMode = 'manual'; batchSize = 16; maximumBatchSize = 256; epochs = 10; gpuCount = 0;
+		batchSizeMode = 'manual'; batchSize = 16; maximumBatchSize = 256; epochs = 10; sslEpochs = 10; gpuCount = 0;
 	}
 
 	function editRun(run: RecordValue) {
@@ -322,7 +348,7 @@
 		batchSizeMode = policy.mode === 'auto' ? 'auto' : 'manual';
 		batchSize = Number(policy.batch_size ?? run.batch_size ?? 16);
 		maximumBatchSize = Number(policy.maximum_batch_size ?? 256);
-		epochs = Number(run.epochs ?? policy.epochs ?? 10);
+		epochs = Number(run.epochs ?? policy.epochs ?? 10); sslEpochs = Number(run.ssl_epochs ?? policy.ssl_epochs ?? object(run.self_supervised).epochs ?? 10);
 		queueFeedback = null;
 		document.getElementById('queue-run-form')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
 	}
@@ -369,7 +395,7 @@
 {/if}
 
 {#if mode === 'queue'}
-	<section id="queue-run-form" class="panel fleet-enqueue"><div class="panel-head"><div><p class="eyebrow">{editingRunId ? 'EDIT QUEUED RUN' : 'SUBMIT'}</p><h2>{editingRunId ? 'Update training run' : 'Prepare a training run'}</h2><p>{editingRunId ? 'Saving creates a new sealed run and archives this queue entry. Prior jobs remain in the history; verify the updated run before starting.' : 'Adding a run pins the definition and dataset. Verification and training happen only when you request them below.'}</p></div>{#if editingRunId}<button class="secondary small" disabled={enqueuing} on:click={cancelEdit}>Cancel edit</button>{/if}</div>{#if editingPoolNotice}<p class="queue-result" role="status">{editingPoolNotice}</p>{/if}{#if pools.length && definitions.length && datasets.length}<div class="fleet-form run-form"><label>Run name<input bind:value={queueName} placeholder="e.g. resnet18-isiisnet-1epoch" aria-describedby="run-name-help" /><small id="run-name-help">A human-readable label for this immutable run.</small></label><label>Definition<select bind:value={selectedDefinitionId}>{#each definitions as definition}<option value={String(definition.definition_id)}>{text(definition.name)} · rev {editingRunId && String(definition.definition_id) === editingOriginalDefinitionId && !useLatestRevision ? editingRevision : text(definition.revision)}</option>{/each}</select>{#if editingRunId}<small>Original: {editingDefinitionName}. Changing definitions creates a new sealed run.</small>{#if selectedDefinitionId === editingOriginalDefinitionId && Number(definitions.find((definition) => String(definition.definition_id) === selectedDefinitionId)?.revision) !== editingRevision}<small class="latest-revision"><input type="checkbox" bind:checked={useLatestRevision} /> Use latest revision</small>{/if}{/if}</label><label>Frozen dataset<select bind:value={selectedDatasetId}>{#each datasets as dataset}<option value={String(dataset.dataset_id)}>{text(dataset.name)}</option>{/each}</select></label><label>GPUs required<input type="number" min="0" bind:value={gpuCount} /><small>Use 0 for CPU-only work.</small></label><label>Batch sizing<select bind:value={batchSizeMode}><option value="manual">Set manually</option><option value="auto">Automatically calibrate on worker</option></select><small>{batchSizeMode === 'auto' ? 'Verification tests safe sizes on a compatible worker.' : 'Use a known-safe batch size.'}</small></label>{#if batchSizeMode === 'manual'}<label>Batch size<input type="number" min="1" bind:value={batchSize} /></label>{:else}<label>Maximum batch size<input type="number" min="1" bind:value={maximumBatchSize} /><small>Calibration chooses a conservative safe size at or below this limit.</small></label>{/if}<label>Epochs<input type="number" min="1" bind:value={epochs} /></label></div>
+	<section id="queue-run-form" class="panel fleet-enqueue"><div class="panel-head"><div><p class="eyebrow">{editingRunId ? 'EDIT QUEUED RUN' : 'SUBMIT'}</p><h2>{editingRunId ? 'Update training run' : 'Prepare a training run'}</h2><p>{editingRunId ? 'Saving creates a new sealed run and archives this queue entry. Prior jobs remain in the history; verify the updated run before starting.' : 'Adding a run pins the definition and dataset. Verification and training happen only when you request them below.'}</p></div>{#if editingRunId}<button class="secondary small" disabled={enqueuing} on:click={cancelEdit}>Cancel edit</button>{/if}</div>{#if editingPoolNotice}<p class="queue-result" role="status">{editingPoolNotice}</p>{/if}{#if pools.length && definitions.length && datasets.length}<div class="fleet-form run-form"><label>Run name<input bind:value={queueName} placeholder="e.g. resnet18-isiisnet-1epoch" aria-describedby="run-name-help" /><small id="run-name-help">A human-readable label for this immutable run.</small></label><label>Definition<select bind:value={selectedDefinitionId}>{#each definitions as definition}<option value={String(definition.definition_id)}>{text(definition.name)} · rev {editingRunId && String(definition.definition_id) === editingOriginalDefinitionId && !useLatestRevision ? editingRevision : text(definition.revision)}</option>{/each}</select>{#if editingRunId}<small>Original: {editingDefinitionName}. Changing definitions creates a new sealed run.</small>{#if selectedDefinitionId === editingOriginalDefinitionId && Number(definitions.find((definition) => String(definition.definition_id) === selectedDefinitionId)?.revision) !== editingRevision}<small class="latest-revision"><input type="checkbox" bind:checked={useLatestRevision} /> Use latest revision</small>{/if}{/if}</label><label>Frozen dataset<select bind:value={selectedDatasetId}>{#each datasets as dataset}<option value={String(dataset.dataset_id)}>{text(dataset.name)}</option>{/each}</select></label><label>GPUs required<input type="number" min="0" bind:value={gpuCount} /><small>Use 0 for CPU-only work.</small></label><label>Batch sizing<select bind:value={batchSizeMode}><option value="manual">Set manually</option><option value="auto">Automatically calibrate on worker</option></select><small>{batchSizeMode === 'auto' ? 'Verification tests safe sizes on a compatible worker.' : 'Use a known-safe batch size.'}</small></label>{#if batchSizeMode === 'manual'}<label>Batch size<input type="number" min="1" bind:value={batchSize} /></label>{:else}<label>Maximum batch size<input type="number" min="1" bind:value={maximumBatchSize} /><small>Calibration chooses a conservative safe size at or below this limit.</small></label>{/if}{#if sslEnabled}<label>SSL epochs<input type="number" min="1" bind:value={sslEpochs} /></label>{/if}{#if !sslOnly}<label>Supervised epochs<input type="number" min="1" bind:value={epochs} /></label>{/if}</div>
 		<fieldset class="execution-target">
 			<legend>Where this run will execute</legend>
 			<p>Choose a worker pool now. Verification assigns a compatible worker in that pool; a passing result pins that worker for training. Reverify to choose a different worker.</p>
@@ -384,7 +410,7 @@
 			</div>
 			{#if hiddenPoolChoiceCount || showOtherPoolChoices}<button type="button" class="secondary small" on:click={() => showOtherPoolChoices = !showOtherPoolChoices}>{showOtherPoolChoices ? 'Hide other pools' : `Show ${hiddenPoolChoiceCount} other pool${hiddenPoolChoiceCount === 1 ? '' : 's'}`}</button>{/if}
 		</fieldset>
-		<div class:warning={!poolAllowsTraining || (gpuCount > 0 && trainingWorkers.length > 0 && !gpuWorkers.length)} class="capacity-guidance" role="status"><strong>Worker capacity check</strong><span>{selectedWorkerMessage}</span><small>Selected pool: {text(selectedPool?.name)} · {selectedPoolWorkers.filter(isCurrentWorker).length} current · {trainingWorkers.length} train-capable · {gpuWorkers.length} matching GPU request</small></div><div class="enqueue-action"><button disabled={enqueuing || !queueName.trim() || !poolAllowsTraining} on:click={queueDefinition}>{enqueuing ? 'Saving…' : editingRunId ? 'Save updated run' : 'Add to queue'}</button><small>{editingRunId ? 'The updated run will need verification before training.' : 'Adding to the queue does not start verification or training.'}</small></div>{#if queueFeedback}<div class:success={queueFeedback.state === 'success'} class:error={queueFeedback.state === 'error'} class:working={queueFeedback.state === 'working'} class="queue-feedback" role={queueFeedback.state === 'error' ? 'alert' : 'status'}><strong>{queueFeedback.state === 'working' ? 'Preparing portable work' : queueFeedback.state === 'success' ? 'Training run queued' : 'Could not queue training run'}</strong><span>{queueFeedback.message}</span>{#if queueFeedback.queueId}<small>Queued run: <code>{queueFeedback.queueId}</code></small>{/if}</div>{/if}{:else}<p class="empty">Before queueing: create a worker pool in Workers, save a versioned definition, and freeze a dataset revision.</p>{/if}</section>
+		<div class:warning={!poolAllowsTraining || (gpuCount > 0 && trainingWorkers.length > 0 && !gpuWorkers.length)} class="capacity-guidance" role="status"><strong>Worker capacity check</strong><span>{selectedWorkerMessage}</span><small>Selected pool: {text(selectedPool?.name)} · {selectedPoolWorkers.filter(isCurrentWorker).length} current · {trainingWorkers.length} train-capable · {gpuWorkers.length} matching GPU request</small></div>{#if definitionLoading}<p role="status">Loading selected definition and SSL settings…</p>{/if}{#if definitionError}<p class="inline-error" role="alert">{definitionError}</p>{/if}{#if sslOnly && !sslEnabled}<p class="inline-error">Enable self-supervised learning in this embedding definition before queueing it.</p>{/if}<div class="enqueue-action"><button disabled={enqueuing || definitionLoading || Boolean(definitionError) || !selectedDefinitionDetail || (sslOnly && !sslEnabled) || !queueName.trim() || !poolAllowsTraining} on:click={queueDefinition}>{enqueuing ? 'Saving…' : editingRunId ? 'Save updated run' : 'Add to queue'}</button><small>{editingRunId ? 'The updated run will need verification before training.' : 'Adding to the queue does not start verification or training.'}</small></div>{#if queueFeedback}<div class:success={queueFeedback.state === 'success'} class:error={queueFeedback.state === 'error'} class:working={queueFeedback.state === 'working'} class="queue-feedback" role={queueFeedback.state === 'error' ? 'alert' : 'status'}><strong>{queueFeedback.state === 'working' ? 'Preparing portable work' : queueFeedback.state === 'success' ? 'Training run queued' : 'Could not queue training run'}</strong><span>{queueFeedback.message}</span>{#if queueFeedback.queueId}<small>Queued run: <code>{queueFeedback.queueId}</code></small>{/if}</div>{/if}{:else}<p class="empty">Before queueing: create a worker pool in Workers, save a versioned definition, and freeze a dataset revision.</p>{/if}</section>
 {/if}
 
 {#if mode === 'queue'}
@@ -403,7 +429,7 @@
 		{@const report = object(run.preflight_report)}
 		{@const splitManifest = object(report.split_manifest)}
 		{@const coverage = object(splitManifest.coverage)}
-		<tr><td><input type="checkbox" aria-label={`Select ${text(run.name)}`} disabled={queueAction || !selectable(run)} checked={selectedRunIds.includes(String(run.queued_run_id))} on:change={(event) => toggleRun(String(run.queued_run_id), event.currentTarget.checked)} /></td><td>{#if renamingRunId === String(run.queued_run_id)}<form class="run-rename-form" on:submit|preventDefault={saveRunName}><input aria-label={`Name for ${text(run.name)}`} maxlength="240" bind:value={renamedRunName} disabled={renameRunBusy} /><button class="secondary small" type="submit" disabled={renameRunBusy || !renamedRunName.trim()}>{renameRunBusy ? 'Saving…' : 'Save'}</button><button class="secondary small" type="button" disabled={renameRunBusy} on:click={() => { renamingRunId = ''; renameRunError = ''; }}>Cancel</button></form>{#if renameRunError}<small class="queue-problem" role="alert">{renameRunError}</small>{/if}{:else}<strong>{text(run.name)}</strong>{/if}<small>{text(run.definition_name)} · rev {text(run.definition_revision)}</small><small>{text(pools.find((pool) => pool.pool_id === run.worker_pool_id)?.name)}</small></td><td><span class="status {text(run.status)}">{runStatus(run)}</span>{#if run.status === 'verifying'}<small>{run.start_authorized ? 'Will start if verification passes' : 'Will wait for your start command'}</small>{/if}</td><td><strong>{policy.mode === 'auto' ? 'Automatic · pending' : `${text(run.batch_size)} / batch`}</strong><small>{text(run.epochs)} epochs</small></td><td>{#if run.latest_job_error && run.can_edit}<small class="queue-problem">{text(run.latest_job_error)}</small>{:else if run.failure_reason}<small class="queue-problem">{text(run.failure_reason)}</small>{:else if run.status === 'verifying'}<small>{verificationWaitMessage(run)}</small>{:else if report.ready}<strong>Preflight passed{actions(coverage.warnings).length ? ' with split warnings' : ''}</strong><small>{text(workers.find((worker) => worker.worker_id === report.worker_id)?.name, text(report.worker_id))}</small>{#if actions(coverage.warnings).length}<small class="queue-problem">{actions(coverage.warnings).slice(0, 3).join('; ')}{actions(coverage.warnings).length > 3 ? `; and ${actions(coverage.warnings).length - 3} more` : ''}</small>{/if}{:else}<small>{actions(report.reasons).join('; ') || 'Select this run to verify.'}</small>{/if}{#if report.ready}<details><summary>View checks</summary><ul>{#each actions(report.checks) as check}<li>{check.replaceAll('_', ' ')}</li>{/each}</ul>{#if Object.keys(coverage).length}<strong>Split coverage {coverage.valid === false ? 'warning' : 'verified'}</strong><small>Minimum per class: {text(coverage.minimum_per_class)}</small><dl class="split-coverage">{#each Object.entries(object(coverage.class_counts)) as [classId, counts]}<dt>Class {classId}</dt><dd>{#each Object.entries(object(counts)) as [split, count], index}{index ? ' · ' : ''}{split}: {count}{/each}</dd>{/each}</dl>{/if}<small>Verified {text(report.verified_at)}</small></details>{/if}</td><td><div class="queue-row-actions">
+		<tr><td><input type="checkbox" aria-label={`Select ${text(run.name)}`} disabled={queueAction || !selectable(run)} checked={selectedRunIds.includes(String(run.queued_run_id))} on:change={(event) => toggleRun(String(run.queued_run_id), event.currentTarget.checked)} /></td><td>{#if renamingRunId === String(run.queued_run_id)}<form class="run-rename-form" on:submit|preventDefault={saveRunName}><input aria-label={`Name for ${text(run.name)}`} maxlength="240" bind:value={renamedRunName} disabled={renameRunBusy} /><button class="secondary small" type="submit" disabled={renameRunBusy || !renamedRunName.trim()}>{renameRunBusy ? 'Saving…' : 'Save'}</button><button class="secondary small" type="button" disabled={renameRunBusy} on:click={() => { renamingRunId = ''; renameRunError = ''; }}>Cancel</button></form>{#if renameRunError}<small class="queue-problem" role="alert">{renameRunError}</small>{/if}{:else}<strong>{text(run.name)}</strong>{/if}<small>{text(run.definition_name)} · rev {text(run.definition_revision)}</small><small>{text(pools.find((pool) => pool.pool_id === run.worker_pool_id)?.name)}</small></td><td><span class="status {text(run.status)}">{runStatus(run)}</span>{#if run.status === 'verifying'}<small>{run.start_authorized ? 'Will start if verification passes' : 'Will wait for your start command'}</small>{/if}</td><td><strong>{policy.mode === 'auto' ? 'Automatic · pending' : `${text(run.batch_size)} / batch`}</strong><small>{run.ssl_enabled ? `SSL ${text(run.ssl_epochs)} epochs · ${text(object(run.self_supervised).method)}` : 'SSL disabled'}</small>{#if Number(run.supervised_epochs ?? run.epochs) > 0}<small>Supervised {text(run.supervised_epochs ?? run.epochs)} epochs</small>{/if}<small>{text(run.total_planned_epochs ?? run.epochs)} total planned epochs</small></td><td>{#if run.latest_job_error && run.can_edit}<small class="queue-problem">{text(run.latest_job_error)}</small>{:else if run.failure_reason}<small class="queue-problem">{text(run.failure_reason)}</small>{:else if run.status === 'verifying'}<small>{verificationWaitMessage(run)}</small>{:else if report.ready}<strong>Preflight passed{actions(coverage.warnings).length ? ' with split warnings' : ''}</strong><small>{text(workers.find((worker) => worker.worker_id === report.worker_id)?.name, text(report.worker_id))}</small>{#if actions(coverage.warnings).length}<small class="queue-problem">{actions(coverage.warnings).slice(0, 3).join('; ')}{actions(coverage.warnings).length > 3 ? `; and ${actions(coverage.warnings).length - 3} more` : ''}</small>{/if}{:else}<small>{actions(report.reasons).join('; ') || 'Select this run to verify.'}</small>{/if}{#if report.ready}<details><summary>View checks</summary><ul>{#each actions(report.checks) as check}<li>{check.replaceAll('_', ' ')}</li>{/each}</ul>{#if Object.keys(coverage).length}<strong>Split coverage {coverage.valid === false ? 'warning' : 'verified'}</strong><small>Minimum per class: {text(coverage.minimum_per_class)}</small><dl class="split-coverage">{#each Object.entries(object(coverage.class_counts)) as [classId, counts]}<dt>Class {classId}</dt><dd>{#each Object.entries(object(counts)) as [split, count], index}{index ? ' · ' : ''}{split}: {count}{/each}</dd>{/each}</dl>{/if}<small>Verified {text(report.verified_at)}</small></details>{/if}</td><td><div class="queue-row-actions">
 			<button class="secondary small" disabled={queueAction || renameRunBusy} on:click={() => beginRunRename(run)}>Rename</button>{#if run.can_edit}<button class="secondary small" disabled={enqueuing || queueAction} on:click={() => editRun(run)}><QueueActionIcon name="edit" />Edit</button>{/if}
 			{#if selectable(run)}<button class="secondary small" disabled={queueAction} on:click={() => actOnRuns([run], 'verify')}><QueueActionIcon name="verify" />Verify</button>{/if}
 			{#if canStartRun(run)}<button class="secondary small" disabled={queueAction} on:click={() => actOnRuns([run], 'start')}><QueueActionIcon name="start" />Start</button>{/if}
@@ -428,6 +454,8 @@
 
 <section class="panel"><div class="panel-head"><div><p class="eyebrow">DURABLE WORK CLAIMS</p><h2>Leases and published output</h2><p>A lease is a time-bounded claim. Output references appear only after validation, sealing, and successful publication.</p></div></div>{#if leases.length}<div class="table-scroll"><table class="fleet-table"><thead><tr><th>Lease</th><th>Worker</th><th>Job</th><th>Status</th><th>Expires / released</th><th>Published output</th></tr></thead><tbody>{#each leases as lease}<tr><td><code>{text(lease.lease_id)}</code></td><td>{text(workers.find((worker) => String(worker.worker_id) === String(lease.worker_id))?.name, text(lease.worker_id))}</td><td><code>{text(lease.job_id)}</code></td><td><span class="status {text(lease.status)}">{text(lease.status)}</span>{#if lease.outcome}<small>{text(lease.outcome)}</small>{/if}</td><td>{text(lease.released_at ?? lease.expires_at)}</td><td>{#if Object.keys(output(lease)).length}<strong>{text(output(lease).kind)}</strong><small class="code">{text(output(lease).artifact_id)} · rev {text(output(lease).revision)}</small>{:else}<small>Not published</small>{/if}</td></tr>{/each}</tbody></table></div>{:else}<p class="empty">No durable pull-worker leases have been issued yet.</p>{/if}</section>
 {/if}
+
+{#if mode === 'queue' && sslEnabled}<section class="panel ssl-epoch-budget"><h3>Self-supervised phase</h3><p>{sslOnly ? 'This embedding run performs self-supervised pretraining only.' : 'Self-supervised pretraining runs before supervised fitting.'} Total planned epochs: {sslOnly ? sslEpochs : sslEpochs + epochs}.</p></section>{/if}
 
 <style>
 	.run-rename-form{display:flex;flex-wrap:wrap;gap:.3rem;margin-bottom:.3rem}.run-rename-form input{min-width:10rem;max-width:16rem;min-height:2rem}

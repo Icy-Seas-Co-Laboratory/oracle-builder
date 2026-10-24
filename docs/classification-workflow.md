@@ -393,3 +393,49 @@ oracle posthoc submit --name "Linear SVM + PCA" --model MODEL_ID \
   --settings '{"estimator":"linear_svm","pca_enabled":true,"pca_components":32}'
 oracle posthoc start RUN_ID
 ```
+
+## Self-supervised learning in the GUI
+
+Self-supervised learning (SSL) is a separate phase with its own optimizer,
+learning rate, objective, view augmentation, and epoch budget. In Model
+Construction, enable SSL and choose BYOL, student–teacher, or SimCLR for an
+image encoder. SimCLR exposes temperature and minimum batch size; teacher
+methods expose teacher momentum. Segmentation uses grayscale reconstruction.
+Projection widths, regularization, optimizer details, and SSL augmentation
+are grouped beneath the main method controls. Supervised optimization and
+augmentation remain separate.
+
+Queue seals two independent durations for classification and segmentation:
+**SSL epochs**, followed by **Supervised epochs**. A request for 3 SSL epochs
+and 7 supervised epochs schedules 10 total planned epochs. Editing a queued
+run preserves its definition revision and both budgets. Verification keeps
+those exact settings; it does not train either phase. Embedding runs are
+SSL-only and show no supervised epoch budget.
+
+For API clients, `epochs` retains its supervised meaning for classification
+and segmentation; `ssl_epochs` supplies the separate SSL duration. Older
+clients that omit `ssl_epochs` retain the previous behavior of applying
+`epochs` to both enabled phases. The CLI accepts `--ssl-epochs` alongside
+`--epochs`. Reusable definitions intentionally omit both durations: each
+queued pairing of a definition and frozen dataset owns its budgets.
+
+Live monitoring identifies the current phase and method. SSL objectives and
+representation-health metrics have separate curves from supervised loss,
+accuracy, and F1. SSL does not run supervised validation. The completed SSL
+trace remains expandable after supervised fitting begins. For classification
+and segmentation, a pause during SSL waits for the complete pretraining
+handoff; SSL mid-phase optimizer continuation is not supported. SSL-only
+embedding jobs execute as a whole workflow and publish the embedding model
+without a supervised continuation.
+
+The model inspector and evidence drawer include a dedicated SSL results panel:
+method, planned and completed epochs, metric picker, saved settings, provenance,
+and available files. SSL history is retained in
+`metrics/pretraining/metrics.csv`, `.json`, and `.jsonl`; method-specific
+pretrained weights are in `model/pretraining/`. Embedding-only training can
+also sample the exported embedding to record geometry and collapse diagnostics
+in `metrics/pretraining/embedding_health.json`. Health threshold failures are
+recorded as evidence; they do not silently change training or its epoch budget.
+The history API accepts `phase=self_supervised`; its default remains supervised
+history for existing clients. Catalog columns expose SSL method, SSL epochs,
+completed SSL epochs, and supervised epochs independently.

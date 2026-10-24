@@ -281,7 +281,7 @@ class TrainingExecutor:
             # fine-tuning. Embedding runs own their complete SSL lifecycle
             # and do not have a supervised continuation phase.
             whole_phase_ssl = bool(
-                config.get('run', {}).get('task') == 'classification'
+                config.get('run', {}).get('task') in {'classification', 'segmentation'}
                 and self_supervised_settings(config).get('enabled', False)
             )
             split = create_split_manifest(staging, dataset / 'payload', config)
@@ -478,16 +478,20 @@ def training_progress_payload(status_path: Path) -> dict[str, Any] | None:
                 post_training[key] = value
         if isinstance(post.get("stopped_early"), bool):
             post_training["stopped_early"] = post["stopped_early"]
-    bounded_trace = [_numeric_fields(item, limit=8) for item in trace[-60:]] if isinstance(trace, list) else []
-    bounded_history = [_numeric_fields(item, limit=24) for item in history[-50:]] if isinstance(history, list) else []
+    # Preserve all ordinary SSL representation-health metrics; point count is
+    # bounded, so metric-key truncation would silently hide a signal.
+    bounded_trace = [_numeric_fields(item, limit=64) for item in trace[-60:]] if isinstance(trace, list) else []
+    bounded_history = [_numeric_fields(item, limit=64) for item in history[-50:]] if isinstance(history, list) else []
     return {
         "updated_at": raw.get("updated_at") if isinstance(raw.get("updated_at"), str) else None,
         "phase": raw.get("phase") if isinstance(raw.get("phase"), str) else None,
+        "phase_id": raw.get("phase_id") if raw.get("phase_id") in {"self_supervised", "supervised"} else None,
+        "method": raw.get("method") if isinstance(raw.get("method"), str) else None,
         "message": raw.get("message") if isinstance(raw.get("message"), str) else None,
         "progress": _numeric_fields(progress, limit=12),
         "timing": _numeric_fields(timing, limit=12),
-        "metrics": _numeric_fields(current, limit=24),
-        "completed_metrics": _numeric_fields(completed, limit=24),
+        "metrics": _numeric_fields(current, limit=64),
+        "completed_metrics": _numeric_fields(completed, limit=64),
         "trace": bounded_trace,
         "history": bounded_history,
         "post_training": post_training,

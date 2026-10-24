@@ -266,3 +266,14 @@ def test_posthoc_invalid_json_types_return_authoring_errors(settings):
     config = v2_defaults()
     config['posthoc'] = settings
     assert any(error['path'] == 'posthoc' for error in v2_validation_errors(config))
+
+
+def test_ssl_schema_has_task_and_method_specific_authoring_metadata():
+    fields = {field['path']: field for field in configuration_schema()['fields']}
+    method = fields['self_supervised.method']
+    assert method['allowed_values_by']['segmentation'] == ['grayscale_reconstruction']
+    assert method['allowed_values_by']['embedding'] == ['byol', 'student_teacher', 'simclr']
+    assert fields['self_supervised.temperature']['visible_when']['self_supervised.method'] == 'simclr'
+    assert tuple(fields['self_supervised.teacher_momentum']['visible_when']['self_supervised.method']) == ('byol', 'student_teacher')
+    assert fields['self_supervised.ssl_optimizer']['choices'] == ['adam', 'adamw']
+    assert fields['self_supervised.optimizer_epsilon']['minimum'] > 0

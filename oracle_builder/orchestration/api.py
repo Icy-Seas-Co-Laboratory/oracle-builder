@@ -174,6 +174,7 @@ class ValidatedQueueRunRequest(BaseModel):
     batch_size: int | None = Field(default=None, ge=1)
     maximum_batch_size: int = Field(default=256, ge=1)
     epochs: int = Field(default=10, ge=1, description="Run-specific training epoch budget sealed with this queued run.")
+    ssl_epochs: int | None = Field(default=None, ge=1)
 
 
 class QueuedRunReplacementRequest(BaseModel):
@@ -188,6 +189,7 @@ class QueuedRunReplacementRequest(BaseModel):
     batch_size: int | None = Field(default=None, ge=1)
     maximum_batch_size: int = Field(default=256, ge=1)
     epochs: int = Field(default=10, ge=1)
+    ssl_epochs: int | None = Field(default=None, ge=1)
 
 
 class InferenceRunRequest(BaseModel):
@@ -1798,9 +1800,10 @@ def create_app(
         except ValueError as exc: raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.get("/v1/artifacts/{artifact_id}/history")
-    def artifact_history(artifact_id: str, limit: int = Query(default=500, ge=1, le=2000)) -> dict[str, Any]:
-        try: return orchestrator.artifact_history(artifact_id, limit=limit)
+    def artifact_history(artifact_id: str, limit: int = Query(default=500, ge=1, le=2000), phase: str = Query(default="supervised")) -> dict[str, Any]:
+        try: return orchestrator.artifact_history(artifact_id, limit=limit, phase=phase)
         except KeyError as exc: raise HTTPException(status_code=404, detail="Artifact was not found") from exc
+        except ValueError as exc: raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.get("/v1/artifacts/{artifact_id}/evidence")
     def artifact_evidence(artifact_id: str) -> dict[str, Any]:

@@ -133,6 +133,8 @@ class RichTrainingStatusCallback(keras.callbacks.Callback):
         self,
         *,
         phase: str,
+        phase_id: str | None = None,
+        method: str | None = None,
         epochs: int | None = None,
         display: str = "rich",
         training_log: str | Path | None = None,
@@ -146,6 +148,8 @@ class RichTrainingStatusCallback(keras.callbacks.Callback):
         if display not in {"rich", "text", "off"}:
             raise ValueError("training.display must be 'rich', 'text', or 'off'")
         self.phase = str(phase)
+        self.phase_id = phase_id or ("self_supervised" if "ssl" in self.phase.lower() else "supervised")
+        self.method = method
         self.epochs = int(epochs) if epochs is not None else None
         self.display = display
         self.training_log = training_log
@@ -222,6 +226,8 @@ class RichTrainingStatusCallback(keras.callbacks.Callback):
         return {
             "state": state,
             "phase": self.phase,
+            "phase_id": self.phase_id,
+            "method": self.method,
             "run_id": self.run_id,
             "progress": {
                 "epoch": self._epoch,

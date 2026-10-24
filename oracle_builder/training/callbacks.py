@@ -70,6 +70,7 @@ def build_callbacks(
 ):
     status_callback = RichTrainingStatusCallback(
         phase="Supervised training",
+        phase_id="supervised",
         epochs=int(config.get("training", {}).get("epochs", 10)),
         display=str(config.get("training", {}).get("display", "rich")),
         training_log=training_log,

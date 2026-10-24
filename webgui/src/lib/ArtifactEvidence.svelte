@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { api, type RecordValue } from '$lib/api';
 	import { formatNumber } from '$lib/number-format';
+	import SslResults from '$lib/SslResults.svelte';
 
 	export let artifactId: string;
 	export let onclose: () => void;
@@ -8,6 +9,7 @@
 
 	type EvidenceTab = 'overview' | 'classes' | 'samples' | 'visuals';
 	let evidence: RecordValue | null = null;
+	let detail: RecordValue | null = null;
 	let loading = true;
 	let tab: EvidenceTab = 'overview';
 
@@ -34,7 +36,7 @@
 
 	async function load() {
 		loading = true;
-		try { evidence = await api.artifactEvidence(artifactId); }
+		try { const [result, artifactDetail] = await Promise.all([api.artifactEvidence(artifactId), api.artifactDetail(artifactId).catch(() => null)]); evidence = result; detail = artifactDetail; }
 		catch (error) { onfailure(error instanceof Error ? error.message : 'Could not load artifact evidence.'); onclose(); }
 		finally { loading = false; }
 	}
@@ -64,6 +66,7 @@
 						<div><span>Dataset fingerprint</span><strong>{display(artifact()?.dataset_fingerprint_sha256)}</strong></div>
 						<div><span>Evidence source</span><strong>Immutable artifact files</strong></div>
 					</section>
+					<SslResults summary={asRecord(detail?.self_supervised)} {artifactId} />
 					<section><div class="section-heading"><div><h3>Recorded metrics</h3><p>Values from the standard evaluation summary.</p></div></div><div class="evidence-metrics">{#each metrics() as [name, value]}<div><span>{name.replaceAll('_', ' ')}</span><strong>{formatMetric(value)}</strong></div>{/each}</div></section>
 					{#if posthocConfig()?.enabled || posthoc()}<section><div class="section-heading"><div><h3>Post-hoc classifier</h3><p>Fitted on training embeddings; validation macro F1 selects candidates. Test metrics are held-out results.</p></div></div>{#if posthoc()}<p>{display(posthoc()?.estimator).replaceAll('_', ' ')} on {display(posthoc()?.representation).replaceAll('_', ' ')} · {display(posthoc()?.scaling)} scaling{#if posthoc()?.pca_enabled} · PCA {display(posthoc()?.pca_components)} dimensions{/if}{#if posthoc()?.calibration_method} · {display(posthoc()?.calibration_method)} calibration{/if}</p>{#if Object.keys(posthocParameters()).length}<details><summary>Selected parameters</summary><pre>{JSON.stringify(posthocParameters(), null, 2)}</pre></details>{/if}<div class="evidence-metrics">{#each posthocMetrics() as [name, value]}<div><span>Test {name.replaceAll('_', ' ')}</span><strong>{formatMetric(value)}</strong></div>{/each}</div>{:else}<p class="empty">No fitted post-hoc classifier or metrics were recorded for this artifact.</p>{/if}</section>{/if}
 					<section><div class="section-heading"><div><h3>Available evidence</h3><p>Missing products are shown explicitly; the interface does not synthesize them.</p></div></div><div class="availability-grid">{#each [['confusion_matrix','Confusion matrix'],['per_class_metrics','Per-class metrics'],['sample_metrics','Sample metrics'],['overlays','Prediction overlays'],['activations','Activations / saliency']] as item}<div class:available={Boolean(availability()?.[item[0]])}><span>{availability()?.[item[0]] ? '✓' : '—'}</span><strong>{item[1]}</strong><small>{availability()?.[item[0]] ? 'Included' : 'Not included in artifact'}</small></div>{/each}</div></section>

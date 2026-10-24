@@ -125,6 +125,7 @@ def test_status_writes_versioned_atomic_web_snapshot_with_transient_batch_metric
     snapshot = json.loads(status_path.read_text())
     assert snapshot["schema_version"] == 1
     assert snapshot["phase"] == "Classification"
+    assert snapshot["phase_id"] == "supervised"
     assert snapshot["progress"] == {
         "epoch": 1,
         "total_epochs": 2,
@@ -137,12 +138,21 @@ def test_status_writes_versioned_atomic_web_snapshot_with_transient_batch_metric
     ]
     assert snapshot["metrics"]["validation"] == {}
     assert snapshot["external_analysis"]["phase"] == "rich metrics: validation"
-
     callback.on_epoch_end(0, {"loss": 1.0, "val_loss": 1.1})
     completed = json.loads(status_path.read_text())
     assert completed["metrics"]["last_completed_epoch"] == {"loss": 1.0, "val_loss": 1.1}
     assert completed["metrics"]["last_completed_epoch"]["val_loss"] == 1.1
     assert completed["metrics"]["history"]["loss"] == [1.0]
+
+
+def test_ssl_status_exposes_machine_phase_and_method(tmp_path):
+    path = tmp_path / "training-status.json"
+    callback = RichTrainingStatusCallback(phase="SSL · SIMCLR", phase_id="self_supervised", method="simclr", display="off", status_path=path)
+    callback.on_train_begin()
+    payload = json.loads(path.read_text())
+    assert payload["phase_id"] == "self_supervised"
+    assert payload["method"] == "simclr"
+
 
 
 def test_status_publishes_the_sealed_dashboard_watchlist(tmp_path):

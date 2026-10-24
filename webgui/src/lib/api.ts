@@ -63,7 +63,7 @@ export const api = {
 	assignArtifactTags: (id: string, tags: string[]) => request<RecordValue>(`/v1/artifacts/${encodeURIComponent(id)}/tags`, { method: 'PUT', body: JSON.stringify({ tags }) }),
 	artifactArchitectureView: (id: string) => request<RecordValue>(`/v1/artifacts/${encodeURIComponent(id)}/architecture-view`),
 	artifactDetail: (id: string) => request<RecordValue>(`/v1/artifacts/${id}/detail`),
-	artifactHistory: (id: string, limit = 500) => request<RecordValue>(`/v1/artifacts/${encodeURIComponent(id)}/history?limit=${Math.min(Math.max(limit, 1), 2000)}`),
+	artifactHistory: (id: string, limit = 500, phase?: 'self_supervised' | 'supervised') => request<RecordValue>(`/v1/artifacts/${encodeURIComponent(id)}/history?limit=${Math.min(Math.max(limit, 1), 2000)}${phase ? `&phase=${phase}` : ''}`),
 	artifactEvidence: (id: string) => request<RecordValue>(`/v1/artifacts/${id}/evidence`),
 	recipes: () => request<{ recipes: RecordValue[] }>('/v1/recipes'),
 	experiments: () => request<{ experiments: RecordValue[] }>('/v1/experiments'),

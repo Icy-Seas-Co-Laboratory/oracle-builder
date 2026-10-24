@@ -136,7 +136,7 @@ def test_ssl_verification_schedules_a_whole_initialization_phase(queue_setup):
     assert lease is not None
     unit = lease["work_unit"]
     assert unit["phase"] == "initialize"
-    assert unit["parameters"]["execution_segment"] == {"phase": "initialize", "total_epochs": 2}
+    assert unit["parameters"]["execution_segment"] == {"phase": "initialize", "total_epochs": 2, "supervised_epochs": 2}
     assert unit["output_contract"]["kind"] == "training_checkpoint"
 
 

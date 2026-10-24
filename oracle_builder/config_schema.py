@@ -26,9 +26,9 @@ from oracle_builder.config import (
 
 
 # Bump whenever clients need to understand a new catalog contract attribute.
-# Version 9 adds configurable post-hoc estimators and dimensionality reduction. Clients must
+# Version 10 promotes SSL phase controls, method applicability, and optimizer metadata. Clients must
 # treat this as an authoring contract, not a dump of internal runtime defaults.
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 EXPOSURES: tuple[dict[str, Any], ...] = (
     {
@@ -364,6 +364,31 @@ _OVERRIDES: dict[str, dict[str, Any]] = {
     "self_supervised.method": {"choices": ("byol", "student_teacher", "simclr", "grayscale_reconstruction"), "advanced": True},
     "self_supervised.ssl_optimizer": {"choices": ("adam", "adamw"), "advanced": True},
 }
+
+
+# SSL is an explicit training phase with its own optimizer and diagnostics.
+_SSL_PAIRED_METHODS = ("byol", "student_teacher", "simclr")
+_SSL_TEACHER_METHODS = ("byol", "student_teacher")
+_OVERRIDES.update({
+    "self_supervised.enabled": {"label": "Enable SSL pretraining", "help": "Learn image representations before supervised fitting. Epoch budgets are chosen separately in Queue."},
+    "self_supervised.method": {"choices": ("byol", "student_teacher", "simclr", "grayscale_reconstruction"), "choice_labels": ("BYOL", "Student–teacher", "SimCLR", "Grayscale reconstruction"), "allowed_values_path": "run.task", "allowed_values_by": {"classification": _SSL_PAIRED_METHODS, "embedding": _SSL_PAIRED_METHODS, "segmentation": ("grayscale_reconstruction",)}, "visible_when": {"self_supervised.enabled": True}},
+    "self_supervised.epochs": {"minimum": 1, "help": "SSL epoch budget sealed for each queued run, independently of supervised epochs."},
+    "self_supervised.learning_rate": {"minimum": 1e-8, "label": "SSL learning rate", "visible_when": {"self_supervised.enabled": True}},
+    "self_supervised.ssl_optimizer": {"choices": ("adam", "adamw"), "label": "SSL optimizer", "visible_when": {"self_supervised.enabled": True, "self_supervised.method": _SSL_PAIRED_METHODS}},
+    "self_supervised.teacher_momentum": {"minimum": 0, "maximum": 0.999999, "help": "Moving-average teacher update; larger values update the teacher more slowly.", "visible_when": {"self_supervised.enabled": True, "self_supervised.method": _SSL_TEACHER_METHODS}},
+    "self_supervised.temperature": {"minimum": 1e-6, "help": "Temperature for SimCLR contrastive similarity scores.", "visible_when": {"self_supervised.enabled": True, "self_supervised.method": "simclr"}},
+    "self_supervised.minimum_global_batch_size": {"minimum": 2, "help": "SimCLR also requires at least two examples per synchronized replica.", "visible_when": {"self_supervised.enabled": True, "self_supervised.method": "simclr"}},
+    "self_supervised.reconstruction_foreground_weight": {"minimum": 1, "visible_when": {"self_supervised.enabled": True, "self_supervised.method": "grayscale_reconstruction"}},
+    "self_supervised.weight_decay": {"minimum": 0, "visible_when": {"self_supervised.enabled": True, "self_supervised.ssl_optimizer": "adamw", "self_supervised.method": _SSL_PAIRED_METHODS}},
+})
+for _key in ("projection_dim", "projection_hidden_dim"):
+    _OVERRIDES[f"self_supervised.{_key}"] = {"minimum": 1, "visible_when": {"self_supervised.enabled": True, "self_supervised.method": _SSL_PAIRED_METHODS}}
+for _key in ("vicreg_variance_weight", "vicreg_covariance_weight", "vicreg_target_std"):
+    _OVERRIDES[f"self_supervised.{_key}"] = {"minimum": 1e-6 if _key.endswith("std") else 0, "visible_when": {"self_supervised.enabled": True, "self_supervised.method": _SSL_TEACHER_METHODS}}
+for _key in ("encoder_variance_weight", "encoder_covariance_weight", "encoder_target_std"):
+    _OVERRIDES[f"self_supervised.{_key}"] = {"minimum": 1e-6 if _key.endswith("std") else 0, "visible_when": {"self_supervised.enabled": True, "self_supervised.method": _SSL_PAIRED_METHODS}}
+for _key in ("beta_1", "beta_2", "optimizer_epsilon"):
+    _OVERRIDES[f"self_supervised.{_key}"] = {"minimum": 1e-12 if _key == "optimizer_epsilon" else 0, **({"maximum": 0.999999} if _key != "optimizer_epsilon" else {}), "visible_when": {"self_supervised.enabled": True, "self_supervised.method": _SSL_PAIRED_METHODS}}
 
 
 # Fields that are required, V2 component settings, or family-specific options

@@ -48,7 +48,6 @@
 	$: stageItems = ['run', 'training', 'callbacks', 'recovery', 'augmentation', 'distribution', 'output', 'evidence', 'inference', 'evaluation']
 		.flatMap((section) => leaves(config[section], section))
 		.concat(leaves((config.metadata as RecordValue | undefined)?.augmentation, 'metadata.augmentation'))
-		.concat(leaves((config.self_supervised as RecordValue | undefined)?.augmentation, 'self_supervised.augmentation'))
 		.filter((item) => item.value !== undefined && inThisStage(item.path))
 		.map((item) => ({ ...item, definition: definitions.get(item.path) ?? { path: item.path, label: humanize(item.path), help: trainingHelp[item.path] } }))
 		.filter((item) => {
@@ -84,8 +83,8 @@
 </script>
 
 <div class="training-controls">
-	<div class="training-core">
-		<div class="subsection-heading"><h3>Core training</h3><p>Optimizer, learning rate, objective, and reported metrics.</p></div>
+	{#if task !== 'embedding'}<div class="training-core">
+		<div class="subsection-heading"><h3>Supervised training</h3><p>These settings apply to supervised fitting. SSL has its own optimizer above.</p></div>
 		<div class="field-grid">
 			{#each corePaths as path}
 				<ConfigField helpDisplay="tooltip" definition={definitions.get(path) ?? { path, label: humanize(path), help: trainingHelp[path] }} value={getPath(config, path)} {config} on:change={(event) => update(path, event.detail.value)} />
@@ -94,17 +93,19 @@
 	</div>
 
 	<details class="training-menu">
-		<summary><span><strong>Augmentation</strong><small>Image transforms, metadata noise, and self-supervised views</small></span><em>{augmentationEnabled ? 'Image on' : 'Image off'}</em></summary>
+		<summary><span><strong>Supervised augmentation</strong><small>Image transforms and metadata noise for supervised fitting</small></span><em>{augmentationEnabled ? 'Image on' : 'Image off'}</em></summary>
 		<div class="menu-body">
 			<div class="subsection-heading"><h3>Training images</h3><p>These transforms apply only when augmentation is enabled.</p></div>
 			<div class="field-grid">{#each grouped.augmentation.regular.filter((item) => item.path.startsWith('augmentation.')) as item}<ConfigField helpDisplay="tooltip" definition={item.definition} value={item.value} {config} on:change={(event) => update(item.path, event.detail.value)} />{/each}</div>
 			{#if grouped.augmentation.regular.some((item) => item.path.startsWith('metadata.augmentation.'))}<div class="subsection-heading nested"><h3>Metadata noise</h3><p>Applied to eligible scalar fields during classification training.</p></div><div class="field-grid">{#each grouped.augmentation.regular.filter((item) => item.path.startsWith('metadata.augmentation.')) as item}<ConfigField helpDisplay="tooltip" definition={item.definition} value={item.value} {config} on:change={(event) => update(item.path, event.detail.value)} />{/each}</div>{/if}
-			{#if (task === 'embedding' || task === 'classification') && Boolean(getPath(config, 'self_supervised.enabled', false)) && grouped.augmentation.regular.some((item) => item.path.startsWith('self_supervised.augmentation.'))}<div class="subsection-heading nested"><h3>Self-supervised views</h3><p>Transforms used to create paired representation-learning views.</p></div><div class="field-grid">{#each grouped.augmentation.regular.filter((item) => item.path.startsWith('self_supervised.augmentation.')) as item}<ConfigField helpDisplay="tooltip" definition={item.definition} value={item.value} {config} on:change={(event) => update(item.path, event.detail.value)} />{/each}</div>{/if}
+
 			{#if grouped.augmentation.expert.length}<details class="expert-menu"><summary>Expert augmentation settings</summary><div class="field-grid">{#each grouped.augmentation.expert as item}<ConfigField helpDisplay="tooltip" definition={item.definition} value={item.value} {config} on:change={(event) => update(item.path, event.detail.value)} />{/each}</div></details>{/if}
 		</div>
 	</details>
 
 	{#if grouped.optimization.regular.length || grouped.optimization.expert.length}<details class="training-menu"><summary><span><strong>Optimization & scheduling</strong><small>Class weighting, weight decay, early stopping, and learning-rate changes</small></span></summary><div class="menu-body"><div class="field-grid">{#each grouped.optimization.regular as item}<ConfigField helpDisplay="tooltip" definition={item.definition} value={item.value} {config} on:change={(event) => update(item.path, event.detail.value)} />{/each}</div>{#if grouped.optimization.expert.length}<details class="expert-menu"><summary>Expert optimization settings</summary><div class="field-grid">{#each grouped.optimization.expert as item}<ConfigField helpDisplay="tooltip" definition={item.definition} value={item.value} {config} on:change={(event) => update(item.path, event.detail.value)} />{/each}</div></details>{/if}</div></details>{/if}
+
+	{/if}
 
 	{#if grouped.execution.regular.length || grouped.execution.expert.length}<details class="training-menu"><summary><span><strong>Compute & execution</strong><small>Device strategy, worker behavior, and execution boundaries</small></span></summary><div class="menu-body"><div class="field-grid">{#each grouped.execution.regular as item}<ConfigField helpDisplay="tooltip" definition={item.definition} value={item.value} {config} on:change={(event) => update(item.path, event.detail.value)} />{/each}</div>{#if grouped.execution.expert.length}<details class="expert-menu"><summary>Expert compute settings</summary><div class="field-grid">{#each grouped.execution.expert as item}<ConfigField helpDisplay="tooltip" definition={item.definition} value={item.value} {config} on:change={(event) => update(item.path, event.detail.value)} />{/each}</div></details>{/if}</div></details>{/if}
 

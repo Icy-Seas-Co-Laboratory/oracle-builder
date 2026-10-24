@@ -349,6 +349,8 @@ def run_grayscale_reconstruction_self_supervised(
             ),
             RichTrainingStatusCallback(
                 phase="SSL · grayscale reconstruction",
+                phase_id="self_supervised",
+                method="grayscale_reconstruction",
                 epochs=epochs,
                 training_log=training_log,
                 run_id=run_id,
@@ -1133,6 +1135,8 @@ def run_self_supervised_training(
             ),
             RichTrainingStatusCallback(
                 phase=f"SSL · {method.upper()}",
+                phase_id="self_supervised",
+                method=method,
                 epochs=epochs,
                 training_log=training_log,
                 run_id=run_id,

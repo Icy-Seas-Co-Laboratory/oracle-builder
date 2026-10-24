@@ -6,6 +6,7 @@ import fcntl
 import hmac
 import hashlib
 import io
+from itertools import islice
 import json
 import math
 import os
@@ -33,6 +34,7 @@ from PIL import Image
 
 from oracle_data_contracts.datasets import dataset_fingerprint, read_dataset_info, set_dataset_lifecycle
 from oracle_builder.data.decoders import decode_blob
+from oracle_builder.orchestration.ssl import phase_budgets, seal_phase_budgets, ssl_artifact_summary
 from oracle_builder.config import (
     DEFAULT_CONFIG,
     deep_merge,
@@ -992,6 +994,7 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
             row["start_authorized"] = bool(row.get("start_authorized"))
             definition = self.model_definition(str(row["definition_id"]), revision=int(row["definition_revision"]))
             row["definition_name"] = definition.get("name") if definition else None
+            sealed = {}
             try:
                 sealed = load_toml(row["resolved_toml_path"])
                 row["batch_size"] = int(sealed.get("data", {}).get("batch_size"))
@@ -999,6 +1002,9 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
             except (OSError, TypeError, ValueError):
                 row["batch_size"] = None
                 row["epochs"] = None
+            row.update(phase_budgets(sealed))
+            if not sealed:
+                row.update(supervised_epochs=None, ssl_epochs=None, total_planned_epochs=None)
             specification = self.specification(str(row["specification_id"])) if row.get("specification_id") else None
             row["batch_execution"] = (specification or {}).get("parameters", {}).get("queue_execution")
             if (row["batch_execution"] or {}).get("mode") == "verified":
@@ -1011,6 +1017,7 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
         if row is not None:
             row.update(self._queued_run_edit_state(row))
             row["start_authorized"] = bool(row.get("start_authorized"))
+            sealed = {}
             try:
                 sealed = load_toml(row["resolved_toml_path"])
                 row["batch_size"] = int(sealed.get("data", {}).get("batch_size"))
@@ -1018,6 +1025,9 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
             except (OSError, TypeError, ValueError):
                 row["batch_size"] = None
                 row["epochs"] = None
+            row.update(phase_budgets(sealed))
+            if not sealed:
+                row.update(supervised_epochs=None, ssl_epochs=None, total_planned_epochs=None)
             specification = self.specification(str(row["specification_id"])) if row.get("specification_id") else None
             row["batch_execution"] = (specification or {}).get("parameters", {}).get("queue_execution")
             if (row["batch_execution"] or {}).get("mode") == "verified":
@@ -1106,6 +1116,7 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
         batch_size: int | None = None,
         maximum_batch_size: int = 256,
         epochs: int = 10,
+        ssl_epochs: int | None = None,
         operation_progress: Callable[[str, str, dict[str, Any] | None], None] | None = None,
     ) -> dict[str, Any]:
         def progress(event_type: str, message: str, data: dict[str, Any] | None = None) -> None:
@@ -1155,6 +1166,8 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
             raise ValueError("maximum_batch_size must be a positive integer")
         if isinstance(epochs, bool) or not isinstance(epochs, int) or epochs < 1:
             raise ValueError("epochs must be a positive integer")
+        if ssl_epochs is not None and (isinstance(ssl_epochs, bool) or not isinstance(ssl_epochs, int) or ssl_epochs < 1):
+            raise ValueError("ssl_epochs must be a positive integer")
         if batch_size_mode == "auto" and batch_size is not None:
             raise ValueError("batch_size is only valid with manual batch_size_mode")
         queue_id, experiment_id, specification_id, now = str(uuid.uuid4()), str(uuid.uuid4()), str(uuid.uuid4()), _now()
@@ -1162,9 +1175,7 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
         # Run length belongs to this sealed dataset/definition pairing, not to
         # the reusable model definition.  The resolved TOML remains the audit
         # record of the exact epoch budget that was executed.
-        config.setdefault("training", {})["epochs"] = epochs
-        if (config.get("self_supervised") or {}).get("enabled"):
-            config.setdefault("self_supervised", {})["epochs"] = epochs
+        budgets = seal_phase_budgets(config, epochs, ssl_epochs)
         # Queue allocation owns physical-device choice.  The runtime sees just
         # that selected device via CUDA_VISIBLE_DEVICES, so use one logical
         # device rather than allowing the legacy automatic selector to choose
@@ -1197,7 +1208,7 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
                 "definition_id": definition_id, "definition_revision": int(definition["revision"]),
                 "run_name": name.strip(),
                 "initialization": dict(initialization or {}),
-                "queue_execution": {**batch_execution, "epochs": epochs},
+                "queue_execution": {**batch_execution, "epochs": epochs, "ssl_epochs": budgets["ssl_epochs"], "supervised_epochs": budgets["supervised_epochs"]},
             },
             specification_id,
         )
@@ -1205,7 +1216,7 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
             "kind": "validated_queue", "queued_run_id": queue_id,
             "definition_id": definition_id, "definition_revision": int(definition["revision"]),
             "dataset_id": dataset_id, "dataset_fingerprint_sha256": dataset.get("fingerprint_sha256"),
-            "batch_execution": {**batch_execution, "epochs": epochs},
+            "batch_execution": {**batch_execution, "epochs": epochs, "ssl_epochs": budgets["ssl_epochs"], "supervised_epochs": budgets["supervised_epochs"]},
         }
         with self._connection() as db:
             db.execute("INSERT INTO experiments VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", (
@@ -1326,6 +1337,7 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
         batch_size: int | None = None,
         maximum_batch_size: int = 256,
         epochs: int = 10,
+        ssl_epochs: int | None = None,
         operation_progress: Callable[[str, str, dict[str, Any] | None], None] | None = None,
     ) -> dict[str, Any]:
         """Pin a definition and frozen input without verifying or training.
@@ -1371,9 +1383,7 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
             raise ValueError("GPU request must be a non-negative integer")
         queue_id, experiment_id, specification_id, now = str(uuid.uuid4()), str(uuid.uuid4()), str(uuid.uuid4()), _now()
         config = self._definition_queue_config(definition, dataset)
-        config.setdefault("training", {})["epochs"] = epochs
-        if (config.get("self_supervised") or {}).get("enabled"):
-            config.setdefault("self_supervised", {})["epochs"] = epochs
+        budgets = seal_phase_budgets(config, epochs, ssl_epochs)
         # Auto calibration is intentionally deferred to the worker that will
         # execute the run.  Only that worker knows its accelerator, runtime,
         # and current isolation boundary.  The configuration artifact remains
@@ -1400,14 +1410,14 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
         self.record_artifact_replica(dataset_ref)
         self.record_artifact_replica(config_ref)
         if batch_size_mode == "manual":
-            execution: dict[str, Any] = {"mode": "manual", "batch_size": resolved_batch_size, "epochs": epochs}
+            execution: dict[str, Any] = {"mode": "manual", "batch_size": resolved_batch_size, "epochs": epochs, "ssl_epochs": budgets["ssl_epochs"], "supervised_epochs": budgets["supervised_epochs"]}
         else:
             execution = {
                 "mode": "auto",
                 "minimum_batch_size": max(1, gpu_count or 1),
                 "maximum_batch_size": maximum_batch_size,
                 "target_vram_fraction": {"minimum": 0.30, "maximum": 0.80},
-                "epochs": epochs,
+                "epochs": epochs, "ssl_epochs": budgets["ssl_epochs"], "supervised_epochs": budgets["supervised_epochs"],
             }
         # New queue intake is V2-only even though the eventual training unit
         # is created after verification. This prevents a V1 worker from
@@ -1456,7 +1466,7 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
     def replace_queued_run(
         self, queued_run_id: str, *, name: str, dataset_id: str, worker_pool_id: str,
         resources: dict[str, Any], batch_size_mode: str, batch_size: int | None = None,
-        maximum_batch_size: int = 256, epochs: int = 10,
+        maximum_batch_size: int = 256, epochs: int = 10, ssl_epochs: int | None = None,
         definition_id: str | None = None, definition_revision: int | None = None,
     ) -> dict[str, Any]:
         """Replace an idle queue decision with a newly sealed revision.
@@ -1477,7 +1487,7 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
             worker_pool_id=worker_pool_id, resources=resources,
             initialization=dict(prior["initialization"] or {}),
             batch_size_mode=batch_size_mode, batch_size=batch_size,
-            maximum_batch_size=maximum_batch_size, epochs=epochs,
+            maximum_batch_size=maximum_batch_size, epochs=epochs, ssl_epochs=ssl_epochs,
         )
         new_id = str(replacement["queued_run_id"])
         with self._connection() as db:
@@ -2743,7 +2753,8 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
             dataset=dataset,
             require_portable=True,
         )
-        if spec['parameters'].get('queue_execution', {}).get('execution_contract_version') == 2:
+        if (spec['parameters'].get('queue_execution', {}).get('execution_contract_version') == 2
+                and not spec['parameters'].get('queue_execution', {}).get('whole_run', False)):
             work_unit = self._begin_sequential_in_connection(db, unit=work_unit,
                 queued_run_id=queued_run['queued_run_id'] if queued_run else None, pool_id=pool_id, now=now)
         db.execute(
@@ -3428,7 +3439,7 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
                 self.artifact_store.resolve(ArtifactRef.from_dict(sealed["configuration"])) / "payload"
             )
             expected_ssl_phase = bool(
-                configured.get("run", {}).get("task") == "classification"
+                configured.get("run", {}).get("task") in {"classification", "segmentation"}
                 and isinstance(configured.get("self_supervised"), dict)
                 and configured["self_supervised"].get("enabled", False)
             )
@@ -3445,7 +3456,10 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
             raise ValueError("Verification lease has no recorded worker environment; reverify the run")
         parameters["queue_execution"] = {
             "mode": "verified", "batch_size": report["batch_size"],
-            "epochs": execution.get("epochs", 10), "verified_worker_id": worker_id,
+            "epochs": execution.get("epochs", 10),
+            "ssl_epochs": execution.get("ssl_epochs"),
+            "supervised_epochs": execution.get("supervised_epochs", execution.get("epochs", 10)),
+            "verified_worker_id": worker_id,
             "verified_environment_sha256": environment_digest, "requested_policy": requested,
         }
         if report.get('execution_contract_version') == 2:
@@ -3454,6 +3468,7 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
                 raise ValueError('Verification has no committed split artifact')
             parameters.setdefault('artifact_inputs', {})['split_manifest'] = json.loads(output_row[0])
             parameters['queue_execution']['execution_contract_version'] = 2
+            parameters['queue_execution']['whole_run'] = configured.get('run', {}).get('task') == 'embedding'
             parameters['queue_execution']['unit_epochs'] = report.get('unit_epochs', 1)
             parameters['queue_execution']['unit_steps'] = report.get('unit_steps', 0)
             parameters['queue_execution']['self_supervised_whole_phase'] = report.get('self_supervised_whole_phase', False)
@@ -4999,6 +5014,10 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
         for name, value in metric_values.items():
             # Evaluation values retain their source; history-only values are explicitly inferred.
             choose(name, (manifest_evaluation.get(name), "sealed_manifest", "recorded"), (summary_evaluation.get(name) if isinstance(summary_evaluation, dict) else None, "evaluation_summary", "recorded"), (value, "training_history", "inferred"))
+        ssl_summary = ssl_artifact_summary(root, config)
+        facts.update({"ssl_enabled": ssl_summary["enabled"], "ssl_method": ssl_summary["method"],
+                      "ssl_epochs": ssl_summary["planned_epochs"], "completed_ssl_epochs": ssl_summary["completed_epochs"],
+                      "supervised_epochs": 0 if task == "embedding" else training.get("epochs")})
         facts.update(metric_values)
         for key in ("stem_size", "epochs", "seed", "parameter_count", "trainable_parameters", "num_classes", "embedding_dim", "metadata_field_count", "architecture_version"):
             if isinstance(facts[key], bool): facts[key] = None
@@ -5256,7 +5275,7 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
         """Read a bounded, display-oriented view of a standard evidence table."""
         try:
             with path.open(newline="", encoding="utf-8") as handle:
-                rows = list(csv.DictReader(handle))[:limit]
+                rows = list(islice(csv.DictReader(handle), limit))
         except OSError:
             return []
         converted: list[dict[str, Any]] = []
@@ -5544,17 +5563,29 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
             raise KeyError(dataset_id)
         return self._sqlite_preview_image(Path(dataset["path"]), item_id, kind=kind, max_size=max_size)
 
-    def artifact_history(self, artifact_id: str, *, limit: int = 500) -> dict[str, Any]:
+    def artifact_history(self, artifact_id: str, *, limit: int = 500, phase: str = "supervised") -> dict[str, Any]:
+        if phase not in {"supervised", "self_supervised"}:
+            raise ValueError("phase must be supervised or self_supervised")
         artifact = self.artifact(artifact_id)
         if artifact is None:
             raise KeyError(artifact_id)
         limit = min(max(1, limit), 2000)
         root = Path(artifact["path"])
-        rows = self._evidence_csv(root / "metrics" / "history.csv", limit=limit)
-        columns = list(rows[0]) if rows else []
-        return {"artifact_id": artifact_id, "rows": rows, "columns": columns, "limit": limit,
-                "truncated": len(rows) == limit and (root / "metrics" / "history.csv").is_file(),
-                "provenance": self._json_file(root / "metrics" / "provenance.json")}
+        history_path = root / "metrics" / "pretraining" / "metrics.csv" if phase == "self_supervised" else root / "metrics" / "history.csv"
+        rows = self._evidence_csv(history_path, limit=limit + 1)
+        truncated = len(rows) > limit
+        rows = rows[:limit]
+        summary = None
+        provenance = self._json_file(root / "metrics" / "provenance.json")
+        if phase == "self_supervised":
+            summary = ssl_artifact_summary(root, self._json_file(root / "config" / "resolved.json") or {}, provenance)
+            provenance = summary["provenance"]
+            for row in rows:
+                if isinstance(row.get("epoch"), (int, float)):
+                    row["epoch"] += 1  # Keras CSV indices start at zero.
+        return {"artifact_id": artifact_id, "phase": phase, "rows": rows,
+                "columns": list(rows[0]) if rows else [], "limit": limit,
+                "truncated": truncated, "provenance": provenance, "self_supervised": summary}
 
     def artifact_detail(self, artifact_id: str) -> dict[str, Any]:
         """Read-only inspector payload for a sealed artifact; all large media stays separate."""
@@ -5600,6 +5631,7 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
             neural_evaluation = self._json_file(root / "provenance" / "neural" / "evaluation" / "evaluation_summary.json")
             neural_dataset_id = (artifact["manifest"].get("lineage") or {}).get("original_neural_dataset_id")
         artifact_result = self._artifact_result(artifact)
+        self_supervised = ssl_artifact_summary(root, config or {}, self._json_file(root / "metrics" / "provenance.json"))
         return {"artifact": artifact_result, "facts": self._artifact_facts(artifact_id, artifact_result), "manifest": artifact["manifest"],
                 "runtime": runtime, "config": config, "model_contract": contract, "model_inspection": inspection, "posthoc": posthoc,
                 "history_provenance": self._json_file(root / "metrics" / "provenance.json"),
@@ -5609,6 +5641,7 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
                 "source_neural_evaluation": neural_evaluation,
                 "source_model_evaluation": self._json_file(root / "provenance" / "source_model" / "evaluation" / "evaluation_summary.json"),
                 "source_posthoc": self._json_file(root / "provenance" / "source_model" / "posthoc" / "report.json"),
+                "self_supervised": self_supervised,
                 "architecture": {"summary": model_summary, "available": model_summary is not None},
                 "history_url": f"/api/v1/artifacts/{artifact_id}/history",
                 "evidence_url": f"/api/v1/artifacts/{artifact_id}/evidence"}
@@ -5808,6 +5841,11 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
         "artifact_size_bytes": "json_extract(artifact_facts.facts_json, '$.artifact_size_bytes')",
         "model_size_bytes": "json_extract(artifact_facts.facts_json, '$.model_size_bytes')",
         "epochs": "json_extract(artifact_facts.facts_json, '$.epochs')",
+        "ssl_enabled": "json_extract(artifact_facts.facts_json, '$.ssl_enabled')",
+        "ssl_method": "json_extract(artifact_facts.facts_json, '$.ssl_method')",
+        "ssl_epochs": "json_extract(artifact_facts.facts_json, '$.ssl_epochs')",
+        "completed_ssl_epochs": "json_extract(artifact_facts.facts_json, '$.completed_ssl_epochs')",
+        "supervised_epochs": "json_extract(artifact_facts.facts_json, '$.supervised_epochs')",
         "parameter_count": "json_extract(artifact_facts.facts_json, '$.parameter_count')",
         "trainable_parameters": "json_extract(artifact_facts.facts_json, '$.trainable_parameters')",
         "accuracy": "json_extract(artifact_facts.facts_json, '$.accuracy')",
@@ -5826,8 +5864,8 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
     def artifact_filter_schema(self) -> dict[str, Any]:
         fields = [
             {"key": key, "label": key.replace("_", " ").title(),
-             "type": "number" if key in {"stem_size", "macro_f1", "loss", "training_seconds", "artifact_size_bytes", "model_size_bytes", "epochs", "parameter_count", "trainable_parameters", "accuracy", "balanced_accuracy", "macro_precision", "macro_recall", "macro_average_precision", "num_classes", "embedding_dim", "metadata_field_count", "architecture_version"} else "datetime" if key in {"updated_at", "discovered_at", "created_at", "completed_at", "modified_at"} else "text",
-             "operators": ["eq", "in", "contains"] if key not in {"stem_size", "macro_f1", "loss", "training_seconds", "artifact_size_bytes", "model_size_bytes", "epochs", "parameter_count", "trainable_parameters", "accuracy", "balanced_accuracy", "macro_precision", "macro_recall", "macro_average_precision", "num_classes", "embedding_dim", "metadata_field_count", "architecture_version", "updated_at", "discovered_at", "created_at", "completed_at", "modified_at"} else ["eq", "gte", "lte"]}
+             "type": "number" if key in {"stem_size", "macro_f1", "loss", "training_seconds", "artifact_size_bytes", "model_size_bytes", "epochs", "ssl_epochs", "completed_ssl_epochs", "supervised_epochs", "parameter_count", "trainable_parameters", "accuracy", "balanced_accuracy", "macro_precision", "macro_recall", "macro_average_precision", "num_classes", "embedding_dim", "metadata_field_count", "architecture_version"} else "datetime" if key in {"updated_at", "discovered_at", "created_at", "completed_at", "modified_at"} else "text",
+             "operators": ["eq", "in", "contains"] if key not in {"stem_size", "macro_f1", "loss", "training_seconds", "artifact_size_bytes", "model_size_bytes", "epochs", "ssl_epochs", "completed_ssl_epochs", "supervised_epochs", "parameter_count", "trainable_parameters", "accuracy", "balanced_accuracy", "macro_precision", "macro_recall", "macro_average_precision", "num_classes", "embedding_dim", "metadata_field_count", "architecture_version", "updated_at", "discovered_at", "created_at", "completed_at", "modified_at"} else ["eq", "gte", "lte"]}
             for key in self._CATALOG_COLUMNS
         ]
         fields.append({"key": "tag", "label": "Tag", "type": "text", "operators": ["eq", "in"]})

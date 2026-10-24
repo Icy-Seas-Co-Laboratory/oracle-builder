@@ -8,6 +8,7 @@
 	export let title = 'Loss';
 	export let mode: 'epoch' | 'batch' = 'epoch';
 	export let validationValue: number | null = null;
+	export let validationExpected = true;
 	export let validationLabel = 'Last completed epoch validation';
 	let hoveredX: number | null = null;
 
@@ -79,7 +80,7 @@
 			<text x="56" y="181">{xMin}</text><text x="460" y="181" text-anchor="end">{xMax}</text>
 			<text x="258" y="193" text-anchor="middle">{mode === 'epoch' ? 'Epoch' : 'Batch'}</text>
 		</svg>
-		<div class="hover-values" aria-live="off">{#if inspected}<strong>{mode === 'epoch' ? 'Epoch' : 'Batch'} {inspected.x}</strong><span>Training: {precise(inspectedSeries?.primary ?? null)}</span>{#if mode === 'batch'}<span>Raw: {precise(inspected.train)}</span>{/if}{#if mode === 'batch' && inspected.validation === null && baseline !== null}<span>{validationLabel}: {precise(baseline)}</span>{:else}<span>Validation: {precise(inspected.validation)}</span>{/if}{:else}<span>Hover over the plot to inspect {mode === 'epoch' ? 'epoch' : 'batch'} values.</span>{/if}</div>
+		<div class="hover-values" aria-live="off">{#if inspected}<strong>{mode === 'epoch' ? 'Epoch' : 'Batch'} {inspected.x}</strong><span>Training: {precise(inspectedSeries?.primary ?? null)}</span>{#if mode === 'batch'}<span>Raw: {precise(inspected.train)}</span>{/if}{#if mode === 'batch' && inspected.validation === null && baseline !== null}<span>{validationLabel}: {precise(baseline)}</span>{:else if validationExpected}<span>Validation: {precise(inspected.validation)}</span>{/if}{:else}<span>Hover over the plot to inspect {mode === 'epoch' ? 'epoch' : 'batch'} values.</span>{/if}</div>
 		<div class="legend"><span><i class="primary-key"></i>{mode === 'epoch' ? 'Training' : 'Training · 7 batch average'}</span>{#if validationCount}<span><i class="secondary-key"></i>Validation · epoch end</span>{:else if mode === 'batch' && baseline !== null}<span><i class="secondary-key baseline-key"></i>{validationLabel}</span>{/if}{#if mode === 'batch' && secondaryCount}<span><i class="raw-key"></i>Raw training</span>{/if}<small>{primaryCount} {mode === 'epoch' ? 'completed epochs' : 'sampled batches'}</small></div>
 	{:else}<p>No {mode} metrics yet.</p>{/if}
 </div>
