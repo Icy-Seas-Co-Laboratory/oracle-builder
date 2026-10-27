@@ -424,9 +424,9 @@ def create_app(
         # Recovery remains synchronous so the readiness report is meaningful;
         # recurring remote reconciliation is subsequently durable/scheduled.
         app.state.startup_reconciliation = await run_in_threadpool(orchestrator.reconcile_startup)
-        # Provider handles are intentionally ephemeral.  Reconciliation only
-        # queries deterministic provider identities and marks unknown rather
-        # than adopting an arbitrary process after restart.
+        # Provider handles are intentionally ephemeral. Reconciliation uses
+        # deterministic profile identities to restore deployments whose
+        # durable desired state is still running.
         app.state.startup_deployments = await run_in_threadpool(orchestrator.reconcile_worker_deployments)
         orchestrator.start_operation_runner()
         yield

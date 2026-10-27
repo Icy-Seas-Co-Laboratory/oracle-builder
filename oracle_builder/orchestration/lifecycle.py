@@ -500,9 +500,25 @@ class DockerPullWorkerProvider:
         return self._runner(command, check=check, capture_output=True, text=True)
 
     def start(self, spec: PullWorkerSpec) -> WorkerStatus:
+        name = self._container_name(spec.worker_id)
+        existing = self._run(
+            (self.profile.docker_executable, "inspect", "--format", "{{.State.Status}}", name),
+            check=False,
+        )
+        state = existing.stdout.strip() if existing.returncode == 0 else ""
+        if state == "running":
+            return WorkerStatus(spec.worker_id, "running", None, f"docker://{name}")
+        if state in {"created", "exited", "dead"}:
+            try:
+                self._run((self.profile.docker_executable, "start", name))
+                return WorkerStatus(spec.worker_id, "running", None, f"docker://{name}", datetime.now(UTC).isoformat(), None)
+            except subprocess.CalledProcessError:
+                # A failed containerd task can leave the deterministic Docker
+                # container present but impossible to start. Remove only this
+                # stopped, profile-owned container and recreate it below.
+                self._run((self.profile.docker_executable, "rm", "--force", name))
         result = self._run(self.command_for(spec))
-        container_id = result.stdout.strip() or None
-        return WorkerStatus(spec.worker_id, "running", None, f"docker://{self._container_name(spec.worker_id)}", datetime.now(UTC).isoformat(), None)
+        return WorkerStatus(spec.worker_id, "running", None, f"docker://{name}", datetime.now(UTC).isoformat(), None)
 
     def stop(self, worker_id: str, *, timeout_seconds: float = 10.0) -> WorkerStatus:
         if timeout_seconds < 0:

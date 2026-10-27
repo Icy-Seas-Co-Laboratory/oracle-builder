@@ -5,6 +5,7 @@
 | Goal | Guide |
 |---|---|
 | Operate the control plane from a terminal | [Oracle control CLI](oracle-cli.md) |
+| Connect an AI client through MCP | [Oracle Builder MCP server](oracle-mcp.md) |
 | Choose the supported GUI, CLI, or API entry point | [Using Oracle Builder](user-entrypoints.md) |
 | Deploy registered pull workers | [Oracle worker](oracle-worker.md) |
 | Deploy the single-host demo | [Non-container demo deployment](../deploy/demo/README.md) |

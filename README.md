@@ -10,6 +10,10 @@ the same control-plane records; none communicates directly with a worker.
 See [Using Oracle Builder](docs/user-entrypoints.md) for supported workflows
 and the current inference boundary.
 
+For AI clients, the optional `oracle-mcp` stdio adapter exposes typed,
+read-only control-plane tools by default and opt-in operator mutations. See
+[Oracle Builder MCP server](docs/oracle-mcp.md).
+
 The durable dataset and annotation-workspace contracts are also available in
 the dependency-light `oracle_data_contracts` Python package within this source
 tree, so other applications can share the same SQLite schema and lifecycle APIs.

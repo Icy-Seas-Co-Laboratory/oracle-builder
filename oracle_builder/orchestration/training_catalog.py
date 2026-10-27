@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import sqlite3
+from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -39,7 +40,7 @@ def _family_and_version(metadata: dict[str, Any], path: Path) -> tuple[str, str]
 
 def _sqlite_entry(path: Path, root: Path) -> dict[str, Any] | None:
     try:
-        with sqlite3.connect(path) as connection:
+        with closing(sqlite3.connect(path)) as connection:
             connection.row_factory = sqlite3.Row
             info = read_dataset_info(connection)
             labels: list[dict[str, Any]] = []

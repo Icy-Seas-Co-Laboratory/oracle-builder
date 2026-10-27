@@ -1573,6 +1573,7 @@ class PullWorkerLoop:
         credentials = self.credentials()
         completed = 0
         recovery_retry_seconds = 5.0
+        poll_failures = 0
         while not stop.is_set() and (max_jobs is None or completed < max_jobs):
             retained = self._retained_outputs(credentials.worker_id)
             if retained:
@@ -1592,8 +1593,20 @@ class PullWorkerLoop:
                 if once:
                     break
                 continue
-            lease = self.client.poll(worker_id=credentials.worker_id, worker_token=credentials.worker_token,
-                                     ttl_seconds=self.lease_ttl_seconds, capabilities=self.capabilities)
+            try:
+                lease = self.client.poll(worker_id=credentials.worker_id, worker_token=credentials.worker_token,
+                                         ttl_seconds=self.lease_ttl_seconds, capabilities=self.capabilities)
+            except PullProtocolError as exc:
+                status_code = getattr(exc, "status_code", None)
+                retryable = status_code is None or status_code in {408, 425, 429} or status_code >= 500
+                if not retryable:
+                    raise
+                delay = min(60.0, max(1.0, self.poll_interval_seconds) * (2 ** min(poll_failures, 6)))
+                print(f"Worker poll failed; retrying in {delay:g}s: {exc}", file=sys.stderr, flush=True)
+                stop.wait(delay)
+                poll_failures += 1
+                continue
+            poll_failures = 0
             if lease is None:
                 if once:
                     break

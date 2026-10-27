@@ -26,7 +26,7 @@ from contextlib import contextmanager
 from functools import wraps
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 from urllib.parse import urlsplit
 
 import numpy as np
@@ -67,6 +67,17 @@ def _now() -> str:
 
 def _json(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+
+
+@contextmanager
+def _sqlite_connection(path: str | Path) -> Iterator[sqlite3.Connection]:
+    """Use SQLite's transaction context while always closing its file handles."""
+    connection = sqlite3.connect(path)
+    try:
+        with connection:
+            yield connection
+    finally:
+        connection.close()
 
 
 def _serialized_output_completion(method):
@@ -188,8 +199,7 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
         uploaded_datasets.mkdir(parents=True, exist_ok=True)
         if not any(uploaded_datasets.is_relative_to(root) for root in self.training_catalog_roots.values()):
             self.training_catalog_roots["uploads"] = uploaded_datasets
-        with connect(self.database):
-            pass
+        connect(self.database).close()
         self._lease_sleep_lock = threading.Lock()
         self._lease_last_wall = datetime.now(timezone.utc)
         self._lease_last_awake = awake_monotonic()
@@ -198,7 +208,8 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
         for name, base_url in compute_endpoints or []:
             self.register_compute_endpoint(name=name, base_url=base_url)
 
-    def _connection(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connection(self) -> Iterator[sqlite3.Connection]:
         db = connect(self.database)
         try:
             # A host suspend stops the worker and this control plane together.
@@ -226,10 +237,14 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
                     db.commit()
                 self._lease_last_wall = wall
                 self._lease_last_awake = awake
-            return db
-        except BaseException:
+            # sqlite3.Connection's context manager commits or rolls back but
+            # does not close its file descriptors. Close every request-scoped
+            # control-plane connection after preserving that transaction
+            # behavior.
+            with db:
+                yield db
+        finally:
             db.close()
-            raise
 
     def server_logs(self, *, tail_lines: int = 400) -> dict[str, Any]:
         """Return bounded service tails plus the scheduler's cached diagnosis.
@@ -466,7 +481,10 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
         self._run_operation(operation)
         return True
 
-    def start_operation_runner(self, *, interval_seconds: float = 0.25, reconciliation_seconds: float = 15.0) -> None:
+    def start_operation_runner(
+        self, *, interval_seconds: float = 0.25, reconciliation_seconds: float = 15.0,
+        deployment_reconciliation_seconds: float = 30.0,
+    ) -> None:
         if self._operation_thread and self._operation_thread.is_alive(): return
         # A process can exit during a slow object-store upload. The local
         # artifact remains published and retrying replication is idempotent.
@@ -488,10 +506,11 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
         self._upload_cleanup_thread.start()
         def loop() -> None:
             last_reconciliation = 0.0
+            last_deployment_reconciliation = 0.0
             while not self._operation_stop.is_set():
-                # Pull workers are reconciled through durable leases and their
-                # staged publications.  The retired HTTP push scheduler is
-                # deliberately not polled or restarted here.
+                # Worker liveness, durable leases, and provider deployments
+                # have separate reconciliation paths. The retired HTTP push
+                # scheduler is deliberately not polled or restarted here.
                 import time
                 if time.monotonic() - last_reconciliation >= reconciliation_seconds:
                     with self._connection() as connection:
@@ -503,6 +522,9 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
                         self.create_operation("worker_reconciliation")
                     self.expire_worker_leases()
                     last_reconciliation = time.monotonic()
+                if time.monotonic() - last_deployment_reconciliation >= deployment_reconciliation_seconds:
+                    self.reconcile_worker_deployments()
+                    last_deployment_reconciliation = time.monotonic()
                 if not self.run_next_operation(): self._operation_stop.wait(interval_seconds)
         self._operation_thread = threading.Thread(target=loop, name="oracle-operation-runner", daemon=True)
         self._operation_thread.start()
@@ -976,7 +998,7 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
         task = str((config.get("run") or {}).get("task", "classification"))
         if task in {"classification", "embedding"}:
             try:
-                with sqlite3.connect(dataset["path"]) as dataset_db:
+                with _sqlite_connection(dataset["path"]) as dataset_db:
                     count = int(dataset_db.execute("SELECT count(*) FROM classification_labels").fetchone()[0])
             except sqlite3.DatabaseError as exc:
                 raise ValueError("Could not read class labels from the frozen dataset") from exc
@@ -1968,7 +1990,7 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
         setup = self.model_setup(architecture)
         config = deep_merge(setup["config"], overrides or {})
         config.setdefault("run", {})["model"] = architecture
-        with sqlite3.connect(dataset["path"]) as db:
+        with _sqlite_connection(dataset["path"]) as db:
             if config["run"].get("task") == "classification":
                 config.setdefault("data", {})["num_classes"] = int(db.execute("SELECT count(*) FROM classification_labels").fetchone()[0])
         try:
@@ -4007,7 +4029,7 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
             raise RuntimeError("deployment profile is unavailable; configure it before lifecycle actions")
         return profile.spec_for(str(deployment["deployment_id"]), str(deployment["name"]), str(deployment["pool_id"]))
 
-    def start_worker_deployment(self, deployment_id: str) -> dict[str, Any]:
+    def start_worker_deployment(self, deployment_id: str, *, recovery: bool = False) -> dict[str, Any]:
         deployment = self._deployment(deployment_id)
         if deployment is None:
             raise KeyError(f"worker deployment does not exist: {deployment_id}")
@@ -4017,10 +4039,35 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
         pool = self.worker_pool(str(deployment["pool_id"]))
         if pool is None or not pool["enabled"]:
             raise ValueError("worker deployment pool is unavailable or disabled")
-        status = provider.start(self._deployment_spec(deployment))
-        now = _now()
+        attempts = int(deployment.get("restart_attempts", 0)) + 1 if recovery else 0
+        try:
+            status = provider.start(self._deployment_spec(deployment))
+        except Exception as exc:
+            attempts = attempts + 1 if not recovery else attempts
+            now_dt = datetime.now(timezone.utc)
+            delay = min(300, 5 * (2 ** min(attempts - 1, 6)))
+            retry_at = (now_dt + timedelta(seconds=delay)).isoformat()
+            now = now_dt.isoformat()
+            message = str(exc)[:2000]
+            with self._connection() as db:
+                db.execute(
+                    "UPDATE worker_deployments SET desired_state='running',state='failed',error=?,"
+                    "restart_attempts=?,next_restart_at=?,last_reconciled_at=?,updated_at=? WHERE deployment_id=?",
+                    (message, attempts, retry_at, now, deployment_id),
+                )
+            self._record_deployment_event(
+                deployment_id, "restart_failed", "Worker deployment start failed; retry scheduled",
+                {"attempt": attempts, "retry_at": retry_at, "error": message},
+            )
+            raise
+        now_dt = datetime.now(timezone.utc)
+        now = now_dt.isoformat()
+        next_restart_at = (
+            (now_dt + timedelta(seconds=min(300, 5 * (2 ** min(attempts - 1, 6))))).isoformat()
+            if recovery else None
+        )
         with self._connection() as db:
-            db.execute("UPDATE worker_deployments SET desired_state='running',state=?,endpoint=?,error=NULL,last_reconciled_at=?,updated_at=? WHERE deployment_id=?", (status.state, status.endpoint, now, now, deployment_id))
+            db.execute("UPDATE worker_deployments SET desired_state='running',state=?,endpoint=?,error=NULL,restart_attempts=?,next_restart_at=?,last_started_at=?,last_reconciled_at=?,updated_at=? WHERE deployment_id=?", (status.state, status.endpoint, attempts, next_restart_at, now, now, now, deployment_id))
         self._record_deployment_event(deployment_id, "started", "Worker deployment started", self._worker_status_payload(status))
         return self._deployment(deployment_id)  # type: ignore[return-value]
 
@@ -4034,23 +4081,90 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
         status = provider.stop(deployment_id, timeout_seconds=timeout_seconds)
         now = _now()
         with self._connection() as db:
-            db.execute("UPDATE worker_deployments SET desired_state='stopped',state=?,endpoint=?,error=NULL,last_reconciled_at=?,updated_at=? WHERE deployment_id=?", (status.state, status.endpoint, now, now, deployment_id))
+            db.execute("UPDATE worker_deployments SET desired_state='stopped',state=?,endpoint=?,error=NULL,restart_attempts=0,next_restart_at=NULL,last_started_at=NULL,last_reconciled_at=?,updated_at=? WHERE deployment_id=?", (status.state, status.endpoint, now, now, deployment_id))
         self._record_deployment_event(deployment_id, "stopped", "Worker deployment stopped", self._worker_status_payload(status))
         return self._deployment(deployment_id)  # type: ignore[return-value]
 
     def reconcile_worker_deployments(self) -> list[dict[str, Any]]:
-        """Reconcile known provider identities; never inspect/adopt local PIDs."""
+        """Reconcile providers and retry desired-running deployments with backoff."""
         reconciled: list[dict[str, Any]] = []
         for deployment in self.worker_deployments():
             provider = self.deployment_providers.get(str(deployment["provider"]))
-            status = provider.status(str(deployment["deployment_id"])) if provider else None
-            state = status.state if status else "unknown"
-            endpoint = status.endpoint if status else deployment.get("endpoint")
-            error = None if status else "provider has no known deployment instance"
+            if provider is None:
+                status = None
+                state = "unknown"
+                endpoint = deployment.get("endpoint")
+                error = "provider is unavailable"
+            else:
+                try:
+                    status = provider.status(str(deployment["deployment_id"]))
+                except Exception as exc:
+                    # A status-query failure is not evidence that the worker
+                    # is down. Record it and let the next periodic pass retry.
+                    now = _now()
+                    error = str(exc)[:2000]
+                    with self._connection() as db:
+                        db.execute(
+                            "UPDATE worker_deployments SET error=?,last_reconciled_at=?,updated_at=? WHERE deployment_id=?",
+                            (error, now, now, deployment["deployment_id"]),
+                        )
+                    reconciled.append(self._deployment(str(deployment["deployment_id"])) or deployment)
+                    continue
+                state = status.state if status else "unknown"
+                endpoint = status.endpoint if status else deployment.get("endpoint")
+                error = None if status else "provider has no known deployment instance"
+
+            if state == "running":
+                now_dt = datetime.now(timezone.utc)
+                now = now_dt.isoformat()
+                attempts = int(deployment.get("restart_attempts", 0))
+                last_started_at = deployment.get("last_started_at")
+                try:
+                    stable_seconds = (now_dt - datetime.fromisoformat(last_started_at)).total_seconds() if last_started_at else 0
+                except ValueError:
+                    stable_seconds = 0
+                if stable_seconds >= 300:
+                    attempts = 0
+                    last_started_at = now
+                with self._connection() as db:
+                    db.execute(
+                        "UPDATE worker_deployments SET state='running',endpoint=?,error=NULL,restart_attempts=?,"
+                        "next_restart_at=?,last_started_at=?,last_reconciled_at=?,updated_at=? WHERE deployment_id=?",
+                        (endpoint, attempts, None if attempts == 0 else deployment.get("next_restart_at"),
+                         last_started_at or now, now, now, deployment["deployment_id"]),
+                    )
+                reconciled.append(self._deployment(str(deployment["deployment_id"])) or deployment)
+                continue
+
+            if deployment.get("desired_state") == "running" and provider is not None:
+                attempts = int(deployment.get("restart_attempts", 0))
+                retry_at = deployment.get("next_restart_at")
+                due = not retry_at or retry_at <= _now()
+                if not error:
+                    error = "worker process stopped unexpectedly; retry scheduled"
+                # Eight failed starts are enough to surface a persistent
+                # failure for operator attention. Explicit start resets it.
+                if due and attempts < 8:
+                    try:
+                        restarted = self.start_worker_deployment(str(deployment["deployment_id"]), recovery=True)
+                        self._record_deployment_event(
+                            str(deployment["deployment_id"]), "recovered",
+                            "Worker deployment restarted by reconciliation",
+                            {"previous_state": state},
+                        )
+                        reconciled.append(restarted)
+                        continue
+                    except Exception:
+                        # start_worker_deployment has persisted the attempt and
+                        # bounded retry time before surfacing the provider error.
+                        reconciled.append(self._deployment(str(deployment["deployment_id"])) or deployment)
+                        continue
+                if attempts >= 8:
+                    error = "automatic restart limit reached; operator action required"
+
             now = _now()
             with self._connection() as db:
-                db.execute("UPDATE worker_deployments SET state=?,endpoint=?,error=?,last_reconciled_at=?,updated_at=? WHERE deployment_id=?", (state, endpoint, error, now, now, deployment["deployment_id"]))
-            self._record_deployment_event(str(deployment["deployment_id"]), "reconciled", "Worker deployment reconciled", {"state": state})
+                db.execute("UPDATE worker_deployments SET state=?,endpoint=?,error=?,last_reconciled_at=?,updated_at=? WHERE deployment_id=?", ("failed" if deployment.get("desired_state") == "running" else state, endpoint, error, now, now, deployment["deployment_id"]))
             reconciled.append(self._deployment(str(deployment["deployment_id"])) or deployment)
         return reconciled
 
@@ -4551,7 +4665,7 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
     def ingest_dataset(self, path: str | Path) -> dict[str, Any]:
         source = Path(path).expanduser().resolve()
         self._require_browse_path(source)
-        with sqlite3.connect(source) as dataset_connection:
+        with _sqlite_connection(source) as dataset_connection:
             info = read_dataset_info(dataset_connection)
             fingerprint = dataset_fingerprint(dataset_connection)
         if info["lifecycle"] not in {"working", "frozen"}:
@@ -5140,7 +5254,7 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
         if entry is None: raise KeyError(catalog_id)
         path = self._training_catalog_sqlite_path(entry)
         offset, limit = max(0, offset), min(max(1, limit), 100)
-        with sqlite3.connect(path) as db:
+        with _sqlite_connection(path) as db:
             db.row_factory = sqlite3.Row
             info = read_dataset_info(db)
             where, params = "", []
@@ -5180,7 +5294,7 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
         entry = self.training_catalog_entry(catalog_id)
         if entry is None: raise KeyError(catalog_id)
         path = self._training_catalog_sqlite_path(entry)
-        with sqlite3.connect(path) as db:
+        with _sqlite_connection(path) as db:
             info = read_dataset_info(db)
             if info["lifecycle"] not in {"working", "frozen"}:
                 raise ValueError(f"Only working datasets can be frozen; this revision is {info['lifecycle']!r}")
@@ -5392,7 +5506,7 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
         if dataset is None:
             raise KeyError(dataset_id)
         path = Path(dataset["path"])
-        with sqlite3.connect(path) as db:
+        with _sqlite_connection(path) as db:
             db.row_factory = sqlite3.Row
             info = read_dataset_info(db)
             total = int(db.execute("SELECT count(*) FROM dataset_items").fetchone()[0])
@@ -5420,7 +5534,7 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
         if dataset is None:
             raise KeyError(dataset_id)
         offset, limit = max(0, offset), min(max(1, limit), 100)
-        with sqlite3.connect(dataset["path"]) as db:
+        with _sqlite_connection(dataset["path"]) as db:
             db.row_factory = sqlite3.Row
             info = read_dataset_info(db)
             total = int(db.execute("SELECT count(*) FROM dataset_items").fetchone()[0])
@@ -5483,7 +5597,7 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
             elif path:
                 add("metadata." + path, value)
 
-        with sqlite3.connect(dataset["path"]) as db:
+        with _sqlite_connection(dataset["path"]) as db:
             rows = db.execute("""SELECT di.metadata_json, a.shape_json FROM dataset_items di
                 LEFT JOIN classification_items ci ON ci.item_id=di.item_id
                 LEFT JOIN assets a ON a.asset_id=ci.image_asset_id""")
@@ -5516,7 +5630,7 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
         if kind not in {"image", "mask", "candidate_mask"}:
             raise ValueError("Preview kind must be image, mask, or candidate_mask")
         max_size = min(max(32, max_size), 1024)
-        with sqlite3.connect(path) as db:
+        with _sqlite_connection(path) as db:
             db.row_factory = sqlite3.Row
             info = read_dataset_info(db)
             if info["dataset_type"] == "classification" and kind != "image":
@@ -6087,7 +6201,7 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
         # selected, but it cannot accidentally seal an incompatible class head.
         if str((config.get("run") or {}).get("task")) == "classification":
             try:
-                with sqlite3.connect(dataset["path"]) as dataset_db:
+                with _sqlite_connection(dataset["path"]) as dataset_db:
                     class_count = int(dataset_db.execute("SELECT count(*) FROM classification_labels").fetchone()[0])
                 if class_count > 0:
                     config.setdefault("data", {})["num_classes"] = class_count

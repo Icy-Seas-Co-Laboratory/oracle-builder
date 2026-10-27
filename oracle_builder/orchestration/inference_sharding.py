@@ -11,6 +11,7 @@ import json
 from typing import Any, Iterable, Mapping
 from pathlib import Path
 import sqlite3
+from contextlib import closing
 import uuid
 
 from oracle_data_contracts.artifacts import ArtifactRef
@@ -99,7 +100,7 @@ class InferenceShardingMixin:
         size = int(work.parameters.get("shard_size", self.inference_shard_threshold))
         input_ref = work.inputs["input"]
         dataset_path = self.artifact_store.resolve(input_ref) / 'payload'
-        with sqlite3.connect(str(dataset_path)) as source:
+        with closing(sqlite3.connect(str(dataset_path))) as source:
             split = str(work.parameters.get("split", "all"))
             # Split membership is immutable model protocol; unsharded external
             # inference has no model split and therefore uses all item ids.
@@ -132,7 +133,7 @@ class InferenceShardingMixin:
         if artifact.get("input", {}).get("reference", {}).get("artifact_id") != unit.inputs["input"].artifact_id:
             raise ValueError("inference shard input identity does not match its work unit")
         prediction_set = artifact.get("parameters", {}).get("prediction_set")
-        with sqlite3.connect(root / "predictions.sqlite") as db:
+        with closing(sqlite3.connect(root / "predictions.sqlite")) as db:
             actual = tuple(str(row[0]) for row in db.execute("SELECT uuid FROM predictions WHERE prediction_set=? ORDER BY uuid", (prediction_set,)))
         if actual != expected:
             raise ValueError("inference shard prediction rows do not match its sealed item-id population")
@@ -144,7 +145,7 @@ class InferenceShardingMixin:
         if artifact.get("model", {}).get("artifact_id") != unit.inputs["model"].artifact_id:
             raise ValueError("merged inference model identity does not match its work unit")
         prediction_set = artifact.get("parameters", {}).get("prediction_set")
-        with sqlite3.connect(root / "predictions.sqlite") as db:
+        with closing(sqlite3.connect(root / "predictions.sqlite")) as db:
             actual = tuple(str(row[0]) for row in db.execute("SELECT uuid FROM predictions WHERE prediction_set=? ORDER BY uuid", (prediction_set,)))
         if actual != expected: raise ValueError("merged inference prediction rows do not match expected population")
 

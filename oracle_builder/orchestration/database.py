@@ -291,6 +291,9 @@ CREATE TABLE IF NOT EXISTS worker_deployments (
   state TEXT NOT NULL,
   endpoint TEXT,
   error TEXT,
+  restart_attempts INTEGER NOT NULL DEFAULT 0,
+  next_restart_at TEXT,
+  last_started_at TEXT,
   last_reconciled_at TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
@@ -507,6 +510,15 @@ def _initialize_schema(connection: sqlite3.Connection) -> None:
     for column, data_type in queued_migrations.items():
         if column not in queued_columns:
             connection.execute(f"ALTER TABLE queued_runs ADD COLUMN {column} {data_type}")
+    deployment_columns = {row[1] for row in connection.execute("PRAGMA table_info(worker_deployments)")}
+    deployment_migrations = {
+        "restart_attempts": "INTEGER NOT NULL DEFAULT 0",
+        "next_restart_at": "TEXT",
+        "last_started_at": "TEXT",
+    }
+    for column, data_type in deployment_migrations.items():
+        if column not in deployment_columns:
+            connection.execute(f"ALTER TABLE worker_deployments ADD COLUMN {column} {data_type}")
     connection.execute("CREATE INDEX IF NOT EXISTS queued_runs_claim_idx ON queued_runs(preflight_endpoint_id, dispatch_claimed_at)")
     # Migration 5 is deliberately one-way. Endpoint-oriented jobs are kept as
     # historical evidence, but can never be picked up by the v2 pull queue.

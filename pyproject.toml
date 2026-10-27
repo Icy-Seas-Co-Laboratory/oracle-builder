@@ -31,6 +31,7 @@ oracle-worker = "oracle_builder.worker.cli:main"
 oracle-orchestrator = "oracle_builder.orchestration.cli:main"
 oracle-inference-runtime = "oracle_builder.inference.server_v2:main"
 oracle = "oracle_builder.orchestration.client_cli:main"
+oracle-mcp = "oracle_builder.mcp.server:main"
 
 [tool.setuptools]
 py-modules = [
@@ -44,6 +45,9 @@ py-modules = [
 include = ["oracle_builder*", "oracle_data_contracts*", "oracle_tools*"]
 
 [project.optional-dependencies]
+mcp = [
+  "mcp>=1.28,<2",
+]
 gpu-linux = [
   "tensorflow[and-cuda]",
 ]

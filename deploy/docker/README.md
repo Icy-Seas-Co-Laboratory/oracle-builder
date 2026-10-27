@@ -119,6 +119,13 @@ the [non-container demo guide](../demo/README.md). Inspect progress with the
 Web GUI Operations page, `oracle worker leases`, and `docker logs
 oracle-worker-DEPLOYMENT_ID`.
 
+Deployments whose desired state is `running` are checked every 30 seconds and
+restarted after a stopped or missing container. Retries use exponential delays
+starting at 5 seconds and capped at 5 minutes. After 8 consecutive recovery
+attempts, automatic restarts pause and the deployment reports a failure for
+operator attention; an explicit start begins a fresh retry cycle. A worker
+that stays up for 5 minutes clears its failure count.
+
 ## Storage, replicas, and upgrades
 
 Back up the entire host data root; it contains the SQLite database and the
