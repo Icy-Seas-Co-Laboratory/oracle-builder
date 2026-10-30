@@ -25,7 +25,7 @@ model artifact plus a frozen SQLite dataset queued as an `infer` WorkUnit. A
 worker executes either under an Orchestrator lease; the Orchestrator validates
 and publishes the resulting immutable artifact.
 
-The old `oracle-serve` push protocol, resident HTTP inference service,
+The old `/v1/models` resident HTTP inference API and `oracle-serve` push protocol,
 path-based model import, and remote-job refresh API are retired. They must not
 be used by new scripts or deployments.
 
@@ -38,6 +38,14 @@ the resulting evidence artifact is immutable, downloadable, and replicated
 like a training artifact. Do not send inference requests to a worker or revive
 `oracle-serve`. Local inference libraries remain useful for controlled
 developer tooling, but are not a deployment API.
+
+For interactive image requests, use the Orchestrator's V2 gateway. List eligible
+sealed artifacts with `GET /v2/inference/models`, pin the returned fingerprint,
+then call `POST /v2/inference/models/{artifact_id}:predict` (or the WebSocket
+stream) with the versioned NPZ envelope. Classification, embedding, and
+clustering artifacts use the `classification` request task; segmentation and
+mask-refinement artifacts use `mask_refinement`. See [Inference APIs](inference-api.md)
+for authentication, output selection, limits, and retry behavior.
 
 ## Security and retrieval
 

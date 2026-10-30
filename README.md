@@ -1,14 +1,43 @@
+<p align="center">
+  <img src="docs/assets/readme-logo.png" alt="Oracle Builder" width="180">
+</p>
+
 # Oracle Builder
+
+Oracle Builder supports reproducible scientific image-model workflows: freeze a dataset,
+define or import a model, verify the work against an admitted worker pool, and
+publish immutable training or inference evidence. Classification, segmentation
+and mask refinement, embeddings, and clustering use the same durable control
+plane.
 
 Oracle Builder is a durable control plane for portable image-model work. The
 Orchestrator owns plans, artifact storage, worker admission, leases, and
 published outputs; stateless `oracle-worker` processes pull sealed WorkUnits.
+
+![Oracle Builder Live Dashboard learning curves](docs/assets/learning-curves.jpg)
+
+*Live Dashboard recorded training and validation curves for an example
+classification run; illustrative UI, not a model benchmark.*
+
+```mermaid
+flowchart LR
+  U[Web GUI / oracle CLI / HTTP API] --> O[Orchestrator]
+  O --> D[(Frozen datasets and artifacts)]
+  W[Registered pull workers] -->|pull sealed work / return staged outputs| O
+  O --> I[Private V2 inference runtime]
+  P[Pelagia] -->|interactive V2 inference| O
+  O --> R[Published evidence]
+```
 
 For normal users, the Orchestrator is the single system entry point: use the
 Web GUI, the `oracle` CLI, or the Orchestrator HTTP API. All three operate on
 the same control-plane records; none communicates directly with a worker.
 See [Using Oracle Builder](docs/user-entrypoints.md) for supported workflows
 and the current inference boundary.
+
+Pelagia integrates with Oracle Builder for model execution; [Pelagia](https://github.com/Icy-Seas-Co-Laboratory/Pelagia)
+owns project-scoped ROI processing and [PelagiaView](https://github.com/Icy-Seas-Co-Laboratory/PelagiaView)
+provides its browser workspace.
 
 For AI clients, the optional `oracle-mcp` stdio adapter exposes typed,
 read-only control-plane tools by default and opt-in operator mutations. See
@@ -47,6 +76,7 @@ Choose the guide that matches what you want to do:
 - [Using Oracle Builder](docs/user-entrypoints.md) — choose the supported GUI,
   CLI, or API entry point.
 - [WorkUnit V1](docs/work-unit-v1.md) — portable execution contract.
+- [Getting started](docs/getting-started.md) — install, launch, and run a first control-plane workflow.
 
 ## Reference
 
@@ -56,6 +86,7 @@ Choose the guide that matches what you want to do:
 - [Model-run artifact V1](docs/run-artifact-v1.md)
 - [Oracle Model Artifact Standard V2](docs/model-artifact-standard-v2.md)
 - [Inference contract V1](docs/inference-contract-v1.md)
+- [Inference APIs](docs/inference-api.md) — durable batch and interactive V2 inference.
 - [Architecture and extension boundaries](docs/architecture.md)
 
 ## Web GUI

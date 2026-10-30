@@ -12,6 +12,8 @@
 | Deploy the containerized single-host demo | [Docker demo deployment](../deploy/docker/README.md) |
 | Use the control-plane protocol | [Orchestrator API](orchestrator-api.md) |
 | Understand portable execution attempts | [WorkUnit V1](work-unit-v1.md) |
+| Install and run a first local workflow | [Getting started](getting-started.md) |
+| Submit durable or interactive inference | [Inference APIs](inference-api.md) |
 | Migrate historical artifacts or datasets | Offline migration readers in the source tree (not a supported runtime API) |
 
 ## Contract references
