@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
 
 import numpy as np
+import tensorflow as tf
 
 from oracle_builder.classification.evidence import (
     IdentityEvidenceIndex,
@@ -97,6 +99,74 @@ def test_streaming_loader_does_not_require_dataset_split_column(tmp_path):
             row[1]
             for row in connection.execute("PRAGMA table_info(dataset_items)")
         }
+
+
+def test_streaming_source_bounds_connections_when_callback_threads_turn_over(tmp_path, monkeypatch):
+    """``tf.py_function`` may use a fresh worker thread for each callback."""
+    database = tmp_path / "classification.sqlite"
+    create_synthetic_classification(database, n=4, shape=(12, 12, 1), classes=2)
+    config = stream_config()
+    config["data"]["streaming"]["reader_workers"] = 2
+    item_id = sqlite3.connect(database).execute(
+        "SELECT item_id FROM dataset_items LIMIT 1"
+    ).fetchone()[0]
+    original_connect = sqlite3.connect
+    opened = 0
+
+    def tracked_connect(*args, **kwargs):
+        nonlocal opened
+        opened += 1
+        return original_connect(*args, **kwargs)
+
+    monkeypatch.setattr(sqlite3, "connect", tracked_connect)
+    source = SQLiteClassificationSource(database, config)
+    # Separate short-lived threads model TensorFlow's callback worker turnover.
+    errors = []
+
+    def read() -> None:
+        try:
+            source.read_image(item_id)
+        except Exception as error:  # pragma: no cover - assertion reports it
+            errors.append(error)
+
+    for _ in range(32):
+        thread = threading.Thread(target=read)
+        thread.start()
+        thread.join()
+
+    assert not errors
+    assert opened <= 2
+    source.close()
+
+
+def test_tf_data_streaming_source_bounds_connections_across_callbacks(tmp_path, monkeypatch):
+    """The production ``tf.py_function`` path cannot accumulate SQLite FDs."""
+    database = tmp_path / "classification.sqlite"
+    create_synthetic_classification(database, n=4, shape=(12, 12, 1), classes=2)
+    config = stream_config()
+    config["data"]["streaming"]["reader_workers"] = 2
+    with sqlite3.connect(database) as connection:
+        item_id = connection.execute("SELECT item_id FROM dataset_items LIMIT 1").fetchone()[0]
+    original_connect = sqlite3.connect
+    opened = 0
+
+    def tracked_connect(*args, **kwargs):
+        nonlocal opened
+        opened += 1
+        return original_connect(*args, **kwargs)
+
+    monkeypatch.setattr(sqlite3, "connect", tracked_connect)
+    source = SQLiteClassificationSource(database, config)
+    dataset = tf.data.Dataset.from_tensor_slices(np.repeat(item_id, 128)).map(
+        source._tf_read_image,
+        num_parallel_calls=2,
+        deterministic=True,
+    ).prefetch(2)
+
+    list(dataset)
+
+    assert opened <= 2
+    source.close()
 
 
 def test_run_manifest_assignments_drive_stream_index(tmp_path):

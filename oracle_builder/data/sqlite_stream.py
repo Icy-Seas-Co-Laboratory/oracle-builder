@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import queue
 import sqlite3
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
@@ -68,6 +70,12 @@ class SQLiteDatasetBundle:
     @property
     def counts(self) -> dict[str, int]:
         return {split: len(index) for split, index in self.indices.items()}
+
+    def close(self) -> None:
+        """Release source resources when the training workflow has finished."""
+        close = getattr(self.source, "close", None)
+        if close is not None:
+            close()
 
 
 def _classification_rows(sqlite_path: str | Path):
@@ -158,13 +166,25 @@ def build_all_classification_index(
 
 
 class SQLiteClassificationSource:
-    """Thread-local, read-only SQLite image source used by tf.data maps."""
+    """Bounded, read-only SQLite image source used by ``tf.data`` maps.
+
+    TensorFlow may run ``py_function`` callbacks on short-lived threads.  A
+    thread-local connection therefore grows without bound during a long run.
+    Keep a small pool instead, returning each connection after one read.
+    """
 
     def __init__(self, sqlite_path: str | Path, config: dict[str, Any]):
         self.sqlite_path = Path(sqlite_path).resolve()
         self.config = config
         self.input_shape = tuple(int(value) for value in config["data"]["input_shape"])
-        self._local = threading.local()
+        streaming = config.get("data", {}).get("streaming", {})
+        self._connection_limit = max(1, int(streaming.get("reader_workers", 4)))
+        self._connections: queue.Queue[sqlite3.Connection] = queue.Queue(
+            maxsize=self._connection_limit
+        )
+        self._connections_created = 0
+        self._connections_lock = threading.Lock()
+        self._closed = False
         self._statistics_lock = threading.Lock()
         self._statistics = {"reads": 0, "read_seconds": 0.0}
 
@@ -184,33 +204,88 @@ class SQLiteClassificationSource:
             "mean_read_milliseconds": (1000 * seconds / reads) if reads else 0.0,
         }
 
-    def _connection(self) -> sqlite3.Connection:
-        connection = getattr(self._local, "connection", None)
-        if connection is None:
-            uri = f"file:{self.sqlite_path}?mode=ro"
-            connection = sqlite3.connect(uri, uri=True)
-            cache_kib = int(
-                self.config.get("data", {})
-                .get("streaming", {})
-                .get("sqlite_cache_kib", 65536)
-            )
+    def _new_connection(self) -> sqlite3.Connection:
+        uri = f"file:{self.sqlite_path}?mode=ro"
+        # Connections are borrowed by a bounded pool, so only one read uses a
+        # connection at a time.  TensorFlow may hand a subsequent callback to
+        # a different Python thread, however, so SQLite's default same-thread
+        # guard is incompatible with pooling.
+        connection = sqlite3.connect(uri, uri=True, check_same_thread=False)
+        cache_kib = int(
+            self.config.get("data", {})
+            .get("streaming", {})
+            .get("sqlite_cache_kib", 65536)
+        )
+        try:
             connection.execute(f"PRAGMA cache_size = {-max(cache_kib, 1)}")
-            self._local.connection = connection
-        return connection
+            return connection
+        except Exception:
+            connection.close()
+            raise
+
+    @contextmanager
+    def _connection(self) -> Iterator[sqlite3.Connection]:
+        """Borrow one of a bounded number of SQLite connections."""
+        with self._connections_lock:
+            if self._closed:
+                raise RuntimeError("SQLiteClassificationSource is closed")
+        try:
+            connection = self._connections.get_nowait()
+        except queue.Empty:
+            with self._connections_lock:
+                if self._closed:
+                    raise RuntimeError("SQLiteClassificationSource is closed")
+                if self._connections_created < self._connection_limit:
+                    connection = self._new_connection()
+                    self._connections_created += 1
+                else:
+                    connection = None
+            if connection is None:
+                # ``close`` must not leave a callback waiting forever for a
+                # connection that it has just discarded.
+                while True:
+                    try:
+                        connection = self._connections.get(timeout=0.1)
+                        break
+                    except queue.Empty:
+                        if self._closed:
+                            raise RuntimeError("SQLiteClassificationSource is closed")
+        try:
+            yield connection
+        finally:
+            # Coordinate with ``close`` so an idle connection cannot be
+            # returned after close has drained the queue.
+            with self._connections_lock:
+                closed = self._closed
+                if not closed:
+                    self._connections.put(connection)
+            if closed:
+                connection.close()
+
+    def close(self) -> None:
+        """Close idle connections once this source is no longer in use."""
+        with self._connections_lock:
+            self._closed = True
+        while True:
+            try:
+                self._connections.get_nowait().close()
+            except queue.Empty:
+                return
 
     def read_image(self, item_id: str) -> np.ndarray:
         started = time.perf_counter()
         try:
-            row = self._connection().execute(
-                """
-                SELECT a.payload, a.encoding, a.shape_json, di.metadata_json
-                FROM classification_items ci
-                JOIN dataset_items di ON di.item_id = ci.item_id
-                JOIN assets a ON a.asset_id = ci.image_asset_id
-                WHERE ci.item_id = ?
-                """,
-                (str(item_id),),
-            ).fetchone()
+            with self._connection() as connection:
+                row = connection.execute(
+                    """
+                    SELECT a.payload, a.encoding, a.shape_json, di.metadata_json
+                    FROM classification_items ci
+                    JOIN dataset_items di ON di.item_id = ci.item_id
+                    JOIN assets a ON a.asset_id = ci.image_asset_id
+                    WHERE ci.item_id = ?
+                    """,
+                    (str(item_id),),
+                ).fetchone()
             if row is None:
                 raise KeyError(f"SQLite dataset item {item_id!r} no longer exists")
             decoded = decode_blob(row[0], row[1], row[2])
@@ -224,16 +299,17 @@ class SQLiteClassificationSource:
     def read_input(self, item_id: str):
         started = time.perf_counter()
         try:
-            row = self._connection().execute(
-                """
-                SELECT a.payload, a.encoding, a.shape_json, di.metadata_json
-                FROM classification_items ci
-                JOIN dataset_items di ON di.item_id = ci.item_id
-                JOIN assets a ON a.asset_id = ci.image_asset_id
-                WHERE ci.item_id = ?
-                """,
-                (str(item_id),),
-            ).fetchone()
+            with self._connection() as connection:
+                row = connection.execute(
+                    """
+                    SELECT a.payload, a.encoding, a.shape_json, di.metadata_json
+                    FROM classification_items ci
+                    JOIN dataset_items di ON di.item_id = ci.item_id
+                    JOIN assets a ON a.asset_id = ci.image_asset_id
+                    WHERE ci.item_id = ?
+                    """,
+                    (str(item_id),),
+                ).fetchone()
             if row is None:
                 raise KeyError(f"SQLite dataset item {item_id!r} no longer exists")
             decoded = decode_blob(row[0], row[1], row[2])

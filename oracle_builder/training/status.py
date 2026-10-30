@@ -24,6 +24,34 @@ TRAINING_STATUS_FILENAME = "training-status.json"
 TRAINING_STATUS_SCHEMA_VERSION = 1
 
 
+def process_resource_snapshot() -> dict[str, int]:
+    """Collect bounded, path-free process diagnostics where supported."""
+    values: dict[str, int] = {}
+    try:
+        import resource
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if soft != resource.RLIM_INFINITY:
+            values["open_files_soft_limit"] = int(soft)
+        if hard != resource.RLIM_INFINITY:
+            values["open_files_hard_limit"] = int(hard)
+    except (ImportError, OSError, ValueError):
+        pass
+    try:
+        # listdir temporarily opens a descriptor for the directory itself.
+        values["open_files"] = max(0, len(os.listdir("/proc/self/fd")) - 1)
+    except OSError:
+        pass
+    try:
+        with open("/proc/self/status", encoding="utf-8") as status:
+            for line in status:
+                if line.startswith("Threads:"):
+                    values["threads"] = int(line.split()[1])
+                    break
+    except (OSError, ValueError, IndexError):
+        pass
+    return values
+
+
 def _finite_metrics(metrics: dict[str, float]) -> dict[str, float]:
     """Return JSON-safe metrics; a live status file must never contain NaN."""
     return {name: value for name, value in metrics.items() if math.isfinite(value)}
@@ -192,6 +220,21 @@ class RichTrainingStatusCallback(keras.callbacks.Callback):
         self._batch_status = "Preparing first batch"
         self._completed_epoch_seconds: list[float] = []
         self._live_events: list[dict[str, Any]] = []
+        self._resource_sample_at = float("-inf")
+        self._resource_sample: dict[str, int] = {}
+        self._resource_warning_emitted = False
+
+    def _resources(self) -> dict[str, int]:
+        now = time.monotonic()
+        if now - self._resource_sample_at >= 30:
+            self._resource_sample = process_resource_snapshot()
+            self._resource_sample_at = now
+            used = self._resource_sample.get("open_files")
+            limit = self._resource_sample.get("open_files_soft_limit")
+            if used is not None and limit and used >= 0.8 * limit and not self._resource_warning_emitted:
+                print(f"Training process has {used} open descriptors (soft limit {limit})", file=sys.stderr, flush=True)
+                self._resource_warning_emitted = True
+        return self._resource_sample
 
     def _status_snapshot(self, *, state: str = "running") -> dict[str, Any]:
         """The browser-facing state. Batch values are explicitly transient."""
@@ -229,6 +272,7 @@ class RichTrainingStatusCallback(keras.callbacks.Callback):
             "phase_id": self.phase_id,
             "method": self.method,
             "run_id": self.run_id,
+            "resources": self._resources(),
             "progress": {
                 "epoch": self._epoch,
                 "total_epochs": self.epochs or parameters.get("epochs"),

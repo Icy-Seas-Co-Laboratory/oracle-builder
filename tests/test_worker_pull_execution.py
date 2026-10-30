@@ -343,6 +343,7 @@ def test_training_progress_payload_is_path_free_and_bounded(tmp_path):
         "updated_at": "2026-01-01T00:00:00Z", "phase": "Supervised training",
         "message": "Completed batch 200", "progress": {"epoch": 1, "total_epochs": 3, "batch": 200},
         "timing": {"elapsed_seconds": 20.0},
+        "resources": {"open_files": 90, "open_files_soft_limit": 1024, "path": "/private"},
         "metrics": {
             "current_batch": {"loss": 0.4, "accuracy": 0.8, "not_a_number": float("nan")},
             "last_completed_epoch": {"loss": 0.5},
@@ -355,6 +356,7 @@ def test_training_progress_payload_is_path_free_and_bounded(tmp_path):
     assert payload is not None
     assert payload["progress"] == {"epoch": 1, "total_epochs": 3, "batch": 200}
     assert payload["metrics"] == {"loss": 0.4, "accuracy": 0.8}
+    assert payload["resources"] == {"open_files": 90, "open_files_soft_limit": 1024}
     assert len(payload["trace"]) == 60
     assert len(payload["history"]) == 50
     assert "worker_path" not in payload

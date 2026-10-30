@@ -5,6 +5,25 @@ from oracle_builder.training.callbacks import build_callbacks
 from oracle_builder.training.status import RichTrainingStatusCallback, _sparkline, _trend
 
 
+def test_resource_snapshot_is_sampled_and_warns_once(monkeypatch, capsys):
+    import oracle_builder.training.status as status
+
+    clock = [0.0]
+    samples = []
+    monkeypatch.setattr(status.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(status, "process_resource_snapshot", lambda: samples.append(1) or {
+        "open_files": 90, "open_files_soft_limit": 100, "threads": 4,
+    })
+    callback = RichTrainingStatusCallback(phase="test", display="off")
+    assert callback._status_snapshot()["resources"]["open_files"] == 90
+    callback._status_snapshot()
+    assert len(samples) == 1
+    clock[0] = 31
+    callback._status_snapshot()
+    assert len(samples) == 2
+    assert capsys.readouterr().err.count("open descriptors") == 1
+
+
 def test_text_status_emits_one_compact_line_per_epoch_without_batch_noise():
     stream = io.StringIO()
     callback = RichTrainingStatusCallback(

@@ -144,6 +144,26 @@ and a read-only bootstrap-token mount. The Orchestrator's Docker provider may
 then create only the fixed worker image and argument vector selected by that
 profile. The complete Compose configuration and its Docker-socket tradeoff are
 documented in the [Docker demo deployment guide](../deploy/docker/README.md).
+
+## Training resource diagnostics
+
+Training status reports the execution process's open descriptor count, soft and
+hard descriptor limits, and thread count where the platform exposes them. The
+counts are sampled at most once every 30 seconds and contain no file paths. A
+warning is written to stderr when descriptor use reaches 80% of the soft
+limit. These are per-process measurements; inspect the execution child, not only
+the parent worker, when investigating a failure.
+
+Worker CPU capacity is an admission declaration and is not itself a limit on
+TensorFlow, OpenMP, or BLAS thread pools. Operators can set
+`TF_NUM_INTRAOP_THREADS`, `TF_NUM_INTEROP_THREADS`, `OMP_NUM_THREADS`, and
+`OPENBLAS_NUM_THREADS` in the worker environment before it starts. These
+settings also affect subprocesses. Benchmark representative models and input
+pipelines before selecting values: each library may create additional threads
+and overly restrictive limits can reduce throughput. Check the container CPU
+quota and the actual training child thread count alongside throughput and GPU
+utilization. Likewise, size the worker's open-file limit based on measured peak
+usage and headroom; increasing it does not repair a descriptor leak.
 # Supervision and upgrades
 
 Pull workers send routine heartbeats while a supervisor controls model execution.

@@ -30,11 +30,42 @@ from typing import Any, Mapping, Protocol
 
 from oracle_data_contracts.work_units import WorkUnit, WorkUnitError, parse_work_unit
 from oracle_builder.worker.control import ExecutionInterrupted
+from oracle_builder.worker.supervisor import terminate_process_group
 from oracle_builder.awake_clock import awake_monotonic
 
 
 class PullProtocolError(RuntimeError):
     """The worker could not safely complete a pull-protocol request."""
+
+
+def _run_batch_calibrator(command: list[str], *, timeout: float) -> subprocess.CompletedProcess[str]:
+    """Run the multiprocessing tuner and reap every probe on timeout."""
+    supervised = os.environ.get("ORACLE_SUPERVISED_EXECUTION") == "1"
+    process = subprocess.Popen(
+        command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, start_new_session=not supervised,
+    )
+    try:
+        output, _ = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        if supervised:
+            # Do not signal this group here: it also contains the executor,
+            # which must unwind and report the calibration timeout. Its outer
+            # supervisor then terminates the entire group in ``finally``.
+            # Avoid communicate() because a surviving probe can retain stdout
+            # and make it block indefinitely.
+            process.terminate()
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
+        else:
+            # A legacy in-process worker has no outer process-group owner, so
+            # calibration has a private session that must be cleaned here.
+            terminate_process_group(process)
+            process.communicate()
+        raise
+    return subprocess.CompletedProcess(command, process.returncode, output)
 
 
 class OutputPublicationError(PullProtocolError):
@@ -177,19 +208,20 @@ class TrainingExecutor:
         emit_event("batch_calibration_started", "Calibrating a safe batch size on this worker", {
             "minimum_batch_size": minimum, "maximum_batch_size": maximum,
         })
+        command = [
+            sys.executable, "-m", "oracle_builder.training.batch_tune",
+            "--config", str(execution_config), "--input", str(dataset),
+            "--minimum", str(minimum), "--maximum", str(maximum),
+            "--target-vram-min", str(float(target_min)), "--target-vram-max", str(float(target_max)),
+        ]
+        # The tuner uses multiprocessing for isolated TensorFlow probes. The
+        # helper keeps those probes within the supervised executor group so a
+        # worker cancellation also reaches them.
         try:
-            completed = subprocess.run(
-                [
-                    sys.executable, "-m", "oracle_builder.training.batch_tune",
-                    "--config", str(execution_config), "--input", str(dataset),
-                    "--minimum", str(minimum), "--maximum", str(maximum),
-                    "--target-vram-min", str(float(target_min)), "--target-vram-max", str(float(target_max)),
-                ],
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=900, check=False,
-            )
+            completed = _run_batch_calibrator(command, timeout=900)
         except subprocess.TimeoutExpired as exc:
             raise PullProtocolError("automatic batch calibration exceeded its 15-minute limit") from exc
-        output = completed.stdout[-20_000:]
+        output = (completed.stdout or "")[-20_000:]
         result_line = next((line for line in reversed(output.splitlines()) if line.startswith(self._BATCH_TUNE_PREFIX)), None)
         if result_line is None:
             raise PullProtocolError("automatic batch calibration returned no structured result")
@@ -466,6 +498,7 @@ def training_progress_payload(status_path: Path) -> dict[str, Any] | None:
     completed = metrics.get("last_completed_epoch") if isinstance(metrics, Mapping) else None
     history = raw.get("history")
     trace = metrics.get("current_epoch_history") if isinstance(metrics, Mapping) else None
+    resources = raw.get("resources")
     post = raw.get("post_training")
     post_training = {}
     if isinstance(post, Mapping):
@@ -490,6 +523,7 @@ def training_progress_payload(status_path: Path) -> dict[str, Any] | None:
         "message": raw.get("message") if isinstance(raw.get("message"), str) else None,
         "progress": _numeric_fields(progress, limit=12),
         "timing": _numeric_fields(timing, limit=12),
+        "resources": _numeric_fields(resources, limit=16),
         "metrics": _numeric_fields(current, limit=64),
         "completed_metrics": _numeric_fields(completed, limit=64),
         "trace": bounded_trace,

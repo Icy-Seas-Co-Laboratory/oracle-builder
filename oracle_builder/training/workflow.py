@@ -30,6 +30,15 @@ from oracle_builder.paths import create_run_dir
 from oracle_builder.training.api import TrainingRequest
 
 
+def _best_effort_failure_record(actions) -> None:
+    """Do not replace the training exception with a failure-reporting error."""
+    for label, action in actions:
+        try:
+            action()
+        except Exception as error:
+            print(f"Could not {label}: {type(error).__name__}: {error}", file=sys.stderr, flush=True)
+
+
 def plot_history(history, run_dir: Path) -> None:
     import matplotlib.pyplot as plt
 
@@ -362,6 +371,8 @@ def _run_training(request: TrainingRequest) -> int:
             resumed_payload,
         )
 
+    streaming_bundle = None
+    pretraining_source = None
     try:
         print("[startup] Loading training components and preparing datasets...", flush=True)
         from oracle_builder.data.sqlite_dataset import load_arrays, load_prediction_arrays, make_tf_datasets
@@ -372,7 +383,6 @@ def _run_training(request: TrainingRequest) -> int:
         from oracle_builder.saving.save_model import save_model_artifacts, write_load_test_report
         from oracle_builder.training.train import train_model
 
-        streaming_bundle = None
         if (
             config["run"]["task"] == "classification"
             and config.get("data", {}).get("streaming", {}).get("enabled", True)
@@ -1083,8 +1093,18 @@ def _run_training(request: TrainingRequest) -> int:
         print(f"Training interrupted; resume with --resume {run_dir}", file=sys.stderr)
         return 130
     except Exception as exc:
-        log_event(training_log, run_id, "ERROR", "Training run failed", {"error": str(exc)})
-        mark_run_complete(training_log, run_id, "failed")
-        update_run_artifact(run_dir, status="failed", error=str(exc))
-        seal_run_artifact(run_dir)
+        _best_effort_failure_record([
+            ("log training failure", lambda: log_event(training_log, run_id, "ERROR", "Training run failed", {"error": str(exc)})),
+            ("mark training log failed", lambda: mark_run_complete(training_log, run_id, "failed")),
+            ("update run artifact", lambda: update_run_artifact(run_dir, status="failed", error=str(exc))),
+            ("seal run artifact", lambda: seal_run_artifact(run_dir)),
+        ])
         raise
+    finally:
+        sources = [getattr(streaming_bundle, "source", None), pretraining_source]
+        seen = set()
+        for source in sources:
+            close = getattr(source, "close", None)
+            if callable(close) and id(source) not in seen:
+                seen.add(id(source))
+                _best_effort_failure_record([("close training data source", close)])

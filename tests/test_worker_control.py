@@ -5,6 +5,7 @@ they do not import TensorFlow or start an Oracle API server.
 """
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import threading
@@ -25,6 +26,31 @@ class _TransientlyOfflineClient:
 
     def commands(self, **_kwargs):
         raise TimeoutError("network temporarily unavailable")
+
+
+def _process_state(pid: int) -> str | None:
+    """Return a portable process state, or ``None`` after it has been reaped."""
+    result = subprocess.run(
+        ["ps", "-o", "stat=", "-p", str(pid)],
+        capture_output=True, text=True, check=False,
+    )
+    state = result.stdout.strip()
+    return state or None
+
+
+def _supports_process_group_signals() -> bool:
+    probe = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    try:
+        os.killpg(probe.pid, 0)
+    except PermissionError:
+        return False
+    finally:
+        probe.terminate()
+        probe.wait(timeout=2)
+    return True
 
 
 def _control(tmp_path, client, *, ttl_seconds=1):
@@ -114,6 +140,45 @@ def test_process_group_termination_stops_a_supervised_child_promptly():
         terminate_process_group(process, grace_seconds=0.2)
         assert process.poll() is not None
         assert time.monotonic() - started < 2
+    finally:
+        terminate_process_group(process, grace_seconds=0.1)
+
+
+def test_process_group_termination_kills_descendant_after_leader_exits(tmp_path):
+    """A multiprocessing probe must not survive its already-exited parent."""
+    if not _supports_process_group_signals():
+        pytest.skip("host does not permit process-group signalling")
+    child_pid = tmp_path / "child.pid"
+    code = (
+        "import os, pathlib, time\n"
+        "pid = os.fork()\n"
+        "if pid:\n"
+        f"    pathlib.Path({str(child_pid)!r}).write_text(str(pid))\n"
+        "else:\n"
+        "    time.sleep(60)\n"
+    )
+    process = subprocess.Popen(
+        [sys.executable, "-c", code], start_new_session=True,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    try:
+        deadline = time.monotonic() + 2
+        while not child_pid.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert child_pid.exists()
+        child = int(child_pid.read_text())
+        state = _process_state(child)
+        assert state is not None and not state.startswith("Z")
+        process.wait(timeout=2)
+        terminate_process_group(process, grace_seconds=0.1)
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            state = _process_state(child)
+            if state is None or state.startswith("Z"):
+                break
+            time.sleep(0.02)
+        state = _process_state(child)
+        assert state is None or state.startswith("Z")
     finally:
         terminate_process_group(process, grace_seconds=0.1)
 

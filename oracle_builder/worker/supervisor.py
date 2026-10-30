@@ -46,21 +46,66 @@ def _retain_failure_log(scratch: Path) -> Path | None:
     return target
 
 
-def terminate_process_group(process, *, grace_seconds=2):
-    if process.poll() is not None:
+def _process_group_exists(process_group_id: int) -> bool:
+    """Return whether a process group still has a live member."""
+    try:
+        os.killpg(process_group_id, 0)
+    except (ProcessLookupError, PermissionError):
+        return False
+    return True
+
+
+def terminate_process_group(process, *, grace_seconds=2, process_group_id: int | None = None):
+    """Terminate a session leader and every descendant in its process group.
+
+    ``Popen.poll()`` only describes the leader. A multiprocessing child can
+    outlive that leader, so signal the process group even after the direct
+    child has exited.
+    """
+    process_group_id = process.pid if process_group_id is None else process_group_id
+    if not _process_group_exists(process_group_id):
+        if process.poll() is None:
+            # Restricted hosts can deny process-group signals. Preserve the
+            # old best-effort leader cleanup there; production workers run on
+            # Linux where the group is available.
+            try:
+                process.terminate()
+            except ProcessLookupError:
+                return
+            try:
+                process.wait(timeout=grace_seconds)
+            except subprocess.TimeoutExpired:
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    return
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
         return
     try:
-        os.killpg(process.pid, signal.SIGTERM)
+        os.killpg(process_group_id, signal.SIGTERM)
     except ProcessLookupError:
         return
-    try:
-        process.wait(timeout=grace_seconds)
-    except subprocess.TimeoutExpired:
+    deadline = time.monotonic() + max(0.0, float(grace_seconds))
+    while time.monotonic() < deadline:
+        # Reap a dead leader promptly. A dead leader may remain as a zombie
+        # while descendants still need the rest of the grace period.
+        process.poll()
+        if not _process_group_exists(process_group_id):
+            break
+        time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+    if _process_group_exists(process_group_id):
         try:
-            os.killpg(process.pid, signal.SIGKILL)
+            os.killpg(process_group_id, signal.SIGKILL)
         except ProcessLookupError:
             pass
-        process.wait(timeout=5)
+    if process.poll() is None:
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
 
 
 def execute_supervised(*, work_unit, inputs, configuration, staging, emit_event, control):
@@ -77,6 +122,10 @@ def execute_supervised(*, work_unit, inputs, configuration, staging, emit_event,
     for key in list(environment):
         if 'TOKEN' in key or 'SECRET' in key or 'PASSWORD' in key:
             environment.pop(key)
+    # Descendants of this executor must remain in its process group. The
+    # executor uses this marker to avoid creating an isolated calibration
+    # session that would escape worker cancellation.
+    environment['ORACLE_SUPERVISED_EXECUTION'] = '1'
     process = subprocess.Popen([sys.executable, '-m', 'oracle_builder.worker.executor_child', str(request_path)],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, start_new_session=True, env=environment)
     events = queue.Queue(maxsize=256)
