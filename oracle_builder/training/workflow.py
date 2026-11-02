@@ -107,6 +107,8 @@ def _run_training(request: TrainingRequest) -> int:
         segment_max_steps=request.segment_max_steps,
         segment_start_step=request.segment_start_step,
         pretrain_only=request.pretrain_only,
+        pretraining_source=request.pretraining_source,
+        pretraining_source_artifact_id=request.pretraining_source_artifact_id,
     )
     resume_state = None
     is_resume = bool(args.resume)
@@ -224,7 +226,8 @@ def _run_training(request: TrainingRequest) -> int:
     finalize_stopped_early = False
     if (is_segment and self_supervised_settings(config).get("enabled", False)
             and not args.pretrain_only
-            and not (resume_state and resume_state.get("pretraining_completed") is True)):
+            and not (resume_state and resume_state.get("pretraining_completed") is True)
+            and not args.pretraining_source):
         raise ValueError(
             "Segmented execution is unsupported for self-supervised training; "
             "run it as a whole phase because its continuation state is not yet portable"
@@ -491,6 +494,8 @@ def _run_training(request: TrainingRequest) -> int:
                     "Resolved weighted cross entropy class weights",
                     resolved_weights,
                 )
+        if args.pretraining_source and stratification_enabled(config):
+            raise ValueError("Pretraining source is unsupported for stratified training")
         if stratification_enabled(config):
             # The controller owns the parent epoch loop so its seeded routing
             # can reassign training examples between child resolutions.
@@ -659,7 +664,7 @@ def _run_training(request: TrainingRequest) -> int:
             return 0
         self_supervised_dataset = None
         self_supervised = self_supervised_settings(config)
-        if self_supervised.get("enabled", False) and resume_state is None:
+        if self_supervised.get("enabled", False) and resume_state is None and not args.pretraining_source:
             if str(self_supervised.get("method", "byol")).lower() == "grayscale_reconstruction":
                 from oracle_builder.training.student_teacher import load_grayscale_self_supervised_dataset
                 source_database = self_supervised.get("database", args.input)
@@ -733,6 +738,8 @@ def _run_training(request: TrainingRequest) -> int:
             segment_max_steps=args.segment_max_steps,
             segment_start_step=args.segment_start_step,
             pretrain_only=args.pretrain_only,
+            pretraining_source=args.pretraining_source,
+            pretraining_source_artifact_id=args.pretraining_source_artifact_id,
         )
         if args.pretrain_only:
             from oracle_builder.training.control import FileSegmentControl, write_segment_result

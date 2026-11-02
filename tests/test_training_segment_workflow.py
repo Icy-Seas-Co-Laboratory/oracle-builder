@@ -33,7 +33,7 @@ validation_split = 0.0
 test_split = 0.0
 
 [training]
-epochs = 1
+epochs = 2
 loss = "sparse_categorical_crossentropy"
 display = "off"
 
@@ -81,7 +81,24 @@ save_predictions = false
         resume=str(run_dir), input=str(database), segment_start_epoch=0,
         segment_stop_epoch=1, segment_result_path=str(segment_path),
     )) == 0
+    assert json.loads(segment_path.read_text())["next_phase"] == "train"
+    manifest = read_run_manifest(run_dir)
+    state = validate_recovery_state(
+        run_dir, read_run_config(run_dir), artifact_id=manifest["artifact_id"],
+        run_id=manifest["run_id"],
+    )
+    assert state["pretraining_completed"] is True
+    assert state["pretraining_handoff"]["boundary"] == "whole_phase"
+    assert run_training(TrainingRequest(
+        resume=str(run_dir), input=str(database), segment_start_epoch=1,
+        segment_stop_epoch=2, segment_result_path=str(segment_path),
+    )) == 0
     assert json.loads(segment_path.read_text())["next_phase"] == "finalize"
+    state = validate_recovery_state(
+        run_dir, read_run_config(run_dir), artifact_id=manifest["artifact_id"],
+        run_id=manifest["run_id"],
+    )
+    assert state["pretraining_completed"] is True
 
 
 def test_real_workflow_commits_and_resumes_an_ordered_batch_segment(tmp_path):

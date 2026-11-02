@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import sys
 import uuid
@@ -72,6 +73,8 @@ def read_recovery_state(run_dir: str | Path) -> dict[str, Any]:
     if not model_path.startswith("model/recovery/") or Path(model_path).is_absolute() or ".." in Path(model_path).parts:
         raise ValueError("Recovery state points to an unexpected model path")
     model = Path(run_dir) / model_path
+    if not model.resolve().is_relative_to(Path(run_dir).resolve()):
+        raise ValueError("Recovery model path escapes the run artifact")
     observed = _sha256(model) if model.exists() else None
     if observed != state.get("model_sha256"):
         raise ValueError("Recovery model checksum mismatch")
@@ -98,7 +101,86 @@ def validate_recovery_state(
     completed_epoch = int(state.get("completed_epoch", 0))
     if completed_epoch < 0:
         raise ValueError("Recovery state has an invalid completed epoch")
+    if "pretraining_completed" in state and not isinstance(state["pretraining_completed"], bool):
+        raise ValueError("Recovery state has an invalid pretraining completion marker")
+    handoff = state.get("pretraining_handoff")
+    if state.get("pretraining_completed") is True:
+        if (not isinstance(handoff, dict)
+                or handoff.get("boundary") not in {"whole_phase", "portable_pretraining"}
+                or type(handoff.get("supervised_epoch")) is not int
+                or handoff["supervised_epoch"] != 0
+                or handoff.get("ssl_continuation") != "not_portable"):
+            raise ValueError("Recovery state has an invalid pretraining handoff")
+        if handoff["boundary"] == "portable_pretraining":
+            if any(not isinstance(handoff.get(key), str) or not handoff[key].strip()
+                   for key in ("source_artifact_id", "source_run_id")) or any(
+                not isinstance(handoff.get(key), str) or not re.fullmatch(r"[0-9a-f]{64}", handoff[key])
+                for key in ("source_fingerprint_sha256", "source_model_sha256")
+            ):
+                raise ValueError("Recovery state has invalid pretraining source provenance")
+    elif "pretraining_handoff" in state:
+        raise ValueError("Recovery state has a pretraining handoff without completion")
     return state
+
+
+def load_portable_pretraining(model, source: str | Path, config: dict[str, Any], expected_artifact_id: str) -> dict[str, Any]:
+    """Verify a sealed epoch-zero handoff and copy weights into a fresh model."""
+    from oracle_builder.artifacts import read_run_config, read_run_manifest, validate_run_artifact
+    from oracle_builder.saving.load_test import _load_keras_model
+
+    source = Path(source)
+    report = validate_run_artifact(source)
+    if not report["valid"] or report["lifecycle"] != "sealed":
+        raise ValueError("Invalid sealed pretraining source: " + "; ".join(report["errors"]))
+    manifest = read_run_manifest(source)
+    if manifest["artifact_id"] != expected_artifact_id:
+        raise ValueError("Pretraining source artifact identity mismatch")
+    if not isinstance(report.get("fingerprint_sha256"), str) or not report["fingerprint_sha256"]:
+        raise ValueError("Pretraining source fingerprint is missing")
+    source_config = read_run_config(source)
+    state = validate_recovery_state(source, source_config, artifact_id=manifest["artifact_id"], run_id=manifest["run_id"])
+    handoff = state.get("pretraining_handoff")
+    if (state.get("completed_epoch") != 0 or state.get("pretraining_completed") is not True
+            or not isinstance(handoff, dict) or handoff.get("boundary") not in {"whole_phase", "portable_pretraining"}
+            or state.get("cursor")):
+        raise ValueError("Pretraining source is not a completed epoch-zero handoff")
+    if handoff["boundary"] == "portable_pretraining" and any(
+        not isinstance(handoff.get(key), str) or not handoff[key]
+        for key in ("source_artifact_id", "source_run_id", "source_fingerprint_sha256", "source_model_sha256")
+    ):
+        raise ValueError("Pretraining source provenance is incomplete")
+    for key in ("model", "preprocessing", "architecture", "normalization", "pooling",
+                "image_embedding", "metadata", "fusion", "classifier", "classification"):
+        if source_config.get(key, {}) != config.get(key, {}):
+            raise ValueError(f"Pretraining source {key} configuration is incompatible")
+    for key in ("input_shape", "output_shape", "num_classes"):
+        if source_config.get("data", {}).get(key) != config.get("data", {}).get(key):
+            raise ValueError(f"Pretraining source data {key} is incompatible")
+    for key in ("task", "model"):
+        if source_config.get("run", {}).get(key) != config.get("run", {}).get(key):
+            raise ValueError(f"Pretraining source run {key} is incompatible")
+    def label_contract(value):
+        labels = value.get("dataset", {}).get("labels")
+        if labels is None:
+            return None
+        return [{key: label.get(key) for key in ("class_index", "name", "concept_node_id", "concept_relationship")}
+                for label in labels]
+    if label_contract(source_config) != label_contract(config):
+        raise ValueError("Pretraining source dataset labels are incompatible")
+    pretrained = _load_keras_model(source / state["model_path"], compile=False)
+    if [(type(layer).__module__, type(layer).__name__) for layer in pretrained.layers] != [
+        (type(layer).__module__, type(layer).__name__) for layer in model.layers
+    ]:
+        raise ValueError("Pretraining source model architecture is incompatible")
+    source_weights = pretrained.get_weights()
+    target_weights = model.get_weights()
+    if len(source_weights) != len(target_weights) or any(a.shape != b.shape for a, b in zip(source_weights, target_weights)):
+        raise ValueError("Pretraining source model weights are incompatible")
+    model.set_weights(source_weights)
+    return {"boundary": "portable_pretraining", "ssl_continuation": "not_portable",
+            "supervised_epoch": 0, "source_artifact_id": manifest["artifact_id"],
+            "source_run_id": manifest["run_id"], "source_fingerprint_sha256": report["fingerprint_sha256"],
+            "source_model_sha256": state["model_sha256"]}
 
 
 def read_recovery_callback_state(
@@ -146,6 +228,7 @@ def save_step_recovery_snapshot(
     completed_epoch: int,
     cursor: dict[str, int],
     partial_metrics: dict[str, Any],
+    pretraining_handoff: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Commit an ordered-batch cursor using the same generation format.
 
@@ -154,7 +237,8 @@ def save_step_recovery_snapshot(
     augmentation pipelines have a portable sampler position.
     """
     callback = RollingRecoveryCallback(
-        run_dir, config, training_log, run_id, artifact_id, force_every_epoch=True
+        run_dir, config, training_log, run_id, artifact_id, force_every_epoch=True,
+        pretraining_completed=pretraining_handoff is not None, pretraining_handoff=pretraining_handoff,
     )
     callback.set_model(model)
     # Keras epoch numbering is zero-based. -1 records a valid pre-epoch
@@ -188,6 +272,7 @@ def save_pretraining_handoff(
     training_log: str | Path,
     run_id: str,
     artifact_id: str,
+    pretraining_handoff: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Save SSL-updated weights as the epoch-zero supervised handoff.
 
@@ -197,21 +282,12 @@ def save_pretraining_handoff(
     """
     callback = RollingRecoveryCallback(
         run_dir, config, training_log, run_id, artifact_id, force_every_epoch=True,
+        pretraining_completed=True,
+        pretraining_handoff=pretraining_handoff or {"boundary": "whole_phase", "ssl_continuation": "not_portable", "supervised_epoch": 0},
     )
     callback.set_model(model)
     callback.on_epoch_end(-1)
-    layout = RunLayout(run_dir)
     state = read_recovery_state(run_dir)
-    state["pretraining_completed"] = True
-    state["pretraining_handoff"] = {
-        "boundary": "whole_phase",
-        "ssl_continuation": "not_portable",
-        "supervised_epoch": 0,
-    }
-    _write_json(layout.recovery_state, state)
-    _write_json(
-        Path(run_dir) / str(state["generation"]["path"]) / "state.json", state,
-    )
     return state
 
 
@@ -259,6 +335,8 @@ class RollingRecoveryCallback(keras.callbacks.Callback):
         *,
         force_every_epoch: bool = False,
         callback_state_provider=None,
+        pretraining_completed: bool = False,
+        pretraining_handoff: dict[str, Any] | None = None,
     ):
         super().__init__()
         self.layout = RunLayout(run_dir)
@@ -268,6 +346,8 @@ class RollingRecoveryCallback(keras.callbacks.Callback):
         self.artifact_id = artifact_id
         self.every = 1 if force_every_epoch else int(config.get("recovery", {}).get("save_every_epochs", 1))
         self.callback_state_provider = callback_state_provider
+        self.pretraining_completed = pretraining_completed
+        self.pretraining_handoff = pretraining_handoff
         self._last_completed_epoch = 0
         self._terminal_snapshot_written = False
 
@@ -355,6 +435,10 @@ class RollingRecoveryCallback(keras.callbacks.Callback):
         }
         if callback_descriptor is not None:
             state["callback_state"] = callback_descriptor
+        if self.pretraining_completed:
+            state["pretraining_completed"] = True
+            if self.pretraining_handoff is not None:
+                state["pretraining_handoff"] = self.pretraining_handoff
         _write_json(generation_dir / "state.json", state)
         _write_json(self.layout.recovery_state, state)
         prune_recovery_generations(generations, generation_id)

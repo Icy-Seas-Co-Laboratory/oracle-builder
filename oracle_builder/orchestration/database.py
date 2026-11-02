@@ -389,6 +389,19 @@ CREATE TABLE IF NOT EXISTS execution_runs (
   total_epochs INTEGER NOT NULL, unit_epochs INTEGER NOT NULL,
   checkpoint_ref_json TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
 );
+-- Successful self-supervised initialization checkpoints remain selectable
+-- independently of whether their parent supervised run later succeeds.
+CREATE TABLE IF NOT EXISTS pretraining_initializations (
+  artifact_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, execution_run_id TEXT NOT NULL,
+  artifact_ref_json TEXT NOT NULL,
+  source_job_id TEXT NOT NULL, specification_id TEXT, queued_run_id TEXT,
+  dataset_ref_json TEXT, configuration_ref_json TEXT NOT NULL,
+  published_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS pretraining_initializations_published_idx
+  ON pretraining_initializations(published_at DESC);
+CREATE INDEX IF NOT EXISTS pretraining_initializations_source_job_idx
+  ON pretraining_initializations(source_job_id);
 CREATE INDEX IF NOT EXISTS worker_commands_lease_idx ON worker_commands(lease_id,sequence);
 CREATE TABLE IF NOT EXISTS worker_heartbeats (
   worker_id TEXT PRIMARY KEY REFERENCES registered_workers(worker_id),

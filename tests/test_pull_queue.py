@@ -83,6 +83,51 @@ def test_v2_queue_rejects_legacy_verification_report(queue_setup):
     assert orch.queued_run(queued["queued_run_id"])["status"] == "verifying"
 
 
+def test_pretraining_selection_is_pinned_into_verification_and_training_units(queue_setup, monkeypatch):
+    orch, pool, worker, queue = queue_setup
+    baseline = queue(batch_size=4)
+    dataset_ref = orch.specification(baseline["specification_id"])["parameters"]["artifact_inputs"]["input"]
+    monkeypatch.setattr(orch, "pretraining_initialization", lambda identifier: {"artifact_ref": dataset_ref} if identifier == "source-id" else None)
+    definition = orch.create_model_definition(
+        name="ssl target", template_id="resnet18", config={"self_supervised": {"enabled": True}},
+    )
+    queued = orch.queue_model_definition_for_pool(
+        definition["definition_id"], name="reuse", dataset_id=baseline["dataset_id"],
+        worker_pool_id=pool["pool_id"], epochs=2, batch_size=4,
+        initialization={"mode": "pretraining", "source_artifact_id": "source-id"},
+    )
+    orch.verify_queued_runs_for_pool(queued_run_ids=[queued["queued_run_id"]])
+    lease = finish_verification(orch, worker, report_overrides={"self_supervised_whole_phase": True})
+    assert lease["work_unit"]["inputs"]["pretraining_source"] == dataset_ref
+    assert lease["work_unit"]["parameters"]["initialization"]["source_artifact_id"] == "source-id"
+    started = orch.authorize_queued_runs_for_pool(queued_run_ids=[queued["queued_run_id"]], worker_pool_id=pool["pool_id"])
+    unit = started["dispatched"][0]["work_unit"]
+    assert unit["phase"] == "initialize"
+    assert unit["inputs"]["pretraining_source"] == dataset_ref
+    assert unit["parameters"]["initialization"]["source_artifact_id"] == "source-id"
+    with pytest.raises(ValueError, match="not found"):
+        orch.queue_model_definition_for_pool(
+            definition["definition_id"], name="missing", dataset_id=baseline["dataset_id"],
+            worker_pool_id=pool["pool_id"], epochs=2, batch_size=4,
+            initialization={"mode": "pretraining", "source_artifact_id": "missing"},
+        )
+
+
+def test_pretraining_source_rejects_stratification_before_queueing(queue_setup, monkeypatch):
+    orch, pool, _worker, queue = queue_setup
+    baseline = queue(batch_size=4)
+    monkeypatch.setattr(orch, "_definition_queue_config", lambda *_args: {
+        "run": {"task": "classification"}, "self_supervised": {"enabled": True},
+        "classification": {"stratification": {"enabled": True}}, "training": {}, "data": {},
+    })
+    with pytest.raises(ValueError, match="stratified"):
+        orch.queue_model_definition_for_pool(
+            baseline["definition_id"], name="stratified", dataset_id=baseline["dataset_id"],
+            worker_pool_id=pool["pool_id"], epochs=2, batch_size=4,
+            initialization={"mode": "pretraining", "source_artifact_id": "source"},
+        )
+
+
 def test_queue_verify_then_explicit_start(queue_setup):
     orch, pool, worker, queue = queue_setup
     queued = queue(batch_size=4)

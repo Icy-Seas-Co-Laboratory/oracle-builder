@@ -290,6 +290,14 @@ class TrainingExecutor:
         if configuration is None or not (configuration / "payload").is_file():
             raise PullProtocolError("train executor requires a materialized configuration payload")
         execution = dict(work_unit.get("parameters", {}).get("queue_execution", {}))
+        initialization = work_unit.get("parameters", {}).get("initialization") or {}
+        if not isinstance(initialization, Mapping):
+            raise PullProtocolError("Training initialization must be an object")
+        if initialization.get("mode", "scratch") not in {"scratch", "pretraining"}:
+            raise PullProtocolError("Unsupported training initialization mode")
+        if (initialization.get("mode") == "pretraining" and not inputs.get("pretraining_source")
+                and not inputs.get("checkpoint")):
+            raise PullProtocolError("Pretraining initialization requires its materialized source")
         if execution.get("phase") == "verify":
             # Resolve the dataset/configuration and exercise a forward/backward
             # probe in an isolated child process. Never enter run_training.
@@ -308,6 +316,17 @@ class TrainingExecutor:
             from oracle_builder.config import resolve_config
             from oracle_data_contracts.artifacts.splits import create_split_manifest
             config = resolve_config(resolved, dataset / 'payload', staging)
+            source = inputs.get('pretraining_source')
+            if source:
+                if config.get("classification", {}).get("stratification", {}).get("enabled", False):
+                    raise PullProtocolError("Pretraining source is unsupported for stratified training")
+                initialization = work_unit.get('parameters', {}).get('initialization', {})
+                source_id = initialization.get('source_artifact_id')
+                if initialization.get('mode') != 'pretraining' or not source_id:
+                    raise PullProtocolError('Pretraining source requires its sealed initialization identity')
+                from oracle_builder.training.recovery import load_portable_pretraining
+                from oracle_builder.training.train import build_and_compile_model
+                load_portable_pretraining(build_and_compile_model(config), source, config, source_id)
             from oracle_builder.config import self_supervised_settings
             # The initialization handoff feeds segmented *classification*
             # fine-tuning. Embedding runs own their complete SSL lifecycle
@@ -379,6 +398,13 @@ class TrainingExecutor:
         segment = work_unit.get('parameters', {}).get('execution_segment')
         checkpoint = inputs.get('checkpoint')
         request_options = {}
+        source = inputs.get('pretraining_source')
+        if source and not checkpoint:
+            initialization = work_unit.get('parameters', {}).get('initialization', {})
+            source_id = initialization.get('source_artifact_id')
+            if initialization.get('mode') != 'pretraining' or not source_id:
+                raise PullProtocolError('Pretraining source requires its sealed initialization identity')
+            request_options.update(pretraining_source=str(source), pretraining_source_artifact_id=source_id)
         display_name = work_unit.get('parameters', {}).get('run_name')
         if display_name is not None and (not isinstance(display_name, str) or not display_name.strip() or len(display_name.strip()) > 240
                                          or any(ord(char) < 32 or ord(char) == 127 for char in display_name.strip())):

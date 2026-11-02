@@ -141,6 +141,8 @@ def train_model(
     segment_max_steps: int | None = None,
     segment_start_step: int | None = None,
     pretrain_only: bool = False,
+    pretraining_source: str | None = None,
+    pretraining_source_artifact_id: str | None = None,
 ):
     set_seed(int(config["run"].get("seed", 123)))
     strategy, distribution_info = select_distribution_strategy(config)
@@ -155,6 +157,13 @@ def train_model(
             # Keras safe deserialization enabled.
             from oracle_builder.saving.load_test import _load_keras_model
             model = _load_keras_model(recovery_path, compile=True)
+    pretraining_handoff = (resume_state or {}).get("pretraining_handoff")
+    if pretraining_source:
+        from oracle_builder.training.recovery import load_portable_pretraining
+        pretraining_handoff = load_portable_pretraining(model, pretraining_source, config, pretraining_source_artifact_id)
+        provenance_path = Path(run_dir) / "model" / "pretraining_source.json"
+        provenance_path.parent.mkdir(parents=True, exist_ok=True)
+        provenance_path.write_text(json.dumps(pretraining_handoff, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     write_distribution_info(distribution_info, run_dir)
     write_model_summary(model, model_summary_path(run_dir, config))
     from oracle_builder.training.logging_callbacks import log_event
@@ -176,6 +185,9 @@ def train_model(
         },
     )
     self_supervised = self_supervised_settings(config)
+    if (self_supervised.get("enabled", False) and resume_state is not None
+            and resume_state.get("pretraining_completed") is not True):
+        raise ValueError("Recovery snapshot does not establish completed self-supervised training")
     if (
         segment_max_steps is None
         and resume_state is not None
@@ -192,8 +204,9 @@ def train_model(
             resume_state=resume_state,
             max_steps=int(segment_max_steps),
             requested_start_step=segment_start_step,
+            pretraining_handoff=pretraining_handoff,
         )
-    if self_supervised.get("enabled", False) and resume_state is None:
+    if self_supervised.get("enabled", False) and resume_state is None and not pretraining_handoff:
         if pretraining_dataset is None:
             raise ValueError("Enabled self-supervised training requires a self-supervised dataset")
         from oracle_builder.training.student_teacher import (
@@ -241,6 +254,7 @@ def train_model(
                 if values
             },
         )
+        pretraining_handoff = {"boundary": "whole_phase", "ssl_continuation": "not_portable", "supervised_epoch": 0}
         if pretrain_only:
             from oracle_builder.training.recovery import save_pretraining_handoff
 
@@ -251,6 +265,14 @@ def train_model(
             history = keras.callbacks.History()
             history.history = {}
             return model, history
+    elif pretrain_only and pretraining_handoff:
+        from oracle_builder.training.recovery import save_pretraining_handoff
+        save_pretraining_handoff(model, run_dir, config, training_log, run_id,
+                                 config.get("artifact", {}).get("artifact_id", ""),
+                                 pretraining_handoff=pretraining_handoff)
+        history = keras.callbacks.History()
+        history.history = {}
+        return model, history
     elif self_supervised.get("enabled", False):
         log_event(
             training_log,
@@ -268,6 +290,11 @@ def train_model(
         segment_control=segment_control,
         segment_stop_epoch=segment_stop_epoch,
         require_recovery=require_recovery,
+        pretraining_completed=bool(
+            bool(pretraining_handoff) or (self_supervised.get("enabled", False)
+            and (resume_state is None or resume_state.get("pretraining_completed") is True))
+        ),
+        pretraining_handoff=pretraining_handoff,
         resume_callback_state=(
             read_recovery_callback_state(run_dir, resume_state)
             if resume_state is not None else None
@@ -327,6 +354,7 @@ def _train_ordered_batch_segment(
     resume_state: dict[str, Any] | None,
     max_steps: int,
     requested_start_step: int | None,
+    pretraining_handoff: dict[str, Any] | None = None,
 ):
     """Advance a portable cursor through one deterministic, finite epoch.
 
@@ -336,7 +364,7 @@ def _train_ordered_batch_segment(
     sealed ``ordered_batches_v1`` policy; streaming, random augmentation and
     callback-controlled schedules are not silently treated as resumable.
     """
-    if self_supervised_settings(config).get("enabled", False):
+    if self_supervised_settings(config).get("enabled", False) and not pretraining_handoff:
         raise ValueError("Step-bounded segments do not support self-supervised training")
     if str(config.get("distribution", {}).get("strategy", "cpu")).lower() != "cpu":
         raise ValueError("Step-bounded segments currently require distribution.strategy = 'cpu'")
@@ -402,6 +430,7 @@ def _train_ordered_batch_segment(
         completed_epoch=completed_epoch,
         cursor={"epoch": epoch, "batch_offset": offset, "global_step": global_step},
         partial_metrics=partial_metrics,
+        pretraining_handoff=pretraining_handoff,
     )
     log_event(training_log, run_id, "INFO", "Committed deterministic batch segment", {
         "cursor": state["cursor"], "partial_metrics": partial_metrics,

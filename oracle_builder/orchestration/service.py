@@ -1146,6 +1146,8 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
                 operation_progress(event_type, message, data)
 
         progress("validating", "Validating definition, frozen dataset, and requested resources")
+        if initialization and initialization != {"mode": "scratch"}:
+            raise ValueError("This legacy queue does not support model initialization; use the worker-pool queue")
         if not isinstance(name, str) or not name.strip() or len(name.strip()) > 240 or any(ord(char) < 32 or ord(char) == 127 for char in name.strip()):
             raise ValueError("A queued run name must be 1–240 visible characters")
         definition = self.model_definition(definition_id, revision=revision)
@@ -1406,6 +1408,25 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
         queue_id, experiment_id, specification_id, now = str(uuid.uuid4()), str(uuid.uuid4()), str(uuid.uuid4()), _now()
         config = self._definition_queue_config(definition, dataset)
         budgets = seal_phase_budgets(config, epochs, ssl_epochs)
+        if initialization is not None and not isinstance(initialization, dict):
+            raise ValueError("Initialization must be an object")
+        initialization = dict(initialization or {})
+        mode = initialization.get("mode", "scratch")
+        source_ref = None
+        if mode == "pretraining":
+            if set(initialization) != {"mode", "source_artifact_id"} or not isinstance(initialization.get("source_artifact_id"), str):
+                raise ValueError("Pretraining initialization requires a source artifact ID")
+            if config.get("run", {}).get("task") not in {"classification", "segmentation"} or not config.get("self_supervised", {}).get("enabled", False):
+                raise ValueError("Pretraining initialization requires an SSL-enabled supervised definition")
+            if config.get("classification", {}).get("stratification", {}).get("enabled", False):
+                raise ValueError("Pretraining initialization does not support stratified training")
+            source = self.pretraining_initialization(initialization["source_artifact_id"])
+            if source is None:
+                raise ValueError("Pretraining result was not found")
+            source_ref = ArtifactRef.from_dict(source["artifact_ref"])
+            self.artifact_store.resolve(source_ref)
+        elif mode != "scratch" or set(initialization) - {"mode"}:
+            raise ValueError("Unsupported initialization; choose scratch or a pretraining result")
         # Auto calibration is intentionally deferred to the worker that will
         # execute the run.  Only that worker knows its accelerator, runtime,
         # and current isolation boundary.  The configuration artifact remains
@@ -1446,7 +1467,7 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
         # silently producing a legacy preflight report for a resumable run.
         execution["required_execution_contract_version"] = 2
         parameters = {
-            "artifact_inputs": {"input": dataset_ref.to_dict()},
+            "artifact_inputs": {"input": dataset_ref.to_dict(), **({"pretraining_source": source_ref.to_dict()} if source_ref else {})},
             "configuration_artifact": config_ref.to_dict(),
             "dataset_id": dataset_id,
             "definition_id": definition_id,
@@ -1490,6 +1511,7 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
         resources: dict[str, Any], batch_size_mode: str, batch_size: int | None = None,
         maximum_batch_size: int = 256, epochs: int = 10, ssl_epochs: int | None = None,
         definition_id: str | None = None, definition_revision: int | None = None,
+        initialization: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Replace an idle queue decision with a newly sealed revision.
 
@@ -1507,7 +1529,7 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
             chosen_definition_id, revision=chosen_revision,
             name=name, description=str(prior["description"]), dataset_id=dataset_id,
             worker_pool_id=worker_pool_id, resources=resources,
-            initialization=dict(prior["initialization"] or {}),
+            initialization=dict(prior["initialization"] or {}) if initialization is None else initialization,
             batch_size_mode=batch_size_mode, batch_size=batch_size,
             maximum_batch_size=maximum_batch_size, epochs=epochs, ssl_epochs=ssl_epochs,
         )
@@ -4922,7 +4944,7 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
             try:
                 if execution.get("phase") == "verify" and recovered_job["queued_run_id"]:
                     verification_report = json.loads((self.artifact_store.resolve(ref) / "verification.json").read_text(encoding="utf-8"))
-                if recovered_unit.get('schema', {}).get('version') == 2 and recovered_unit.get('phase') == 'train':
+                if recovered_unit.get('schema', {}).get('version') == 2 and recovered_unit.get('phase') in {'initialize', 'train'}:
                     segment = self._read_segment_result(self.artifact_store.resolve(ref), recovered_unit)
             except (OSError, ValueError, KeyError, json.JSONDecodeError):
                 continue
@@ -6220,8 +6242,8 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
             if source_shape and target_shape and list(source_shape) != list(target_shape):
                 raise ValueError("Initialization source input shape is incompatible with the draft")
         mode = str(initialization.get("mode", "scratch"))
-        if mode not in {"scratch", "fine_tune", "transfer_encoder", "resume"}: raise ValueError("Unsupported initialization mode")
-        if mode != "scratch" and not source_id: raise ValueError("A non-scratch initialization requires source_artifact_id")
+        if mode != "scratch" or source_id:
+            raise ValueError("Draft training does not support model initialization; use the worker-pool queue")
         experiment_id, specification_id, now = str(uuid.uuid4()), str(uuid.uuid4()), _now()
         config_dir = self.artifact_root / "experiments" / experiment_id / "configs"
         config_dir.mkdir(parents=True, exist_ok=True)

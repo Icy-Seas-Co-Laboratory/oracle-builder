@@ -30,6 +30,20 @@
 		return typeof item === 'number' ? Number(item).toLocaleString(undefined, { maximumFractionDigits: 4 }) : String(item);
 	};
 
+	let pretrainingResults: RecordValue[] = [];
+	let pretrainingLoading = true;
+	let pretrainingError = '';
+	async function loadPretraining() {
+		pretrainingLoading = true; pretrainingError = '';
+		try { pretrainingResults = (await api.pretrainingInitializations()).initializations; }
+		catch (error) { pretrainingError = error instanceof Error ? error.message : 'Could not load pretraining results.'; }
+		finally { pretrainingLoading = false; }
+	}
+	const referenceLabel = (ref: unknown) => {
+		const record = asRecord(ref);
+		return text(record.dataset_id ?? record.artifact_id ?? record.uri ?? record.path ?? (typeof ref === 'string' ? ref : undefined));
+	};
+
 	let fields: Field[] = [];
 	let rows: RecordValue[] = [];
 	let visible = [...defaults];
@@ -365,7 +379,7 @@
 	}
 	$: shownRows = rows.filter((row) => !search.trim() || JSON.stringify(row).toLowerCase().includes(search.toLowerCase()));
 	onMount(() => {
-		void Promise.all([loadSchema(), load()]);
+		void Promise.all([loadSchema(), load(), loadPretraining()]);
 		const timer = window.setInterval(() => {
 			if (posthocOpen && posthocRun && !posthocBusy && !['indexed', 'failed', 'cancelled'].includes(String(posthocRun.status))) void refreshPosthoc();
 			if (posthocOpen && posthocCompareRuns.some((run) => !['indexed', 'failed', 'cancelled'].includes(String(run.status))) && !posthocBusy) void refreshComparePosthoc();
@@ -377,6 +391,11 @@
 <section class="runs-hero">
 	<div><p class="eyebrow">MODEL RUNS</p><h2>A clear record of every trained or imported model.</h2><p>Search results, compare candidates, and inspect the sealed configuration behind each score.</p></div>
 	<div class="run-count"><strong>{total}</strong><span>indexed models</span></div>
+</section>
+
+<section class="pretraining-catalog" aria-label="Pretraining results">
+	<div class="pretraining-heading"><div><p class="eyebrow">INDEPENDENT RESULTS</p><h2>Pretraining results</h2><p>Published initialization checkpoints are recorded independently of later supervised runs. Choose one when preparing a supervised run; access and compatibility are checked by the backend.</p></div><button class="secondary small" disabled={pretrainingLoading} on:click={loadPretraining}>Refresh</button></div>
+	{#if pretrainingLoading}<p class="empty" role="status">Loading pretraining results…</p>{:else if pretrainingError}<p class="inline-error" role="alert">Could not load pretraining results: {pretrainingError}</p>{:else if !pretrainingResults.length}<p class="empty">No pretraining results have been published yet.</p>{:else}<div class="pretraining-list">{#each pretrainingResults as result}<article><div class="pretraining-result-heading"><strong>{text(result.name || result.artifact_id)}</strong><span class="status">{text(result.status)}</span></div><dl><div><dt>Artifact</dt><dd><code>{text(result.artifact_id)}</code></dd></div><div><dt>Source run</dt><dd><code>{text(result.run_id)}</code></dd></div><div><dt>Dataset</dt><dd>{text(result.dataset_name || referenceLabel(result.dataset_ref))}</dd></div><div><dt>Task / architecture</dt><dd>{text(result.task)} · {text(result.architecture)}</dd></div><div><dt>Method</dt><dd>{text(result.method)}</dd></div><div><dt>Initialization job</dt><dd><code>{text(result.source_job_id)}</code></dd></div><div><dt>Published</dt><dd>{text(result.published_at, 'published_at')}</dd></div></dl><details><summary>Inspect source provenance</summary><pre>{JSON.stringify({ dataset: result.dataset_ref, configuration: result.configuration_ref, artifact: result.artifact_ref, specification_id: result.specification_id, queued_run_id: result.queued_run_id }, null, 2)}</pre></details></article>{/each}</div>{/if}
 </section>
 
 <section class="runs-toolbar" aria-label="Model run controls">
@@ -453,6 +472,8 @@
 
 
 <style>
+	.pretraining-catalog{margin:0 0 1rem;padding:1.1rem;background:white;border:1px solid var(--line);border-radius:10px}.pretraining-heading,.pretraining-result-heading{display:flex;justify-content:space-between;align-items:start;gap:1rem}.pretraining-heading h2{margin:.1rem 0}.pretraining-heading p:not(.eyebrow){max-width:720px;margin:.3rem 0 .8rem;color:var(--muted);font-size:.8rem}.pretraining-list{display:grid;gap:.6rem}.pretraining-list article{padding:.8rem;border:1px solid var(--line);border-radius:8px;background:#f9fbfa;min-width:0}.pretraining-result-heading strong,.pretraining-list dd{overflow-wrap:anywhere}.pretraining-list dl{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:.6rem;margin:.8rem 0}.pretraining-list dt{color:var(--muted);font-size:.68rem;font-weight:700;text-transform:uppercase}.pretraining-list dd{margin:.2rem 0 0;font-size:.75rem}.pretraining-list summary{cursor:pointer;font-size:.75rem;font-weight:700}.pretraining-list pre{max-height:220px;overflow:auto;padding:.7rem;background:#102a35;color:#dceced;border-radius:7px;font-size:.7rem}
+
 	.rename-form{display:flex;flex-wrap:wrap;align-items:end;gap:.5rem;margin:.8rem 0;padding:.8rem;border:1px solid var(--line);border-radius:8px;background:#f9fbfa}.rename-form label{display:grid;gap:.25rem;flex:1;min-width:180px}.rename-form label span{font-size:.72rem;font-weight:700}.rename-form .inline-error{flex-basis:100%;margin:0}
 	.posthoc-progress{margin-top:.9rem;padding:.85rem 1rem;border:1px solid var(--line);border-radius:8px;background:#fff}.posthoc-progress>strong{font-size:.8rem}.posthoc-progress p{margin:.4rem 0;color:var(--ink)}.posthoc-progress progress{display:block;width:100%;height:.5rem;accent-color:var(--teal)}.posthoc-progress ol{margin:.65rem 0 0;padding-left:1.25rem;display:grid;gap:.3rem}.posthoc-progress li{font-size:.72rem;color:var(--muted)}.posthoc-progress li small{margin-left:.5rem;color:var(--muted)}
 	.posthoc-compare-action{position:fixed;z-index:21;right:2rem;bottom:2rem;display:grid;gap:.35rem;max-width:360px;padding:.8rem;background:white;border:1px solid var(--line);border-radius:8px;box-shadow:var(--shadow)}.posthoc-compare-action small{color:var(--muted);font-size:.7rem}

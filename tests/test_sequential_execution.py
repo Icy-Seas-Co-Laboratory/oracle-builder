@@ -9,6 +9,7 @@ import uuid
 import zipfile
 
 import pytest
+from fastapi.testclient import TestClient
 
 from oracle_builder.artifacts import (
     create_run_artifact,
@@ -19,6 +20,7 @@ from oracle_builder.artifacts import (
     validate_run_artifact,
 )
 from oracle_builder.orchestration.service import Orchestrator
+from oracle_builder.orchestration.api import create_app
 from oracle_builder.training.control import FileSegmentControl
 from oracle_builder.training.recovery import RECOVERY_SCHEMA, recovery_config_hash
 from oracle_builder.worker.control import WorkerControl
@@ -28,7 +30,8 @@ from oracle_data_contracts.work_units import WorkUnit, WorkUnitV2
 
 def _segment_artifact(
     root: Path, *, run_id: str, completed_epoch: int, stop_epoch: int,
-    interrupted: bool = False, next_phase: str | None = None,
+    interrupted: bool = False, next_phase: str | None = None, phase: str = "train",
+    pretraining_handoff: dict | None = None,
 ) -> Path:
     root.mkdir(parents=True)
     source = root / "source.toml"
@@ -70,11 +73,19 @@ def _segment_artifact(
             "schema": "oracle_builder_training_checkpoint_generation/v1",
         },
     }
+    if phase == "initialize":
+        recovery["pretraining_completed"] = True
+        recovery["pretraining_handoff"] = {
+            "boundary": "portable_pretraining" if pretraining_handoff is not None else "whole_phase",
+            "supervised_epoch": 0,
+            "ssl_continuation": "not_portable",
+            **(pretraining_handoff or {}),
+        }
     (model.parent / "state.json").write_text(json.dumps(recovery), encoding="utf-8")
     (run / "model" / "recovery" / "state.json").write_text(json.dumps(recovery), encoding="utf-8")
     (root / "run" / "segment-result.json").write_text(json.dumps({
         "schema": "oracle_builder_training_segment_result/v1",
-        "phase": "train",
+        "phase": phase,
         "cursor": {"completed_epoch": completed_epoch},
         "checkpoint": "model/recovery/state.json",
         # The workflow advances to finalization only after the full run
@@ -132,6 +143,123 @@ def _sequential_lease(tmp_path, *, unit_epochs: int = 1):
     assert lease is not None
     credentials = {"lease_id": lease["lease_id"], "worker_id": worker["worker_id"], "worker_token": worker["worker_token"], "lease_token": lease["lease_token"]}
     return orch, worker, unit, lease, credentials
+
+
+def test_completed_initialization_is_cataloged_and_api_returns_immutable_source(tmp_path):
+    orch, _worker, unit, _lease, credentials = _sequential_lease(tmp_path)
+    unit_dict = unit.to_dict()
+    unit_dict["phase"] = "initialize"
+    unit_dict["parameters"]["execution_segment"] = {
+        "phase": "initialize", "start_epoch": 0, "stop_epoch": 0, "total_epochs": 2,
+    }
+    unit_dict["start_cursor"] = {"completed_epoch": 0}
+    unit_dict["stop_boundary"] = {"completed_epoch": 0}
+    from oracle_data_contracts.work_units import WorkUnitV2
+    initialized_unit = WorkUnitV2.from_dict(unit_dict)
+    with orch._connection() as db:
+        db.execute("UPDATE jobs SET work_unit_json=?,work_unit_sha256=? WHERE job_id=?",
+                   (initialized_unit.canonical_json(), initialized_unit.sha256, unit.work_unit_id))
+    artifact = _segment_artifact(
+        tmp_path / "initialize", run_id=str(uuid.uuid4()), completed_epoch=0, stop_epoch=0,
+        phase="initialize", next_phase="train",
+    )
+    _complete_segment(orch, credentials, artifact)
+    manifest = read_run_manifest(artifact)
+    # Simulate a pre-catalog successful completion: the worker lease keeps its
+    # accepted immutable ref, so a metadata-only backfill recovers the result.
+    with orch._connection() as db:
+        db.execute("DELETE FROM pretraining_initializations WHERE artifact_id=?", (manifest["artifact_id"],))
+    listed = orch.pretraining_initializations()
+    assert len(listed) == 1
+    entry = listed[0]
+    assert entry["artifact_id"] == manifest["artifact_id"]
+    assert entry["run_id"] == manifest["run_id"]
+    assert entry["execution_run_id"] == unit.run_id
+    assert entry["source_job_id"] == unit.work_unit_id
+    assert entry["artifact_ref"]["kind"] == "job_output"
+    assert entry["artifact_ref"]["fingerprint_sha256"]
+    assert entry["status"] == "recorded"
+    # The catalog publication is independent of later supervised execution.
+    with orch._connection() as db:
+        db.execute("UPDATE execution_runs SET status='failed' WHERE run_id=?", (unit.run_id,))
+    assert orch.pretraining_initialization(manifest["artifact_id"])["artifact_ref"] == entry["artifact_ref"]
+    with TestClient(create_app(orch)) as client:
+        response = client.get("/v1/pretraining-initializations")
+        detail = client.get(f"/v1/pretraining-initializations/{manifest['artifact_id']}")
+    assert response.status_code == 200
+    assert response.json()["initializations"][0]["artifact_ref"] == entry["artifact_ref"]
+    assert detail.status_code == 200
+    assert detail.json()["initialization"] == entry
+
+
+@pytest.mark.parametrize("mismatch", [None, "source_artifact_id", "source_run_id", "source_fingerprint_sha256", "source_model_sha256"])
+def test_initialization_publication_verifies_selected_source_provenance(tmp_path, mismatch):
+    orch, _worker, unit, _lease, _credentials = _sequential_lease(tmp_path)
+    source_artifact = _segment_artifact(
+        tmp_path / "selected-source", run_id=str(uuid.uuid4()), completed_epoch=0, stop_epoch=0,
+        phase="initialize", next_phase="train",
+    )
+    source_manifest = read_run_manifest(source_artifact)
+    source_report = validate_run_artifact(source_artifact)
+    source_state = json.loads((source_artifact / "model/recovery/state.json").read_text())
+    source_ref = ArtifactRef(
+        "job_output", str(uuid.uuid4()), "source-attempt", directory_content_digest(source_artifact),
+    )
+    orch.artifact_store.register_existing(source_ref, source_artifact)
+    expected_handoff = {
+        "source_artifact_id": source_manifest["artifact_id"],
+        "source_run_id": source_manifest["run_id"],
+        "source_fingerprint_sha256": source_report["fingerprint_sha256"],
+        "source_model_sha256": source_state["model_sha256"],
+    }
+    supplied_handoff = dict(expected_handoff)
+    if mismatch is not None:
+        supplied_handoff[mismatch] = (
+            "f" * 64 if mismatch.endswith("sha256") else str(uuid.uuid4())
+        )
+    unit_dict = unit.to_dict()
+    unit_dict["phase"] = "initialize"
+    unit_dict["inputs"]["pretraining_source"] = source_ref.to_dict()
+    unit_dict["parameters"]["initialization"] = {
+        "mode": "pretraining", "source_artifact_id": source_manifest["artifact_id"],
+    }
+    unit_dict["parameters"]["execution_segment"] = {
+        "phase": "initialize", "start_epoch": 0, "stop_epoch": 0, "total_epochs": 2,
+    }
+    initialized_unit = WorkUnitV2.from_dict(unit_dict)
+    with orch._connection() as db:
+        db.execute("UPDATE jobs SET work_unit_json=?,work_unit_sha256=? WHERE job_id=?",
+                   (initialized_unit.canonical_json(), initialized_unit.sha256, unit.work_unit_id))
+    artifact = _segment_artifact(
+        tmp_path / "initialize-provenance", run_id=str(uuid.uuid4()), completed_epoch=0,
+        stop_epoch=0, phase="initialize", next_phase="train",
+        pretraining_handoff=supplied_handoff,
+    )
+    if mismatch is None:
+        result = orch._read_segment_result(artifact, unit_dict)
+        assert result["phase"] == "initialize"
+        output_ref = ArtifactRef(
+            "job_output", unit.work_unit_id, "output-attempt", directory_content_digest(artifact),
+        )
+        orch.artifact_store.register_existing(output_ref, artifact)
+        with orch._connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            job = db.execute("SELECT * FROM jobs WHERE job_id=?", (unit.work_unit_id,)).fetchone()
+            orch._commit_segment_in_connection(
+                db, job=job, lease_id="test-lease", output_ref=output_ref, result=result,
+                now="2026-11-02T00:00:00+00:00",
+            )
+        successor = _units_for_run(orch, unit.run_id)[-1]["work_unit"]
+        assert "pretraining_source" not in successor["inputs"]
+        assert successor["inputs"]["checkpoint"] == output_ref.to_dict()
+        import shutil
+        shutil.rmtree(source_artifact)
+        assert orch.artifact_store.resolve(output_ref).is_dir()
+        with pytest.raises(FileNotFoundError):
+            orch.artifact_store.resolve(source_ref)
+    else:
+        with pytest.raises(ValueError, match="lineage does not match the selected pretraining source"):
+            orch._read_segment_result(artifact, unit_dict)
 
 
 def _complete_segment(orch, credentials, artifact: Path):
@@ -435,3 +563,40 @@ def test_reconciliation_commits_published_segment_without_retraining(tmp_path):
     run = orch.execution_run(unit.run_id)
     assert run["completed_epoch"] == 1 and len(_units_for_run(orch, unit.run_id)) == 2
     assert orch.reconcile_worker_publications() == 0
+
+
+def test_reconciliation_publishes_interrupted_initialization_to_catalog(tmp_path):
+    orch, _worker, unit, lease, credentials = _sequential_lease(tmp_path)
+    unit_dict = unit.to_dict()
+    unit_dict["phase"] = "initialize"
+    unit_dict["parameters"]["execution_segment"] = {
+        "phase": "initialize", "start_epoch": 0, "stop_epoch": 0, "total_epochs": 2,
+    }
+    unit_dict["stop_boundary"] = {"completed_epoch": 0}
+    from oracle_data_contracts.work_units import WorkUnitV2
+    initialized = WorkUnitV2.from_dict(unit_dict)
+    with orch._connection() as db:
+        db.execute("UPDATE jobs SET work_unit_json=?,work_unit_sha256=? WHERE job_id=?",
+                   (initialized.canonical_json(), initialized.sha256, unit.work_unit_id))
+    acknowledged = orch.acknowledge_worker_lease(**credentials)
+    artifact = _segment_artifact(
+        tmp_path / "initialize-reconcile", run_id=str(uuid.uuid4()), completed_epoch=0,
+        stop_epoch=0, phase="initialize", next_phase="train",
+    )
+    orch.upload_worker_lease_output_archive(**credentials, archive=_zip_directory(artifact))
+    staging = orch.artifact_store.staging(lease["job_id"], acknowledged["output_attempt_id"])
+    staged_path = orch.artifact_store.staging_path(staging)
+    digest = directory_content_digest(staged_path)
+    assert orch.artifact_store.validate(staging, validate_run_artifact).valid
+    orch.artifact_store.seal(staging)
+    ref = ArtifactRef(
+        "job_output", lease["job_id"], revision=acknowledged["output_attempt_id"],
+        fingerprint_sha256=digest,
+    )
+    orch.artifact_store.publish(staging, ref)
+
+    assert orch.reconcile_worker_publications() == 1
+    manifest = read_run_manifest(artifact)
+    entry = orch.pretraining_initialization(manifest["artifact_id"])
+    assert entry is not None
+    assert entry["artifact_ref"] == ref.to_dict()

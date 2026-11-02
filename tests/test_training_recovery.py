@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 import uuid
 import copy
+import json
 import subprocess
 import sys
 
@@ -91,6 +92,35 @@ def test_rolling_recovery_prunes_only_after_state_commit(tmp_path, monkeypatch):
     current = recovery.read_recovery_state(layout.root)["generation"]["id"]
     assert {path.name for path in generations.iterdir()} == {current}
     assert (generations / current / "model.keras").exists()
+
+
+def test_recovery_rejects_malformed_pretraining_marker(tmp_path, monkeypatch):
+    from oracle_builder.training import recovery
+
+    config = recovery_config()
+    layout = RunLayout(tmp_path / "run")
+    layout.create_directories()
+    monkeypatch.setattr(recovery, "log_event", lambda *args, **kwargs: None)
+
+    class Model:
+        def save(self, path):
+            path.write_bytes(b"snapshot")
+
+    callback = RollingRecoveryCallback(
+        layout.root, config, layout.training_log,
+        config["run"]["run_id"], config["artifact"]["artifact_id"],
+    )
+    callback.set_model(Model())
+    callback.on_epoch_end(0)
+    state = recovery.read_recovery_state(layout.root)
+    assert "pretraining_completed" not in state
+    state["pretraining_completed"] = "true"
+    layout.recovery_state.write_text(json.dumps(state))
+    with pytest.raises(ValueError, match="invalid pretraining completion marker"):
+        validate_recovery_state(
+            layout.root, config, artifact_id=config["artifact"]["artifact_id"],
+            run_id=config["run"]["run_id"],
+        )
 
 
 def test_rolling_recovery_restores_optimizer_model_and_continues_history(tmp_path):
@@ -372,3 +402,28 @@ def test_deterministic_batch_cursor_resumes_mid_epoch_on_cpu(tmp_path):
     }
     for expected, observed in zip(uninterrupted.get_weights(), resumed.get_weights(), strict=True):
         np.testing.assert_allclose(observed, expected, rtol=1e-6, atol=1e-7)
+
+
+def test_unsegmented_ssl_records_handoff_for_resume(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    import tensorflow as tf
+    from oracle_builder.training import student_teacher
+
+    config = recovery_config()
+    config["training"]["epochs"] = 1
+    config["self_supervised"] = {"enabled": True, "method": "byol"}
+    layout = RunLayout(tmp_path / "run")
+    layout.create_directories()
+    init_training_log(layout.training_log, config["run"]["run_id"], "ssl", config, {"test": True})
+    images = np.zeros((4, 16, 16, 1), dtype="float32")
+    labels = np.array([0, 1, 0, 1], dtype="int64")
+    dataset = tf.data.Dataset.from_tensor_slices((images, labels)).batch(2)
+    monkeypatch.setattr(student_teacher, "run_self_supervised_training", lambda *a, **kw: SimpleNamespace(history={}))
+    train_model(config, {"train": dataset}, layout.root, layout.training_log, config["run"]["run_id"],
+                pretraining_dataset=dataset)
+    state = validate_recovery_state(layout.root, config, artifact_id=config["artifact"]["artifact_id"],
+                                    run_id=config["run"]["run_id"])
+    assert state["pretraining_handoff"] == {"boundary": "whole_phase", "supervised_epoch": 0,
+                                           "ssl_continuation": "not_portable"}
+    train_model(config, {"train": dataset}, layout.root, layout.training_log,
+                config["run"]["run_id"], resume_state=state)

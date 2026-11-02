@@ -124,6 +124,11 @@ def build_work_unit(
             raise ValueError("queue_execution must be an object")
         if raw_execution:
             action_parameters = {"queue_execution": dict(raw_execution)}
+        initialization = parameters.get("initialization", {})
+        if not isinstance(initialization, Mapping):
+            raise ValueError("initialization must be an object")
+        if initialization:
+            action_parameters["initialization"] = dict(initialization)
         run_name = parameters.get("run_name")
         if run_name is not None:
             if (not isinstance(run_name, str) or not run_name.strip() or len(run_name.strip()) > 240

@@ -67,6 +67,8 @@ def build_callbacks(
     segment_stop_epoch: int | None = None,
     require_recovery: bool = False,
     resume_callback_state: dict[str, Any] | None = None,
+    pretraining_completed: bool = False,
+    pretraining_handoff: dict[str, Any] | None = None,
 ):
     status_callback = RichTrainingStatusCallback(
         phase="Supervised training",
@@ -157,6 +159,8 @@ def build_callbacks(
                 artifact_id,
                 force_every_epoch=require_recovery,
                 callback_state_provider=callback_state_provider,
+                pretraining_completed=pretraining_completed,
+                pretraining_handoff=pretraining_handoff,
             )
         )
     if segment_control is not None:

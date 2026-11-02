@@ -184,6 +184,7 @@ class QueuedRunReplacementRequest(BaseModel):
     definition_revision: int | None = Field(default=None, ge=1)
     dataset_id: str
     worker_pool_id: str
+    initialization: dict[str, Any] | None = None
     resources: dict[str, Any] = Field(default_factory=dict)
     batch_size_mode: str = "manual"
     batch_size: int | None = Field(default=None, ge=1)
@@ -704,6 +705,16 @@ def create_app(
     @app.get("/v1/execution-runs/{run_id}")
     def execution_run(run_id: str) -> dict[str, Any]:
         return {"run": required(orchestrator.execution_run(run_id), "Execution run")}
+
+    @app.get("/v1/pretraining-initializations")
+    def pretraining_initializations() -> dict[str, Any]:
+        return {"initializations": orchestrator.pretraining_initializations()}
+
+    @app.get("/v1/pretraining-initializations/{artifact_id}")
+    def pretraining_initialization(artifact_id: str) -> dict[str, Any]:
+        return {"initialization": required(
+            orchestrator.pretraining_initialization(artifact_id), "Pretraining initialization"
+        )}
 
     @app.post("/v1/jobs/{job_id}/commands", status_code=202)
     def request_job_command(job_id: str, body: JobCommandRequest) -> dict[str, Any]:

@@ -84,6 +84,7 @@ export const api = {
 	registeredWorkers: (poolId?: string) => request<{ workers: RecordValue[] }>(`/v1/workers${poolId ? `?pool_id=${encodeURIComponent(poolId)}` : ''}`),
 	workerLeases: (workerId?: string) => request<{ leases: RecordValue[] }>(`/v1/worker-leases${workerId ? `?worker_id=${encodeURIComponent(workerId)}` : ''}`),
 	executionRun: (runId: string) => request<{ run: RecordValue }>(`/v1/execution-runs/${encodeURIComponent(runId)}`),
+	pretrainingInitializations: () => request<{ initializations: RecordValue[] }>('/v1/pretraining-initializations'),
 	queuedRuns: () => request<{ queued_runs: RecordValue[] }>('/v1/queued-runs'),
 	renameQueuedRun: (id: string, name: string) => request<RecordValue>(`/v1/queued-runs/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify({ name }) }),
 	replaceQueuedRun: (id: string, body: RecordValue) => request<RecordValue>(`/v1/queued-runs/${encodeURIComponent(id)}:replace`, { method: 'POST', body: JSON.stringify(body) }, 960_000),

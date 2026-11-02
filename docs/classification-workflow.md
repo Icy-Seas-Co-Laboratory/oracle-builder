@@ -412,6 +412,21 @@ run preserves its definition revision and both budgets. Verification keeps
 those exact settings; it does not train either phase. Embedding runs are
 SSL-only and show no supervised epoch budget.
 
+After a classification or segmentation initialization finishes, its sealed
+epoch-zero checkpoint is listed under **Model Runs → Pretraining results**,
+even if a later supervised segment fails. In the training queue, choose an
+SSL-enabled supervised definition and select that result as the initialization
+source. Verification checks its identity, integrity and model compatibility;
+training loads its weights into a newly compiled model and records the source
+in the new run. The new run does not repeat SSL training or resume its optimizer.
+Model architecture, input and output shape, class mapping, and preprocessing
+must be compatible. A different batch size or data split is allowed. Selecting a
+source does not modify the original result.
+
+Only completed, committed initialization checkpoints are eligible. An
+interrupted SSL phase cannot be resumed or selected. Embedding-only and
+stratified training do not support this initialization workflow.
+
 For API clients, `epochs` retains its supervised meaning for classification
 and segmentation; `ssl_epochs` supplies the separate SSL duration. Older
 clients that omit `ssl_epochs` retain the previous behavior of applying

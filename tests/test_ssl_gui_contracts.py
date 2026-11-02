@@ -32,6 +32,32 @@ def _sealed(orch, queued):
     return load_toml(orch.artifact_store.resolve(ArtifactRef.from_dict(spec['parameters']['configuration_artifact'])) / 'payload')
 
 
+def test_pretraining_catalog_enriches_display_context_from_pinned_queue_revision(queue_setup):
+    orch, _pool, _worker, _queue = queue_setup
+    definition, dataset, queued = _queue_ssl(queue_setup)
+    artifact_id, source_job_id, execution_run_id = 'a' * 36, 'b' * 36, 'c' * 36
+    source_ref = ArtifactRef('job_output', source_job_id, 'attempt-1', 'd' * 64)
+    with orch._connection() as db:
+        db.execute("""INSERT INTO pretraining_initializations
+            (artifact_id,run_id,execution_run_id,artifact_ref_json,source_job_id,specification_id,
+             queued_run_id,dataset_ref_json,configuration_ref_json,published_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?)""",
+            (artifact_id, 'e' * 36, execution_run_id, json.dumps(source_ref.to_dict()), source_job_id,
+             queued['specification_id'], queued['queued_run_id'], None, json.dumps({}), '2026-11-02T00:00:00Z'))
+    item = orch.pretraining_initialization(artifact_id)
+    assert item['name'] == queued['name']
+    assert item['dataset_name'] == dataset['name']
+    assert item['definition_name'] == definition['name']
+    assert item['task'] == 'classification'
+    assert item['architecture']
+    assert item['method'] == 'simclr'
+    with TestClient(create_app(orch)) as client:
+        result = client.get('/v1/pretraining-initializations').json()['initializations'][0]
+    assert {key: result[key] for key in ('name', 'dataset_name', 'definition_name', 'task', 'architecture', 'method')} == {
+        key: item[key] for key in ('name', 'dataset_name', 'definition_name', 'task', 'architecture', 'method')
+    }
+
+
 def test_independent_ssl_budgets_survive_verification_and_replacement(queue_setup):
     orch, pool, worker, _ = queue_setup
     definition, dataset, queued = _queue_ssl(queue_setup)

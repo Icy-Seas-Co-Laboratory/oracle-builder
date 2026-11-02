@@ -38,6 +38,8 @@ class TrainingRequest:
     # resulting recovery snapshot is then the input to resumable supervised
     # segments; SSL optimizer/teacher state is deliberately not resumed.
     pretrain_only: bool = False
+    pretraining_source: str | None = None
+    pretraining_source_artifact_id: str | None = None
 
     def __post_init__(self) -> None:
         if not self.runs_dir:
@@ -59,6 +61,10 @@ class TrainingRequest:
             raise ValueError("segment_start_step must be non-negative")
         if self.segment_start_step is not None and self.segment_max_steps is None:
             raise ValueError("segment_start_step requires segment_max_steps")
+        if bool(self.pretraining_source) != bool(self.pretraining_source_artifact_id):
+            raise ValueError("pretraining_source and pretraining_source_artifact_id are both required")
+        if self.pretraining_source and (self.resume or self.finalize_only):
+            raise ValueError("pretraining_source requires a fresh run")
         if self.pretrain_only and self.finalize_only:
             raise ValueError("pretrain_only cannot be combined with finalize_only")
         if (

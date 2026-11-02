@@ -222,6 +222,30 @@ def test_verified_training_applies_batch_without_recalibrating(tmp_path, monkeyp
     assert (configuration / 'payload').read_text() == '[data]\nbatch_size = 4\n'
 
 
+def test_initialization_unit_passes_selected_source_to_training(tmp_path, monkeypatch):
+    configuration, dataset, staging, source = [tmp_path / name for name in ('configuration', 'dataset', 'staging', 'source')]
+    for path in (configuration, dataset, staging, source):
+        path.mkdir()
+    (configuration / 'payload').write_text('[data]\nbatch_size = 4\n')
+    (dataset / 'payload').write_bytes(b'sqlite')
+    def train(request):
+        assert request.pretrain_only is True
+        assert request.pretraining_source == str(source)
+        assert request.pretraining_source_artifact_id == 'source-id'
+        run = Path(request.runs_dir) / request.output
+        run.mkdir()
+        (run / 'artifact.json').write_text('{}')
+        return 0
+    monkeypatch.setattr('oracle_builder.training.workflow.run_training', train)
+    TrainingExecutor().execute(
+        work_unit={'parameters': {'initialization': {'mode': 'pretraining', 'source_artifact_id': 'source-id'},
+                                  'execution_segment': {'phase': 'initialize'},
+                                  'queue_execution': {'mode': 'verified', 'batch_size': 4}}},
+        inputs={'input': dataset, 'pretraining_source': source}, configuration=configuration,
+        staging=staging, emit_event=lambda *args: None,
+    )
+
+
 def test_training_output_is_resealed_after_runtime_path_sanitization(tmp_path, monkeypatch):
     import uuid
     from oracle_builder.artifacts import create_run_artifact, update_run_artifact, seal_run_artifact, validate_run_artifact

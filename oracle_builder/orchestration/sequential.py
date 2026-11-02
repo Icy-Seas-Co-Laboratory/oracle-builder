@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import hashlib
 import uuid
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -136,6 +137,122 @@ class SequentialExecutionMixin:
                 unit['work_unit'] = json.loads(unit.pop('work_unit_json'))
             return result
 
+    @staticmethod
+    def _pretraining_initialization_view(row):
+        if row is None:
+            return None
+        result = dict(row)
+        for source, target in (("artifact_ref_json", "artifact_ref"),
+                               ("dataset_ref_json", "dataset_ref"),
+                               ("configuration_ref_json", "configuration_ref")):
+            raw = result.pop(source)
+            result[target] = json.loads(raw) if raw else None
+        raw_config = result.pop("_pinned_config_json", None)
+        config = None
+        if raw_config:
+            try:
+                config = json.loads(raw_config)
+            except (TypeError, json.JSONDecodeError):
+                config = None
+        result["task"] = (config.get("run", {}).get("task")
+                          if isinstance(config, dict) and isinstance(config.get("run"), dict) else None)
+        encoder = config.get("encoder") if isinstance(config, dict) else None
+        model = config.get("model") if isinstance(config, dict) else None
+        run = config.get("run") if isinstance(config, dict) else None
+        result["architecture"] = (
+            (encoder.get("family") or encoder.get("architecture")) if isinstance(encoder, dict) else None
+        ) or ((model.get("architecture")) if isinstance(model, dict) else None) or (
+            run.get("model") if isinstance(run, dict) else None
+        )
+        settings = config.get("self_supervised") or config.get("pretraining") if isinstance(config, dict) else None
+        result["method"] = (
+            settings.get("method", "byol")
+            if isinstance(settings, dict) and settings.get("enabled") is True else None
+        )
+        result["status"] = "recorded"
+        return result
+
+    @staticmethod
+    def _pretraining_initialization_query(where=""):
+        return """SELECT p.*,queued_runs.name AS name,datasets.name AS dataset_name,
+                   model_definitions.name AS definition_name,
+                   model_definition_revisions.config_json AS _pinned_config_json
+            FROM pretraining_initializations p
+            LEFT JOIN queued_runs ON queued_runs.queued_run_id=p.queued_run_id
+            LEFT JOIN datasets ON datasets.dataset_id=queued_runs.dataset_id
+            LEFT JOIN model_definitions ON model_definitions.definition_id=queued_runs.definition_id
+            LEFT JOIN model_definition_revisions
+              ON model_definition_revisions.definition_id=queued_runs.definition_id
+             AND model_definition_revisions.revision=queued_runs.definition_revision
+            """ + where
+
+    def pretraining_initializations(self):
+        """Return published immutable initialization checkpoints for selection."""
+        self._backfill_pretraining_initializations()
+        with self._connection() as db:
+            rows = db.execute(self._pretraining_initialization_query(
+                "ORDER BY p.published_at DESC,p.artifact_id"
+            )).fetchall()
+        return [self._pretraining_initialization_view(row) for row in rows]
+
+    def pretraining_initialization(self, artifact_id):
+        self._backfill_pretraining_initializations()
+        with self._connection() as db:
+            row = db.execute(self._pretraining_initialization_query(
+                "WHERE p.artifact_id=?"
+            ), (artifact_id,)).fetchone()
+        return self._pretraining_initialization_view(row)
+
+    def _backfill_pretraining_initializations(self):
+        """Index older accepted initialization outputs without rehashing them.
+
+        The stored output ref only comes from a completed lease, whose output
+        passed the publication validator before it was accepted. This
+        backfill checks the reachable artifact's bounded manifest identity;
+        byte integrity is checked by materialization on selection.
+        """
+        with self._connection() as db:
+            rows = db.execute("""SELECT jobs.*,worker_leases.output_ref_json,
+                       worker_leases.released_at
+                    FROM jobs JOIN worker_leases ON worker_leases.job_id=jobs.job_id
+                    WHERE worker_leases.outcome='completed'
+                      AND worker_leases.output_ref_json IS NOT NULL
+                      AND jobs.status IN ('completed','indexed')
+                      AND json_valid(jobs.work_unit_json)
+                      AND json_extract(jobs.work_unit_json,'$.schema.version')=2
+                      AND json_extract(jobs.work_unit_json,'$.phase')='initialize'
+                      AND NOT EXISTS (SELECT 1 FROM pretraining_initializations p
+                                      WHERE p.source_job_id=jobs.job_id)
+                    ORDER BY worker_leases.released_at""").fetchall()
+        for row in rows:
+            try:
+                unit = json.loads(row['work_unit_json'] or '{}')
+                if unit.get('schema', {}).get('version') != 2 or unit.get('phase') != 'initialize':
+                    continue
+                ref = ArtifactRef.from_dict(json.loads(row['output_ref_json']))
+                root = self.artifact_store.resolve(ref)
+                manifest_path = root / 'artifact.json'
+                if not manifest_path.is_file() or manifest_path.stat().st_size > 1024 * 1024:
+                    continue
+                manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+                artifact_id, run_id = str(manifest['artifact_id']), str(manifest['run_id'])
+                dataset_ref = unit.get('inputs', {}).get('input') or unit.get('inputs', {}).get('dataset')
+                published_at = row['released_at'] or row['completed_at'] or row['updated_at']
+                with self._connection() as db:
+                    db.execute('BEGIN IMMEDIATE')
+                    db.execute("""INSERT INTO pretraining_initializations
+                        (artifact_id,run_id,execution_run_id,artifact_ref_json,source_job_id,
+                         specification_id,queued_run_id,dataset_ref_json,configuration_ref_json,published_at)
+                        VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(artifact_id) DO NOTHING""",
+                        (artifact_id, run_id, str(unit['run_id']), json.dumps(ref.to_dict()), row['job_id'],
+                         row['specification_id'], row['queued_run_id'],
+                         json.dumps(dataset_ref) if dataset_ref else None,
+                         json.dumps(unit.get('configuration')), published_at))
+            except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+                # Missing historical payloads remain absent rather than
+                # becoming selectable as if their bytes were available.
+                continue
+
     def _validate_training_output_inputs(self, path, unit):
         root = Path(path)
         manifest = json.loads((root / 'artifact.json').read_text())
@@ -162,8 +279,7 @@ class SequentialExecutionMixin:
             if config.get('data', {}).get('batch_size') != execution['batch_size']:
                 raise ValueError('Training output changed its verified batch size')
 
-    @staticmethod
-    def _read_segment_result(path, unit):
+    def _read_segment_result(self, path, unit):
         candidate = Path(path) / 'segment-result.json'
         if not candidate.is_file() or candidate.stat().st_size > 65536:
             raise ValueError('Training segment must provide a bounded result manifest')
@@ -205,6 +321,31 @@ class SequentialExecutionMixin:
         if unit['phase'] == 'initialize':
             if cursor != 0 or state.get('pretraining_completed') is not True or result.get('next_phase') != 'train':
                 raise ValueError('Self-supervised initialization did not produce a valid supervised handoff')
+            source_ref = unit.get('inputs', {}).get('pretraining_source')
+            initialization = unit.get('parameters', {}).get('initialization', {})
+            source_id = initialization.get('source_artifact_id') if isinstance(initialization, dict) else None
+            handoff = state.get('pretraining_handoff')
+            if (not isinstance(handoff, dict)
+                    or handoff.get('boundary') not in {'whole_phase', 'portable_pretraining'}
+                    or type(handoff.get('supervised_epoch')) is not int
+                    or handoff.get('supervised_epoch') != 0
+                    or handoff.get('ssl_continuation') != 'not_portable'):
+                raise ValueError('Self-supervised initialization has invalid handoff provenance')
+            if handoff['boundary'] == 'portable_pretraining' and (
+                    any(not isinstance(handoff.get(key), str) or not handoff[key].strip()
+                        for key in ('source_artifact_id', 'source_run_id'))
+                    or any(not isinstance(handoff.get(key), str)
+                           or not re.fullmatch(r'[0-9a-f]{64}', handoff[key])
+                           for key in ('source_fingerprint_sha256', 'source_model_sha256'))):
+                raise ValueError('Self-supervised initialization has invalid source provenance')
+            if source_ref is not None:
+                if (not isinstance(initialization, dict) or initialization.get('mode') != 'pretraining'
+                        or not isinstance(source_id, str) or not source_id
+                        or handoff['boundary'] != 'portable_pretraining'):
+                    raise ValueError('Initialization output does not preserve its selected pretraining source identity')
+                self._validate_selected_pretraining_handoff(source_ref, handoff, source_id)
+            elif isinstance(initialization, dict) and initialization.get('mode') == 'pretraining':
+                raise ValueError('Selected pretraining initialization is missing its sealed source reference')
         elif unit['phase'] == 'train':
             if segment.get('max_steps'):
                 global_step = result['cursor'].get('global_step')
@@ -228,6 +369,69 @@ class SequentialExecutionMixin:
             raise ValueError('Worker next phase disagrees with authoritative training progress')
         return result
 
+    def _validate_selected_pretraining_handoff(self, source_ref, handoff, expected_artifact_id):
+        """Verify worker-reported lineage against the immutable selected source."""
+        from oracle_builder.artifacts import validate_run_artifact
+
+        ref = ArtifactRef.from_dict(source_ref)
+        source = self.artifact_store.resolve(ref)
+        report = validate_run_artifact(source)
+        if not report.get('valid') or report.get('lifecycle') != 'sealed':
+            raise ValueError('Selected pretraining source is missing, invalid, or unsealed')
+        manifest = json.loads((source / 'artifact.json').read_text(encoding='utf-8'))
+        if manifest.get('artifact_id') != expected_artifact_id:
+            raise ValueError('Selected pretraining source artifact identity mismatch')
+        if ref.fingerprint_sha256:
+            from oracle_data_contracts.artifacts import directory_content_digest
+            if directory_content_digest(source) != ref.fingerprint_sha256:
+                raise ValueError('Selected pretraining source reference fingerprint mismatch')
+        state_path = source / 'model/recovery/state.json'
+        shared_state_path = source / 'model/recovery/stratified_state.json'
+        source_state_path = state_path if state_path.is_file() else shared_state_path
+        if not source_state_path.is_file() or source_state_path.stat().st_size > 1024 * 1024:
+            raise ValueError('Selected pretraining source has no bounded recovery state')
+        source_state = json.loads(source_state_path.read_text(encoding='utf-8'))
+        source_handoff = source_state.get('pretraining_handoff')
+        if (source_state.get('schema') != {'name': 'oracle_builder_training_recovery', 'version': '2.0.0'}
+                or source_state.get('artifact_id') != manifest.get('artifact_id')
+                or source_state.get('run_id') != manifest.get('run_id')
+                or source_state.get('pretraining_completed') is not True
+                or type(source_state.get('completed_epoch')) is not int
+                or source_state.get('completed_epoch') != 0 or source_state.get('cursor')
+                or not isinstance(source_handoff, dict)
+                or source_handoff.get('boundary') not in {'whole_phase', 'portable_pretraining'}
+                or type(source_handoff.get('supervised_epoch')) is not int
+                or source_handoff.get('supervised_epoch') != 0
+                or source_handoff.get('ssl_continuation') != 'not_portable'):
+            raise ValueError('Selected pretraining source is not a completed epoch-zero handoff')
+        if source_handoff['boundary'] == 'portable_pretraining' and (
+                any(not isinstance(source_handoff.get(key), str) or not source_handoff[key].strip()
+                    for key in ('source_artifact_id', 'source_run_id'))
+                or any(not isinstance(source_handoff.get(key), str)
+                       or not re.fullmatch(r'[0-9a-f]{64}', source_handoff[key])
+                       for key in ('source_fingerprint_sha256', 'source_model_sha256'))):
+            raise ValueError('Selected pretraining source has invalid lineage metadata')
+        model_state = source_state if source_state_path == state_path else source_state.get('shared', {})
+        model_path = model_state.get('model_path', '')
+        model_file = source / model_path
+        if (not model_path or not model_file.is_file()
+                or not model_file.resolve().is_relative_to(source.resolve())):
+            raise ValueError('Selected pretraining source model path is invalid')
+        model_digest = hashlib.sha256()
+        with model_file.open('rb') as model_bytes:
+            for chunk in iter(lambda: model_bytes.read(1024 * 1024), b''):
+                model_digest.update(chunk)
+        if model_digest.hexdigest() != model_state.get('model_sha256'):
+            raise ValueError('Selected pretraining source model checksum mismatch')
+        expected = {
+            'source_artifact_id': manifest['artifact_id'],
+            'source_run_id': manifest['run_id'],
+            'source_fingerprint_sha256': report.get('fingerprint_sha256'),
+            'source_model_sha256': model_state.get('model_sha256'),
+        }
+        if any(not expected[key] or handoff.get(key) != expected[key] for key in expected):
+            raise ValueError('Initialization output lineage does not match the selected pretraining source')
+
     def _commit_segment_in_connection(self, db, *, job, lease_id, output_ref, result, now):
         unit = json.loads(job['work_unit_json'])
         run = db.execute('SELECT * FROM execution_runs WHERE run_id=?', (unit['run_id'],)).fetchone()
@@ -237,11 +441,33 @@ class SequentialExecutionMixin:
         pending = db.execute("SELECT * FROM worker_commands WHERE lease_id=? AND status IN ('pending','received','accepted') ORDER BY sequence DESC LIMIT 1", (lease_id,)).fetchone()
         if pending and pending['action'] in {'stop_now', 'restart'}:
             raise ValueError('Stopped attempt cannot advance training')
+        if unit.get('phase') == 'initialize':
+            # Publication is committed alongside the accepted checkpoint and
+            # continuation, so subsequent supervised failure cannot hide it.
+            checkpoint_path = self.artifact_store.resolve(output_ref)
+            manifest = json.loads((checkpoint_path / 'artifact.json').read_text(encoding='utf-8'))
+            artifact_id = str(manifest['artifact_id'])
+            dataset_ref = unit.get('inputs', {}).get('input') or unit.get('inputs', {}).get('dataset')
+            configuration_ref = unit.get('configuration')
+            db.execute(
+                """INSERT INTO pretraining_initializations
+                   (artifact_id,run_id,execution_run_id,artifact_ref_json,source_job_id,specification_id,queued_run_id,
+                    dataset_ref_json,configuration_ref_json,published_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(artifact_id) DO NOTHING""",
+                (artifact_id, str(manifest['run_id']), str(unit['run_id']), json.dumps(output_ref.to_dict()), job['job_id'],
+                 job['specification_id'], job['queued_run_id'],
+                 json.dumps(dataset_ref) if dataset_ref else None,
+                 json.dumps(configuration_ref), now),
+            )
         phase = ('train' if unit['phase'] == 'initialize'
                  else ('finalize' if cursor >= run['total_epochs'] or result.get('stopped_early') else 'train'))
         paused = bool(pending and pending['action'] == 'pause')
         next_id = str(uuid.uuid4())
         inputs = {key: ArtifactRef.from_dict(ref) for key, ref in unit['inputs'].items()}
+        # The committed checkpoint owns the copied weights and provenance.
+        # Later segments must not depend on retaining the original source.
+        inputs.pop('pretraining_source', None)
         inputs['checkpoint'] = output_ref
         end = min(cursor + run['unit_epochs'], run['total_epochs'])
         step_fields = {}
