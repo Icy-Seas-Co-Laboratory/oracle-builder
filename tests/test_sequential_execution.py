@@ -410,10 +410,10 @@ def test_manual_restart_requeues_failed_unit_from_committed_checkpoint(tmp_path)
     assert [row[0] for row in attempts] == [1, 2, 3]
 
 
-def _failed_finalization(tmp_path):
+def _failed_finalization(tmp_path, *, artifact_run_id=None):
     orch, worker, unit, _lease, credentials = _sequential_lease(tmp_path, unit_epochs=2)
     artifact = _segment_artifact(
-        tmp_path / "artifact", run_id=unit.run_id, completed_epoch=2, stop_epoch=2,
+        tmp_path / "artifact", run_id=artifact_run_id or unit.run_id, completed_epoch=2, stop_epoch=2,
     )
     _complete_segment(orch, credentials, artifact)
     checkpoint = orch.execution_run(unit.run_id)["checkpoint_ref"]
@@ -485,6 +485,16 @@ def test_failed_legacy_finalization_uses_checkpoint_pinned_on_unit(tmp_path):
         worker_id=worker["worker_id"], worker_token=worker["worker_token"],
     )
     assert next_lease["work_unit"]["inputs"]["checkpoint"] == checkpoint
+
+
+def test_finalization_retry_allows_distinct_artifact_run_id(tmp_path):
+    orch, _worker, _unit, finalizer, _checkpoint = _failed_finalization(
+        tmp_path, artifact_run_id=str(uuid.uuid4()),
+    )
+
+    restarted = orch.restart_failed_training_unit(finalizer["job_id"])
+
+    assert restarted["status"] == "queued"
 
 
 def test_failed_finalization_rejects_a_damaged_checkpoint(tmp_path):

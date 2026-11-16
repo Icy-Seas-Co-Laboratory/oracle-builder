@@ -29,7 +29,8 @@ class SequentialExecutionMixin:
         result = self._read_segment_result(path, prior_unit)
         if (result['next_phase'] != 'finalize'
                 or result['cursor']['completed_epoch'] != completed_epoch
-                or report['run_id'] != unit.get('run_id')):
+                or checkpoint.get('artifact_id') != predecessor_id
+                or prior_unit.get('run_id') != unit.get('run_id')):
             raise ValueError('Committed checkpoint does not match finalization progress')
 
     def restart_failed_training_unit(self, job_id: str) -> dict:
