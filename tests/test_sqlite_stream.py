@@ -10,7 +10,7 @@ from oracle_builder.classification.evidence import (
     IdentityEvidenceIndex,
     build_evidence_index_streaming,
 )
-from oracle_builder.data.sqlite_dataset import create_synthetic_classification, load_arrays
+from oracle_builder.data.sqlite_dataset import create_synthetic_classification, load_arrays, load_prediction_arrays
 from oracle_builder.data.sqlite_stream import (
     SQLiteClassificationSource,
     build_all_classification_index,
@@ -19,6 +19,7 @@ from oracle_builder.data.sqlite_stream import (
 )
 from oracle_builder.evaluation.predictions import (
     write_classification_predictions_streaming,
+    write_predictions_db,
 )
 from oracle_builder.datasets.schema import set_dataset_lifecycle
 from oracle_builder.training.train import build_and_compile_model
@@ -310,3 +311,47 @@ def test_streaming_predictions_include_posthoc_head_and_neural_prediction(tmp_pa
 
     assert len(json.loads(neural)) == 3
     assert json.loads(result)["output"]["posthoc"]["class_index"] == 2
+
+
+def test_streaming_predictions_with_metadata_hash_each_image(tmp_path):
+    from oracle_data_contracts.inference_v2 import ArrayPayload
+
+    database = tmp_path / "classification.sqlite"
+    output = tmp_path / "predictions.sqlite"
+    create_synthetic_classification(database, n=5, shape=(12, 12, 1), classes=3)
+    config = stream_config()
+    config["model"]["auxiliary_features"] = [
+        {"name": "area", "source": "roi.bounding_box_area_px", "transform": "none"}
+    ]
+    source = SQLiteClassificationSource(database, config)
+    index = build_all_classification_index(database, config, labeled_only=False)
+    batches = list(source.indexed_image_dataset(index, batch_size=2, shuffle=True))
+    expected = {
+        index.refs[int(position)].uuid: ArrayPayload(np.asarray(inputs["image"])[i]).sha256
+        for inputs, positions in batches
+        for i, position in enumerate(np.asarray(positions))
+    }
+
+    written = write_classification_predictions_streaming(
+        build_and_compile_model(config), batches, index, config, output,
+        source_sqlite=database, prediction_set="stream", progress=False,
+    )
+
+    assert written == len(index) == 5
+    with sqlite3.connect(output) as connection:
+        actual = dict(connection.execute("SELECT uuid, input_sha256 FROM predictions"))
+    assert actual == expected
+
+    eager_inputs, targets, records = load_prediction_arrays(database, config)
+    eager_output = tmp_path / "eager_predictions.sqlite"
+    write_predictions_db(
+        build_and_compile_model(config), eager_inputs, targets, records, config,
+        eager_output, source_sqlite=database, prediction_set="eager",
+    )
+    expected_eager = {
+        record["uuid"]: ArrayPayload(np.asarray(eager_inputs["image"])[i]).sha256
+        for i, record in enumerate(records)
+    }
+    with sqlite3.connect(eager_output) as connection:
+        actual_eager = dict(connection.execute("SELECT uuid, input_sha256 FROM predictions"))
+    assert actual_eager == expected_eager

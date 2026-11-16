@@ -259,11 +259,12 @@ def write_predictions_db(
     )
     target_mode = segmentation_target_mode(config)
     segmentation_threshold = float(config.get("evaluation", {}).get("segmentation_threshold", 0.5))
+    image_inputs = x["image"] if isinstance(x, dict) else x
     for record_index, (row, true_value, prediction, logit_values) in enumerate(
         zip(records, y, predictions, logits, strict=False)
     ):
         result_id = str(uuid.uuid4())
-        input_payload = ArrayPayload(np.asarray(x[record_index]))
+        input_payload = ArrayPayload(np.asarray(image_inputs[record_index]))
         output_payload = ArrayPayload(np.asarray(prediction))
         prediction_metadata = dict(row.get("metadata", {}))
         prediction_metadata["prediction"] = {
@@ -486,6 +487,7 @@ def write_classification_predictions_streaming(
     )
     for batch_number, (images, positions) in enumerate(dataset, start=1):
         outputs = feature_model(images, training=False)
+        image_batch = np.asarray(images["image"] if isinstance(images, dict) else images)
         logits = np.asarray(outputs["logits"], dtype="float32")
         probabilities = np.asarray(outputs["probabilities"])
         features = np.asarray(outputs["features"], dtype="float32")
@@ -564,13 +566,7 @@ def write_classification_predictions_streaming(
                     (result_id := str(uuid.uuid4())),
                     encode_npy(logit_values),
                     "npy",
-                    (input_payload := ArrayPayload(
-                        np.asarray(images)[
-                            list(np.asarray(positions, dtype="int64")).index(
-                                int(position)
-                            )
-                        ]
-                    )).sha256,
+                    (input_payload := ArrayPayload(image_batch[batch_position])).sha256,
                     (output_payload := ArrayPayload(probability)).sha256,
                     json.dumps(
                         {
