@@ -74,6 +74,20 @@ def benchmark_model(
         [int(batch_size), *config["data"]["input_shape"]],
         dtype=tf.float32,
     )
+    model_inputs = sample
+    inputs = getattr(model, "inputs", []) or []
+    metadata_input = next(
+        (value for value in inputs if value.name.split(":")[0] == "metadata"),
+        None,
+    )
+    if metadata_input is not None:
+        model_inputs = {
+            "image": sample,
+            "metadata": tf.zeros(
+                [int(batch_size), int(metadata_input.shape[-1])],
+                dtype=metadata_input.dtype,
+            ),
+        }
     gpu_names = [
         device.name.replace("/physical_device:", "")
         for device in tf.config.list_physical_devices("GPU")
@@ -84,11 +98,11 @@ def benchmark_model(
         except (ValueError, RuntimeError):
             pass
     for _ in range(warmup):
-        _synchronize(model(sample, training=False))
+        _synchronize(model(model_inputs, training=False))
     latencies = []
     for _ in range(measured):
         started = time.perf_counter()
-        _synchronize(model(sample, training=False))
+        _synchronize(model(model_inputs, training=False))
         latencies.append(time.perf_counter() - started)
     values = np.asarray(latencies, dtype="float64")
     total_samples = measured * int(batch_size)

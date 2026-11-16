@@ -41,3 +41,21 @@ def test_performance_benchmark_records_latency_throughput_and_parameters(tmp_pat
         (tmp_path / "evaluation" / "performance.json").read_text()
     )
     assert saved["evaluation_pipeline_seconds"] == 1.25
+
+
+def test_performance_benchmark_supplies_metadata_input(tmp_path):
+    image = tf.keras.Input(shape=(8, 8, 1), name="image")
+    metadata = tf.keras.Input(shape=(3,), name="metadata")
+    features = tf.keras.layers.Concatenate()(
+        [tf.keras.layers.Flatten()(image), metadata]
+    )
+    model = tf.keras.Model([image, metadata], tf.keras.layers.Dense(2)(features))
+    config = {
+        "data": {"input_shape": [8, 8, 1]},
+        "evaluation": {"benchmark": {"warmup_batches": 1, "measured_batches": 2}},
+    }
+
+    report = benchmark_model(model, config, batch_size=2, output_dir=tmp_path)
+
+    assert report["benchmark"]["measured_samples"] == 4
+    assert report["benchmark"]["throughput_samples_per_second"] > 0
