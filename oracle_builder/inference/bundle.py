@@ -205,7 +205,7 @@ class InferenceBundle:
                 raise ValueError("Stratification manifest has no child models")
             child_bundles: dict[int, InferenceBundle] = {}
             shared_model = (
-                load_model_for_run(run_dir, config, prefer_savedmodel=True)
+                load_model_for_run(run_dir, config)
                 if payload.get("weight_sharing") == "shared"
                 else None
             )
@@ -221,7 +221,7 @@ class InferenceBundle:
                     raise ValueError(f"Invalid stratification child {dimension}: {child_path}")
                 child_config = _stratified_child_config(config, entry, dimension)
                 child_model = shared_model or load_model_from_dir(
-                    child_path, child_config, prefer_savedmodel=True
+                    child_path, child_config
                 )
                 evidence_path = child_path / "classification_evidence"
                 if not evidence_path.exists():
@@ -231,7 +231,7 @@ class InferenceBundle:
                     evidence_index=IdentityEvidenceIndex.load(evidence_path) if evidence_path.exists() else None,
                 )
             return cls(None, config, reference, strata=child_bundles)
-        model = load_model_for_run(run_dir, config, prefer_savedmodel=True)
+        model = load_model_for_run(run_dir, config)
         evidence_path = run_dir / "model" / "classification_evidence"
         if not evidence_path.exists():
             evidence_path = run_dir / "model" / "classification_evidence.npz"
@@ -647,7 +647,7 @@ class InferenceBundle:
         image = np.asarray(prepared)
         stratification = self.config.get("classification", {}).get("stratification", {})
         conditioning = stratification.get("conditioning", {}) if isinstance(stratification, dict) else {}
-        needs_stratum = bool(conditioning.get("enabled", False))
+        needs_stratum = bool(stratification.get("enabled", False) and conditioning.get("enabled", False))
         if needs_stratum and stratification.get("_active_dimension") is None:
             raise ValueError("Conditioned stratified inference requires an active stratum dimension")
         if auxiliary_features_enabled(self.config) or needs_stratum:

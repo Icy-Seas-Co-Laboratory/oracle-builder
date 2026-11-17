@@ -52,8 +52,11 @@ class ClassificationExecutor:
     def __init__(self, model: Any, input_shape: tuple[int, ...]):
         self.model = model
         self.input_shape = tuple(int(value) for value in input_shape)
-        self.metadata_count = len(getattr(model, "inputs", [])) > 1
-        if self.metadata_count:
+        self.metadata_count = 0
+        signature = getattr(getattr(model, "infer", None), "structured_input_signature", None)
+        if signature and "metadata" in signature[1]:
+            self.metadata_count = int(signature[1]["metadata"].shape[-1])
+        elif len(getattr(model, "inputs", [])) > 1:
             self.metadata_count = int(model.inputs[1].shape[-1])
         self.execution_diagnostics = execution_device_diagnostics()
         self.runtime = "adapter"
