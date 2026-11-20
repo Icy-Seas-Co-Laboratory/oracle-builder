@@ -1939,6 +1939,13 @@ def create_app(
         required(orchestrator.job(job_id), "Job")
         return {"events": orchestrator.job_events(job_id)}
 
+    @app.get("/v1/jobs/{job_id}/telemetry")
+    def job_telemetry(job_id: str) -> dict[str, Any]:
+        try:
+            return orchestrator.job_telemetry(job_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Job was not found") from exc
+
     @app.get("/v1/jobs/{job_id}/timing")
     def job_timing(job_id: str) -> dict[str, Any]:
         try:

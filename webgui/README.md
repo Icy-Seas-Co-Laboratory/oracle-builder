@@ -82,3 +82,32 @@ the command's received/accepted/applied state and do not claim completion when
 the request is merely delivered. Safe pause and yield appear only for jobs that
 advertise an execution segment. Queue verification details include the frozen
 split policy and class-by-split coverage report when available.
+
+### Dashboard telemetry and review
+
+The dashboard reads `/v1/jobs/{job_id}/telemetry`, a compact latest-event-per-type
+snapshot. The complete `/events` audit ledger is unchanged. Completed units are
+cached for the lifetime of the dashboard; at most four telemetry reads run at
+once. Batch charts show the latest bounded worker trace window, while completed
+epoch histories are assembled across units. Timing details load when opened.
+Individual metric charts are available under an expandable section.
+
+Deploy the Orchestrator and GUI together when updating this telemetry contract.
+
+Model Runs places search and paginated results first; pretraining checkpoints
+are in a collapsible section. Plot values have an accessible table alternative.
+Comparison deltas use improvement colors only when evaluation compatibility is
+recorded for every member. Operational errors remain visible until dismissed,
+and Operations participates in the shared refresh loop while retaining its last
+successful snapshot on failure.
+
+Construction passes the selected definition revision into Queue, and Training
+Sets passes the selected frozen dataset. Review these pinned choices before
+adding a run. Edited definitions display an unsaved state; saving and opening
+Queue uses the resulting immutable revision.
+
+Navigation groups preparation, design, execution, review, and system views.
+Construction includes section shortcuts and warns before discarding edited or
+new definitions. Model details open in a native modal dialog with Overview,
+Learning curves, Evaluation, Architecture, and Provenance sections; Escape
+closes the dialog and returns focus to its trigger.

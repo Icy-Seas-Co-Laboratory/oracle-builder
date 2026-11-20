@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { exactPosthocComparison, lowerIsBetter } from '../src/lib/models/posthoc-comparison.ts';
+import { comparisonDeltaTone, exactPosthocComparison, lowerIsBetter } from '../src/lib/models/posthoc-comparison.ts';
 const member = (overrides = {}) => ({ posthoc: { evaluation_signature: 'test-population', training_dataset: { fingerprint_sha256: 'frozen-dataset' }, class_names: { 0: 'a', 1: 'b' }, ...overrides } });
 test('comparison requires identical complete evidence for every member', () => {
   assert.equal(exactPosthocComparison([member(), member()]), true);
@@ -14,4 +14,11 @@ test('comparison requires identical complete evidence for every member', () => {
 test('probability losses and calibration error use lower-is-better deltas', () => {
   for (const key of ['log_loss', 'multiclass_brier_score', 'expected_calibration_error']) assert.equal(lowerIsBetter(key), true);
   for (const key of ['accuracy', 'macro_f1', 'macro_roc_auc']) assert.equal(lowerIsBetter(key), false);
+});
+
+test('leaves incompatible comparison deltas neutral', () => {
+  assert.equal(comparisonDeltaTone([member(), member()], 'accuracy', .1), 'positive');
+  assert.equal(comparisonDeltaTone([member(), member()], 'log_loss', -.1), 'positive');
+  assert.equal(comparisonDeltaTone([member(), {}], 'accuracy', .1), 'neutral');
+  assert.equal(comparisonDeltaTone([member(), member()], 'accuracy', null), 'neutral');
 });

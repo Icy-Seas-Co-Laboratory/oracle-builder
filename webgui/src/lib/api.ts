@@ -9,22 +9,21 @@ export class ApiRequestError extends Error {
 async function request<T>(path: string, options: RequestInit = {}, timeoutMs = 15_000): Promise<T> {
 	const controller = new AbortController();
 	const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
-	let response: Response;
-	try {
-		response = await fetch(`/api${path}`, {
-			...options,
-			signal: options.signal ? AbortSignal.any([options.signal, controller.signal]) : controller.signal,
-			headers: { 'content-type': 'application/json', ...options.headers }
-		});
-	} catch (error) {
-		if (controller.signal.aborted) throw new Error(`The service did not respond within ${Math.ceil(timeoutMs / 1_000)} seconds.`);
-		throw error;
-	} finally { window.clearTimeout(timeout); }
-	if (!response.ok) {
-		const body = await response.json().catch(() => ({}));
-		throw new ApiRequestError(String(body.detail ?? `${response.status} ${response.statusText}`), response.status);
-	}
-	return response.json() as Promise<T>;
+    try {
+        const response = await fetch(`/api${path}`, {
+            ...options,
+            signal: options.signal ? AbortSignal.any([options.signal, controller.signal]) : controller.signal,
+            headers: { 'content-type': 'application/json', ...options.headers }
+        });
+        if (!response.ok) {
+            const body = await response.json().catch(() => ({}));
+            throw new ApiRequestError(String(body.detail ?? `${response.status} ${response.statusText}`), response.status);
+        }
+        return await response.json() as T;
+    } catch (error) {
+        if (controller.signal.aborted) throw new Error(`The service did not respond within ${Math.ceil(timeoutMs / 1_000)} seconds.`);
+        throw error;
+    } finally { window.clearTimeout(timeout); }
 }
 
 export const api = {
@@ -89,6 +88,7 @@ export const api = {
 	renameQueuedRun: (id: string, name: string) => request<RecordValue>(`/v1/queued-runs/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify({ name }) }),
 	replaceQueuedRun: (id: string, body: RecordValue) => request<RecordValue>(`/v1/queued-runs/${encodeURIComponent(id)}:replace`, { method: 'POST', body: JSON.stringify(body) }, 960_000),
 	artifactReplicas: (status?: 'pending' | 'replicated' | 'failed') => request<{ replications: RecordValue[] }>(`/v1/artifact-replicas${status ? `?status=${status}` : ''}`),
+	jobTelemetry: (id: string) => request<{ events: RecordValue[]; summary: RecordValue }>(`/v1/jobs/${encodeURIComponent(id)}/telemetry`),
 	jobEvents: (id: string) => request<{ events: RecordValue[] }>(`/v1/jobs/${id}/events`),
 	jobCommands: (id: string) => request<{ commands: RecordValue[] }>(`/v1/jobs/${encodeURIComponent(id)}/commands`),
 	issueJobCommand: (id: string, body: { action: 'pause' | 'yield' | 'stop_now' | 'restart' | 'resume'; reason?: string; command_id?: string }) => request<{ command: RecordValue }>(`/v1/jobs/${encodeURIComponent(id)}/commands`, { method: 'POST', body: JSON.stringify(body) }),

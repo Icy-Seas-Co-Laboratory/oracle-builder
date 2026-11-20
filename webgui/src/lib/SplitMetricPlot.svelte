@@ -99,6 +99,7 @@
 	</svg>
 	<div class="hover-values" aria-live="off">{#if hovered}<strong>{hovered.section === 'epoch' ? 'Epoch' : 'Batch'} {hovered.x}</strong>{#if hovered.section === 'epoch'}<span>Training: {precise(hoveredTraining)}</span>{#if validationExpected}<span>Validation: {precise(hoveredValidation)}</span>{/if}{:else}<span>Training average: {precise(hoveredSmoothed)}</span><span>Raw training: {precise(hoveredBatch)}</span>{#if lastValidation !== null}<span>Latest validation (epoch {lastValidationEpoch}): {precise(lastValidation)}</span>{/if}{/if}{:else}<span>Hover over either section to inspect recorded values.</span>{/if}</div>
 	<div class="legend"><span><i class="training-key"></i>Training</span>{#if validationExpected}<span><i class="validation-key"></i>Validation · epoch end</span>{/if}{#if batchTraining.length}<span><i class="average-key"></i>Current epoch · 7 batch average</span>{/if}{#if lastValidation !== null}<span><i class="reference-key"></i>Latest validation reference</span>{/if}</div>
+	<details class="plot-values"><summary>View chart values</summary><div><table><thead><tr><th>Section</th><th>Point</th><th>Training</th>{#if validationExpected}<th>Validation</th>{/if}</tr></thead><tbody>{#each epochs as point}<tr><td>Epoch</td><td>{point.epoch}</td><td>{precise(numeric(point[metric]))}</td>{#if validationExpected}<td>{precise(numeric(point[`val_${metric}`]))}</td>{/if}</tr>{/each}{#each batches as point}<tr><td>Batch</td><td>{point.batch}</td><td>{precise(numeric(point[metric]))}</td>{#if validationExpected}<td>—</td>{/if}</tr>{/each}</tbody></table></div></details>
 </div>
 
 <style>
@@ -128,4 +129,5 @@
 	.training-key,.average-key { background:var(--teal); }
 	.validation-key { background:#d08a35; }
 	.reference-key { background:repeating-linear-gradient(90deg,#d08a35 0 6px,transparent 6px 9px); }
+	.plot-values{margin-top:.55rem;font-size:.68rem}.plot-values summary{cursor:pointer;color:var(--teal);font-weight:700}.plot-values div{max-height:14rem;overflow:auto;margin-top:.4rem}.plot-values table{width:100%;border-collapse:collapse}.plot-values th,.plot-values td{padding:.3rem;text-align:right;border-bottom:1px solid var(--line)}.plot-values th:first-child,.plot-values td:first-child{text-align:left}
 </style>

@@ -10,6 +10,7 @@
 	export let validationValue: number | null = null;
 	export let validationExpected = true;
 	export let validationLabel = 'Last completed epoch validation';
+	export let showValues = true;
 	let hoveredX: number | null = null;
 
 	const numeric = (value: unknown): number | null => typeof value === 'number' && Number.isFinite(value) ? value : null;
@@ -82,6 +83,7 @@
 		</svg>
 		<div class="hover-values" aria-live="off">{#if inspected}<strong>{mode === 'epoch' ? 'Epoch' : 'Batch'} {inspected.x}</strong><span>Training: {precise(inspectedSeries?.primary ?? null)}</span>{#if mode === 'batch'}<span>Raw: {precise(inspected.train)}</span>{/if}{#if mode === 'batch' && inspected.validation === null && baseline !== null}<span>{validationLabel}: {precise(baseline)}</span>{:else if validationExpected}<span>Validation: {precise(inspected.validation)}</span>{/if}{:else}<span>Hover over the plot to inspect {mode === 'epoch' ? 'epoch' : 'batch'} values.</span>{/if}</div>
 		<div class="legend"><span><i class="primary-key"></i>{mode === 'epoch' ? 'Training' : 'Training · 7 batch average'}</span>{#if validationCount}<span><i class="secondary-key"></i>Validation · epoch end</span>{:else if mode === 'batch' && baseline !== null}<span><i class="secondary-key baseline-key"></i>{validationLabel}</span>{/if}{#if mode === 'batch' && secondaryCount}<span><i class="raw-key"></i>Raw training</span>{/if}<small>{primaryCount} {mode === 'epoch' ? 'completed epochs' : 'sampled batches'}</small></div>
+		{#if showValues}<details class="plot-values"><summary>View chart values</summary><div><table><thead><tr><th>{mode === 'epoch' ? 'Epoch' : 'Batch'}</th><th>Training</th>{#if mode === 'batch'}<th>Raw</th>{/if}{#if validationExpected}<th>Validation</th>{/if}</tr></thead><tbody>{#each samples as point, index}<tr><td>{point.x}</td><td>{precise(series[index]?.primary ?? null)}</td>{#if mode === 'batch'}<td>{precise(point.train)}</td>{/if}{#if validationExpected}<td>{precise(point.validation)}</td>{/if}</tr>{/each}</tbody></table></div></details>{/if}
 	{:else}<p>No {mode} metrics yet.</p>{/if}
 </div>
 
@@ -111,5 +113,6 @@
 	.baseline-key { background:repeating-linear-gradient(90deg,#d08a35 0 6px,transparent 6px 9px); }
 	.raw-key { background:#88aca4; }
 	.legend small { margin-left:auto; font-size:.63rem; }
+	.plot-values{margin-top:.55rem;font-size:.68rem}.plot-values summary{cursor:pointer;color:var(--teal);font-weight:700}.plot-values div{max-height:14rem;overflow:auto;margin-top:.4rem}.plot-values table{width:100%;border-collapse:collapse}.plot-values th,.plot-values td{padding:.3rem;text-align:right;border-bottom:1px solid var(--line)}.plot-values th:first-child,.plot-values td:first-child{text-align:left}
 	p { padding:2rem 0; color:var(--muted); font-size:.75rem; text-align:center; }
 </style>

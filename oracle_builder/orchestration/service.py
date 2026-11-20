@@ -6693,6 +6693,28 @@ class Orchestrator(WorkerControlMixin, SequentialExecutionMixin, InferenceShardi
             rows = db.execute("SELECT * FROM job_events WHERE job_id=? ORDER BY sequence", (job_id,)).fetchall()
         return [{**dict(row), "data": json.loads(row["data_json"])} for row in rows]
 
+    def job_telemetry(self, job_id: str) -> dict[str, Any]:
+        """Compact latest state by event type; the full event ledger stays intact.
+
+        Charts receive the worker's bounded trace and epoch history, rather than
+        every overlapping snapshot accumulated during training.
+        """
+        job = self.job(job_id)
+        if job is None:
+            raise KeyError(job_id)
+        with self._connection() as db:
+            rows = db.execute(
+                "SELECT * FROM job_events WHERE job_id=? AND sequence IN "
+                "(SELECT MAX(sequence) FROM job_events WHERE job_id=? GROUP BY event_type) "
+                "ORDER BY sequence", (job_id, job_id)
+            ).fetchall()
+        events = [{key: value for key, value in dict(row).items() if key != "data_json"}
+                  | {"data": json.loads(row["data_json"])} for row in rows]
+        return {"events": events, "trace_scope": "latest_worker_snapshot", "summary": {
+            "queue_seconds": self._duration_seconds(job.get("submitted_at"), job.get("started_at")),
+            "runtime_seconds": self._duration_seconds(job.get("started_at"), job.get("completed_at") or _now()),
+        }}
+
     def job_timing(self, job_id: str) -> dict[str, Any]:
         """Return a compact timing breakdown for a durable pull-worker job.
 

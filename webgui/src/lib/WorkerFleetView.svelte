@@ -7,6 +7,9 @@
 	export let onchanged: (message: string) => void = () => {};
 	export let onfailure: (message: string) => void = () => {};
 	export let mode: 'queue' | 'workers' = 'queue';
+	export let preferredDefinitionId = '';
+	export let preferredDefinitionRevision = 0;
+	export let preferredDatasetId = '';
 
 	let queuedRuns: RecordValue[] = [];
 	let pretrainingInitializations: RecordValue[] = [];
@@ -33,6 +36,11 @@
 	const canRemoveRun = (run: RecordValue) => !activeJobStatuses.has(String(run.latest_job_status)) && (Boolean(run.can_edit) || Boolean(run.can_clear));
 	const runStatus = (run: RecordValue) => run.status === 'queued' && ['failed', 'cancelled', 'dispatch_failed', 'artifact_invalid'].includes(String(run.latest_job_status)) ? 'Previous attempt failed' : ({ pending_verification: 'Awaiting verification', verifying: 'Verifying', ready: 'Verified · ready', needs_attention: 'Needs verification', queued: 'Waiting to train', indexed: 'Complete' }[String(run.status)] ?? String(run.status).replaceAll('_', ' '));
 	$: selectedRuns = queuedRuns.filter((run) => selectedRunIds.includes(String(run.queued_run_id)));
+	$: displayedQueuedRuns = [...queuedRuns].sort((left, right) => {
+		const priority = ['running', 'verifying', 'queued', 'waiting_for_resources', 'ready', 'pending_verification', 'needs_attention', 'failed', 'indexed'];
+		const rank = (run: RecordValue) => { const index = priority.indexOf(String(run.status)); return index < 0 ? priority.length : index; };
+		return rank(left) - rank(right);
+	});
 	$: canVerify = selectedRuns.length > 0 && selectedRuns.every(selectable);
 	$: canStart = selectedRuns.length > 0 && selectedRuns.every(canStartRun);
 	function toggleRun(id: string, checked: boolean) { selectedRunIds = checked ? [...selectedRunIds, id] : selectedRunIds.filter((value) => value !== id); }
@@ -161,6 +169,7 @@
 	let useLatestRevision = false;
 	let editingPoolNotice = '';
 	let selectedDefinitionId = '';
+	let pinnedDefinitionRevision = 0;
 	let selectedDatasetId = '';
 	let batchSizeMode: 'manual' | 'auto' = 'manual';
 	let batchSize = 16;
@@ -249,7 +258,7 @@
 				: gpuCount > 0 && !gpuWorkers.length
 					? `No registered training worker in this pool currently advertises ${gpuCount} GPU${gpuCount === 1 ? '' : 's'}. The job can be queued, but cannot start until compatible capacity registers.`
 					: `${gpuWorkers.length} compatible worker${gpuWorkers.length === 1 ? '' : 's'} can claim this run when idle.`;
-	$: chosenDefinitionRevision = editingRunId && selectedDefinitionId === editingOriginalDefinitionId && !useLatestRevision ? editingRevision : Number(selectedDefinition?.revision);
+	$: chosenDefinitionRevision = editingRunId && selectedDefinitionId === editingOriginalDefinitionId && !useLatestRevision ? editingRevision : pinnedDefinitionRevision || Number(selectedDefinition?.revision);
     $: definitionKey = `${selectedDefinitionId}:${chosenDefinitionRevision}`;
     async function loadQueueDefinition(id: string, revision: number, key: string) {
         selectedDefinitionRequest = key;
@@ -280,6 +289,11 @@
 			leases = records(leaseResult.leases);
 			definitions = records(definitionResult.definitions);
 			datasets = records(datasetResult.datasets).filter((dataset) => String(dataset.lifecycle) === 'frozen');
+			if (!editingRunId && preferredDefinitionId && definitions.some((definition) => String(definition.definition_id) === preferredDefinitionId)) {
+				selectedDefinitionId = preferredDefinitionId;
+				pinnedDefinitionRevision = preferredDefinitionRevision;
+			}
+			if (!editingRunId && preferredDatasetId && datasets.some((dataset) => String(dataset.dataset_id) === preferredDatasetId)) selectedDatasetId = preferredDatasetId;
 			if (!selectedPoolId && pools[0]) selectedPoolId = preferredPoolId();
 			if (!selectedDefinitionId && definitions[0]) selectedDefinitionId = String(definitions[0].definition_id);
 			if (!selectedDatasetId && datasets[0]) selectedDatasetId = String(datasets[0].dataset_id);
@@ -345,7 +359,7 @@
 	function cancelEdit() {
 		editingRunId = ''; editingDefinitionName = ''; editingOriginalDefinitionId = ''; editingRevision = 0; useLatestRevision = false; editingPoolNotice = '';
 		queueName = ''; queueFeedback = null; sourcePretrainingId = ''; originalPretrainingId = '';
-		selectedDefinitionId = String(definitions[0]?.definition_id ?? '');
+		selectedDefinitionId = String(definitions[0]?.definition_id ?? ''); pinnedDefinitionRevision = 0;
 		selectedDatasetId = String(datasets[0]?.dataset_id ?? '');
 		selectedPoolId = preferredPoolId();
 		batchSizeMode = 'manual'; batchSize = 16; maximumBatchSize = 256; epochs = 10; sslEpochs = 10; gpuCount = 0;
@@ -360,7 +374,7 @@
 		queueName = String(run.name ?? '');
 		sourcePretrainingId = object(run.initialization).mode === 'pretraining' ? String(object(run.initialization).source_artifact_id ?? '') : '';
 		originalPretrainingId = sourcePretrainingId;
-		selectedDefinitionId = String(run.definition_id);
+		selectedDefinitionId = String(run.definition_id); pinnedDefinitionRevision = 0;
 		selectedDatasetId = String(run.dataset_id);
 		gpuCount = Number(object(run.resources).gpu_count ?? 0);
 		const compatible = (pool: RecordValue) => pool.enabled !== false && actions(pool.allowed_actions).includes('train') && workers.some((worker) => String(worker.pool_id) === String(pool.pool_id) && isCurrentWorker(worker) && actions(object(worker.capabilities).actions).includes('train') && object(worker.capabilities).training_verification_v1 === true && object(worker.capabilities).work_unit_v2 === true && gpuCapacity(worker) >= gpuCount);
@@ -460,8 +474,8 @@
 		<button disabled={queueAction || !canStart} on:click={() => actOnSelection('start')}>Start selected</button>
 	</div>
 	{#if queueActionMessage}<p class="queue-result" role="status">{queueActionMessage}</p>{/if}
-	{#if queuedRuns.length}<div class="table-scroll"><table class="fleet-table"><thead><tr><th><input type="checkbox" aria-label="Select all unstarted runs" disabled={queueAction} checked={queuedRuns.some(selectable) && queuedRuns.filter(selectable).every((run) => selectedRunIds.includes(String(run.queued_run_id)))} on:change={(event) => selectedRunIds = event.currentTarget.checked ? queuedRuns.filter(selectable).map((run) => String(run.queued_run_id)) : []} /></th><th>Run / definition</th><th>Stage</th><th>Batch / epochs</th><th>Verification details</th><th>Actions</th></tr></thead><tbody>
-	{#each queuedRuns as run}
+		{#if queuedRuns.length}<div class="table-scroll"><table class="fleet-table"><thead><tr><th><input type="checkbox" aria-label="Select all unstarted runs" disabled={queueAction} checked={queuedRuns.some(selectable) && queuedRuns.filter(selectable).every((run) => selectedRunIds.includes(String(run.queued_run_id)))} on:change={(event) => selectedRunIds = event.currentTarget.checked ? queuedRuns.filter(selectable).map((run) => String(run.queued_run_id)) : []} /></th><th>Run / definition</th><th>Stage</th><th>Batch / epochs</th><th>Verification details</th><th>Actions</th></tr></thead><tbody>
+	{#each displayedQueuedRuns as run}
 		{@const policy = object(run.batch_execution)}
 		{@const report = object(run.preflight_report)}
 		{@const splitManifest = object(report.split_manifest)}
@@ -483,13 +497,13 @@
 {/if}
 
 {#if mode === 'workers'}
-<section class="fleet-stats" aria-label="Pull worker fleet summary"><article><span>Current pools</span><strong>{currentPools.length}</strong></article><article><span>Available workers</span><strong>{activeWorkers.length}</strong></article><article><span>Active leases</span><strong>{activeLeases.length}</strong></article><article><span>Published outputs</span><strong>{publishedOutputs.length}</strong></article></section>
+	{#if loading}<section class="panel"><p class="empty" role="status">Loading worker fleet…</p></section>{:else}<section class="fleet-stats" aria-label="Pull worker fleet summary"><article><span>Current pools</span><strong>{currentPools.length}</strong></article><article><span>Available workers</span><strong>{activeWorkers.length}</strong></article><article><span>Active leases</span><strong>{activeLeases.length}</strong></article><article><span>Published outputs</span><strong>{publishedOutputs.length}</strong></article></section>
 
 <section class="panel"><div class="panel-head"><div><p class="eyebrow">ADMISSION</p><h2>Worker pools</h2><p>Current pools have a recently reporting worker or unfinished queued work. Join secrets remain private.</p></div>{#if pastPools.length}<button class="secondary small" on:click={() => showPastPools = !showPastPools}>{showPastPools ? 'Hide' : 'Show'} {pastPools.length} past pool{pastPools.length === 1 ? '' : 's'}</button>{/if}</div>{#if displayedPools.length}<div class="table-scroll"><table class="fleet-table"><thead><tr><th>Pool</th><th>Allowed actions</th><th>Capacity</th><th>Workers</th><th>Created</th></tr></thead><tbody>{#each displayedPools as pool}<tr><td><strong>{text(pool.name)}</strong><small class="code">{text(pool.pool_id)}</small></td><td>{actions(pool.allowed_actions).join(', ') || '—'}</td><td>{pool.max_workers == null ? 'Unlimited' : text(pool.max_workers)}</td><td>{workerCountFor(pool.pool_id)}</td><td>{text(pool.created_at)}</td></tr>{/each}</tbody></table></div>{:else}<p class="empty">No current worker pools. Create a pool or show past pools to inspect older registrations.</p>{/if}</section>
 
 <section class="panel"><div class="panel-head"><div><p class="eyebrow">REGISTERED EXECUTORS · STEP 2 OF 2</p><h2>Workers claim compatible runs</h2><p>A worker must be registered in the selected pool, support training, and advertise enough GPUs for the request. Its detailed credentials remain private.</p></div>{#if pastWorkers.length}<button class="secondary small" on:click={() => showPastWorkers = !showPastWorkers}>{showPastWorkers ? 'Hide' : 'Show'} {pastWorkers.length} past worker{pastWorkers.length === 1 ? '' : 's'}</button>{/if}</div>{#if displayedWorkers.length}<div class="table-scroll"><table class="fleet-table"><thead><tr><th>Worker</th><th>Pool</th><th>State</th><th>What it can run</th><th>Last seen</th></tr></thead><tbody>{#each displayedWorkers as worker}<tr><td><strong>{text(worker.name)}</strong><small class="code">{text(worker.worker_id)}</small>{#if worker.endpoint}<small>{text(worker.endpoint)}</small>{/if}</td><td>{text(pools.find((pool) => String(pool.pool_id) === String(worker.pool_id))?.name, text(worker.pool_id))}</td><td><span class="status {text(worker.state)}">{text(worker.state)}</span></td><td>{workerSummary(worker)}</td><td>{text(worker.last_seen_at)}</td></tr>{/each}</tbody></table></div>{:else}<p class="empty">No worker is currently available. {pastWorkers.length ? 'Use Show past workers to inspect offline registrations.' : 'Start a worker to claim queued work.'}</p>{/if}</section>
 
-<section class="panel"><div class="panel-head"><div><p class="eyebrow">DURABLE WORK CLAIMS</p><h2>Leases and published output</h2><p>A lease is a time-bounded claim. Output references appear only after validation, sealing, and successful publication.</p></div></div>{#if leases.length}<div class="table-scroll"><table class="fleet-table"><thead><tr><th>Lease</th><th>Worker</th><th>Job</th><th>Status</th><th>Expires / released</th><th>Published output</th></tr></thead><tbody>{#each leases as lease}<tr><td><code>{text(lease.lease_id)}</code></td><td>{text(workers.find((worker) => String(worker.worker_id) === String(lease.worker_id))?.name, text(lease.worker_id))}</td><td><code>{text(lease.job_id)}</code></td><td><span class="status {text(lease.status)}">{text(lease.status)}</span>{#if lease.outcome}<small>{text(lease.outcome)}</small>{/if}</td><td>{text(lease.released_at ?? lease.expires_at)}</td><td>{#if Object.keys(output(lease)).length}<strong>{text(output(lease).kind)}</strong><small class="code">{text(output(lease).artifact_id)} · rev {text(output(lease).revision)}</small>{:else}<small>Not published</small>{/if}</td></tr>{/each}</tbody></table></div>{:else}<p class="empty">No durable pull-worker leases have been issued yet.</p>{/if}</section>
+	<section class="panel"><div class="panel-head"><div><p class="eyebrow">DURABLE WORK CLAIMS</p><h2>Leases and published output</h2><p>A lease is a time-bounded claim. Output references appear only after validation, sealing, and successful publication.</p></div></div>{#if leases.length}<div class="table-scroll"><table class="fleet-table"><thead><tr><th>Lease</th><th>Worker</th><th>Job</th><th>Status</th><th>Expires / released</th><th>Published output</th></tr></thead><tbody>{#each leases as lease}<tr><td><code>{text(lease.lease_id)}</code></td><td>{text(workers.find((worker) => String(worker.worker_id) === String(lease.worker_id))?.name, text(lease.worker_id))}</td><td><code>{text(lease.job_id)}</code></td><td><span class="status {text(lease.status)}">{text(lease.status)}</span>{#if lease.outcome}<small>{text(lease.outcome)}</small>{/if}</td><td>{text(lease.released_at ?? lease.expires_at)}</td><td>{#if Object.keys(output(lease)).length}<strong>{text(output(lease).kind)}</strong><small class="code">{text(output(lease).artifact_id)} · rev {text(output(lease).revision)}</small>{:else}<small>Not published</small>{/if}</td></tr>{/each}</tbody></table></div>{:else}<p class="empty">No durable pull-worker leases have been issued yet.</p>{/if}</section>{/if}
 {/if}
 
 {#if mode === 'queue' && sslEnabled}<section class="panel ssl-epoch-budget"><h3>Self-supervised phase</h3><p>{sourcePretrainingId ? 'This run reuses a pretraining result and skips SSL training.' : sslOnly ? 'This embedding run performs self-supervised pretraining only.' : 'Self-supervised pretraining runs before supervised fitting.'} Total planned epochs: {sourcePretrainingId ? epochs : sslOnly ? sslEpochs : sslEpochs + epochs}.</p></section>{/if}

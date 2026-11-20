@@ -10,14 +10,20 @@
 	export let onfailure: (message: string) => void = () => {};
 
 	type Field = { key: string; label?: string; type?: string; operators?: string[] };
-	const defaults = ['name', 'status', 'architecture', 'variant', 'classifier_type', 'evaluation_head', 'training_set', 'macro_f1', 'accuracy', 'epochs', 'artifact_size_bytes', 'created_at'];
+	// Keep the catalog scannable by default.  Less frequently compared provenance
+	// remains available from the Columns picker and the sealed inspector.
+	const defaults = ['name', 'status', 'architecture', 'training_set', 'macro_f1', 'accuracy', 'created_at'];
 	const asRecord = (value: unknown) => value && typeof value === 'object' ? value as RecordValue : {};
 	function normalizePosthocReport(value: RecordValue): RecordValue { const posthoc = asRecord(value.posthoc); if (!Object.keys(posthoc).length) return value; const preprocessing = asRecord(posthoc.preprocessing); const calibration = asRecord(posthoc.calibration); return { ...value, posthoc: { ...posthoc, scaling: posthoc.scaling ?? preprocessing.scaling, pca_enabled: posthoc.pca_enabled ?? preprocessing.pca_enabled, pca_components: posthoc.pca_components ?? preprocessing.output_dimension, calibration_method: posthoc.calibration_method ?? calibration.method, calibration_folds: posthoc.calibration_folds ?? calibration.folds } }; }
 	const readable = (key: string) => key === 'evaluation_head' ? 'Metric head' : key.replaceAll('_', ' ').replace(/\b\w/g, (letter) => letter.toUpperCase());
 	const value = (row: RecordValue, key: string): unknown => {
-		if (key in row) return row[key];
+		const withDatasetName = (item: unknown) => {
+			if (key !== 'training_set' || typeof item !== 'string') return item;
+			return inferenceDatasets.find((dataset) => String(dataset.dataset_id ?? dataset.id) === item)?.name ?? item;
+		};
+		if (key in row) return withDatasetName(row[key]);
 		for (const group of ['metrics', 'runtime', 'model', 'training', 'metadata']) {
-			const nested = asRecord(row[group]); if (key in nested) return nested[key];
+			const nested = asRecord(row[group]); if (key in nested) return withDatasetName(nested[key]);
 		}
 		return undefined;
 	};
@@ -55,6 +61,9 @@
 	let selected = new Set<string>();
 	let loading = true;
 	let total = 0;
+	let offset = 0;
+	const pageSize = 50;
+	let catalogRequest = 0;
 	let detail: RecordValue | null = null;
 	let architecture: RecordValue | null = null;
 	let history: RecordValue[] = [];
@@ -70,6 +79,10 @@
 	}
 	let detailLoading = false;
 	let detailRequest = 0;
+	let detailDialog: HTMLDialogElement | null = null;
+	let detailReturnFocus: HTMLElement | null = null;
+	type DetailTab = 'overview' | 'history' | 'evaluation' | 'architecture' | 'provenance';
+	let detailTab: DetailTab = 'overview';
 	let renaming = false;
 	let renameName = '';
 	let renameBusy = false;
@@ -118,13 +131,21 @@
 		return out;
 	}
 	async function load() {
+		const request = ++catalogRequest;
 		loading = true;
 		try {
-			const result = await modelCatalogClient.artifactCatalogQuery({ filters: queryFilters(), sort, columns: visible, offset: 0, limit: 250 });
-			rows = result.artifacts; total = result.total ?? rows.length;
+			const result = await modelCatalogClient.artifactCatalogQuery({ filters: queryFilters(), sort, columns: visible, offset, limit: pageSize });
+			if (request !== catalogRequest) return;
+			total = result.total ?? result.artifacts.length;
+			if (total > 0 && offset >= total) {
+				offset = Math.floor((total - 1) / pageSize) * pageSize;
+				void load();
+				return;
+			}
+			rows = result.artifacts;
 		} catch (error) {
 			// Existing installations can still browse artifacts before the catalog index migration runs.
-			try { rows = (await api.artifactCatalog()).artifacts; total = rows.length; }
+			try { const artifacts = (await api.artifactCatalog()).artifacts; if (request !== catalogRequest) return; rows = artifacts.slice(offset, offset + pageSize); total = artifacts.length; }
 			catch { onfailure(error instanceof Error ? error.message : 'Could not load model runs.'); }
 		} finally { loading = false; }
 	}
@@ -132,29 +153,34 @@
 		try {
 			const schema = await modelCatalogClient.artifactFilterSchema();
 			fields = schema.fields.map((field) => ({ key: String(field.key ?? field.name), label: String(field.label ?? field.key ?? field.name), type: String(field.type ?? 'text') })).filter((field) => field.key && field.key !== 'undefined');
-			if (schema.default_columns?.length) visible = schema.default_columns;
+			// The API schema may expose a larger operator-oriented default.  Keep the
+			// browser's concise result view until the user opts into more columns.
 		} catch { fields = defaults.map((key) => ({ key, label: readable(key) })); }
 	}
-	function setSort(key: string) { sort = { field: key, direction: sort?.field === key && sort.direction === 'asc' ? 'desc' : 'asc' }; void load(); }
-	function toggleColumn(key: string) { visible = visible.includes(key) ? visible.filter((item) => item !== key) : [...visible, key]; void load(); }
-	function applyFilter() { filters = filterValue.trim() ? { ...filters, [filterField]: filterValue.trim() } : (() => { const next = { ...filters }; delete next[filterField]; return next; })(); void load(); }
-	function removeFilter(key: string) { const next = { ...filters }; delete next[key]; filters = next; filterValue = ''; void load(); }
+	function setSort(key: string) { offset = 0; sort = { field: key, direction: sort?.field === key && sort.direction === 'asc' ? 'desc' : 'asc' }; void load(); }
+	function toggleColumn(key: string) { offset = 0; visible = visible.includes(key) ? visible.filter((item) => item !== key) : [...visible, key]; void load(); }
+	function applyFilter() { offset = 0; filters = filterValue.trim() ? { ...filters, [filterField]: filterValue.trim() } : (() => { const next = { ...filters }; delete next[filterField]; return next; })(); void load(); }
+	function removeFilter(key: string) { offset = 0; const next = { ...filters }; delete next[key]; filters = next; filterValue = ''; void load(); }
 	function toggle(row: RecordValue) { const next = new Set(selected); next.has(id(row)) ? next.delete(id(row)) : next.add(id(row)); selected = next; }
 	async function inspect(row: RecordValue) {
 		const request = ++detailRequest;
+		detailReturnFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
 		renaming = false; renameError = '';
-		detailLoading = true; historyLoading = true; detail = row; architecture = null; history = []; historyError = ''; selectedHistoryMetric = ''; insight = null;
-		try { const [model, graph] = await Promise.all([modelCatalogClient.artifactDetail(id(row)), modelCatalogClient.artifactArchitectureView(id(row))]); if (request !== detailRequest) return; detail = normalizePosthocReport(model); architecture = graph; }
+		detailLoading = true; historyLoading = true; detail = row; architecture = null; history = []; historyError = ''; selectedHistoryMetric = ''; insight = null; detailTab = 'overview';
+		await tick(); if (detailDialog && !detailDialog.open) detailDialog.showModal();
+		const detailTask = Promise.all([modelCatalogClient.artifactDetail(id(row)), modelCatalogClient.artifactArchitectureView(id(row))]);
+		const historyTask = api.artifactHistory(id(row), 2000);
+		try { const [model, graph] = await detailTask; if (request !== detailRequest) return; detail = normalizePosthocReport(model); architecture = graph; }
 		catch (error) { if (request === detailRequest) onfailure(error instanceof Error ? error.message : 'Could not load model details.'); }
 		finally { if (request === detailRequest) detailLoading = false; }
 		if (request !== detailRequest) return;
 		try {
-			const result = await api.artifactHistory(id(row), 2000);
+			const result = await historyTask;
 			if (request === detailRequest) history = Array.isArray(result.rows) ? result.rows as RecordValue[] : [];
 		} catch (error) { if (request === detailRequest) historyError = error instanceof Error ? error.message : 'Training history is unavailable.'; }
 		finally { if (request === detailRequest) historyLoading = false; }
 	}
-	function closeDetail() { detailRequest += 1; detail = null; architecture = null; history = []; selectedHistoryMetric = ''; insight = null; historyLoading = false; posthocOpen = false; renaming = false; renameError = ''; }
+	function closeDetail() { detailRequest += 1; if (detailDialog?.open) detailDialog.close(); detail = null; architecture = null; history = []; selectedHistoryMetric = ''; insight = null; historyLoading = false; posthocOpen = false; renaming = false; renameError = ''; detailReturnFocus?.focus(); }
 	function startRename() {
 		renameName = String(detailArtifact().name ?? detail?.name ?? '');
 		renameError = '';
@@ -379,7 +405,7 @@
 	}
 	$: shownRows = rows.filter((row) => !search.trim() || JSON.stringify(row).toLowerCase().includes(search.toLowerCase()));
 	onMount(() => {
-		void Promise.all([loadSchema(), load(), loadPretraining()]);
+		void Promise.all([loadSchema(), load(), loadPretraining(), api.datasets().then((result) => inferenceDatasets = result.datasets).catch(() => {})]);
 		const timer = window.setInterval(() => {
 			if (posthocOpen && posthocRun && !posthocBusy && !['indexed', 'failed', 'cancelled'].includes(String(posthocRun.status))) void refreshPosthoc();
 			if (posthocOpen && posthocCompareRuns.some((run) => !['indexed', 'failed', 'cancelled'].includes(String(run.status))) && !posthocBusy) void refreshComparePosthoc();
@@ -391,11 +417,6 @@
 <section class="runs-hero">
 	<div><p class="eyebrow">MODEL RUNS</p><h2>A clear record of every trained or imported model.</h2><p>Search results, compare candidates, and inspect the sealed configuration behind each score.</p></div>
 	<div class="run-count"><strong>{total}</strong><span>indexed models</span></div>
-</section>
-
-<section class="pretraining-catalog" aria-label="Pretraining results">
-	<div class="pretraining-heading"><div><p class="eyebrow">INDEPENDENT RESULTS</p><h2>Pretraining results</h2><p>Published initialization checkpoints are recorded independently of later supervised runs. Choose one when preparing a supervised run; access and compatibility are checked by the backend.</p></div><button class="secondary small" disabled={pretrainingLoading} on:click={loadPretraining}>Refresh</button></div>
-	{#if pretrainingLoading}<p class="empty" role="status">Loading pretraining results…</p>{:else if pretrainingError}<p class="inline-error" role="alert">Could not load pretraining results: {pretrainingError}</p>{:else if !pretrainingResults.length}<p class="empty">No pretraining results have been published yet.</p>{:else}<div class="pretraining-list">{#each pretrainingResults as result}<article><div class="pretraining-result-heading"><strong>{text(result.name || result.artifact_id)}</strong><span class="status">{text(result.status)}</span></div><dl><div><dt>Artifact</dt><dd><code>{text(result.artifact_id)}</code></dd></div><div><dt>Source run</dt><dd><code>{text(result.run_id)}</code></dd></div><div><dt>Dataset</dt><dd>{text(result.dataset_name || referenceLabel(result.dataset_ref))}</dd></div><div><dt>Task / architecture</dt><dd>{text(result.task)} · {text(result.architecture)}</dd></div><div><dt>Method</dt><dd>{text(result.method)}</dd></div><div><dt>Initialization job</dt><dd><code>{text(result.source_job_id)}</code></dd></div><div><dt>Published</dt><dd>{text(result.published_at, 'published_at')}</dd></div></dl><details><summary>Inspect source provenance</summary><pre>{JSON.stringify({ dataset: result.dataset_ref, configuration: result.configuration_ref, artifact: result.artifact_ref, specification_id: result.specification_id, queued_run_id: result.queued_run_id }, null, 2)}</pre></details></article>{/each}</div>{/if}
 </section>
 
 <section class="runs-toolbar" aria-label="Model run controls">
@@ -417,8 +438,16 @@
 	{#if loading}<p class="empty">Loading indexed model runs…</p>{:else if !shownRows.length}<p class="empty">No models match these filters.</p>{:else}<table><thead><tr><th><input class="selection-box" type="checkbox" aria-label="Select all visible models" checked={shownRows.length > 0 && shownRows.every((row) => selected.has(id(row)))} on:change={() => selected = new Set(shownRows.every((row) => selected.has(id(row))) ? [] : shownRows.map(id))} /></th>{#each visible as column}<th><button class="sort-button" on:click={() => setSort(column)}>{readable(column)} {sort?.field === column ? (sort.direction === 'asc' ? '↑' : '↓') : ''}</button></th>{/each}<th>Inspect</th></tr></thead><tbody>{#each shownRows as row}<tr class:selected={selected.has(id(row))}><td><input class="selection-box" type="checkbox" aria-label={`Select ${text(value(row, 'name') ?? id(row))}`} checked={selected.has(id(row))} on:change={() => toggle(row)} /></td>{#each visible as column}<td title={sourceTitle(row, column)}>{#if column === 'status' || column === 'lifecycle'}<span class="status {String(value(row, column))}">{text(value(row, column), column)}</span>{:else if column === 'evaluation_head'}<span class="metric-head-label {String(value(row, column) ?? 'neural')}">{value(row, column) === 'posthoc' ? 'Post-hoc' : 'Neural'}</span>{:else}{text(value(row, column), column)}{/if}</td>{/each}<td><button class="secondary small" on:click={() => inspect(row)}>Details</button></td></tr>{/each}</tbody></table>{/if}
 </section>
 
-{#if detail}<div class="modal-backdrop" role="presentation" on:click={(event) => event.target === event.currentTarget && closeDetail()}><div class="model-modal" role="dialog" aria-modal="true" aria-label="Model details" tabindex="-1"><header><div><p class="eyebrow">SEALED MODEL</p><h2>{text(detailArtifact().name ?? detail.name ?? detailArtifact().artifact_id ?? detail.artifact_id)}</h2><p>{text(detailArtifact().architecture ?? detail.architecture)} · {text(detailArtifact().task ?? detail.task)}</p></div><div class="modal-actions">{#if detailArtifact().artifact_id ?? detail.artifact_id}<button class="secondary small" disabled={detailLoading || renameBusy} on:click={startRename}>Rename</button><a class="secondary small" href={api.artifactDownloadUrl(String(detailArtifact().artifact_id ?? detail.artifact_id))}>Download archive</a>{#if String(detailArtifact().task ?? detail.task) === 'classification'}<button class="secondary small" on:click={openPosthoc}>Fit post-hoc head</button>{/if}<button class="secondary small" on:click={openInference}>Run inference</button>{/if}<button class="icon-button" aria-label="Close" on:click={closeDetail}>×</button></div></header>{#if renaming}<form class="rename-form" on:submit|preventDefault={saveRename}><label><span>Model run name</span><input aria-label="Model run name" maxlength="240" bind:value={renameName} disabled={renameBusy} /></label><button type="submit" disabled={renameBusy || !renameName.trim()}>{renameBusy ? 'Saving…' : 'Save name'}</button><button type="button" class="secondary" disabled={renameBusy} on:click={() => { renaming = false; renameError = ''; }}>Cancel</button>{#if renameError}<p class="inline-error" role="alert">{renameError}</p>{/if}</form>{/if}{#if detailLoading}<p class="empty">Gathering architecture and provenance…</p>{:else}<div class="detail-grid">
-				{#if detailArtifact().task !== 'embedding'}<article class="head-results"><h3>Classifier metrics</h3>
+{#if total > pageSize}<nav class="catalog-pagination" aria-label="Model catalog pages"><span>Showing {offset + 1}–{Math.min(offset + rows.length, total)} of {total}</span><button class="secondary small" disabled={loading || offset === 0} on:click={() => { offset = Math.max(0, offset - pageSize); void load(); }}>Previous</button><button class="secondary small" disabled={loading || offset + pageSize >= total} on:click={() => { offset += pageSize; void load(); }}>Next</button></nav>{/if}
+
+<details class="pretraining-catalog" aria-label="Pretraining results">
+	<summary><span><strong>Pretraining results</strong><small>{pretrainingResults.length} published initialization checkpoint{pretrainingResults.length === 1 ? '' : 's'}</small></span></summary>
+	<div class="pretraining-heading"><div><p>Published initialization checkpoints are recorded independently of later supervised runs. Choose one when preparing a supervised run; access and compatibility are checked by the backend.</p></div><button class="secondary small" disabled={pretrainingLoading} on:click|stopPropagation={loadPretraining}>Refresh</button></div>
+	{#if pretrainingLoading}<p class="empty" role="status">Loading pretraining results…</p>{:else if pretrainingError}<p class="inline-error" role="alert">Could not load pretraining results: {pretrainingError}</p>{:else if !pretrainingResults.length}<p class="empty">No pretraining results have been published yet.</p>{:else}<div class="pretraining-list">{#each pretrainingResults as result}<article><div class="pretraining-result-heading"><strong>{text(result.name || result.artifact_id)}</strong><span class="status">{text(result.status)}</span></div><dl><div><dt>Artifact</dt><dd><code>{text(result.artifact_id)}</code></dd></div><div><dt>Source run</dt><dd><code>{text(result.run_id)}</code></dd></div><div><dt>Dataset</dt><dd>{text(result.dataset_name || referenceLabel(result.dataset_ref))}</dd></div><div><dt>Task / architecture</dt><dd>{text(result.task)} · {text(result.architecture)}</dd></div><div><dt>Method</dt><dd>{text(result.method)}</dd></div><div><dt>Published</dt><dd>{text(result.published_at, 'published_at')}</dd></div></dl><details><summary>Inspect source provenance</summary><pre>{JSON.stringify({ dataset: result.dataset_ref, configuration: result.configuration_ref, artifact: result.artifact_ref, specification_id: result.specification_id, queued_run_id: result.queued_run_id }, null, 2)}</pre></details></article>{/each}</div>{/if}
+</details>
+
+{#if detail}<dialog class="model-modal" bind:this={detailDialog} aria-label="Model details" on:cancel|preventDefault={closeDetail} on:click={(event) => event.target === detailDialog && closeDetail()}><header><div><p class="eyebrow">SEALED MODEL</p><h2>{text(detailArtifact().name ?? detail.name ?? detailArtifact().artifact_id ?? detail.artifact_id)}</h2><p>{text(detailArtifact().architecture ?? detail.architecture)} · {text(detailArtifact().task ?? detail.task)}</p></div><div class="modal-actions">{#if detailArtifact().artifact_id ?? detail.artifact_id}<button class="secondary small" disabled={detailLoading || renameBusy} on:click={startRename}>Rename</button><a class="secondary small" href={api.artifactDownloadUrl(String(detailArtifact().artifact_id ?? detail.artifact_id))}>Download archive</a>{#if String(detailArtifact().task ?? detail.task) === 'classification'}<button class="secondary small" on:click={openPosthoc}>Fit post-hoc head</button>{/if}<button class="secondary small" on:click={openInference}>Run inference</button>{/if}<button class="icon-button" aria-label="Close" on:click={closeDetail}>×</button></div></header><nav class="detail-tabs" aria-label="Model detail sections">{#each ['overview', 'history', 'evaluation', 'architecture', 'provenance'] as tab}<button class:active={detailTab === tab} aria-current={detailTab === tab ? 'page' : undefined} on:click={() => detailTab = tab as DetailTab}>{tab === 'overview' ? 'Overview' : tab === 'history' ? 'Learning curves' : tab === 'evaluation' ? 'Evaluation' : tab === 'architecture' ? 'Architecture' : 'Provenance'}</button>{/each}</nav>{#if renaming}<form class="rename-form" on:submit|preventDefault={saveRename}><label><span>Model run name</span><input aria-label="Model run name" maxlength="240" bind:value={renameName} disabled={renameBusy} /></label><button type="submit" disabled={renameBusy || !renameName.trim()}>{renameBusy ? 'Saving…' : 'Save name'}</button><button type="button" class="secondary" disabled={renameBusy} on:click={() => { renaming = false; renameError = ''; }}>Cancel</button>{#if renameError}<p class="inline-error" role="alert">{renameError}</p>{/if}</form>{/if}{#if detailLoading}<p class="empty">Gathering architecture and provenance…</p>{:else}<div class="detail-grid">
+				{#if detailArtifact().task !== 'embedding'}<article class="head-results" class:hidden={detailTab !== 'evaluation'}><h3>Classifier metrics</h3>
 					<p class="inspect-hint">Scores are grouped by the head that produced them. Test scores use each head’s recorded dataset; select a metric for its validation history or fitting context.</p>
 					{#if !detail.posthoc && posthocRequested()}<p class="dataset-notice" role="status">This model requested a post-hoc classifier, but its sealed artifact contains no fitted head or post-hoc metrics. You can fit a head from this model using the button above; the result will appear as a separate model with both classifiers’ scores.</p>{:else if !detail.posthoc}<p class="inspect-hint">No post-hoc classifier has been fitted to this model.</p>{/if}
 					{#if detail.posthoc && String(neuralDatasetId()) !== String(posthocDatasetIdForDetail())}<p class="dataset-notice">These heads were evaluated on different datasets. Their scores are shown together for reference, not as a direct comparison.</p>{/if}
@@ -465,14 +494,16 @@
 			{#if Number.isFinite(posthocProgressFraction)}<progress max="100" value={Math.max(0, Math.min(100, posthocProgressFraction * 100))} aria-label="Post-hoc classifier fitting progress"></progress>{/if}
 			{#if posthocEvents.length}<ol>{#each [...posthocEvents].reverse().filter((event) => String(event.event_type ?? '').startsWith('worker.posthoc_')).slice(0, 6) as event}<li><span>{text(event.message)}</span><small>{text(event.timestamp ? new Date(String(event.timestamp)).toLocaleTimeString() : '')}</small></li>{/each}</ol>{/if}
 		</section>{/if}{#if posthocCompareRuns.length}<section class="posthoc-progress"><strong>Classifier comparison</strong>{#if posthocCompareError}<p class="inline-error" role="alert">{posthocCompareError}</p>{/if}<ol>{#each posthocCompareRuns as run}<li><span>{text(asRecord(run.posthoc).estimator ?? run.name ?? run.posthoc_run_id)} · {text(run.status)}</span>{#if run.output_artifact_id}<button class="secondary small" on:click={() => inspect({ artifact_id: run.output_artifact_id })}>Inspect</button>{/if}</li>{/each}</ol><div class="modal-actions"><button class="secondary small" disabled={posthocBusy} on:click={refreshComparePosthoc}>Refresh all</button>{#if posthocCompareRuns.some((run) => !['indexed', 'completed', 'failed', 'cancelled'].includes(String(run.status)))}<button class="secondary small" disabled={posthocBusy} on:click={cancelComparePosthoc}>Cancel active</button>{/if}{#if compareArtifactIds().length > 1}<button class="secondary small" on:click={() => oncompare(compareArtifactIds())}>Compare results</button>{/if}</div></section>{/if}</section>{/if}
-	{#if inferenceOpen}<section class="inference-panel"><div class="panel-head"><div><p class="eyebrow">ORCHESTRATED BATCH INFERENCE</p><h3>Run this sealed model</h3><p>The Orchestrator validates and leases this request to an admitted worker; no browser connects to a worker.</p></div><button class="icon-button" aria-label="Close inference form" on:click={() => inferenceOpen = false}>×</button></div>{#if inferenceError}<p class="inline-error" role="alert">{inferenceError}</p>{/if}{#if !inferenceRun}<div class="inference-form"><label><span>Name</span><input bind:value={inferenceName} /></label><label><span>Frozen dataset</span><select bind:value={inferenceDatasetId}><option value="">Choose frozen dataset</option>{#each frozenDatasetOptions as dataset}<option value={String(dataset.dataset_id ?? dataset.id)}>{text(dataset.name ?? dataset.dataset_id ?? dataset.id)}</option>{/each}</select></label><label><span>Inference worker pool</span><select bind:value={inferencePoolId}><option value="">Choose inference pool</option>{#each inferencePoolOptions as pool}<option value={String(pool.pool_id ?? pool.id)}>{text(pool.name ?? pool.pool_id ?? pool.id)}</option>{/each}</select></label><label><span>Dataset split</span><select bind:value={inferenceSplit}><option value="all">All records</option><option value="train">Train</option><option value="validation">Validation</option><option value="test">Test</option></select></label></div><button disabled={inferenceBusy} on:click={submitInference}>{inferenceBusy ? 'Submitting…' : 'Queue inference'}</button>{:else}<div class="inference-result"><div><span>Status</span><strong class="status {inferenceStatus(inferenceRun)}">{inferenceStatus(inferenceRun)}</strong></div><div><span>Run</span><strong>{inferenceId(inferenceRun)}</strong></div><div class="modal-actions"><button class="secondary small" disabled={inferenceBusy} on:click={refreshInference}>Refresh</button>{#if !['completed', 'published', 'failed', 'cancelled', 'canceled'].includes(inferenceStatus(inferenceRun).toLowerCase())}<button class="secondary small" disabled={inferenceBusy} on:click={cancelInference}>Cancel</button>{/if}<a class="secondary small" href={api.inferenceDownloadUrl(inferenceId(inferenceRun))}>Download results</a></div></div>{/if}</section>{/if}</div></div>{/if}
+	{#if inferenceOpen}<section class="inference-panel"><div class="panel-head"><div><p class="eyebrow">ORCHESTRATED BATCH INFERENCE</p><h3>Run this sealed model</h3><p>The Orchestrator validates and leases this request to an admitted worker; no browser connects to a worker.</p></div><button class="icon-button" aria-label="Close inference form" on:click={() => inferenceOpen = false}>×</button></div>{#if inferenceError}<p class="inline-error" role="alert">{inferenceError}</p>{/if}{#if !inferenceRun}<div class="inference-form"><label><span>Name</span><input bind:value={inferenceName} /></label><label><span>Frozen dataset</span><select bind:value={inferenceDatasetId}><option value="">Choose frozen dataset</option>{#each frozenDatasetOptions as dataset}<option value={String(dataset.dataset_id ?? dataset.id)}>{text(dataset.name ?? dataset.dataset_id ?? dataset.id)}</option>{/each}</select></label><label><span>Inference worker pool</span><select bind:value={inferencePoolId}><option value="">Choose inference pool</option>{#each inferencePoolOptions as pool}<option value={String(pool.pool_id ?? pool.id)}>{text(pool.name ?? pool.pool_id ?? pool.id)}</option>{/each}</select></label><label><span>Dataset split</span><select bind:value={inferenceSplit}><option value="all">All records</option><option value="train">Train</option><option value="validation">Validation</option><option value="test">Test</option></select></label></div><button disabled={inferenceBusy} on:click={submitInference}>{inferenceBusy ? 'Submitting…' : 'Queue inference'}</button>{:else}<div class="inference-result"><div><span>Status</span><strong class="status {inferenceStatus(inferenceRun)}">{inferenceStatus(inferenceRun)}</strong></div><div><span>Run</span><strong>{inferenceId(inferenceRun)}</strong></div><div class="modal-actions"><button class="secondary small" disabled={inferenceBusy} on:click={refreshInference}>Refresh</button>{#if !['completed', 'published', 'failed', 'cancelled', 'canceled'].includes(inferenceStatus(inferenceRun).toLowerCase())}<button class="secondary small" disabled={inferenceBusy} on:click={cancelInference}>Cancel</button>{/if}<a class="secondary small" href={api.inferenceDownloadUrl(inferenceId(inferenceRun))}>Download results</a></div></div>{/if}</section>{/if}</dialog>{/if}
 
 {#if posthocOpen && !posthocRun && !posthocCompareRuns.length}<div class="posthoc-compare-action"><button class="secondary" disabled={posthocBusy || posthocInputsLoading || !posthocDatasetOptions.length || !posthocPoolOptions.length} on:click={comparePosthoc}>{posthocBusy ? 'Submitting comparison…' : 'Compare all four classifiers'}</button><small>Queues four heads with the same dataset, split strategy, seed, scaling, PCA, and calibration settings.</small></div>{/if}
 
 
 
 <style>
-	.pretraining-catalog{margin:0 0 1rem;padding:1.1rem;background:white;border:1px solid var(--line);border-radius:10px}.pretraining-heading,.pretraining-result-heading{display:flex;justify-content:space-between;align-items:start;gap:1rem}.pretraining-heading h2{margin:.1rem 0}.pretraining-heading p:not(.eyebrow){max-width:720px;margin:.3rem 0 .8rem;color:var(--muted);font-size:.8rem}.pretraining-list{display:grid;gap:.6rem}.pretraining-list article{padding:.8rem;border:1px solid var(--line);border-radius:8px;background:#f9fbfa;min-width:0}.pretraining-result-heading strong,.pretraining-list dd{overflow-wrap:anywhere}.pretraining-list dl{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:.6rem;margin:.8rem 0}.pretraining-list dt{color:var(--muted);font-size:.68rem;font-weight:700;text-transform:uppercase}.pretraining-list dd{margin:.2rem 0 0;font-size:.75rem}.pretraining-list summary{cursor:pointer;font-size:.75rem;font-weight:700}.pretraining-list pre{max-height:220px;overflow:auto;padding:.7rem;background:#102a35;color:#dceced;border-radius:7px;font-size:.7rem}
+	.pretraining-catalog{margin:1rem 0;padding:1.1rem;background:white;border:1px solid var(--line);border-radius:10px}.pretraining-catalog>summary{display:flex;justify-content:space-between;cursor:pointer;color:#1d464c}.pretraining-catalog>summary span{display:grid;gap:.15rem}.pretraining-catalog>summary small{color:var(--muted);font-size:.72rem;font-weight:400}.pretraining-heading,.pretraining-result-heading{display:flex;justify-content:space-between;align-items:start;gap:1rem}.pretraining-heading p{max-width:720px;margin:.8rem 0;color:var(--muted);font-size:.8rem}.pretraining-list{display:grid;gap:.6rem}.pretraining-list article{padding:.8rem;border:1px solid var(--line);border-radius:8px;background:#f9fbfa;min-width:0}.pretraining-result-heading strong,.pretraining-list dd{overflow-wrap:anywhere}.pretraining-list dl{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:.6rem;margin:.8rem 0}.pretraining-list dt{color:var(--muted);font-size:.68rem;font-weight:700;text-transform:uppercase}.pretraining-list dd{margin:.2rem 0 0;font-size:.75rem}.pretraining-list summary{cursor:pointer;font-size:.75rem;font-weight:700}.pretraining-list pre{max-height:220px;overflow:auto;padding:.7rem;background:#102a35;color:#dceced;border-radius:7px;font-size:.7rem}
+	.catalog-pagination{display:flex;justify-content:flex-end;align-items:center;gap:.5rem;margin:.75rem 0;color:var(--muted);font-size:.75rem}.catalog-pagination span{margin-right:auto}
+	.detail-tabs{display:flex;flex-wrap:wrap;gap:.35rem;margin:1rem 0;border-bottom:1px solid var(--line);padding-bottom:.65rem}.detail-tabs button{padding:.38rem .6rem;color:var(--muted);background:transparent;border:1px solid transparent;font-size:.72rem}.detail-tabs button:hover,.detail-tabs button.active{color:var(--teal-dark);background:var(--teal-soft);border-color:#9bcec5}.model-modal::backdrop{background:rgba(8,29,35,.56)}.model-modal{border:0}.model-modal:has(.detail-tabs button:nth-child(1).active) .head-results,.model-modal:has(.detail-tabs button:nth-child(1).active) .module-map,.model-modal:has(.detail-tabs button:nth-child(1).active) .field-evidence,.model-modal:has(.detail-tabs button:nth-child(1).active) .training-charts,.model-modal:has(.detail-tabs button:nth-child(1).active) .insight-panel,.model-modal:has(.detail-tabs button:nth-child(1).active)>details{display:none}.model-modal:has(.detail-tabs button:nth-child(2).active) .detail-grid,.model-modal:has(.detail-tabs button:nth-child(2).active) .module-map,.model-modal:has(.detail-tabs button:nth-child(2).active) .field-evidence,.model-modal:has(.detail-tabs button:nth-child(2).active) .insight-panel,.model-modal:has(.detail-tabs button:nth-child(2).active)>details{display:none}.model-modal:has(.detail-tabs button:nth-child(3).active) .detail-grid>article:not(.head-results),.model-modal:has(.detail-tabs button:nth-child(3).active) .module-map,.model-modal:has(.detail-tabs button:nth-child(3).active) .field-evidence,.model-modal:has(.detail-tabs button:nth-child(3).active) .training-charts,.model-modal:has(.detail-tabs button:nth-child(3).active)>details{display:none}.model-modal:has(.detail-tabs button:nth-child(4).active) .detail-grid,.model-modal:has(.detail-tabs button:nth-child(4).active) .field-evidence,.model-modal:has(.detail-tabs button:nth-child(4).active) .training-charts,.model-modal:has(.detail-tabs button:nth-child(4).active)>details{display:none}.model-modal:has(.detail-tabs button:nth-child(5).active) .detail-grid,.model-modal:has(.detail-tabs button:nth-child(5).active) .module-map,.model-modal:has(.detail-tabs button:nth-child(5).active) .training-charts,.model-modal:has(.detail-tabs button:nth-child(5).active) .insight-panel{display:none}
 
 	.rename-form{display:flex;flex-wrap:wrap;align-items:end;gap:.5rem;margin:.8rem 0;padding:.8rem;border:1px solid var(--line);border-radius:8px;background:#f9fbfa}.rename-form label{display:grid;gap:.25rem;flex:1;min-width:180px}.rename-form label span{font-size:.72rem;font-weight:700}.rename-form .inline-error{flex-basis:100%;margin:0}
 	.posthoc-progress{margin-top:.9rem;padding:.85rem 1rem;border:1px solid var(--line);border-radius:8px;background:#fff}.posthoc-progress>strong{font-size:.8rem}.posthoc-progress p{margin:.4rem 0;color:var(--ink)}.posthoc-progress progress{display:block;width:100%;height:.5rem;accent-color:var(--teal)}.posthoc-progress ol{margin:.65rem 0 0;padding-left:1.25rem;display:grid;gap:.3rem}.posthoc-progress li{font-size:.72rem;color:var(--muted)}.posthoc-progress li small{margin-left:.5rem;color:var(--muted)}

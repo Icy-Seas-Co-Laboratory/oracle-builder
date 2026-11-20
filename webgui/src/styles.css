@@ -766,3 +766,7 @@ tbody tr.selected { background: #eff6ff; }
     .workflow-nav button > span { min-width: 0; max-width: 100%; }
     .workflow-nav strong { overflow-wrap: anywhere; }
 }
+
+/* Grouped navigation remains reachable on short laptop screens. */
+.app-sidebar { overflow-y: auto; }
+.workflow-nav > .nav-label { margin-top: .45rem; margin-bottom: .05rem; }

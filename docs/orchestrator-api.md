@@ -294,3 +294,13 @@ set the service limit.
 `POST /v1/uploads/{kind}/{filename}` remains as a streaming one-request
 compatibility endpoint for the CLI and simple integrations; new browser work
 should use resumable sessions.
+
+### Compact dashboard telemetry
+
+`GET /v1/jobs/{job_id}/telemetry` returns `events` containing the latest event
+of each recorded type, ordered by sequence, and
+`trace_scope: "latest_worker_snapshot"`. The lightweight `summary` carries queue
+and runtime seconds derived from job timestamps. Event data is decoded once; internal
+`data_json` fields are omitted. The worker snapshot retains its epoch history
+and bounded batch trace. Missing jobs return 404. This read does not prune or
+modify the complete `/v1/jobs/{job_id}/events` provenance ledger.

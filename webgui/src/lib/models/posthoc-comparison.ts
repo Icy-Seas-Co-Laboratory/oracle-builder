@@ -21,3 +21,9 @@ export function exactPosthocComparison(members: RecordValue[]): boolean {
 export function lowerIsBetter(key: string): boolean {
 	return /(^|_)(loss|error|brier|log_loss)(_|$)/.test(key);
 }
+
+/** A numeric difference is not an improvement claim without matching evidence. */
+export function comparisonDeltaTone(members: RecordValue[], key: string, delta: number | null): 'positive' | 'negative' | 'neutral' {
+	if (delta === null || !exactPosthocComparison(members)) return 'neutral';
+	return (lowerIsBetter(key) ? delta < 0 : delta > 0) ? 'positive' : 'negative';
+}

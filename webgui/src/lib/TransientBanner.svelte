@@ -17,6 +17,7 @@
 	}
 	function expireAfterOnset(_message: string) {
 		clearTimer();
+		if (tone === 'error') return;
 		timer = setTimeout(ondismiss, 8000);
 	}
 	// A changed message gets its own lifetime; identical polling errors do not
